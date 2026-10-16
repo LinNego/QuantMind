@@ -282,12 +282,20 @@ def _prepare_arrays(
             f", quantiles={_quantiles}" if _quantiles else "",
         )
 
-    # 逐列取中位数：train_df[features] 整块取值会临时复制 ~8GB（7.4M×273 float32）
-    fill_values_raw = {c: train_df[c].median() for c in features}
-    # 中位数本身也可能非有限（列含 ±inf 时 pandas median 不忽略 inf）——一律回退 0.0，
-    # 否则「填缺失」会把 inf 再写回矩阵，XGBoost 照旧 Check failed。
-    fill_values = {k: (0.0 if (isinstance(v, float) and not math.isfinite(v)) else v) for k, v in fill_values_raw.items()}
-    _fill_vec = np.array([fill_values[c] for c in features], dtype=np.float32)
+    # 逐列取中位数：train_df[features] 整块取值会临时复制 ~8GB（7.4M×273 float32）。
+    # 多模型循环会对同一批帧重复调用本函数：原地填充（_fill_inplace）后重算中位数
+    # 不保证与原始帧逐位一致——attrs 缓存首次结果（改动前重复调用本是逐位相同的）。
+    _fv_cache = train_df.attrs.get("qm_fill_values")
+    if _fv_cache is not None and all(c in _fv_cache for c in features):
+        fill_values = {c: _fv_cache[c] for c in features}
+        _fill_vec = np.array([fill_values[c] for c in features], dtype=np.float32)
+    else:
+        fill_values_raw = {c: train_df[c].median() for c in features}
+        # 中位数本身也可能非有限（列含 ±inf 时 pandas median 不忽略 inf）——一律回退 0.0，
+        # 否则「填缺失」会把 inf 再写回矩阵，XGBoost 照旧 Check failed。
+        fill_values = {k: (0.0 if (isinstance(v, float) and not math.isfinite(v)) else v) for k, v in fill_values_raw.items()}
+        _fill_vec = np.array([fill_values[c] for c in features], dtype=np.float32)
+        train_df.attrs["qm_fill_values"] = fill_values
 
     def _fill(frame: pd.DataFrame) -> np.ndarray:
         # 预分配一块 float32 矩阵逐列搬入并原地填 NaN。原实现
@@ -318,10 +326,108 @@ def _prepare_arrays(
             )
         return arr
 
-    X_train = _fill(train_df)
+    def _feature_block_view(frame: pd.DataFrame) -> np.ndarray | None:
+        """零拷贝取特征块视图：pandas 把同 dtype 各列存为单块 values=(n_cols,
+        n_rows)，转置即 (n_rows, n_cols) 的 C 连续视图、与块共享内存
+        （2026-10-16 探针锁定：`_take_rows` 取段后与 memmap 溢出帧上均成立）。
+        用内部 API（_mgr），每一项都做运行时校验；任何异常/不满足一律弃用走拷贝路径。
+        """
+        try:
+            want = list(features)
+            hit = None
+            for blk in frame._mgr.blocks:
+                if blk.dtype != np.float32 or blk.values.ndim != 2:
+                    continue
+                if blk.values.shape[0] != len(want):
+                    continue
+                if list(frame.columns[blk.mgr_locs.as_array]) != want:
+                    continue
+                if hit is not None:
+                    return None  # 多候选，语义不明——不猜
+                hit = blk
+            if hit is None:
+                return None
+            X = hit.values.T
+            if (
+                X.dtype != np.float32
+                or X.shape != (len(frame), len(want))
+                or not X.flags.c_contiguous
+                or not X.flags.writeable
+                or not np.shares_memory(X, hit.values)
+            ):
+                return None
+            return X
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _fill_inplace(frame: pd.DataFrame) -> np.ndarray | None:
+        """原地把 NaN/±inf 按 _fill_vec 填进帧的特征块（写透传），返回 X 视图。
+
+        与 _fill 拷贝路径逐位等价：同一 _fill_vec、同一 mask 口径（NaN|inf）。
+        填完帧的该列即已填充——下游只读消费方安全：训练后预测/指标经 _fill 重算
+        结果相同（掩码幂等），SHAP 原本就按 fill_values 填 NaN（±inf 格除外）。
+        任何校验不过返回 None（调用方回退 _fill 拷贝路径）。
+        """
+        X = _feature_block_view(frame)
+        if X is None:
+            return None
+        try:
+            probe = frame[features[0]].to_numpy(dtype=np.float32, copy=False)
+            if not np.shares_memory(probe, X):
+                return None  # 列读不给视图则写不进块——整体放弃
+            _inf_cols: list[tuple[str, int]] = []
+            for i, c in enumerate(features):
+                col = frame[c].to_numpy(dtype=np.float32, copy=False)
+                mask = np.isnan(col)
+                inf_mask = np.isinf(col)
+                if inf_mask.any():
+                    _inf_cols.append((c, int(inf_mask.sum())))
+                    mask = mask | inf_mask
+                if mask.any():
+                    col[mask] = _fill_vec[i]
+            if _inf_cols:
+                _top = sorted(_inf_cols, key=lambda t: -t[1])[:5]
+                logger.warning(
+                    "_fill(原地): %d 列含 ±inf，已按缺失填充（total=%d，Top: %s）",
+                    len(_inf_cols),
+                    sum(n for _, n in _inf_cols),
+                    ", ".join(f"{c}×{n}" for c, n in _top),
+                )
+            return X
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _warn_view_miss(name: str, frame: pd.DataFrame) -> None:
+        """视图未命中时把帧的块结构打进日志——回退路径的可诊断性（2026-10-16）。"""
+        try:
+            parts = []
+            for blk in frame._mgr.blocks:
+                fl = getattr(blk.values, "flags", None)
+                order = (
+                    ("C" if fl.c_contiguous else "") + ("F" if fl.f_contiguous else "")
+                ) or "?"
+                parts.append(f"{blk.dtype}:{getattr(blk.values, 'shape', '?')}:{order}")
+            logger.warning(
+                "特征块视图未命中（%s），回退拷贝路径。块结构: %s",
+                name, "; ".join(parts),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("特征块视图未命中（%s），回退拷贝路径（块结构 dump 失败）", name)
+
+    X_train = _fill_inplace(train_df)
+    _x_mode = "零拷贝视图"
+    if X_train is None:
+        X_train = _fill(train_df)
+        _x_mode = "拷贝"
+        _warn_view_miss("train_df", train_df)
     y_train = train_df["label"].astype("float32").to_numpy()
-    log_rss("X_train 物化", f"{X_train.shape[0]:,} × {X_train.shape[1]}")
-    X_val = _fill(val_df)
+    log_rss("X_train 物化", f"{X_train.shape[0]:,} × {X_train.shape[1]}（{_x_mode}）")
+    X_val = _fill_inplace(val_df)
+    _xv_mode = "零拷贝视图"
+    if X_val is None:
+        X_val = _fill(val_df)
+        _xv_mode = "拷贝"
+        _warn_view_miss("val_df", val_df)
     y_val = val_df["label"].astype("float32").to_numpy()
-    log_rss("X_val 物化", f"{X_val.shape[0]:,} × {X_val.shape[1]}")
+    log_rss("X_val 物化", f"{X_val.shape[0]:,} × {X_val.shape[1]}（{_xv_mode}）")
     return fill_values, X_train, y_train, X_val, y_val, _fill

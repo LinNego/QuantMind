@@ -5,8 +5,10 @@
 """
 from __future__ import annotations
 
+import atexit
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +19,81 @@ from data.memprobe import log_rss, rss_stage
 from data.splits import _EXECUTION_LAG_DAYS
 
 logger = logging.getLogger("quantmind.train")
+
+
+# ══ 特征溢出（memmap）═══════════════════════════════════════════════════════
+# 2026-10-16 全窗（2016-01 起 ≈ 10.72M 行 × 300 特征）内存改造：取行结果的宽帧
+# 特征列按行块流式写入 C 序 memmap（临时文件、进程退出即删），返回的帧特征块架在
+# 该映射上——列读数穿页、页缓存可回收（对 MemAvailable 友好），PSI/切分/训练后
+# 预测等下游全部按普通 DataFrame 使用、代码零改动；薄列（symbol/trade_date/
+# label）驻内存。输出与旧 `.loc[valid_index, keep_cols].reset_index(drop=True)`
+# 逐位一致（2026-10-16 探针锁定）：行序=pos 顺序、列序=[symbol, trade_date,
+# label]+features、dtype 原样。任何不可行情形（非 f32、索引非唯一、异常）回退旧写法。
+_SPILL_REFS: list = []          # 保活 memmap 对象（帧块的 base 链之外再钉一道）
+_SPILL_PATHS: list = []
+_SPILL_CHUNK_ROWS = 262_144
+
+
+def _spill_enabled() -> bool:
+    v = os.environ.get("QM_TRAIN_FEATURE_SPILL", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _spill_cleanup() -> None:
+    for _p in _SPILL_PATHS:
+        try:
+            os.remove(_p)
+        except OSError:
+            pass
+    _SPILL_PATHS.clear()
+
+
+atexit.register(_spill_cleanup)
+
+
+def _clip_rows_via_spill(df: pd.DataFrame, pos, features: list[str]) -> pd.DataFrame | None:
+    """按位置取行并把特征列落 memmap；任何不可行情形返回 None（调用方回退）。
+
+    pos：df 内的行位置数组（valid_index 经 get_indexer 反查，须全部 ≥0）。
+    旧写法 `.loc[valid_index, keep_cols].reset_index(drop=True)` 在 10.72M 行时
+    同时驻留 3 份帧级拷贝（源帧 + 取行副本 + reset_index 内部再拷）必 OOM；
+    本实现逐行块 take + 写 memmap，瞬态只多一个行块的量。
+    """
+    n, nf = len(pos), len(features)
+    if n == 0 or nf == 0:
+        return None
+    _bad = [c for c in features if df[c].dtype != np.float32]
+    if _bad:
+        logger.warning(
+            "Feature spill skipped: %d feature column(s) not float32 (e.g. %s)",
+            len(_bad), _bad[:5],
+        )
+        return None
+    path = None
+    try:
+        fd, path = tempfile.mkstemp(prefix="qm_feat_spill_", suffix=".f32")
+        os.close(fd)
+        _SPILL_PATHS.append(path)  # 先登记，异常路径也能被 atexit 清掉
+        mat = np.memmap(path, dtype=np.float32, mode="w+", shape=(n, nf))
+        for start in range(0, n, _SPILL_CHUNK_ROWS):
+            idx = pos[start:start + _SPILL_CHUNK_ROWS]
+            sub = df.take(idx)
+            mat[start:start + len(idx)] = sub[features].to_numpy(dtype=np.float32, copy=False)
+            del sub
+        mat.flush()
+        out = pd.DataFrame(mat, columns=list(features), copy=False)
+        out.insert(0, "label", df["label"].take(pos).to_numpy())
+        out.insert(0, "trade_date", df["trade_date"].take(pos).to_numpy())
+        out.insert(0, "symbol", df["symbol"].take(pos).to_numpy())
+        _SPILL_REFS.append(mat)
+        logger.info(
+            "[mem] 特征溢出到 memmap: %d 行 × %d 列 → %s（%.2fG，页缓存可回收）",
+            n, nf, path, n * nf * 4 / 1e9,
+        )
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Feature spill failed (%s), falling back to in-memory clip", exc)
+        return None
 
 
 def _to_prefix_symbol(sym: str) -> str:
@@ -547,7 +624,21 @@ def load_data(
     # 宽表一次性取回（行=已排序有效行，列=最终保留列），label 从窄表对齐写入
     df["label"] = narrow["label"]
     keep_cols = ["symbol", "trade_date", "label"] + features
-    df = df.loc[valid_index, keep_cols].reset_index(drop=True)
+    # 优先走 memmap 溢出（见 _clip_rows_via_spill：全窗下旧写法的 3 份帧级拷贝
+    # 必 OOM）；不可行时回退旧写法（当前窗口记忆里安全，全窗下则是已知风险路径）。
+    _spilled = None
+    if _spill_enabled() and df.index.is_unique:
+        try:
+            _pos = df.index.get_indexer(valid_index)
+        except Exception:  # noqa: BLE001
+            _pos = None
+            logger.warning("Feature spill: get_indexer failed, falling back", exc_info=True)
+        if _pos is not None and (_pos >= 0).all():
+            _spilled = _clip_rows_via_spill(df, _pos, features)
+    if _spilled is not None:
+        df = _spilled
+    else:
+        df = df.loc[valid_index, keep_cols].reset_index(drop=True)
     logger.info(f"After date range clip ({train_start} to {_clip_end}): {len(df)} rows")
 
     # 保留原始收益标签：label 随后会被截面 rank（回归）或二值化（分类）改写，
