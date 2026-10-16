@@ -1,4 +1,4 @@
-"""提交跨库 T+5 树模型训练（lightgbm/xgboost/catboost），并对训练 config.yaml 做回读断言。
+"""提交跨库 T+5 模型训练（lightgbm/xgboost/catboost/nativetft），并对训练 config.yaml 做回读断言。
 
 唯一事实源：`data/quantdb/factor_research/screening/training_selection_300.json`
 （`backend/scripts/select_training_features.py` 的产物；`train_plan` + `features_payload`）。
@@ -27,6 +27,9 @@ config.yaml>` 钉扎逐库目录版本——版本不一致即拒绝提交，保
     # 对比训练：同因子/窗口换模型类型 + 钉扎库版本
     QM_PASSWORD=... python3 backend/scripts/submit_crosslib_training.py \\
         --model-type xgboost --pin-versions-from data/training_jobs/<base_run>/config.yaml
+    # GPU TFT（NativeTFT，dl_params 走内置配方；训练容器自动探测 GPU，无卡回落 CPU）
+    QM_PASSWORD=... python3 backend/scripts/submit_crosslib_training.py \\
+        --model-type nativetft --pin-versions-from data/training_jobs/<base_run>/config.yaml
 """
 
 from __future__ import annotations
@@ -48,14 +51,29 @@ _MARKET = "CN"
 _CONFIG_POLL_INTERVAL_S = 5.0
 
 # 模型类型 → job/display 名 token 与模型产物文件名（train.py `_save_model` 分派）。
+# nativetft 的落盘权重是固定名 model.pth（trainers_dl 写出，单模型流程不改名；
+# metadata.model_file 记 model_nativetft.pth 属已知对不上，加载侧有 *.pth 兜底）。
 _MODEL_TYPE_INFO: dict[str, dict[str, str]] = {
     "lightgbm": {"token": "LGB", "label": "LightGBM", "file": "model.lgb"},
     "xgboost": {"token": "XGB", "label": "XGBoost", "file": "model.xgb"},
     "catboost": {"token": "CAT", "label": "CatBoost", "file": "model.cbm"},
+    "nativetft": {"token": "TFT", "label": "NativeTFT", "file": "model.pth"},
+}
+
+# NativeTFT 配方（两轮全窗前例一致：2026-09-17 批 / 2026-09-23 批）。
+# n_epochs=8 必须显式传（框架默认 200）；实测 best epoch=1~2、第 7 轮早停。
+# 口径注意：训练日志的 valid_ic 是 Pearson，result.json by_split 才是平台 rank-IC。
+_TFT_DL_PARAMS: dict[str, int] = {
+    "n_epochs": 8,
+    "step_len": 20,
+    "batch_size": 4000,
+    "early_stopping_rounds": 5,
 }
 
 
-def _derive_run_names(job_name: str, display_name: str, model_type: str) -> tuple[str, str]:
+def _derive_run_names(
+    job_name: str, display_name: str, model_type: str
+) -> tuple[str, str]:
     """把基准名里的模型 token 改写成目标模型；原名不含任何已知 token 时兜底追加。"""
     info = _MODEL_TYPE_INFO[model_type]
     for other in _MODEL_TYPE_INFO.values():
@@ -193,6 +211,11 @@ def _build_payload(sel: dict[str, Any], versions: dict[str, str]) -> dict[str, A
         "num_boost_round": int(tp["num_boost_round"]),
         "early_stopping_rounds": int(tp["early_stopping_rounds"]),
         "lgb_params": {},  # 走平台默认（LR/叶子数/正则等）
+        # nativetft 显式传配方 dl_params（n_epochs=8 必须传，框架默认 200）；
+        # 树模型保持 {}（走各自默认）。
+        "dl_params": (
+            dict(_TFT_DL_PARAMS) if str(tp["model_type"]) == "nativetft" else {}
+        ),
         "max_time_minutes": int(tp["max_time_minutes"]),
         "context": dict(tp["context"]),
         "explain": {
@@ -311,14 +334,21 @@ def _assert_config(
 
     if str(model.get("type") or "") != str(tp["model_type"]):
         fails.append(f"model.type={model.get('type')!r} != {tp['model_type']!r}")
-    if int(model.get("num_boost_round") or -1) != int(tp["num_boost_round"]):
-        fails.append(f"model.num_boost_round={model.get('num_boost_round')!r}")
-    if int(model.get("early_stopping_rounds") or -1) != int(
-        tp["early_stopping_rounds"]
-    ):
-        fails.append(
-            f"model.early_stopping_rounds={model.get('early_stopping_rounds')!r}"
-        )
+    if str(tp["model_type"]) in ("lightgbm", "xgboost", "catboost"):
+        if int(model.get("num_boost_round") or -1) != int(tp["num_boost_round"]):
+            fails.append(f"model.num_boost_round={model.get('num_boost_round')!r}")
+        if int(model.get("early_stopping_rounds") or -1) != int(
+            tp["early_stopping_rounds"]
+        ):
+            fails.append(
+                f"model.early_stopping_rounds={model.get('early_stopping_rounds')!r}"
+            )
+    elif str(tp["model_type"]) == "nativetft":
+        got_dl = model.get("dl_params") or {}
+        if {k: got_dl.get(k) for k in _TFT_DL_PARAMS} != _TFT_DL_PARAMS:
+            fails.append(
+                f"model.dl_params 缺项/不符：{got_dl!r}（期望含 {_TFT_DL_PARAMS!r}）"
+            )
 
     if str(context.get("market") or "") != str(tp["context"]["market"]):
         fails.append(f"context.market={context.get('market')!r}")
@@ -394,7 +424,9 @@ async def main() -> None:
         default=None,
         help="覆盖 train_plan.model_type（对比训练用；job/display 名按 token 自动改写）",
     )
-    ap.add_argument("--job-name", default="", help="覆盖任务机器名（默认按 model-type 改写）")
+    ap.add_argument(
+        "--job-name", default="", help="覆盖任务机器名（默认按 model-type 改写）"
+    )
     ap.add_argument(
         "--display-name", default="", help="覆盖任务展示名（默认按 model-type 改写）"
     )
@@ -411,7 +443,9 @@ async def main() -> None:
     model_type = str(args.model_type or tp.get("model_type") or "lightgbm")
     if model_type not in _MODEL_TYPE_INFO:
         _fail(f"不支持的 model_type={model_type!r}（可选：{sorted(_MODEL_TYPE_INFO)}）")
-    job_name, display_name = _derive_run_names(tp["job_name"], tp["display_name"], model_type)
+    job_name, display_name = _derive_run_names(
+        tp["job_name"], tp["display_name"], model_type
+    )
     if args.job_name:
         job_name = args.job_name
     if args.display_name:
@@ -452,7 +486,9 @@ async def main() -> None:
                 f"  · {lib:22s} {catalogs[lib]['version_id']}  enabled={len(catalogs[lib]['columns'])}"
             )
         if args.pin_versions_from:
-            versions_now = {lib: str(cat["version_id"]) for lib, cat in catalogs.items()}
+            versions_now = {
+                lib: str(cat["version_id"]) for lib, cat in catalogs.items()
+            }
             pinned = _load_pinned_versions(args.pin_versions_from)
             if pinned != versions_now:
                 diffs = [
