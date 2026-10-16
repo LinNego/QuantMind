@@ -766,7 +766,7 @@ export const ModelRegistryPage: React.FC = () => {
                       </h2>
                       <p className="text-xs text-slate-400 mt-1 font-mono">
                         {selectedModel.model_id}
-                        {selectedModel.created_at && ` · 创建于 ${dayjs(selectedModel.created_at).format('YYYY-MM-DD')}`}
+                        {selectedModel.created_at && ` · 创建于 ${dayjs(selectedModel.created_at).format('YYYY-MM-DD HH:mm:ss')}`}
                       </p>
                       {getMeta(selectedModel).description && (
                         <p className="text-xs text-slate-500 mt-2 max-w-xl">{getMeta(selectedModel).description}</p>

@@ -162,7 +162,7 @@ export const ModelCard: React.FC<{
           )}
           {model.is_default && <Star size={9} fill="#fbbf24" className="text-amber-400" />}
         </div>
-        <Text className="text-[8px] text-slate-400 font-mono">{dayjs(model.created_at).format('YY/MM/DD')}</Text>
+        <Text className="text-[8px] text-slate-400 font-mono whitespace-nowrap shrink-0">{dayjs(model.created_at).format('YY/MM/DD HH:mm:ss')}</Text>
       </div>
       <div className="flex items-start justify-between gap-2">
         <Text className={clsx('font-black text-[11px] tracking-tight truncate block leading-tight min-w-0', isSelected ? 'text-blue-700' : 'text-slate-800')}>

@@ -619,7 +619,7 @@ export const ModelRollingPanel: React.FC<{ model: UserModelRecord }> = ({ model 
               <div className="rp-field rp-field--last">
                 <span className="rp-field__label">上次运行</span>
                 <div className="rp-lastrun">
-                  <b>{lastRun ? dayjs(lastRun).format('YYYY-MM-DD HH:mm') : '—'}</b>
+                  <b>{lastRun ? dayjs(lastRun).format('YYYY-MM-DD HH:mm:ss') : '—'}</b>
                 </div>
               </div>
               <div className="rp-foot">
