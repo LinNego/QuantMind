@@ -32,9 +32,14 @@ def _compute_metrics(df: pd.DataFrame, y_true: np.ndarray, y_pred: np.ndarray) -
                 "rmse": 0.0, "auc": 0.0, "score_direction": "normal"}
     y_true = y_true[valid]
     y_pred = y_pred[valid]
-    # df 与 y 长度一致时同步过滤，避免 assign 长度不匹配
+    # df 与 y 长度一致时同步过滤，避免 assign 长度不匹配。
+    # 只物化 trade_date 一列：下游 _rank_ic_series 仅按 trade_date 分组消费
+    # _pred/_label，其余特征列纯陪跑。旧写法 `df.iloc[valid].copy()` 对全窗
+    # train 帧（9.5M×304 f32 ≈ 11.4G）是两份整帧深拷 ≈ 23G 瞬时驻留——2026-10-16
+    # 全窗训练宿主 OOM 的根因（内核报告 anon-rss 44.3G ≈ 21G 稳态 + 23G，吻合）。
+    # DL 路径早已收敛到同款小帧口径（trainers_dl._dl_metrics 的 small 帧）。
     if len(df) == len(valid):
-        df = df.iloc[valid].copy()
+        df = pd.DataFrame({"trade_date": df["trade_date"].to_numpy()[valid]})
     ic     = _ic(y_pred, y_true)
     series = _rank_ic_series(df.assign(_pred=y_pred, _label=y_true), "_pred", "_label")
     rank_ic   = float(np.nanmean(series)) if series else float("nan")

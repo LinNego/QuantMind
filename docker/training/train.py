@@ -144,7 +144,12 @@ from data.factor_selection import _log_factor_selection_summary, select_top_fact
 from data.fingerprint import build_data_fingerprint
 from data.loading import load_data
 from data.memprobe import log_rss, peak_gb, reset_peak, rss_gb
-from data.splits import _EXECUTION_LAG_DAYS, _prepare_arrays, _split_data
+from data.splits import (
+    _EXECUTION_LAG_DAYS,
+    _frame_with_range_index,
+    _prepare_arrays,
+    _split_data,
+)
 from model_trainers.predict import _predict_with_model
 
 
@@ -512,11 +517,11 @@ def train_model(df: pd.DataFrame, features: list[str], cfg: dict, hardware: dict
         train_m,
         val_m,
         test_m,
-        full_pred_df.reset_index(drop=True),
+        _frame_with_range_index(full_pred_df),
         {
-            "train": train_df.reset_index(drop=True),
-            "valid": val_df.reset_index(drop=True),
-            "test": test_df.reset_index(drop=True),
+            "train": _frame_with_range_index(train_df),
+            "valid": _frame_with_range_index(val_df),
+            "test": _frame_with_range_index(test_df),
         },
         model_type,
         _optuna_result,
@@ -721,8 +726,8 @@ def _train_single_model(
         "train_m": train_m,
         "val_m": val_m,
         "test_m": test_m,
-        "pred_df": full_pred_df.reset_index(drop=True) if full_pred_df is not None else None,
-        "split_frames": {"train": train_df.reset_index(drop=True), "valid": val_df.reset_index(drop=True), "test": test_df.reset_index(drop=True)},
+        "pred_df": _frame_with_range_index(full_pred_df) if full_pred_df is not None else None,
+        "split_frames": {"train": _frame_with_range_index(train_df), "valid": _frame_with_range_index(val_df), "test": _frame_with_range_index(test_df)},
         "best_iteration": best_iteration,
         "optuna": _optuna_result,
         "elapsed": elapsed,
@@ -815,7 +820,7 @@ def train_multi_models(
         "primary_model_type": best,
         "model_types": model_types,
         "ensemble_method": ensemble_method,
-        "split_frames": {"train": train_df.reset_index(drop=True), "valid": val_df.reset_index(drop=True), "test": test_df.reset_index(drop=True)},
+        "split_frames": {"train": _frame_with_range_index(train_df), "valid": _frame_with_range_index(val_df), "test": _frame_with_range_index(test_df)},
     }
 
 
@@ -1098,7 +1103,7 @@ def train_stacking(
         "test_ensemble_m": test_ensemble_m,
         "pred_df": pred_df,
         "oof_preds": oof_preds,
-        "split_frames": {"train": train_df.reset_index(drop=True), "valid": val_df.reset_index(drop=True), "test": test_df.reset_index(drop=True)},
+        "split_frames": {"train": _frame_with_range_index(train_df), "valid": _frame_with_range_index(val_df), "test": _frame_with_range_index(test_df)},
     }
 
 

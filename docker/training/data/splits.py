@@ -51,6 +51,22 @@ def _take_rows(frame: pd.DataFrame, mask, name: str) -> pd.DataFrame:
     return seg
 
 
+def _frame_with_range_index(frame: pd.DataFrame) -> pd.DataFrame:
+    """索引已是 RangeIndex 时**原样返回**，否则才 `reset_index(drop=True)`。
+
+    pandas 2.3（无 CoW）下 `reset_index(drop=True)` 内部无条件
+    `self.copy(deep=None)`——对全窗 train 帧（9.5M×304 f32 ≈ 11.4G）就是一份
+    整帧深拷、且新旧两份同时驻留（`_take_rows` docstring 2026-09-23 实测
+    2.01 份段；2026-10-16 全窗 run OOM 复盘的第二颗雷）。切分链（_take_rows）
+    与溢出链（_clip_rows_via_spill）落地时索引均已归零 RangeIndex，这里只需
+    放行原帧；非 RangeIndex（外部传入 df 的派生帧）才真重置——drop=True 仅丢
+    旧索引、不改数据与列序，两分支输出逐位一致。
+    """
+    if isinstance(frame.index, pd.RangeIndex):
+        return frame
+    return frame.reset_index(drop=True)
+
+
 def _split_data(df: pd.DataFrame, cfg: dict) -> tuple:
     """数据切分：显式 split 优先于 val_ratio。返回 (train_df, val_df, test_df)。
 
