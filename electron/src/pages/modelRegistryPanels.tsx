@@ -131,6 +131,10 @@ export const ModelCard: React.FC<{
   const fc = getMeta(model).feature_count ?? null;
   const ensemble = isEnsembleModel(model);
   const memberCount = ensemble ? ensembleMemberIds(model).length : 0;
+  // 系统融合模型（sys-ensemble_cn）created_at 为空串 → dayjs 得 Invalid Date；缺失一律 —
+  const createdLabel = model.created_at && dayjs(model.created_at).isValid()
+    ? dayjs(model.created_at).format('YY/MM/DD HH:mm:ss')
+    : '—';
   return (
     <div
       onClick={onClick}
@@ -162,7 +166,7 @@ export const ModelCard: React.FC<{
           )}
           {model.is_default && <Star size={9} fill="#fbbf24" className="text-amber-400" />}
         </div>
-        <Text className="text-[8px] text-slate-400 font-mono whitespace-nowrap shrink-0">{dayjs(model.created_at).format('YY/MM/DD HH:mm:ss')}</Text>
+        <Text className="text-[8px] text-slate-400 font-mono whitespace-nowrap shrink-0">{createdLabel}</Text>
       </div>
       <div className="flex items-start justify-between gap-2">
         <Text className={clsx('font-black text-[11px] tracking-tight truncate block leading-tight min-w-0', isSelected ? 'text-blue-700' : 'text-slate-800')}>
