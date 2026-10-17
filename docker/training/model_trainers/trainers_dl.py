@@ -796,6 +796,17 @@ def _train_nativetft(
             "std": [float(v) for v in _fs],
         }
 
+    # ── 指标段前释放训练底仓（2026-10-17 全窗 OOM 修复）──
+    # 两个 loader 持有单拷贝 X 主数组（train 1072 万行×300 f32 ≈12GB）与
+    # 滑窗索引；模型已存盘、feat_norm 已进 dl_metadata，后续指标段一律从
+    # 磁盘权重重新预测，loader 再无复用点。不释放则指标段预测工作集与训练
+    # 底仓叠加——全窗两次训练均在 41~42GB 被内核全局 OOM（journalctl
+    # anon-rss 实证，两例都死在 model.pth 落盘后的 _tft_metrics 段）。
+    del _train_loader, _val_loader
+    from diagnostics.utils import trim_memory as _trim_mem
+
+    _trim_mem("after nativetft training, before metrics")
+
     # 计算真实 train/val 指标（不再硬编码 NaN rmse/auc）
     def _tft_metrics(frame: pd.DataFrame) -> dict:
         try:
@@ -1091,7 +1102,10 @@ def _predict_nativetft(
     hidden_dim = int(model_arch.get("hidden_dim", 64))
     num_heads = int(model_arch.get("num_heads", 4))
     dropout = float(model_arch.get("dropout", 0.1))
-    step_len = int(dl_metadata.get("dl_params", {}).get("dl_step_len", 20))
+    # 与 _train_nativetft 同口径取 step_len：训练侧认 dl_step_len 或 step_len，
+    # 此处只认 dl_step_len 会在 step_len≠20 时静默用错窗口（训练 5 预测 20）。
+    _dlp = dl_metadata.get("dl_params", {})
+    step_len = int(_dlp.get("dl_step_len", _dlp.get("step_len", 20)))
 
     # 重建模型架构 (与 _train_nativetft 中一致)
     import torch.nn as nn
@@ -1159,9 +1173,11 @@ def _predict_nativetft(
                      np.asarray(_fn["std"], dtype=np.float32))
     # 分块预测（符号块，同 _predict_dl）：全量单拷贝数组（768 万行 ≈8.4GB）与
     # 帧副本叠加会顶穿主机上限（2026-09-16 v4 实证）；窗口永不跨 symbol，
-    # 分块逐值等价。返回顺序为各块内 (symbol, trade_date) 排序后拼接。
+    # 分块逐值等价。输出与输入同序（全局 scatter），消费者按 (symbol,
+    # trade_date) 键 merge，与 _predict_dl 返回口径一致。
     _has_keys = "symbol" in df_X.columns and "trade_date" in df_X.columns
     n_total = len(df_X)
+    out = np.full(n_total, np.nan, dtype=np.float32)
     if _has_keys and n_total:
         _sym_codes = pd.factorize(df_X["symbol"].to_numpy(), sort=False)[0]
         _n_codes = int(_sym_codes.max()) + 1
@@ -1172,29 +1188,47 @@ def _predict_nativetft(
     else:
         _blocks = [np.arange(n_total)]
 
-    _parts = []
     for _pos in _blocks:
         if _pos.size == 0:
             continue
+        # 单块覆盖全帧时不复制（小帧与旧实现内存同路径）
         _chunk = df_X if _pos.size == n_total else df_X.iloc[_pos]
-        # TS 滑窗必须按 symbol 分组，否则窗口跨股票边界产生污染样本
-        _pred_df = _chunk.copy()
-        if _has_keys:
-            _pred_df = _pred_df.sort_values(["symbol", "trade_date"])
-            _idx = pd.MultiIndex.from_arrays(
-                [_pred_df["symbol"].to_numpy(), _pred_df["trade_date"].to_numpy()],
-                names=["instrument", "datetime"],
+        # 乱序块修正：滑窗要求同符号行连续且日期升序（窗口末端 = 起始行 +
+        # step_len-1）。仅验符号单调不够——块内只剩单一符号时符号检查恒真，
+        # 日期乱序会让滑窗按错序生成、scatter 把 NaN/预测落到错误行（2026-10-17
+        # 追加日期判据修复）。同符号相邻行的日期也必须非降；任一条不满足即做
+        # (symbol, trade_date) 稳定排序并同步置换行号映射。
+        # 生产数据为 (symbol, trade_date) 有序（loader 日志 order=identity），
+        # 此分支零成本跳过。
+        if _has_keys and len(_chunk) > 1:
+            _csym = _chunk["symbol"].to_numpy()
+            _cdt = _chunk["trade_date"].to_numpy()
+            _same_sym = _csym[1:] == _csym[:-1]
+            _ordered = bool((_csym[1:] >= _csym[:-1]).all()) and bool(
+                (_cdt[1:][_same_sym] >= _cdt[:-1][_same_sym]).all()
             )
-            _X = _pred_df[features].set_axis(_idx)
-            _y = pd.Series(0.0, index=_idx)
-        else:
-            _X = _pred_df[features]
-            _y = pd.Series(0.0, index=_pred_df.index)
-
-        # 构建 TS DataLoader 并预测
+            if not _ordered:
+                _ord = np.lexsort((_cdt, _csym))
+                _chunk = _chunk.iloc[_ord]
+                _pos = _pos[_ord]
         try:
-            loader, _ = _build_ts_dataloader(
-                _X, _y, step_len, batch_size, shuffle=False, feat_norm=feat_norm, drop_last=False)
+            if _has_keys:
+                # 单拷贝通路（内存模型，2026-10-17 全窗 OOM 修复）：旧实现每块
+                # copy→sort_values→MultiIndex→.values 再 z-score，瞬时并存 5~6 份
+                # 块副本（400 符号 ≈0.85GB/份）；本通路全流程只有 1 个 n×d 主数组。
+                loader, _ = _build_ts_dataloader_from_frame(
+                    _chunk, features, None,
+                    step_len=step_len, batch_size=batch_size,
+                    shuffle=False, feat_norm=feat_norm, drop_last=False,
+                )
+            else:
+                # 遗留无键调用：保持旧构造兼容
+                _X = _chunk[features]
+                _y = pd.Series(0.0, index=_chunk.index)
+                loader, _ = _build_ts_dataloader(
+                    _X, _y, step_len, batch_size, shuffle=False,
+                    feat_norm=feat_norm, drop_last=False,
+                )
         except ValueError as exc:
             # 退化块（块内所有 symbol 行数 < step_len）：与全量路径这些 symbol
             # 无窗口的语义一致，记 NaN 跳过
@@ -1213,24 +1247,28 @@ def _predict_nativetft(
                 preds.append(pred.cpu().numpy())
         raw_pred = np.concatenate(preds) if preds else np.empty(0, dtype=np.float32)
 
-        # 与 _predict_dl 相同的 scatter 逻辑：用 original_rows 映射回块帧行
-        _n_chunk = len(_pred_df)
-        out = np.full(_n_chunk, np.nan, dtype=np.float32)
+        # 与 _predict_dl 相同的 scatter 逻辑：用 original_rows（块内排序索引→
+        # 块帧行）把预测散回块帧原始行，再经 _pos 映射回全局行号，其余填 NaN
         if raw_pred.shape[0] > 0 and hasattr(loader.dataset, "original_rows"):
             ds = loader.dataset
             orig = ds.original_rows[ds.indices] + step_len - 1
-            if orig.max() < _n_chunk and len(orig) == raw_pred.shape[0]:
-                out[orig] = raw_pred
-        _parts.append(pd.DataFrame({
-            "symbol": _pred_df["symbol"].to_numpy(),
-            "trade_date": _pred_df["trade_date"].to_numpy(),
-            "pred": out,
-        }))
-        del loader, _X, _y, _pred_df, preds, raw_pred, out
+            if orig.max() < len(_chunk) and len(orig) == raw_pred.shape[0]:
+                out[_pos[orig]] = raw_pred
+            else:
+                logger.warning(
+                    "NativeTFT predict scatter 不匹配(块): pred=%d orig=%d chunk=%d -> 块内全 NaN",
+                    raw_pred.shape[0], len(orig), len(_chunk),
+                )
+        else:
+            logger.warning("NativeTFT predict 无 original_rows 或无预测(块): pred=%d", raw_pred.shape[0])
+        del loader, preds, raw_pred
         if _chunk is not df_X:
             del _chunk
         # 块间归还 glibc arena（同 _predict_dl，防滞留累积）
         _trim()
-    if not _parts:
-        return pd.DataFrame({"symbol": [], "trade_date": [], "pred": []})
-    return pd.concat(_parts, ignore_index=True)
+
+    return pd.DataFrame({
+        "symbol": df_X["symbol"].to_numpy(),
+        "trade_date": df_X["trade_date"].to_numpy(),
+        "pred": out,
+    })
