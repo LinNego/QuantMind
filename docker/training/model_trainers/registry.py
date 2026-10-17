@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from data.splits import _frame_with_range_index
 from model_trainers.metrics import _compute_metrics
 from model_trainers.trainers_dl import (
     _predict_dl,
@@ -160,7 +161,7 @@ class DLAdapter:
                 # 与 run_dl(single=True) 保持同键名：train.py 的多模型保存段按
                 # res["pred_df"] 取每个基模型的全量预测写出 pred_{type}.parquet，
                 # 只给 full_pred_df 会让 nativetft 的基模型预测被静默跳过。
-                "pred_df": full_pred_df.reset_index(drop=True),
+                "pred_df": _frame_with_range_index(full_pred_df),
                 "full_pred_df": full_pred_df,
                 # 与 run_dl(single=True) 对齐键名：train.py 主模型消费段按
                 # res["split_frames"] 读取（SHAP 抽样用）——nativetft 若被选为
@@ -179,11 +180,16 @@ class DLAdapter:
             train_m,
             val_m,
             test_m,
-            full_pred_df.reset_index(drop=True),
+            # 2026-10-17 全窗 nativetft 三次 OOM 的尾段根因：pandas 2.3（无 CoW）
+            # 下 reset_index(drop=True) 内部无条件 self.copy(deep=None)，对 9.5M×304
+            # 的 train 帧（≈11.4G）就是整帧深拷且新旧两份驻留（实测该步 3× 峰值），
+            # 与树路径（train.py 520~524 行）口径统一改为 RangeIndex 直通、非零索引
+            # 才真重置。切分链 _take_rows 落地时索引已归零，这里恒为同一对象。
+            _frame_with_range_index(full_pred_df),
             {
-                "train": train_df.reset_index(drop=True),
-                "valid": val_df.reset_index(drop=True),
-                "test": test_df.reset_index(drop=True),
+                "train": _frame_with_range_index(train_df),
+                "valid": _frame_with_range_index(val_df),
+                "test": _frame_with_range_index(test_df),
             },
             model_type,
             dl_metadata,
@@ -214,7 +220,8 @@ class DLAdapter:
                 "train_m": train_m,
                 "val_m": val_m,
                 "test_m": test_m,
-                "pred_df": full_pred_df.reset_index(drop=True),
+                # merge 出来的帧索引本就是 RangeIndex，直通不复制（同上 2026-10-17 修复）
+                "pred_df": _frame_with_range_index(full_pred_df),
                 # 引用共享切分帧（train_multi_models 的同一份），不做 reset_index 全量
                 # 副本：单份副本 ≈8.7GB（train 7.2G + val 0.85G + test 0.6G），7 模型
                 # 在 model_results 里囤积 ≈61GB 必 OOM（2026-09-16 v6 修复）。
@@ -233,11 +240,16 @@ class DLAdapter:
             train_m,
             val_m,
             test_m,
-            full_pred_df.reset_index(drop=True),
+            # 2026-10-17 全窗 nativetft 三次 OOM 的尾段根因：pandas 2.3（无 CoW）
+            # 下 reset_index(drop=True) 内部无条件 self.copy(deep=None)，对 9.5M×304
+            # 的 train 帧（≈11.4G）就是整帧深拷且新旧两份驻留（实测该步 3× 峰值），
+            # 与树路径（train.py 520~524 行）口径统一改为 RangeIndex 直通、非零索引
+            # 才真重置。切分链 _take_rows 落地时索引已归零，这里恒为同一对象。
+            _frame_with_range_index(full_pred_df),
             {
-                "train": train_df.reset_index(drop=True),
-                "valid": val_df.reset_index(drop=True),
-                "test": test_df.reset_index(drop=True),
+                "train": _frame_with_range_index(train_df),
+                "valid": _frame_with_range_index(val_df),
+                "test": _frame_with_range_index(test_df),
             },
             model_type,
             dl_metadata,
