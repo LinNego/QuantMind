@@ -1,9 +1,15 @@
-# ===== 补池链硬化（2026-10-13 事故后加；宿主 JST = 北京+1h）=====
-# alpha 因子库 02:30 档被内存闸门跳过时自动重试，并**把下游接上**（CUSTOM 重建 + 备选池重算）。
-# 两档都在盘前：JST05:30 起跑（实测 alpha 43-53min）→ 06:20 收工 → 池 ~06:30 北京落地。
-# 05:30 档推 🟢/🟠；06:30 档为当日最后一档（失败也喊人）。幂等：已最新则只有两次 ls 的开销。
-30 5 * * 2-6 bash /home/zbox/projects/quantmind/scripts/alpha_refresh_retry.sh >> /home/zbox/projects/quantmind/logs/keepers/alpha_refresh_retry.log 2>&1
-30 6 * * 2-6 QM_RETRY_FINAL=1 bash /home/zbox/projects/quantmind/scripts/alpha_refresh_retry.sh >> /home/zbox/projects/quantmind/logs/keepers/alpha_refresh_retry.log 2>&1
-# 盘前补池就绪检查（JST08:50=北京07:50，开盘前 1h40m；晚于 06:30 重试收工、早于容器 08:00 盘前推理）。
+# ===== 补池链盘前双保险（2026-10-13 事故后加，2026-10-18 扩为链级；宿主 JST = 北京+1h）=====
+# 判据：alpha 与 CUSTOM 数据集**各自**落后日K 就补，不再只看 alpha——2026-10-16/17 两晚
+# jq110 在 8G celery worker 被 OOM，alpha 是新的、CUSTOM 停在旧日，旧脚本恰好早退。
+# 动作：alpha 滞后 → 刷新；CUSTOM 滞后 → 45G quantmind 容器内重建；补新 → 备选池重算。
+# 三档全在盘前：JST05:30（北京04:30；alpha 实测 43-53min）→ JST06:30 再试 → JST07:30 末档。
+# 末档（QM_RETRY_FINAL=1）失败才推 🟠；自愈成功推 🟢；失败默认只记日志（盘前告警另有其人）。
+# 星期字段必须写 1-5：JST 与北京同日、仅差 1 小时，`2-6` 会漏掉北京周一盘前
+# （JST 周一 = 北京周一；旧值 `2-6` 实际只覆盖北京周二至周六）。
+30 5 * * 1-5 bash /home/zbox/projects/quantmind/scripts/alpha_refresh_retry.sh >> /home/zbox/projects/quantmind/logs/keepers/alpha_refresh_retry.log 2>&1
+30 6 * * 1-5 bash /home/zbox/projects/quantmind/scripts/alpha_refresh_retry.sh >> /home/zbox/projects/quantmind/logs/keepers/alpha_refresh_retry.log 2>&1
+30 7 * * 1-5 QM_RETRY_FINAL=1 bash /home/zbox/projects/quantmind/scripts/alpha_refresh_retry.sh >> /home/zbox/projects/quantmind/logs/keepers/alpha_refresh_retry.log 2>&1
+# 盘前补池就绪检查（JST08:50=北京07:50，开盘前 1h40m；晚于 07:30 末档收工、早于容器 08:00 盘前推理）。
 # 断链才推 QQ（方向闸按设计清空不推）；当天已推过则静默。判据与后台状态卡同源。
-50 8 * * 2-6 /usr/bin/python3 /home/zbox/projects/quantmind/scripts/preopen_pool_check.py >> /home/zbox/projects/quantmind/logs/keepers/preopen_pool_check.log 2>&1
+# 同样必须 1-5：`2-6` 会让北京周一开盘前**没有任何**就绪检查（2026-10-19 正是这种日子）。
+50 8 * * 1-5 /usr/bin/python3 /home/zbox/projects/quantmind/scripts/preopen_pool_check.py >> /home/zbox/projects/quantmind/logs/keepers/preopen_pool_check.log 2>&1
