@@ -367,7 +367,7 @@ def _get_model_framework(model_type: str) -> str:
         "tabnet": "pytorch",
         "tcn": "pytorch",
         "nativetft": "pytorch",
-        "mlp": "pytorch",
+        "mlp": "sklearn",
     }
     return mapping.get(model_type, "unknown")
 

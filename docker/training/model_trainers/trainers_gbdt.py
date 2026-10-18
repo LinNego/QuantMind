@@ -234,10 +234,25 @@ def _train_catboost(cfg: dict, features: list[str], X_train: np.ndarray, y_train
     model.fit(train_pool, eval_set=val_pool, early_stopping_rounds=max(1, int(model_cfg.get("early_stopping_rounds", 100) or 100)))
     return model
 
+def _scaled_pipeline(model: Any) -> Any:
+    """尺度敏感模型统一预处理：先 z-score 再拟合/预测（scaler 随模型一起 pickle）。
+
+    Cross300 因子的量纲跨 20 个数量级（入选列 absmax 达 9e23）。Ridge/MLP 直接
+    吃原始值会被极端列主导：Ridge 的 float32 正规方程溢出（2026-10-18 首轮
+    Linear 实败），MLP 首层激活/梯度爆炸（同日 MLP 预测 rmse 1.8e11、三档
+    rank IC 全负）。StandardScaler 与回归器同装在 Pipeline 里落盘，预测路径
+    `model.predict` 自动复用训练集均值/方差，训练与推理同口径。
+    """
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    return Pipeline([("scaler", StandardScaler()), ("model", model)])
+
+
 @register_trainer("linear", framework="sklearn")
 def _train_linear(cfg: dict, features: list[str], X_train: np.ndarray, y_train: np.ndarray,
                   X_val: np.ndarray, y_val: np.ndarray) -> Any:
-    """线性基线：收益任务用 Ridge，分类任务用 LogisticRegression。"""
+    """线性基线：收益任务用 Ridge，分类任务用 LogisticRegression（均先标准化）。"""
     from sklearn.linear_model import LogisticRegression, Ridge
     model_cfg = cfg.get("model", {})
     dl_params = model_cfg.get("dl_params", {})
@@ -247,6 +262,7 @@ def _train_linear(cfg: dict, features: list[str], X_train: np.ndarray, y_train: 
                                    random_state=int((cfg.get("seed") or 42)))
     else:
         model = Ridge(alpha=alpha, random_state=int((cfg.get("seed") or 42)))
+    model = _scaled_pipeline(model)
     model.fit(X_train, y_train)
     return model
 
@@ -285,7 +301,9 @@ def _train_mlp(cfg: dict, features: list[str], X_train: np.ndarray, y_train: np.
                X_val: np.ndarray, y_val: np.ndarray) -> Any:
     """MLP 基线：神经网络最简对照，验证 RNN/Transformer 是否真优于全连接。
 
-    用 sklearn MLPRegressor（结构化表格数据基线足够），与树模型共享数据流。
+    用 sklearn MLPRegressor（结构化表格数据基线足够），与树模型共享数据流；
+    入模前经 `_scaled_pipeline` 标准化——MLP 不像树模型那样对量纲免疫，
+    原始 Cross300 因子的极端量纲会把首层激活与梯度直接打爆。
     参数：hidden_layer_sizes（默认 [64, 32]）、alpha（L2，默认 1e-3）、
     early_stopping（默认 True，用 val 集早停）。
     """
@@ -304,15 +322,17 @@ def _train_mlp(cfg: dict, features: list[str], X_train: np.ndarray, y_train: np.
     # 3.2 万次微型更新（Python 循环瓶颈，实测 28 分钟仍未跑完首轮预算）。
     # 尊重载荷的 batch_size（DL 批统一 4000）后单轮约 8 秒。
     batch_size = int(dl_params.get("batch_size", 200) or 200)
-    model = model_class(
-        hidden_layer_sizes=[int(h) for h in hidden],
-        alpha=alpha,
-        learning_rate_init=float(dl_params.get("lr", 0.001)),
-        batch_size=batch_size,
-        max_iter=int(dl_params.get("n_epochs", 500)),
-        early_stopping=True,
-        n_iter_no_change=10,
-        random_state=seed,
+    model = _scaled_pipeline(
+        model_class(
+            hidden_layer_sizes=[int(h) for h in hidden],
+            alpha=alpha,
+            learning_rate_init=float(dl_params.get("lr", 0.001)),
+            batch_size=batch_size,
+            max_iter=int(dl_params.get("n_epochs", 500)),
+            early_stopping=True,
+            n_iter_no_change=10,
+            random_state=seed,
+        )
     )
     model.fit(X_train, y_train)
     return model
