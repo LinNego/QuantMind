@@ -514,6 +514,14 @@ services:
     image: quantmind-oss:latest
     platform: linux/amd64
     container_name: quantmind-celery
+    # 内存上限（2026-10-14 防假死）。--concurrency=4 的回测 worker 曾被
+    # 全局 OOM 牵连 SIGKILL；限定上限后超限只杀本容器任务。
+    # 2026-10-18 CUSTOM 重建连续两晚在 03:01:46 被 8G cgroup OOM。隔离实测
+    # 同一作业峰值 RSS 7820MB（alpha360+tdxgs+jq110 全窗，925 交易日 × 5578 只），
+    # 8g 只剩约 370MB——worker 基线与任何并发任务都会顶破。12g 留约 4.4G 余量；
+    # 同一负载在 12g 硬限下复跑通过（峰值 7820MB，114s）。
+    mem_limit: 12g
+    memswap_limit: 14g
     depends_on:
       db:
         condition: service_healthy
