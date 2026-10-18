@@ -6,6 +6,7 @@ forward label 都应使用相同的 T+1 执行口径（_EXECUTION_LAG_DAYS）。
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
 import pandas as pd
@@ -218,12 +219,28 @@ def _split_data(df: pd.DataFrame, cfg: dict) -> tuple:
     return train_df, val_df, test_df
 
 
+def _finite_or_zero(value) -> float:
+    """fill_values 兜底：只接受有限浮点，其余（NaN/±inf/None）一律 0.0。
+
+    注意 pandas 对 float32 列的 `median()` 返回 np.float32 标量，而
+    `isinstance(np.float32("nan"), float)` 为 False（np.float64 才是 float 子类），
+    旧写法会把 NaN 中位数原样留下、再经 `_fill` 填回矩阵（树模型容忍 NaN 掩盖了
+    该缺陷，Ridge/MLP 直接报错）。
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return out if math.isfinite(out) else 0.0
+
+
 def _prepare_arrays(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     features: list[str],
     prep_cfg: dict | None = None,
     extra_frames: list[pd.DataFrame] | None = None,
+    clip_value: float | None = None,
 ) -> tuple:
     """计算 fill_values 并转换为 numpy 数组。
 
@@ -234,9 +251,12 @@ def _prepare_arrays(
     此前只处理 train/val，测试期与全窗口预测（pred.pkl）在原始特征上进行，与训练/
     推理口径不一致。截面统计按日独立（切分按日期，单日横截面完整落在同一段内），
     故各帧分别处理与其自身口径一致。
+    clip_value：非 None 时把特征（含预测路径 `_fill`）裁剪到 ±clip_value。供
+    linear/MLP 这类对尺度敏感、且内部会组正规方程（float32 下平方溢出）的模型使用；
+    训练矩阵与预测必须共用同一裁剪，否则口径不一致。
+
     返回 (fill_values, X_train, y_train, X_val, y_val, _fill_fn)。
     """
-    import math
     from preprocessing import cross_sectional_preprocess
 
     prep_cfg = prep_cfg or {}
@@ -309,7 +329,9 @@ def _prepare_arrays(
         fill_values_raw = {c: train_df[c].median() for c in features}
         # 中位数本身也可能非有限（列含 ±inf 时 pandas median 不忽略 inf）——一律回退 0.0，
         # 否则「填缺失」会把 inf 再写回矩阵，XGBoost 照旧 Check failed。
-        fill_values = {k: (0.0 if (isinstance(v, float) and not math.isfinite(v)) else v) for k, v in fill_values_raw.items()}
+        # 必须用 float() 归一后再判：float32 列的 median 返回 np.float32，
+        # 它不是 Python float 子类，isinstance(v, float) 判不到 NaN。
+        fill_values = {k: _finite_or_zero(v) for k, v in fill_values_raw.items()}
         _fill_vec = np.array([fill_values[c] for c in features], dtype=np.float32)
         train_df.attrs["qm_fill_values"] = fill_values
 
@@ -331,6 +353,8 @@ def _prepare_arrays(
                 mask = mask | inf_mask
             if mask.any():
                 col[mask] = _fill_vec[i]
+            if clip_value is not None:
+                np.clip(col, -clip_value, clip_value, out=col)
             arr[:, i] = col
         if _inf_cols:
             _top = sorted(_inf_cols, key=lambda t: -t[1])[:5]
@@ -401,6 +425,8 @@ def _prepare_arrays(
                     mask = mask | inf_mask
                 if mask.any():
                     col[mask] = _fill_vec[i]
+                if clip_value is not None:
+                    np.clip(col, -clip_value, clip_value, out=col)
             if _inf_cols:
                 _top = sorted(_inf_cols, key=lambda t: -t[1])[:5]
                 logger.warning(
@@ -429,6 +455,12 @@ def _prepare_arrays(
             )
         except Exception:  # noqa: BLE001
             logger.warning("特征块视图未命中（%s），回退拷贝路径（块结构 dump 失败）", name)
+
+    if clip_value is not None:
+        logger.info(
+            "Feature clip enabled: ±%g（训练与预测 _fill 同口径；防 float32 正规方程溢出）",
+            clip_value,
+        )
 
     X_train = _fill_inplace(train_df)
     _x_mode = "零拷贝视图"

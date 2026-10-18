@@ -213,3 +213,66 @@ def test_prepare_arrays_falls_back_to_copy_when_block_not_found() -> None:
     # 值仍与旧口径逐位一致
     fill_vec = np.array([fill_values[c] for c in feats], dtype=np.float32)
     np.testing.assert_array_equal(X_train, _legacy_fill(train_df, feats, fill_vec))
+
+
+def test_prepare_arrays_clip_value_caps_extreme_finite_features() -> None:
+    """极端有限值（非 NaN/inf）也必须被裁剪——Ridge 的 float32 正规方程会溢出。
+
+    2026-10-18 Linear 实败根因：TDXGS_VR_12 / JQ110_VR 等入选列 absmax 达 9e23，
+    X 本身全有限，但 XᵀX 在 float32 下平方即 inf，scipy 报
+    "array must not contain infs or NaNs"。裁剪必须同时覆盖训练矩阵与预测 `_fill`。
+    """
+    df = _make_wide_frame()
+    df["f2"] = np.where(
+        np.arange(len(df)) % 5 == 0, np.float32(9e23), np.float32(1.0)
+    )
+    pos = df.index.get_indexer(_sorted_valid_index(df))
+    seg = df.take(pos)
+    seg.index = pd.RangeIndex(len(seg))
+    train_df = seg[["symbol", "trade_date", "label"] + _FEATURES]
+    val_df = _fake_val(train_df)
+    clip = 1e14
+
+    fill_values, X_train, _, X_val, _, _fill = _prepare_arrays(
+        train_df, val_df, _FEATURES, clip_value=clip
+    )
+
+    # Assert —— 训练矩阵与预测路径同口径：有限且被裁到 ±clip
+    assert np.isfinite(X_train).all()
+    assert np.isfinite(X_val).all()
+    assert np.abs(X_train).max() <= clip
+    assert np.abs(X_val).max() <= clip
+    np.testing.assert_array_equal(_fill(train_df), X_train)
+    np.testing.assert_array_equal(_fill(val_df), X_val)
+    # 未触发裁剪的列仍与旧口径逐位一致
+    fill_vec = np.array([fill_values[c] for c in _FEATURES], dtype=np.float32)
+    np.testing.assert_array_equal(
+        X_train[:, 0], _legacy_fill(train_df, _FEATURES, fill_vec)[:, 0]
+    )
+
+
+def test_prepare_arrays_fill_values_finite_for_all_nan_float32_column() -> None:
+    """全 NaN 的 float32 列：median 返回 np.float32 NaN，isinstance(v, float) 为 False。
+
+    旧兜底只认 Python float，会把 NaN 原样填回 X（树模型容忍 NaN 掩盖，Ridge 直接炸）。
+    fill_values 必须逐列有限；X 中该列不得残留 NaN。
+    """
+    df = _make_wide_frame()
+    df["f3"] = np.full(len(df), np.nan, dtype=np.float32)
+    pos = df.index.get_indexer(_sorted_valid_index(df))
+    seg = df.take(pos)
+    seg.index = pd.RangeIndex(len(seg))
+    train_df = seg[["symbol", "trade_date", "label"] + _FEATURES]
+    val_df = _fake_val(train_df)
+
+    fill_values, X_train, _, X_val, _, _fill = _prepare_arrays(
+        train_df, val_df, _FEATURES
+    )
+
+    assert np.isfinite(fill_values["f3"])
+    assert fill_values["f3"] == 0.0
+    assert np.isfinite(X_train).all()
+    assert np.isfinite(X_val).all()
+    np.testing.assert_array_equal(
+        X_train[:, 3], np.zeros(len(train_df), dtype=np.float32)
+    )
