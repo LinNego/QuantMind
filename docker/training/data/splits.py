@@ -17,6 +17,22 @@ logger = logging.getLogger("quantmind.train")
 
 _EXECUTION_LAG_DAYS = 1
 
+# 尺度敏感模型的特征裁剪上界（Cross300 入选列 absmax 达 9e23，均为有限值）。
+# - Ridge 在 float32 下组正规方程 XᵀX，|x|≈1e19 时平方即溢出（2026-10-18 实败）；
+# - sklearn MLP 首层激活/梯度爆炸（同日预测 rmse 1.8e11、三档 rank IC 全负）；
+# - Qlib TabNet 的 CUDA BatchNorm 用 float32 累加，9e23 输入的方差溢出为 NaN，
+#   Sparsemax 随即 support_size=0、gather(-1) 越界触发 device-side assert
+#   （2026-10-18 实败；同一输入 CPU 双精度累加不复现，GPU 已实证）。
+# 裁剪是单调变换（不改变列内排序），训练与推理必须共用同一上界；树模型不组
+# 正规方程、序列模型自带 z-score，均保持原始口径。
+FEATURE_ABS_CLIP = 1e14
+_CLIP_MODEL_TYPES = ("linear", "mlp", "tabnet")
+
+
+def feature_clip_for(model_type: str) -> float | None:
+    """按模型类型决定特征裁剪上界；None 表示不裁剪（树/序列模型原始口径）。"""
+    return FEATURE_ABS_CLIP if model_type in _CLIP_MODEL_TYPES else None
+
 
 def _take_rows(frame: pd.DataFrame, mask, name: str) -> pd.DataFrame:
     """按布尔掩码取行，**只付一份整段拷贝**，索引归零且与源帧脱钩。

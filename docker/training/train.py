@@ -149,6 +149,7 @@ from data.splits import (
     _frame_with_range_index,
     _prepare_arrays,
     _split_data,
+    feature_clip_for,
 )
 from model_trainers.predict import _predict_with_model
 
@@ -164,18 +165,6 @@ TRAINING_BASE_FEATURES: list[str] = [
 # ── 训练 ──────────────────────────────────────────────────────────────────────
 
 _QUANTILE_LEVELS = (0.1, 0.5, 0.9)
-
-# linear/MLP 的特征裁剪上界。Ridge 在 float32 下组 XᵀX，|x|≈1e19 时平方即溢出；
-# 2026-10-18 Linear 实败：TDXGS_VR_12 / JQ110_VR 等入选列 absmax 达 9e23（有限值，
-# 非 NaN/inf），scipy 报 "array must not contain infs or NaNs"。全窗 6.5M 行下
-# n·(1e14)² ≈ 6.5e34 << float32 上限 3.4e38，且只触及明显的数值产物尾部。
-# 树模型不组正规方程，保持原始口径，不裁剪（已完成的 LGB/XGB/CAT/TFT 不受影响）。
-_SKLEARN_LINEAR_CLIP = 1e14
-
-
-def _feature_clip_for(model_type: str) -> float | None:
-    """按模型类型决定特征裁剪上界；None 表示不裁剪（树/DL 原始口径）。"""
-    return _SKLEARN_LINEAR_CLIP if model_type in ("linear", "mlp") else None
 
 
 def _quantile_mode_enabled(cfg: dict) -> bool:
@@ -420,7 +409,7 @@ def train_model(df: pd.DataFrame, features: list[str], cfg: dict, hardware: dict
     _trim_memory("after split")
     fill_values, X_train, y_train, X_val, y_val, _fill = _prepare_arrays(
         train_df, val_df, features, prep_cfg=cfg.get("preprocessing") or {},
-        extra_frames=[test_df, df], clip_value=_feature_clip_for(model_type),
+        extra_frames=[test_df, df], clip_value=feature_clip_for(model_type),
     )
     _trim_memory("after prepare")
 
@@ -641,7 +630,7 @@ def _train_single_model(
     _optuna_result = None
     fill_values, X_train, y_train, X_val, y_val, _fill = _prepare_arrays(
         train_df, val_df, features, prep_cfg=cfg.get("preprocessing") or {},
-        extra_frames=[test_df, df], clip_value=_feature_clip_for(model_type),
+        extra_frames=[test_df, df], clip_value=feature_clip_for(model_type),
     )
 
     if model_type in ("lightgbm", "xgboost", "catboost"):

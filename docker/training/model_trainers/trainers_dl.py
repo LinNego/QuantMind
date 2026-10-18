@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from data.splits import feature_clip_for
 from model_trainers.metrics import _compute_metrics
 
 logger = logging.getLogger("quantmind.train")
@@ -389,6 +390,23 @@ def _train_dl(
         y_train = train_df["label"]
         X_val = val_df[features]
         y_val = val_df["label"]
+        # 尺度敏感 flat 模型（TabNet）入模兜底裁剪：_prepare_arrays 的原地裁剪
+        # 只在零拷贝视图命中时写回帧，view miss 回退拷贝路径时帧仍是原值；flat
+        # 模型直接把帧喂给 Qlib，故这里按列再兜底一次（训练/推理同口径）。
+        _flat_clip = feature_clip_for(model_type)
+        if _flat_clip is not None:
+            for _name, _frame in (("train", X_train), ("valid", X_val)):
+                _n_clipped = 0
+                for _c in features:
+                    _col = _frame[_c].to_numpy(dtype=np.float32, copy=False)
+                    if np.abs(_col).max() > _flat_clip:
+                        _frame[_c] = np.clip(_col, -_flat_clip, _flat_clip)
+                        _n_clipped += 1
+                if _n_clipped:
+                    logger.info(
+                        "Flat 模型入模裁剪（%s）：%d 列裁到 ±%g",
+                        _name, _n_clipped, _flat_clip,
+                    )
 
     # Qlib TS 模型（pytorch_*_ts）的 train_epoch/test_epoch 只接受 DataLoader，
     # 且要求样本形如 [step_len, d_feat+1]（最后一列末行为 label）；
@@ -1056,6 +1074,12 @@ def _predict_dl(
                     logger.warning("DL flat predict: 特征含 NaN/Inf，填 0（分块处理）")
                     _nan_warned = True
                 np.nan_to_num(X_values, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            # 尺度敏感 flat 模型（TabNet）：与训练同口径裁剪。CUDA BatchNorm 的
+            # float32 累加在 9e23 级输入上方差溢出为 NaN，Sparsemax 随后
+            # support_size=0、gather(-1) 触发 device-side assert（2026-10-18 实证）。
+            _feat_clip = feature_clip_for(_mt)
+            if _feat_clip is not None:
+                np.clip(X_values, -_feat_clip, _feat_clip, out=X_values)
             preds = []
             for i in range(0, len(X_values), batch_size):
                 # 逐批上卡：旧实现把整表 .to(device)（≈7GB 显存 + 同量主机侧
