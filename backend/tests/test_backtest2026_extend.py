@@ -153,6 +153,34 @@ def test_run_inference_builds_docker_and_local_commands(tmp_path, monkeypatch) -
 
 
 @pytest.mark.unit
+def test_run_inference_passes_thread_env_to_docker_and_local(
+    tmp_path, monkeypatch
+) -> None:
+    repo = Path(__file__).resolve().parents[2]
+    model_dir = repo / "data" / "training_jobs" / "run"
+    output = repo / "data" / "backtest_2026" / "scores.json"
+    captured: list[tuple[list[str], dict | None]] = []
+
+    def fake_run(cmd, capture_output, text, timeout, env=None):
+        captured.append((cmd, env))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ext.subprocess, "run", fake_run)
+    ext._run_inference(
+        model_dir, "2026-08-27", output, "docker", env={"OMP_NUM_THREADS": "3"}
+    )
+    ext._run_inference(
+        model_dir, "2026-08-27", output, "local", env={"OMP_NUM_THREADS": "3"}
+    )
+
+    docker_cmd = captured[0][0]
+    assert docker_cmd[:2] == ["docker", "exec"]
+    assert "OMP_NUM_THREADS=3" in docker_cmd
+    assert captured[0][1] is None
+    assert captured[1][1]["OMP_NUM_THREADS"] == "3"
+
+
+@pytest.mark.unit
 def test_run_inference_raises_with_stderr_on_failure(tmp_path, monkeypatch) -> None:
     repo = Path(__file__).resolve().parents[2]
     monkeypatch.setattr(

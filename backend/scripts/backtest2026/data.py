@@ -91,6 +91,19 @@ def load_price_matrices(
     return close_raw, close_qfq, volume
 
 
+#: QuantDB 日线 ``amount`` 的单位是万元；统一换算成元后再用于容量约束，
+#: 否则 1% 参与率会被当成 1%×万元，所有买单都会被截成 0 股。
+AMOUNT_UNIT_TO_YUAN = 10_000.0
+
+
+def load_amount_matrix(start: str = PRICE_START, end: str = PRICE_END) -> pd.DataFrame:
+    """日成交额矩阵（元），容量约束的唯一数据源。"""
+    frame = _read_partitions(
+        "daily_unadjusted", start, end, ["symbol", "time", "amount"]
+    )
+    return _pivot(frame, "amount") * AMOUNT_UNIT_TO_YUAN
+
+
 def load_st_symbols(asof_dt: str = ST_ASOF_DT) -> pd.Series:
     """最新可得 ST 名单（静态回填；QuantDB 无更早的逐日 ST 标记）。"""
     path = (
@@ -192,6 +205,54 @@ def load_prediction_panel(
     return panel, first_seen
 
 
+def read_matrix_extensions(out_dir: Path, horizon: int, model: str) -> pd.DataFrame:
+    """读取 ``extend_matrix`` 产出的矩阵外推预测。"""
+    path = out_dir / f"pred_extend_{horizon}_{model}.parquet"
+    if not path.is_file():
+        return pd.DataFrame(
+            columns=["symbol", "trade_date", "pred", "label_return", "source"]
+        )
+    frame = pq.read_table(path).to_pandas()
+    frame["symbol"] = normalize_symbol(frame["symbol"])
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+    if "label_return" not in frame.columns:
+        frame["label_return"] = np.nan
+    frame["source"] = "extended"
+    return frame[["symbol", "trade_date", "pred", "label_return", "source"]]
+
+
+def load_extended_predictions(
+    run_dir: Path,
+    horizon: int,
+    model: str,
+    start: str,
+    end: str | None,
+    extension_dir: Path | None,
+) -> pd.DataFrame:
+    """训练 pred + 矩阵外推；同一 (symbol, date) 以训练产物为准。
+
+    外推只在训练产物末日之后生效。扩展段的 ``label_return`` 为 NaN——真实
+    收益由回测面板的 ``forward_return_matrix`` 另算，绝不把 rank 目标当收益。
+    """
+    stored = load_stored_predictions(run_dir, start, end)
+    if extension_dir is None:
+        return stored
+    extension = read_matrix_extensions(extension_dir, horizon, model)
+    if extension.empty:
+        return stored
+    if not stored.empty:
+        last_stored = stored["trade_date"].max()
+        extension = extension[extension["trade_date"] > last_stored]
+    if end is not None:
+        extension = extension[extension["trade_date"] <= pd.Timestamp(end)]
+    panel = pd.concat([stored, extension], ignore_index=True)
+    panel = panel.sort_values(["trade_date", "symbol"]).reset_index(drop=True)
+    panel.attrs["label_return_available"] = bool(
+        stored.attrs.get("label_return_available", True)
+    )
+    return panel
+
+
 def load_index_closes(start: str, end: str) -> pd.DataFrame:
     frame = _read_partitions("index_daily", start, end, ["symbol", "time", "close"])
     return frame.pivot(
@@ -213,6 +274,7 @@ class MarketPanel:
     is_st: pd.Series
     age_days: pd.DataFrame
     close_qfq_ffill: pd.DataFrame
+    amount: pd.DataFrame | None = None
 
     def price(self, symbol: str, day: pd.Timestamp) -> float:
         value = self.close_qfq.at[day, symbol]
@@ -224,7 +286,11 @@ class MarketPanel:
 
 
 def build_market_panel(
-    start: str = PRICE_START, end: str = PRICE_END, st_asof: str = ST_ASOF_DT
+    start: str = PRICE_START,
+    end: str = PRICE_END,
+    st_asof: str = ST_ASOF_DT,
+    *,
+    with_amount: bool = False,
 ) -> MarketPanel:
     close_raw, close_qfq, volume = load_price_matrices(start, end)
     is_st_index = load_st_symbols(st_asof)
@@ -232,6 +298,11 @@ def build_market_panel(
     is_st = is_st_index.reindex(symbols).fillna(False).astype(bool)
     limit_up, limit_down, suspended = compute_limit_matrices(close_raw, volume, is_st)
     full_calendar = load_calendar()
+    amount = None
+    if with_amount:
+        amount = load_amount_matrix(start, end).reindex(
+            index=close_raw.index, columns=symbols
+        )
     return MarketPanel(
         dates=close_raw.index,
         full_calendar=full_calendar,
@@ -245,6 +316,7 @@ def build_market_panel(
         is_st=is_st,
         age_days=pd.DataFrame(index=close_raw.index, columns=symbols, dtype=float),
         close_qfq_ffill=close_qfq.ffill(),
+        amount=amount,
     )
 
 
@@ -281,7 +353,9 @@ __all__ = [
     "build_market_panel",
     "extension_dates",
     "forward_return_matrix",
+    "load_amount_matrix",
     "load_calendar",
+    "load_extended_predictions",
     "load_index_closes",
     "load_prediction_panel",
     "load_price_matrices",
@@ -289,4 +363,5 @@ __all__ = [
     "load_stored_predictions",
     "normalize_symbol",
     "read_first_seen",
+    "read_matrix_extensions",
 ]

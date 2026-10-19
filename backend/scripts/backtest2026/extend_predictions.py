@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -50,20 +51,31 @@ def _model_dir_in_container(model_dir: Path) -> str:
     return f"{CONTAINER_DATA_ROOT}/{relative.as_posix()}"
 
 
-def _run_inference(model_dir: Path, trade_date: str, output: Path, runner: str) -> None:
+def _run_inference(
+    model_dir: Path,
+    trade_date: str,
+    output: Path,
+    runner: str,
+    env: dict[str, str] | None = None,
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     if runner == "docker":
         model_path = _model_dir_in_container(model_dir)
         output_path = _container_path(output)
+        env_flags: list[str] = []
+        for key, value in (env or {}).items():
+            env_flags.extend(["-e", f"{key}={value}"])
         cmd = [
             "docker",
             "exec",
+            *env_flags,
             CONTAINER,
             "bash",
             "-lc",
             f"cd {CONTAINER_REPO} && python {model_path}/inference.py "
             f"--date {trade_date} --output {output_path} --data-dir {CONTAINER_DATA_ROOT}/quantdb",
         ]
+        run_env = None
     else:
         cmd = [
             sys.executable,
@@ -75,7 +87,14 @@ def _run_inference(model_dir: Path, trade_date: str, output: Path, runner: str) 
             "--data-dir",
             str(DATA_ROOT),
         ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        run_env = {**os.environ, **env} if env else None
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        **({"env": run_env} if run_env is not None else {}),
+    )
     if result.returncode != 0:
         raise RuntimeError(
             f"推理失败 date={trade_date} exit={result.returncode}\n"

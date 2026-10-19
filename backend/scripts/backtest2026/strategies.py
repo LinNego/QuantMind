@@ -63,11 +63,13 @@ class Portfolio:
         fee_rate: float = COMMISSION_RATE,
         stamp_rate: float = 0.0,
         slippage: float = SLIPPAGE,
+        max_participation: float | None = None,
     ) -> None:
         self.cash = float(cash)
         self.fee_rate = float(fee_rate)
         self.stamp_rate = float(stamp_rate)
         self.slippage = float(slippage)
+        self.max_participation = max_participation
         self.buckets: dict[int, Bucket] = {}
         self.trades: list[dict] = []
         self.equity_rows: list[dict] = []
@@ -153,7 +155,31 @@ class Portfolio:
                 )
                 continue
             exec_price = price * (1.0 + self.slippage)
-            shares = int(per_name // (exec_price * LOT_SIZE)) * LOT_SIZE
+            requested_shares = int(per_name // (exec_price * LOT_SIZE)) * LOT_SIZE
+            requested_amount = requested_shares * exec_price
+            shares = requested_shares
+            cap_value = float("nan")
+            cap_binding = False
+            if self.max_participation is not None:
+                if panel.amount is None:
+                    raise RuntimeError("启用容量约束时必须先加载成交额面板")
+                daily_amount = (
+                    float(panel.amount.at[day, symbol])
+                    if symbol in panel.amount.columns
+                    else float("nan")
+                )
+                if not np.isfinite(daily_amount) or daily_amount <= 0:
+                    cap_value = 0.0
+                else:
+                    cap_value = float(self.max_participation) * daily_amount
+                cap_shares = (
+                    int(cap_value // (exec_price * LOT_SIZE)) * LOT_SIZE
+                    if cap_value > 0
+                    else 0
+                )
+                if cap_shares < shares:
+                    cap_binding = True
+                    shares = cap_shares
             while (
                 shares > 0 and shares * exec_price * (1.0 + self.fee_rate) > bucket.cash
             ):
@@ -164,7 +190,7 @@ class Portfolio:
                         "bucket": bucket.bucket_id,
                         "date": day,
                         "symbol": symbol,
-                        "reason": "insufficient_cash",
+                        "reason": "capacity" if cap_binding else "insufficient_cash",
                     }
                 )
                 continue
@@ -197,6 +223,13 @@ class Portfolio:
                     "net_pnl": np.nan,
                     "exit_reason": "",
                     "scheduled_exit": pos.due_date,
+                    "requested_shares": requested_shares,
+                    "requested_amount": requested_amount,
+                    "cap_value": cap_value,
+                    "fill_ratio": (
+                        shares / requested_shares if requested_shares > 0 else np.nan
+                    ),
+                    "cap_binding": cap_binding,
                 }
             )
 
@@ -273,6 +306,11 @@ class Portfolio:
             "net_pnl",
             "exit_reason",
             "scheduled_exit",
+            "requested_shares",
+            "requested_amount",
+            "cap_value",
+            "fill_ratio",
+            "cap_binding",
         ]
         return pd.DataFrame(self.trades, columns=columns)
 
@@ -300,6 +338,8 @@ class StrategySpec:
     exclude_st: bool = True
     exclude_limits: bool = True
     exclude_new: bool = True
+    #: 单票买入金额不得超过当日成交额的比例；None 表示不约束。
+    max_participation: float | None = None
 
 
 @dataclass
@@ -352,6 +392,7 @@ def run_strategy(
         fee_rate=spec.commission,
         stamp_rate=spec.stamp,
         slippage=spec.slippage,
+        max_participation=spec.max_participation,
     )
     pending: list[tuple[Bucket, list[str], float]] = []
     selected_total = 0

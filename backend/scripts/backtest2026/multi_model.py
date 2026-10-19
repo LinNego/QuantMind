@@ -39,8 +39,8 @@ from .data import (
     attach_listing_age,
     build_market_panel,
     forward_return_matrix,
+    load_extended_predictions,
     load_index_closes,
-    load_stored_predictions,
     read_first_seen,
 )
 from .metrics import index_summary, performance_summary
@@ -90,6 +90,9 @@ class RunSettings:
     n_boot: int = 5000
     seed: int = 20261019
     n_trials: int = 26
+    price_start: str = PRICE_START
+    price_end: str = PRICE_END
+    extension_dir: Path | None = None
 
 
 @dataclass
@@ -146,7 +149,14 @@ def _first_seen_signature(run_dir: Path) -> dict[str, object]:
 def _load_frame(run: ModelRun, settings: RunSettings) -> pd.DataFrame:
     if run.run_dir is None:
         raise FileNotFoundError(f"{run.label} 没有运行目录")
-    frame = load_stored_predictions(run.run_dir, settings.start, settings.end)
+    frame = load_extended_predictions(
+        run.run_dir,
+        run.horizon,
+        run.key,
+        settings.start,
+        settings.end,
+        settings.extension_dir,
+    )
     duplicates = frame.duplicated(subset=["trade_date", "symbol"]).sum()
     if duplicates:
         raise RuntimeError(
@@ -381,8 +391,8 @@ def run(settings: RunSettings) -> dict[str, object]:
     if not outputs_runs:
         raise RuntimeError("没有可评估的模型")
 
-    LOG.info("构建价格面板 %s ~ %s", PRICE_START, PRICE_END)
-    panel = build_market_panel(PRICE_START, PRICE_END)
+    LOG.info("构建价格面板 %s ~ %s", settings.price_start, settings.price_end)
+    panel = build_market_panel(settings.price_start, settings.price_end)
     canonical = outputs_runs[0]
     if canonical.run_dir is None:
         raise RuntimeError("规范模型缺少运行目录")
@@ -406,7 +416,7 @@ def run(settings: RunSettings) -> dict[str, object]:
         horizon: forward_return_matrix(panel.close_qfq, horizon)
         for horizon in settings.horizons
     }
-    index_closes = load_index_closes(PRICE_START, PRICE_END)
+    index_closes = load_index_closes(settings.price_start, settings.price_end)
     wanted = [f"{code[-2:]}{code[:6]}" for code in INDEX_SYMBOLS]
     index_closes = index_closes[
         [column for column in index_closes.columns if column in wanted]
@@ -562,6 +572,8 @@ def run(settings: RunSettings) -> dict[str, object]:
         "n_trials": settings.n_trials,
         "models": list(settings.models),
         "horizons": list(settings.horizons),
+        "price_start": settings.price_start,
+        "price_end": settings.price_end,
         "versions": {
             "python": sys.version.split()[0],
             "pandas": pd.__version__,
@@ -628,6 +640,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--n-boot", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=20261019)
     parser.add_argument("--n-trials", type=int, default=26)
+    parser.add_argument("--price-start", default=PRICE_START)
+    parser.add_argument("--price-end", default=PRICE_END)
+    parser.add_argument(
+        "--extension-dir",
+        type=Path,
+        default=None,
+        help="extend_matrix 产物目录；给定时把外推预测接到训练 pred 之后",
+    )
     return parser.parse_args(argv)
 
 
@@ -651,6 +671,9 @@ def main(argv: list[str] | None = None) -> None:
         n_boot=args.n_boot,
         seed=args.seed,
         n_trials=args.n_trials,
+        price_start=args.price_start,
+        price_end=args.price_end,
+        extension_dir=args.extension_dir,
     )
     run(settings)
 
