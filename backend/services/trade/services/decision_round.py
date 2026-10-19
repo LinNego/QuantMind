@@ -539,7 +539,12 @@ async def _run_once_inner(
         reason = str(getattr(attempt, "error_text", lambda: "")() or "")
         note = f"LLM 未给出决策（{getattr(attempt, 'status', '')}）：{reason or '未报告原因'}"
         if getattr(attempt, "truncated", False):  # 顶格截断≠格式烂（reason=length）
-            note += "（供应商输出顶格截断，非解析问题：调大该家 max_tokens）"
+            usage = dict(getattr(attempt, "usage", None) or {})
+            got = usage.get("completion_tokens")
+            detail = f"，completion_tokens={got}" if got is not None else ""
+            note += (
+                f"（供应商输出顶格截断{detail}，非解析问题：调大该家 max_tokens）"
+            )
         return RoundResult(
             status=STATUS_LLM_FAILED,
             day=day,

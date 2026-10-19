@@ -27,6 +27,7 @@ exit code：
 from __future__ import annotations
 
 # 并发推理时，多个 worker 会同时执行 _persist_and_publish 写 engine_signal_scores
+import asyncio
 import logging
 import json
 import math
@@ -84,6 +85,10 @@ from backend.shared.stock_utils import StockCodeUtil
 from backend.shared.training_runtime import rebase_container_path, repo_root_dir, resolve_feature_snapshot_dir
 
 logger = logging.getLogger(__name__)
+
+#: ``create_task`` 的返回值必须有强引用：否则任务可能在完成前被 GC（Python 文档明示）。
+#: 同步上下文（celery/线程池）走 ``asyncio.run``，不进这个集合。
+_BACKGROUND_PUSH_TASKS: set[asyncio.Task] = set()
 
 # 写库并发控制：**不在本模块做**。
 #
@@ -2034,6 +2039,54 @@ class InferenceScriptRunner:
 
         return resolve_feature_version(model_id)
 
+    @staticmethod
+    def _dispatch_push(coro: Any, *, label: str) -> None:
+        """把推送协程派发到当前/新事件循环，并保证临时循环的 DB 池随循环释放。
+
+        事故（2026-10-18 11:47）：同步线程里每调一次 ``asyncio.run`` 就新建一个
+        循环，而 ``database_manager_v2`` 当时只有一个全局 ``AsyncEngine``；
+        asyncpg 连接绑定创建它的循环，第二个 ``asyncio.run`` 复用上一个循环的
+        池连接必然抛 ``got Future attached to a different loop``——滚动买卖
+        推送整条失效，还会污染主循环的普通请求。现在引擎按循环隔离
+        （见 ``database_manager_v2._LoopPools``），这里再在**临时循环关闭前**
+        释放本循环的池，避免连接在循环关闭后才被 GC。
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:  # 同步上下文（celery / to_thread 线程）
+
+            async def _isolated() -> None:
+                try:
+                    await coro
+                finally:
+                    from backend.shared.database_manager_v2 import (
+                        dispose_current_loop_pools,
+                    )
+
+                    try:
+                        await dispose_current_loop_pools()
+                    except Exception as exc:  # noqa: BLE001 释放失败不改推送结果
+                        logger.warning(
+                            "[InferenceScriptRunner] %s 临时循环连接池释放失败: %s",
+                            label,
+                            exc,
+                        )
+
+            asyncio.run(_isolated())
+        else:  # 已在事件循环里：交给主循环，绝不 dispose 主循环的池
+            task = asyncio.create_task(coro)
+            _BACKGROUND_PUSH_TASKS.add(task)
+            task.add_done_callback(_BACKGROUND_PUSH_TASKS.discard)
+            task.add_done_callback(
+                lambda t: (
+                    logger.warning(
+                        "[InferenceScriptRunner] %s 后台推送失败: %s", label, t.exception()
+                    )
+                    if not t.cancelled() and t.exception() is not None
+                    else None
+                )
+            )
+
     def _persist_and_publish(
         self,
         run_id: str,
@@ -2186,7 +2239,6 @@ class InferenceScriptRunner:
                             run_id,
                         )
                         return True
-                    import asyncio
 
                     from backend.services.live_trading.services.tdx_signal_push_service import (
                         tdx_signal_pusher,
@@ -2210,13 +2262,17 @@ class InferenceScriptRunner:
                                 result.get("error") or "未知原因",
                             )
 
+                    # 两段推送各自兜底：选股推送失败不能连带跳过滚动买卖
                     try:
-                        asyncio.get_running_loop()
-                    except RuntimeError:
-                        # celery 同步上下文: 没有运行中的事件循环
-                        asyncio.run(_push_to_tdx())
-                    else:
-                        asyncio.create_task(_push_to_tdx())
+                        self._dispatch_push(
+                            _push_to_tdx(), label="tdx_signal_push"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "[InferenceScriptRunner] 通达信选股推送失败"
+                            "（不影响滚动买卖）: %s",
+                            exc,
+                        )
 
                     # === 滚动买卖检查 (分数>2.2买/掉下2.2卖/大盘MA20过滤) ===
                     # A 股专属链路：HK/US 等市场信号不推通达信（market 参数即 universe_tag 市场）
@@ -2227,7 +2283,9 @@ class InferenceScriptRunner:
                             market,
                             run_id,
                         )
-                        return
+                        # 写库已成功：这里必须回 True，裸 return（None）会被调用方
+                        # 当成「明细没落库→批次失败」，港美股推理每次都被误判失败。
+                        return True
                     from backend.services.live_trading.services.tdx_rolling_trade_service import (
                         tdx_rolling_trader,
                     )
@@ -2252,11 +2310,13 @@ class InferenceScriptRunner:
                             )
 
                     try:
-                        asyncio.get_running_loop()
-                    except RuntimeError:
-                        asyncio.run(_run_rolling_push())
-                    else:
-                        asyncio.create_task(_run_rolling_push())
+                        self._dispatch_push(
+                            _run_rolling_push(), label="tdx_rolling_push"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "[InferenceScriptRunner] 滚动买卖推送失败: %s", exc
+                        )
                 except Exception as exc:
                     logger.warning(
                         f"[InferenceScriptRunner] 推送通达信失败（不影响结果）: {exc}"

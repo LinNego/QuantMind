@@ -435,7 +435,22 @@ def call_with_usage(
     last: BaseException | None = None
     for attempt in range(PROVIDER_RETRY_ATTEMPTS):
         try:
-            return _extract(_post(cfg.chat_url, payload, headers, cfg.timeout))
+            text, usage, finish_reason = _extract(
+                _post(cfg.chat_url, payload, headers, cfg.timeout)
+            )
+            # 逐轮留痕：顶格截断（finish=length）排查全靠这两个数——
+            # 只有 max_tokens 与 completion_tokens 放在一起才能判断是「配额给小了」
+            # 还是「模型自己在长思考」。不含任何提示词/密钥。
+            logger.info(
+                "决策 LLM 调用完成 model=%s finish=%s max_tokens=%s "
+                "prompt_tokens=%s completion_tokens=%s",
+                cfg.model,
+                finish_reason or "(none)",
+                cfg.max_tokens,
+                (usage or {}).get("prompt_tokens"),
+                (usage or {}).get("completion_tokens"),
+            )
+            return text, usage, finish_reason
         except Exception as exc:  # noqa: BLE001 供应商抖动（超时/5xx/网关 200 坏体）都重发
             last = exc
             logger.warning(
