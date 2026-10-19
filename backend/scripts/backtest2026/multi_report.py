@@ -34,6 +34,7 @@ EXTRA_CSS = """
 .section { break-inside: auto; }
 .data-table { break-inside: auto; }
 .data-table.keep { break-inside: avoid; }
+.data-table.compact th, .data-table.compact td { padding: 0.7mm 2mm; font-size: 7.9pt; }
 .data-table thead { display: table-header-group; }
 .data-table tr { break-inside: avoid; }
 h3, h4 { break-after: avoid; }

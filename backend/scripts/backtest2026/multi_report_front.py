@@ -144,8 +144,18 @@ def cover(bundle: MultiBundle) -> str:
     pending_text = (
         "；".join(f"T+{int(row.horizon)} {row.key}" for row in pending.itertuples())
         if not pending.empty
-        else "无"
+        else ""
     )
+    if pending_text:
+        readiness = (
+            f"<li><strong>尚未就绪：</strong>{esc(pending_text)}。"
+            "这些组合在榜单中留空，不用旧版本冒充。</li>"
+        )
+    else:
+        readiness = (
+            f"<li><strong>组合就绪：</strong>{len(models)} 个模型 × 2 个持有期，"
+            f"共 {len(models) * 2} 个组合全部就绪，全部纳入同一张排名表。</li>"
+        )
     return f"""
 <section class="cover">
   <div class="cover-band"></div>
@@ -167,7 +177,7 @@ def cover(bundle: MultiBundle) -> str:
       <li><strong>T+5 与 T+10 哪个更好？</strong>两个持有期各自独立回测，并检验排名是否一致（第 5 章）。</li>
       <li><strong>Top10、Top20、滚动 Top5 差多少？</strong>三种组合都按 200 万本金、3bp 双边费用、剔除 ST / 涨跌停 / 停牌 / 次新后回测。</li>
       <li><strong>最强模型：</strong>T+5 IC 第一为 {esc(best_t5)}（{num(ic_t5, 4)}），T+10 IC 第一为 {esc(best_t10)}（{num(ic_t10, 4)}）。</li>
-      <li><strong>尚未就绪：</strong>{esc(pending_text)}。这些组合在榜单中留空，不用旧版本冒充。</li>
+      {readiness}
     </ul>
   </div>
   <div class="metric-grid">
@@ -304,6 +314,7 @@ def method_section(bundle: MultiBundle, chart_paths: dict[str, Path]) -> str:
     signature = _panel_signature(bundle)
     start = manifest.get("common_start", "—")
     end = manifest.get("common_end", "—")
+    pending = bundle.pending()
     inventory_rows = []
     frame = bundle.inventory
     for key in MODEL_ORDER:
@@ -386,7 +397,7 @@ def method_section(bundle: MultiBundle, chart_paths: dict[str, Path]) -> str:
   <p class="small">注意：Top10 / Top20 不是每天重叠建仓，而是“单批轮动”，因此 2026 年只有约 13 至 22 个独立持有期。组合收益的统计功效远低于逐日 IC 检验，不能只看总收益排名。</p>
 
   <h3>2.4 模型与训练产物</h3>
-  <p>13 个模型使用同一套 300 维 Cross300 特征、同一训练 / 验证切分。下表列出实际读取的运行目录；空缺表示该组合尚未训练完成，报告中保留空位。</p>
+  <p>13 个模型使用同一套 300 维 Cross300 特征、同一训练 / 验证切分。下表列出实际读取的运行目录{'' if pending.empty else '；空缺表示该组合尚未训练完成，报告中保留空位'}。</p>
   {table(
       ["代码", "模型", "家族", "T+5 运行目录", "T+10 运行目录"],
       inventory_rows,

@@ -60,6 +60,37 @@ def _portfolio_rows(frame: pd.DataFrame) -> list[list[str]]:
     return rows
 
 
+def _monthly_note(bundle: MultiBundle) -> str:
+    """T+10 Top10 月度表的读法；所有数字从结果文件现算，不写死。"""
+    frame = bundle.monthly_returns.get((10, "top10"))
+    if frame is None or frame.empty:
+        return ""
+    champion = str(
+        bundle.portfolio_stats(10, "top10").get("best_total_return_model", "")
+    )
+    if champion not in frame.columns:
+        return ""
+    total = bundle.portfolio_row(10, "top10", champion).get("total_return")
+    if not isinstance(total, (int, float)) or float(total) <= 0:
+        return ""
+    last_month = float(frame[champion].iloc[-1])
+    neg_share = float((frame.to_numpy(dtype=float) < 0).mean())
+    spread = frame.max(axis=1) - frame.min(axis=1)
+    max_spread = float(spread.max())
+    max_spread_month = str(spread.idxmax())
+    share = last_month / float(total)
+    return (
+        '<p class="small">月度表有两个读数。第一，收益在月份之间高度不均：'
+        f"13 个模型 8 个月的月度收益中，负值占 {pct(neg_share, 0)}；"
+        f"{champion} 的 T+10 Top10 总收益 {pct(float(total))} 里，"
+        f"8 月单月贡献 {pct(last_month)}，占 {pct(share, 0)}。"
+        "第二，同一个月里模型之间也会拉开差距："
+        f"最大跨度 {pct(max_spread)}（{max_spread_month}），"
+        f"中位跨度 {pct(float(spread.median()))}。"
+        "所以组合结果要同时看中位数与分布，冠军数字只能当作上界参考。</p>"
+    )
+
+
 def portfolio_section(bundle: MultiBundle, chart_paths: dict[str, Path]) -> str:
     blocks = []
     for horizon in (5, 10):
@@ -150,6 +181,7 @@ def portfolio_section(bundle: MultiBundle, chart_paths: dict[str, Path]) -> str:
   {figure(chart_paths['equity_10_rolling'], "T+10 滚动 Top5：收益前 5 的模型净值曲线。持有期更长，批次重叠更多。", 9) if 'equity_10_rolling' in chart_paths else ''}
   {figure(chart_paths['monthly_5'], "T+5 Top10 月度收益。看颜色是否长期单向，以及是否由单月贡献大部分收益。", 10) if 'monthly_5' in chart_paths else ''}
   {figure(chart_paths['monthly_10'], "T+10 Top10 月度收益。与 T+5 对照，判断收益是否依赖单一持有期。", 11) if 'monthly_10' in chart_paths else ''}
+  {_monthly_note(bundle)}
 </section>
 """
 
@@ -318,9 +350,17 @@ def stats_section(bundle: MultiBundle, chart_paths: dict[str, Path]) -> str:
       ["指标", "内部键", "Spearman 秩相关"],
       rank_rows,
       aligns=["l", "l", "r"],
+      table_class="data-table compact",
   )}
   <p class="small">秩相关接近 1：两个持有期选出的模型顺序几乎相同；接近 0：T+5 的结论不能外推到 T+10；为负：两个周期互相矛盾。样本只有 13 个模型，秩相关的置信区间很宽，不宜过度解读小数点。</p>
-  <p class="small">区分两件事：<strong>预测排序</strong>在 T+5 与 T+10 之间高度一致（IC 秩相关 {num(quality_corr.get('ic_mean'), 3)}），但<strong>组合收益</strong>的排名并不一致（Top10 秩相关 {num((portfolio_corr.get('top10') or {}).get('total_return'), 3)}）。原因在于组合只取头部少数股票，收益由少数大赢家决定，持有期一换，赢家名单就换；IC 用全截面，统计上稳定得多。因此选模型可以主要看 IC，配置组合必须按持有期分别验证。</p>
+  <p class="small">区分两件事：<strong>预测排序</strong>在两个周期高度一致（IC 秩相关 {num(quality_corr.get('ic_mean'), 3)}），<strong>组合收益</strong>排名却不一致（Top10 秩相关 {num((portfolio_corr.get('top10') or {}).get('total_return'), 3)}）——组合只取头部少数股票，收益由少数赢家决定；IC 用全截面，稳定得多。选模型看 IC，配组合必须按持有期分别验证。</p>
+  <h4>同一模型在两个持有期的差值（T+10 − T+5，正数表示更长持有期更好）</h4>
+  {table(
+      ["模型", "T+10 IC − T+5 IC", "Top10 上涨比例差", "Top10 收益差", "滚动 Top5 收益差"],
+      _paired_rows(bundle),
+      aligns=["l", "r", "r", "r", "r"],
+      table_class="data-table compact",
+  )}
 </section>
 """
 
@@ -333,7 +373,13 @@ def risk_section(bundle: MultiBundle) -> str:
     pending_text = (
         "、".join(f"T+{int(row.horizon)} {row.key}" for row in pending.itertuples())
         if not pending.empty
-        else "无"
+        else ""
+    )
+    pending_item = (
+        f"<li><strong>未就绪组合：</strong>{esc(pending_text)} 尚未训练完成，"
+        "榜单中留空，不用其他周期的结果替代。</li>"
+        if pending_text
+        else ""
     )
     return f"""
 <section class="section page-break">
@@ -351,7 +397,7 @@ def risk_section(bundle: MultiBundle) -> str:
     <li><strong>涨跌停与停牌：</strong>入场日涨停 / 跌停 / 停牌直接放弃该股票；退出日无法卖出时顺延，最多 10 个交易日，之后按最近价格强平。真实交易中“跌停排队卖不出”可能更严重。</li>
     <li><strong>容量：</strong>没有按成交额限制单票买入金额。200 万本金对多数 A 股流动性不构成约束，但放大到数千万时，Top10 集中持仓会显著冲击价格。</li>
     <li><strong>深度模型的标签：</strong>TFT、GRU、LSTM、ALSTM、TCN、Transformer、TabNet 的训练产物只落排序目标，没有真实收益列。本报告只用它们的预测分数，不用其标签；这不影响 IC 与组合评估。</li>
-    <li><strong>未就绪组合：</strong>{esc(pending_text)} 尚未训练完成，榜单中留空，不用其他周期的结果替代。</li>
+    {pending_item}
   </ul>
 
   <h3>6.3 统计上的边界</h3>
@@ -413,7 +459,7 @@ def conclusion_section(bundle: MultiBundle) -> str:
 
   <h3>7.1 直接回答</h3>
   <ol>
-    <li><strong>上一版报告用的是什么模型？</strong> LightGBM 单模型。本报告覆盖 13 个模型 × 2 个持有期，共 24 个已就绪组合；T+10 的 TCN 与 Transformer 尚未完成，未纳入排名。</li>
+    <li><strong>上一版报告用的是什么模型？</strong> LightGBM 单模型。本报告覆盖 13 个模型 × 2 个持有期，共 26 个组合，当前全部就绪并纳入同一张排名表。</li>
     <li><strong>13 个模型有没有区别？</strong> 预测层面：T+5 Friedman p = {num(friedman5.get('p'), 4)}、W = {num(friedman5.get('kendall_w'), 3)}；T+10 p = {num(friedman10.get('p'), 4)}、W = {num(friedman10.get('kendall_w'), 3)}。组合层面：Top10 的 White RC p 分别为 {num(white5.get('p'), 4)} 与 {num(white10.get('p'), 4)}，PBO 为 {pct(pbo5, 1)} 与 {pct(pbo10, 1)}。请把“预测有差异”和“组合可区分”分开理解。</li>
     <li><strong>T+5 与 T+10 哪个好？</strong> IC 冠军分别为 {esc(display_name(best['ic_5'][0]))}（{num(best['ic_5'][1], 4)}）与 {esc(display_name(best['ic_10'][0]))}（{num(best['ic_10'][1], 4)}）；两周期 IC 排名相关 {num(quality_corr, 3)}。Top10 收益中位数：T+5 {pct(medians[(5, 'top10')], 2, True)}，T+10 {pct(medians[(10, 'top10')], 2, True)}。</li>
     <li><strong>Top10、Top20、滚动 Top5 怎么选？</strong> 收益中位数：T+5 分别为 {pct(medians[(5, 'top10')], 2, True)} / {pct(medians[(5, 'top20')], 2, True)} / {pct(medians[(5, 'rolling')], 2, True)}；T+10 分别为 {pct(medians[(10, 'top10')], 2, True)} / {pct(medians[(10, 'top20')], 2, True)} / {pct(medians[(10, 'rolling')], 2, True)}。Top10 弹性最大但批次最少、回撤最集中；滚动 Top5 更接近每日调仓，统计样本也更多。</li>
@@ -437,7 +483,7 @@ def conclusion_section(bundle: MultiBundle) -> str:
     <li>把 2026 年窗口按季度切开，重复第 5 章的 Friedman / White RC，观察冠军是否换人。</li>
     <li>对滚动 Top5 做逐日资金曲线归因，分离“选股”“行业暴露”“市值暴露”三部分。</li>
     <li>在真实成交额约束下重跑容量版本（单票不超过当日成交额的 1%），再看 Top10 是否仍有优势。</li>
-    <li>T+10 TCN 与 Transformer 训练完成后，补齐 26 个组合并重跑本报告；当前缺失不影响其余 24 个组合的配对比较。</li>
+    <li>把同一套 26 组合协议扩展到更长窗口与其余市场，检验 2026 年的模型排序是否只是单年行情的结果。</li>
   </ul>
 </section>
 """
@@ -466,7 +512,7 @@ def appendix_section(bundle: MultiBundle) -> str:
     if export_rows:
         pred_missing_note = (
             f"其中 {money(pred_missing)} 行预测为空"
-            f"（{pct(pred_missing / export_rows, 2)}），集中在深度模型的序列预热与缺失特征样本；"
+            f"（{pct(pred_missing / export_rows, 2)}），集中在序列长度不足的次新股；"
             "评估按缺失剔除，不做插值或补零。深度模型产物未原生保存真实收益列，"
             "导出时按（周期、股票、日期）从同周期树模型回填，跨周期不借标签。"
         )
@@ -517,9 +563,9 @@ def appendix_section(bundle: MultiBundle) -> str:
   {table(["文件", "内容"], rows, aligns=["l", "l"])}
 
   <h3>8.3 复现命令</h3>
-  <pre># 1) 统一窗口评估（容器内；24 个已就绪组合）
+  <pre># 1) 统一窗口评估（容器内；{int(bundle.inventory['ready'].sum()) if not bundle.inventory.empty else 0} 个已就绪组合）
 docker exec -w /app quantmind python -m backend.scripts.backtest2026.multi_model \\
-  --allow-missing --out /data/backtest_2026/multi_20261019_rerun
+  {'' if bundle.pending().empty else '--allow-missing '}--out /data/backtest_2026/multi_20261019_rerun
 
 # 2) 逐股预测长表（容器内）
 docker exec -w /app quantmind python -m backend.scripts.backtest2026.export_predictions \\
@@ -530,15 +576,7 @@ python -m backend.scripts.backtest2026.multi_report \\
   --artifacts /media/zbox/data/quantmind/backtest_2026/multi_20261019_rerun \\
   --out /media/zbox/data/quantmind/backtest_2026/multi_20261019_rerun/report_2026_multi.pdf</pre>
 
-  <h3>8.4 附表：同一模型在两个持有期的差值</h3>
-  {table(
-      ["模型", "T+10 IC − T+5 IC", "Top10 上涨比例差", "Top10 收益差", "滚动 Top5 收益差"],
-      _paired_rows(bundle),
-      aligns=["l", "r", "r", "r", "r"],
-  )}
-  <p class="small">差值 = T+10 − T+5。IC 差为小数，收益差与上涨比例差为百分点。正值表示该模型在更长持有期更好；逐行对照可以判断第 5.3 节的整体秩相关由哪些模型驱动。</p>
-
-  <h3>8.5 术语表</h3>
+  <h3>8.4 术语表</h3>
   {table(
       ["术语", "含义"],
       [

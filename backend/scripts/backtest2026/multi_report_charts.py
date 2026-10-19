@@ -416,7 +416,7 @@ def cross_horizon_scatter(bundle: MultiBundle, path: Path) -> Path:
     if top_left is None or top_right is None or top_left.empty or top_right.empty:
         raise ValueError("缺少 Top10 组合榜")
 
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.5))
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.0))
     panels = (
         (
             axes[0],
