@@ -13,6 +13,7 @@ from backend.scripts.backtest2026.model_registry import (
     PINNED_RUN_IDS,
     _ready_reason,
     inventory_rows,
+    pins_for_horizons,
     resolve_model_run,
     resolve_registry,
 )
@@ -145,6 +146,29 @@ def test_registry_require_all_raises_when_incomplete(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="模型尚未就绪"):
         resolve_registry(root=tmp_path, require_all=True, use_pins=False)
+
+
+@pytest.mark.unit
+def test_registry_accepts_extra_horizon_bucket(tmp_path: Path) -> None:
+    for horizon in (5, 10, 20):
+        _make_run(tmp_path, f"train_2026100{horizon}000000_aaaaaaaa", horizon, "LGB")
+
+    registry = resolve_registry(
+        root=tmp_path,
+        use_pins=False,
+        horizons=(5, 10, 20),
+    )
+
+    assert set(registry) == {5, 10, 20}
+    assert registry[20]["LGB"].ready is True
+    assert registry[20]["LGB"].label == "LGB · T+20"
+    rows = inventory_rows(registry)
+    assert {row["horizon"] for row in rows} == {5, 10, 20}
+
+
+@pytest.mark.unit
+def test_pins_for_default_horizons_does_not_pull_t20_subset() -> None:
+    assert pins_for_horizons((5, 10)) == PINNED_RUN_IDS
 
 
 @pytest.mark.unit

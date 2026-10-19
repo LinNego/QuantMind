@@ -424,7 +424,7 @@ def test_run_end_to_end_with_synthetic_panel(
         },
         index=dates,
     )
-    monkeypatch.setattr(mm, "resolve_registry", lambda: registry)
+    monkeypatch.setattr(mm, "resolve_registry", lambda **kwargs: registry)
     monkeypatch.setattr(mm, "build_market_panel", lambda *args, **kwargs: panel)
     monkeypatch.setattr(mm, "attach_listing_age", lambda *args, **kwargs: None)
     monkeypatch.setattr(

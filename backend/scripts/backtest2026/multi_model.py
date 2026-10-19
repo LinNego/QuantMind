@@ -375,7 +375,7 @@ def _benchmark_block(
 
 def run(settings: RunSettings) -> dict[str, object]:
     settings.out_dir.mkdir(parents=True, exist_ok=True)
-    registry = resolve_registry()
+    registry = resolve_registry(horizons=settings.horizons)
     missing = _missing_runs(registry, settings)
     if missing and not settings.allow_missing:
         labels = ", ".join(run.label for run in missing)

@@ -1,8 +1,11 @@
-"""13 个模型 × T+5/T+10 的运行目录登记表。
+"""13 个模型 × T+5/T+10 的运行目录登记表（另有 T+20 对照子集）。
 
 训练任务目录名带时间戳，且同一模型可能重训过（例如 T+5 MLP 的第一版失败）。
 因此 26 个组合全部**显式钉扎 run_id**。钉扎避免报告生成时误取到后来的
 重训版本；新增组合或重训时同步改这里。
+
+T+20 只跑 `T20_PINNED_RUN_IDS` 里的对照子集；调用方通过
+`resolve_registry(horizons=(5, 10, 20))` 显式纳入，缺省仍是 5/10 全矩阵。
 """
 
 from __future__ import annotations
@@ -93,6 +96,23 @@ PINNED_RUN_IDS: dict[tuple[int, str], str | None] = {
     (10, "TRF"): "train_20261019021411_fff3c7af",
 }
 
+#: T+20 只训练对照子集（树族三个代表 + 序列/随机森林对照），不参与 13 模型全矩阵。
+#: 单独一张表，保持 PINNED_RUN_IDS 的「26 组合全覆盖」不变量不被稀释。
+T20_PINNED_RUN_IDS: dict[tuple[int, str], str | None] = {
+    (20, "LGB"): "train_20261019111759_ed5c3699",
+    (20, "XGB"): "train_20261019115827_f5346da1",
+    (20, "CAT"): "train_20261019122330_21225069",
+    (20, "TFT"): "train_20261019124917_ec429052",
+    (20, "RF"): "train_20261019135823_8cf74b3d",
+}
+
+
+def pins_for_horizons(horizons: tuple[int, ...]) -> dict[tuple[int, str], str | None]:
+    merged = dict(PINNED_RUN_IDS)
+    if 20 in horizons:
+        merged.update(T20_PINNED_RUN_IDS)
+    return merged
+
 
 @dataclass(frozen=True)
 class ModelRun:
@@ -167,9 +187,11 @@ def resolve_model_run(
     *,
     root: Path | None = None,
     use_pins: bool = True,
+    pins: dict[tuple[int, str], str | None] | None = None,
 ) -> ModelRun:
     jobs_root = root or (DATA_VOLUME / "training_jobs")
-    pinned = PINNED_RUN_IDS.get((horizon, key)) if use_pins else None
+    pin_map = PINNED_RUN_IDS if pins is None else pins
+    pinned = pin_map.get((horizon, key)) if use_pins else None
     run_dir = jobs_root / pinned if pinned else _discover(jobs_root, horizon, key)
     job_name = JOB_TEMPLATE.format(horizon=horizon, key=key)
     if run_dir is None:
@@ -203,18 +225,26 @@ def resolve_registry(
     root: Path | None = None,
     require_all: bool = False,
     use_pins: bool = True,
+    horizons: tuple[int, ...] = HORIZONS,
 ) -> dict[int, dict[str, ModelRun]]:
+    pin_map = pins_for_horizons(horizons) if use_pins else {}
     registry = {
         horizon: {
-            key: resolve_model_run(horizon, key, root=root, use_pins=use_pins)
+            key: resolve_model_run(
+                horizon,
+                key,
+                root=root,
+                use_pins=use_pins,
+                pins=pin_map,
+            )
             for key in MODEL_ORDER
         }
-        for horizon in HORIZONS
+        for horizon in horizons
     }
     if require_all:
         missing = [
             run.label
-            for horizon in HORIZONS
+            for horizon in horizons
             for run in registry[horizon].values()
             if not run.ready
         ]
@@ -225,7 +255,7 @@ def resolve_registry(
 
 def inventory_rows(registry: dict[int, dict[str, ModelRun]]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for horizon in HORIZONS:
+    for horizon in registry:
         for key in MODEL_ORDER:
             run = registry[horizon][key]
             rows.append(
