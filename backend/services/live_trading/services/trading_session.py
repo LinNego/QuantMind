@@ -26,6 +26,15 @@ TRADING_SESSIONS: tuple[tuple[int, int, int, int], ...] = (
     (12, 55, 15, 5),
 )
 
+#: 连续竞价时段（有逐笔/快照行情）。与 ``TRADING_SESSIONS`` 的差集是**报单缓冲**：
+#: 09:15–09:30 / 12:55–13:00 / 15:00–15:05 可以报单，但没有连续行情（午休后第一笔
+#: 13:00 才出）。决策轮/唤醒轮判「行情该不该有」必须用这条——用含缓冲的口径会把
+#: 「缓冲期本来无行情」误判成「交易时段内行情全缺」（2026-10-19 12:55 唤醒轮三连中止）。
+CONTINUOUS_SESSIONS: tuple[tuple[int, int, int, int], ...] = (
+    (9, 30, 11, 30),
+    (13, 0, 15, 0),
+)
+
 
 def now_shanghai() -> datetime:
     """当前上海时间。"""
@@ -39,6 +48,19 @@ def is_trading_time(now: datetime | None = None) -> bool:
         return False
     hm = (now.hour, now.minute)
     return any((sh, sm) <= hm < (eh, em) for sh, sm, eh, em in TRADING_SESSIONS)
+
+
+def is_continuous_trading_time(now: datetime | None = None) -> bool:
+    """是否连续竞价时段（不含报单缓冲；不判断节假日）。
+
+    **不要**拿它替换真单时段闸门（``real_order_session_refusal``）：缓冲期能报单，
+    只是没有连续行情。反过来，决策类判定（唤醒轮、行情闸门）要用这一条。
+    """
+    now = now or now_shanghai()
+    if now.weekday() >= 5:
+        return False
+    hm = (now.hour, now.minute)
+    return any((sh, sm) <= hm < (eh, em) for sh, sm, eh, em in CONTINUOUS_SESSIONS)
 
 
 def trade_date_str(now: datetime | None = None) -> str:

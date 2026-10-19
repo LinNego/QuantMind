@@ -465,6 +465,7 @@ def make_harness(**over) -> Harness:
         write_ledger=over.pop("write_ledger", write_ledger),
         is_trading_day=over.pop("is_trading_day", is_trading_day),
         is_trading_time=over.pop("is_trading_time", lambda now: True),
+        is_continuous_trading=over.pop("is_continuous_trading", None),
         real_enabled=over.pop("real_enabled", lambda: False),
         now=over.pop("now", lambda: NOW),
         # 默认不接线镜像探测 = 「探不到」（老替身/未接线），审计段落 None。
@@ -2609,6 +2610,29 @@ async def test_wake_tick_gates_skip_without_burning_the_round(caplog):
     h2 = make_harness(is_trading_time=lambda now: False)
     assert await wake_tick(deps=h2.deps, native=native, now=WAKE_NOW) == ()
     assert native.calls == []
+
+
+@pytest.mark.asyncio
+async def test_wake_tick_skips_order_buffers_without_continuous_quotes():
+    """报单缓冲（09:15-09:30 / 12:55-13:00）：可下单但**没有连续竞价行情**。
+
+    这段 ``is_trading_time`` 为真（真单闸门放行），但决策轮拿不到连续行情：
+    12:55 唤醒轮若照跑，池票在行情轮转采到之前就是空池 → 三家模型三连中止
+    告警（2026-10-19 12:55 实测）。唤醒只认连续竞价，把机会交给 13:00 正点槽。
+    """
+    native = FakeNative()
+    h = make_harness(
+        is_trading_time=lambda now: True,
+        is_continuous_trading=lambda now: False,
+    )
+    assert await wake_tick(deps=h.deps, native=native, now=WAKE_NOW) == ()
+    assert native.calls == []  # 连唤醒状态键都不碰
+
+    # 未接线的替身（None）保持旧口径：is_trading_time 说了算。
+    native2 = FakeNative()
+    h2 = make_harness(is_trading_time=lambda now: False)
+    assert await wake_tick(deps=h2.deps, native=native2, now=WAKE_NOW) == ()
+    assert native2.calls == []
 
 
 @pytest.mark.asyncio

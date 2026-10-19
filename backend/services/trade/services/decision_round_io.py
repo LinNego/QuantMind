@@ -379,7 +379,7 @@ def default_round_deps() -> RoundDeps:
     """生产接线（每项都指向既有唯一实现，本模块不复制任何取数口径）。"""
     from backend.services.trade.services.decision_executor import run_round
     from backend.services.trade_shared.deps import get_redis
-    from backend.services.live_trading.services.trading_session import is_trading_time
+    from backend.services.live_trading.services import trading_session
     from backend.shared.database_manager_v2 import get_session
     from backend.shared.decision_context_source import (
         load_pool_doc,
@@ -464,7 +464,8 @@ def default_round_deps() -> RoundDeps:
         write_watch=_write_watch,
         write_ledger=_write_ledger,
         is_trading_day=_is_trading_day,
-        is_trading_time=is_trading_time,
+        is_trading_time=trading_session.is_trading_time,
+        is_continuous_trading=trading_session.is_continuous_trading_time,
         real_enabled=is_real_trading_enabled,
         mirror_ready=_mirror_ready,
         now=now_cn,

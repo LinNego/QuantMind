@@ -563,6 +563,12 @@ async def _wake_tick(
     try:
         if not deps.is_trading_time(now):
             return ()
+        # 报单缓冲（09:15-09:30 / 12:55-13:00）可下单但没有连续竞价行情：唤醒轮
+        # 在这段起来只会看到空池（2026-10-19 12:55 三家模型三连中止）。唤醒只认
+        # 连续竞价，缓冲期的事件交给随后正点槽（13:00）处理。
+        is_continuous = deps.is_continuous_trading or deps.is_trading_time
+        if not is_continuous(now):
+            return ()
         trading_day = await deps.is_trading_day(now.date())
     except Exception as exc:  # noqa: BLE001 判不了就不评（与 round_tick 同 fail-closed）
         logger.warning("[DecisionRound] 唤醒评估：时段/交易日判定失败，跳过: %s", exc)

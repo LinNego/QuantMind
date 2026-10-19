@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -205,6 +206,42 @@ def test_in_session_still_reaches_the_transport(
         f"{name} 时段内没有走到传输层——闸门被做成了「永远拒」（或更早的校验挡住了）"
     )
     assert result.success is True, f"{name} 时段内下发失败：{result.message}"
+
+
+# ── 连续竞价谓词：报单缓冲 ≠ 有行情 ─────────────────────────────────────
+# 交易日 2026-10-19（周一）。
+@pytest.mark.parametrize(
+    ("hhmm", "expected"),
+    [
+        ("09:14", False),
+        ("09:15", False),  # 开盘报单缓冲：可下单，但没有连续竞价行情
+        ("09:29", False),
+        ("09:30", True),
+        ("11:29", True),
+        ("11:30", False),  # 上午连续竞价恰好收在 11:30
+        ("11:35", False),
+        ("12:55", False),  # 午后报单缓冲：午休后第一笔 13:00 才出
+        ("12:59", False),
+        ("13:00", True),
+        ("14:59", True),
+        ("15:00", False),  # 收盘；15:00-15:05 只是尾部报单缓冲
+    ],
+)
+def test_continuous_session_excludes_order_buffers(hhmm: str, expected: bool) -> None:
+    """``is_continuous_trading_time`` 只认 09:30–11:30 / 13:00–15:00。
+
+    决策轮的唤醒与「时段内池票全无现价」判定用它：用含缓冲的 ``is_trading_time``
+    判，12:55 的唤醒轮会被当成「交易时段内却拿不到行情」而中止告警（2026-10-19
+    12:55 三家模型三连）——那段只是报单缓冲，本来就没有连续行情。
+    """
+    hh, mm = (int(part) for part in hhmm.split(":"))
+    now = datetime(2026, 10, 19, hh, mm, tzinfo=trading_session.TZ)
+    assert trading_session.is_continuous_trading_time(now) is expected
+
+
+def test_continuous_session_rejects_weekends() -> None:
+    saturday = datetime(2026, 10, 17, 10, 0, tzinfo=trading_session.TZ)
+    assert trading_session.is_continuous_trading_time(saturday) is False
 
 
 def test_paper_broker_is_not_gated(monkeypatch: pytest.MonkeyPatch) -> None:

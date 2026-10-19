@@ -921,22 +921,23 @@ async def execute_batch(
             agent=agent,
         )
 
-    if env_flag("QM_DECISION_ROUND_QUOTE_REFRESH", default=True):
-        # 派发前把本轮腿的行情**现查现写**标准键（2026-10-12 决策轮 22/22 拒
-        # ``l3.stale_quote`` 的修复面）：热集轮转 ~100s 才轮到同一只票一圈，而
-        # 风控时效门 max_age_s=5——不刷新则池票快照在提交时刻必然判「陈旧」。
-        # **这不违反模块头纪律 1（执行段不重读行情）**：plan_orders 用的仍是
-        # 轮次开始的那份快照（本刷新不喂计划）；更新的只是风控在提交时刻读到的
-        # 行情新鲜度。best-effort：刷新内部自带超时护栏且绝不抛出，桥不可达时
-        # 照常提交、闸门按老数据自行裁定（fail-closed 语义不动）。
-        try:
-            from backend.services.live_trading.services.tdx_quote_feed import (
-                refresh_symbols_now,
-            )
-
-            await refresh_symbols_now([leg.symbol for leg in plan.legs])
-        except Exception as exc:  # noqa: BLE001 刷新失败不挡派发
-            logger.warning("[DecisionExec] 派发前行情刷新失败（继续提交）: %s", exc)
+    # 派发前把每腿的行情**现查现写**标准键（2026-10-12 决策轮 22/22 拒
+    # ``l3.stale_quote`` 的修复面）：热集轮转 ~100s 才轮到同一只票一圈，而
+    # 风控时效门 max_age_s=5——不刷新则池票快照在提交时刻必然判「陈旧」。
+    # **这不违反模块头纪律 1（执行段不重读行情）**：plan_orders 用的仍是
+    # 轮次开始的那份快照（本刷新不喂计划）；更新的只是风控在提交时刻读到的
+    # 行情新鲜度。best-effort：刷新内部自带超时护栏且绝不抛出，桥不可达时
+    # 照常提交、闸门按老数据自行裁定（fail-closed 语义不动）。
+    #
+    # **必须逐腿刷、紧贴提交**（2026-10-19 13:02 修复）：整批在循环外刷一次时，
+    # 首腿的真单派发（风控 + 桥往返）实测 ~5s，把后面腿的快照年龄推过 5s 门——
+    # SELL 601857 于 13:02:32 提交成功，13:02:37 轮到 601618/002469 时快照已 6s，
+    # 两笔买单被 ``[l3.stale_quote] 行情陈旧`` 拒掉（行情当时其实一直有）。
+    refresh_quotes = env_flag("QM_DECISION_ROUND_QUOTE_REFRESH", default=True)
+    if refresh_quotes:
+        from backend.services.live_trading.services.tdx_quote_feed import (
+            refresh_symbols_now,
+        )
 
     submit = submitter
     if submit is None:
@@ -978,6 +979,13 @@ async def execute_batch(
                 )
             )
             continue
+        if refresh_quotes:
+            # 紧贴该腿的提交：风控在 ``submit_order`` 入口第一件事读快照，中间多
+            # 一次远程/桥往返都可能把年龄推过 5s 门。
+            try:
+                await refresh_symbols_now([leg.symbol])
+            except Exception as exc:  # noqa: BLE001 刷新失败不挡派发
+                logger.warning("[DecisionExec] 派发前行情刷新失败（继续提交）: %s", exc)
         try:
             outcome = await submit(leg, key, bool(real))
             receipts.append(

@@ -370,7 +370,7 @@ class RoundDeps:
     write_ledger: Callable[..., Awaitable[int]]
     #: (day) → 是否交易日
     is_trading_day: Callable[[date], Awaitable[bool]]
-    #: (now) → 是否连续竞价时段
+    #: (now) → 是否交易时段（含报单缓冲：09:15-11:35 / 12:55-15:05）
     is_trading_time: Callable[[datetime], bool]
     #: 现读实盘开关（一轮内不变）
     real_enabled: Callable[[], bool]
@@ -380,6 +380,8 @@ class RoundDeps:
     #: （``real_mirror_service.real_trading_ready``）。``None``/探测失败 = 探不到，
     #: 审计记 None——绝不把「没探测」粉饰成「就绪」。生产接线见 `default_round_deps`。
     mirror_ready: Callable[[], tuple[bool, str]] | None = None
+    #: (now) → 是否**连续竞价**（09:30-11:30 / 13:00-15:00）；None=未接线退回旧口径。
+    is_continuous_trading: Callable[[datetime], bool] | None = None
     #: () → 名册（P2.9）：**一家一项**，顺序即执行顺序（``None``/空 = 单家路径，
     #: 走 ``load_llm`` 那一条）。解析失败上抛，由 tick 收成「一家都跑不动」。
     roster: Callable[[], Sequence[AgentRun]] | None = None

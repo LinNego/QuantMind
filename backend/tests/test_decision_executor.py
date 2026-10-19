@@ -1670,10 +1670,17 @@ def quote_refresh_spy(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_execute_batch_refreshes_every_leg_quote_before_any_submit(
+async def test_execute_batch_refreshes_each_leg_quote_just_before_its_submit(
     monkeypatch,
 ) -> None:
-    """刷新一次、覆盖全部腿的代码、且**先于任何提交**（风控在提交时刻读新鲜度）。"""
+    """刷新**逐腿**紧贴提交，而不是整批开头只刷一次。
+
+    风控时效门 ``max_age_s=5`` 在提交入口第一件事读快照；首腿真单派发（风控 +
+    桥往返）实测 ~5s。整批只刷一次时，后面腿读到的快照年龄必然越线——2026-10-19
+    13:02 的两笔买单就是这形态：SELL 601857 于 :32 提交成功，:37 轮到第二腿时
+    快照年龄 6s，``[l3.stale_quote] 行情陈旧`` 两连拒。刷新紧贴每一腿的提交，
+    首腿再慢也不会把后面腿的行情拖老。
+    """
     from backend.services.live_trading.services import tdx_quote_feed as feed
 
     events: list[tuple] = []
@@ -1702,10 +1709,13 @@ async def test_execute_batch_refreshes_every_leg_quote_before_any_submit(
         submitter=caller,
     )
 
-    assert events and events[0][0] == "refresh"  # 任何提交之前先刷新
-    assert sorted(events[0][1]) == ["000001.SZ", "600036.SH"]
-    submit_symbols = [sym for tag, sym in events if tag == "submit"]
-    assert sorted(submit_symbols) == ["000001.SZ", "600036.SH"]
+    # 逐腿交错：refresh(A) → submit(A) → refresh(B) → submit(B)
+    assert events == [
+        ("refresh", ("600036.SH",)),
+        ("submit", "600036.SH"),
+        ("refresh", ("000001.SZ",)),
+        ("submit", "000001.SZ"),
+    ]
     assert len(outcome.receipts) == 2
 
 
