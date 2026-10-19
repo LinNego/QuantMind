@@ -440,6 +440,19 @@ def holding_days(buy_ts: Any, sell_ts: Any) -> float | None:
     return round((s - b).total_seconds() / 86400, 3)
 
 
+def holding_age_days(buy_ts: Any, now: Any) -> int | None:
+    """自**首次建仓**起的持有天数（四舍五入），任一侧不可解析 → ``None``。
+
+    与 :func:`holding_days` 同源（时间戳差 / 86400），只多两件事：取整、负数夹到 0
+    （时钟回拨/未来时间戳不该渲染成「-1 天」）。``None`` 的意思始终是「不知道」——
+    提示词渲染 ``—``，绝不回落到 0（0 = 今天刚买）。
+    """
+    days = holding_days(buy_ts, now)
+    if days is None:
+        return None
+    return max(0, int(round(days)))
+
+
 # ── 期初结转（P3：隔壁 live_ledger.json → 本仓账本）────────────────────
 #
 # 切换日之后本仓的账本从零开始，而三个 agent 名下的仓**已经在真实账户里**——

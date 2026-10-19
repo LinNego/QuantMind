@@ -18,7 +18,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from backend.shared.decision.agent_ledger import DEFAULT_AGENT_QUOTA, positions_cost
+from backend.shared.decision.agent_ledger import (
+    DEFAULT_AGENT_QUOTA,
+    holding_age_days as holding_age_days,  # noqa: PLC0414 —— 对外契约再导出
+    positions_cost,
+)
 
 
 @dataclass(frozen=True, slots=True)

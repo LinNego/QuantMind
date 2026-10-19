@@ -37,6 +37,7 @@ from backend.services.trade.services.decision_round_core import (
     STATUS_ABORTED,
     AgentLedgerRead,
 )
+from backend.services.trade.services.decision_round_ledger import holding_age_days
 from backend.shared.decision.agent_ledger import DEFAULT_AGENT_QUOTA
 from backend.tests.test_decision_round import (
     BANK_ROW,
@@ -410,3 +411,53 @@ def test_agent_ledger_read_is_frozen():
     led = AgentLedgerRead(ok=True, known=True)
     with pytest.raises(dataclasses.FrozenInstanceError):
         led.ok = False  # type: ignore[misc]
+
+
+# ── ⑦ 持仓天数（T+5 / T+10 换仓提醒）─────────────────────────────────
+def test_holding_age_days_rounds_and_never_invents_a_value():
+    """买卖时间戳任一不可解析 → ``None``（渲染 ``—``），绝不回落到 0。"""
+    assert holding_age_days("2026-09-20T01:30:00Z", NOW) == 4
+    assert holding_age_days(None, NOW) is None
+    assert holding_age_days("not-a-time", NOW) is None
+
+
+@pytest.mark.asyncio
+async def test_holding_age_reaches_the_prompt_with_the_horizon_rule():
+    """账本 ``buy_ts`` → 提示词「持有天数」列 + T+5/T+10 换仓规则。
+
+    没有这列时，模型只能看到成本/浮盈，看不到「这笔仓已经拿了多久」——
+    T+5/T+10 周期的票就会一直被 hold，这正是用户 2026-10-19 点名的缺口。
+    """
+    h = make_harness(positions=TWO_HOLDINGS, ledger=LEDGER_ONLY_600036)
+    await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    prompt = h.log["llm"][0]["prompt"]
+    assert "持有天数" in prompt
+    assert "T+5" in prompt and "T+10" in prompt
+    cells = holding_cells(prompt)
+    # LEDGER_ONLY_600036.buy_ts = 2026-09-20T01:30Z，NOW = 2026-09-24 09:35 CST
+    assert cells[0][-1] == "4"
+
+
+@pytest.mark.asyncio
+async def test_missing_buy_ts_renders_a_dash_not_zero():
+    """同一张表里某只没 ``buy_ts`` → 该格 ``—``：0 天会被模型读成「今天刚买」。"""
+    ledger = AgentLedgerRead(
+        ok=True,
+        known=True,
+        positions={
+            "600036.SH": {
+                "volume": 1000,
+                "cost_price": 30.0,
+                "buy_ts": "2026-09-20T01:30:00Z",
+            },
+            "000001.SZ": {"volume": 500, "cost_price": 11.0},  # 无 buy_ts
+        },
+        virtual_cash=100_000.0,
+    )
+    h = make_harness(positions=TWO_HOLDINGS, ledger=ledger)
+    await run_once(SLOT_0935, deps=h.deps, now=NOW)
+
+    cells = holding_cells(h.log["llm"][0]["prompt"])
+    ages = {row[0]: row[-1] for row in cells}
+    assert ages == {"600036.SH": "4", "000001.SZ": "—"}

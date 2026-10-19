@@ -16,7 +16,9 @@ import pytest
 from backend.shared.decision.context import (
     MISSING,
     DirectionBlock,
+    HoldingRow,
     PoolRow,
+    ledger_cost_rows,
     render_prompt,
 )
 from backend.shared.decision_context_source import (
@@ -473,6 +475,63 @@ def test_positions_day_chg_none_when_no_snapshot() -> None:
     )
     # 盈亏是 −0.83/41.65 = −1.99%（手算过，别照抄旁边的直觉数字）
     assert "| 600036.SH | 招商银行 | 200 | 41.65* | 40.82 | -1.99% | — | 200 |" in out
+
+
+def _holding(**over: object) -> HoldingRow:
+    base: dict = {
+        "code": "600036.SH",
+        "name": "招商银行",
+        "volume": 200,
+        "cost": 41.65,
+        "price": 40.82,
+        "pnl_pct": -1.99,
+        "day_chg": 0.5,
+        "avail": 200,
+    }
+    base.update(over)
+    return HoldingRow(**base)  # type: ignore[arg-type]
+
+
+def test_holding_age_column_is_data_gated() -> None:
+    """没有持有天数（legacy/金样）→ 列不出现，旧提示词逐字节不动。"""
+    out = render_prompt(
+        build_context(
+            agent="flash",
+            holdings=(_holding(),),
+            pool=(),
+            now=NOW,
+            direction=DirectionBlock("偏多"),
+        )
+    )
+    assert "持有天数" not in out
+
+
+def test_holding_age_column_renders_and_missing_age_is_a_dash() -> None:
+    out = render_prompt(
+        build_context(
+            agent="flash",
+            holdings=(
+                _holding(held_days=5),
+                _holding(code="600519.SH", name="贵州茅台", held_days=None),
+            ),
+            pool=(),
+            now=NOW,
+            direction=DirectionBlock("偏多"),
+        )
+    )
+    assert "| 可卖量 | 持有天数 |" in out
+    assert out.count("| 5 |") == 1
+    assert out.count(f"| {MISSING} |") >= 1
+
+
+def test_ledger_cost_rows_preserves_holding_age() -> None:
+    """成本改写只换成本口径，不能把 `held_days` 丢掉（丢掉 = 列变空）。"""
+    rows = ledger_cost_rows(
+        (_holding(held_days=7),),
+        {"600036.SH": {"cost_price": 30.0}},
+    )
+    assert rows[0].cost == 30.0
+    assert rows[0].held_days == 7
 
 
 def test_positions_price_prefers_snapshot_now_over_bridge_price() -> None:

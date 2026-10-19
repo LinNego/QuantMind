@@ -49,6 +49,7 @@ from datetime import datetime
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from backend.shared.decision.agent_ledger import holding_age_days
 from backend.shared.decision.contract import (
     ANALYSIS_SECTIONS,
     INTRADAY_SCHEMA_JSON,
@@ -123,6 +124,10 @@ class HoldingRow:
     cost_src: str = COST_SRC_BRIDGE
     #: 现价取数源（见 ``PRICE_SRC_BRIDGE`` 注释）：``""`` = 未标注（legacy/金样）。
     price_src: str = ""
+    #: 自首次建仓起的持有天数（自然日，四舍五入）。``None`` = 账本没有 ``buy_ts``
+    #: （渲染 ``—``，绝不写成 0——0 的意思是「今天刚买」）。默认 ``None`` 让
+    #: legacy/金样路径不出现该列，提示词逐字节不变。
+    held_days: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,7 +257,10 @@ def budget_filter_note(pct: float) -> str:
 
 
 def ledger_cost_rows(
-    rows: Sequence[HoldingRow], positions: Mapping[str, Any] | None
+    rows: Sequence[HoldingRow],
+    positions: Mapping[str, Any] | None,
+    *,
+    now: datetime | None = None,
 ) -> tuple[HoldingRow, ...]:
     """持仓行 → 提示词展示副本：成本/浮盈改**分账账本**口径。
 
@@ -264,9 +272,13 @@ def ledger_cost_rows(
     **只改展示**：返回新对象，绝不改入参。桥口径的 ``pnl_pct`` 在别处还被
     波动触发基线、强制减仓与执行路径消费，交易判定一律不动。
 
-    ``positions`` = ``{code: {"volume", "cost_price", ...}}``（账本里该 agent 的
-    持仓段）。类型坏值（不是 Mapping、``cost_price`` 不是数）一律走回退分支，
-    不许炸穿提示词——提示词构建失败等于该轮 0 决策。
+    ``positions`` = ``{code: {"volume", "cost_price", "buy_ts", ...}}``（账本里该
+    agent 的持仓段）。类型坏值（不是 Mapping、``cost_price`` 不是数）一律走回退
+    分支，不许炸穿提示词——提示词构建失败等于该轮 0 决策。
+
+    ``now`` 给出时补「自首次建仓起的天数」（``positions[code].buy_ts``）；账本没有
+    该票/没有 ``buy_ts`` → ``held_days=None``（渲染 ``—``，绝不写成 0）。这只是展示
+    层增强，算不出来不影响本轮决策。``now=None`` 时保持原样（金样/legacy 路径）。
     """
     if not isinstance(positions, Mapping):
         positions = {}
@@ -277,6 +289,10 @@ def ledger_cost_rows(
             lc = float((pos or {}).get("cost_price") or 0)
         except (TypeError, ValueError, AttributeError):
             lc = 0.0
+        held_days = r.held_days
+        if held_days is None and now is not None:
+            buy_ts = pos.get("buy_ts") if isinstance(pos, Mapping) else None
+            held_days = holding_age_days(buy_ts, now)
         if math.isfinite(lc) and lc > 0:
             out.append(
                 HoldingRow(
@@ -290,6 +306,7 @@ def ledger_cost_rows(
                     avail=r.avail,
                     cost_src=COST_SRC_LEDGER,
                     price_src=r.price_src,
+                    held_days=held_days,
                 )
             )
         else:
@@ -305,9 +322,19 @@ def ledger_cost_rows(
                     avail=r.avail,
                     cost_src=COST_SRC_BRIDGE,
                     price_src=r.price_src,
+                    held_days=held_days,
                 )
             )
     return tuple(out)
+
+
+def _display_holdings(ctx: RebalanceContext) -> tuple[HoldingRow, ...]:
+    """提示词展示行：成本/浮盈/持有天数统一按分账账本口径补全。
+
+    正文表与收尾的「T+5/T+10 换仓」规则必须看**同一份**行：规则段若按原始
+    ``ctx.holdings`` 判有没有天数，账本里明明有 ``buy_ts`` 也不会出规则。
+    """
+    return ledger_cost_rows(ctx.holdings, ctx.ledger_positions, now=ctx.now)
 
 
 # ── 单元格渲染 ────────────────────────────────────────────────────────
@@ -328,7 +355,7 @@ def _pct(value: float | None) -> str:
     return text if text == MISSING else text + "%"
 
 
-def _holding_row_line(h: HoldingRow) -> str:
+def _holding_row_line(h: HoldingRow, *, show_age: bool = False) -> str:
     """一行持仓。价格/成本沿用隔壁的**裸 float 渲染**（``35.8`` 而非 ``35.80``）——
     逐字节对齐优先于好看。
 
@@ -338,15 +365,27 @@ def _holding_row_line(h: HoldingRow) -> str:
 
     现价带 ``‡`` = 实时行情未取到、回退桥快照价（见 :data:`PRICE_SRC_BRIDGE`）；
     ``price_src=""``（legacy/金样）不标——逐字节不动。
+
+    ``show_age=True`` 时追加「持有天数」列（调用方按**整表**是否拿到账本
+    ``buy_ts`` 统一决定，单行缺失渲染 ``—``）——同一张表不能有的行有列、有的行没有。
     """
     mark = "" if h.cost_src == COST_SRC_LEDGER else "*"
     has_cost = math.isfinite(h.cost) and h.cost > 0
     cost_cell = format(h.cost, "") + mark if has_cost else MISSING
     price_cell = f"{h.price}‡" if h.price_src == PRICE_SRC_BRIDGE else h.price
-    return (
-        f"| {h.code} | {h.name} | {h.volume} | {cost_cell} | {price_cell} "
-        f"| {_pct(h.pnl_pct) if has_cost else MISSING} | {_pct(h.day_chg)} | {h.avail} |"
-    )
+    cells = [
+        h.code,
+        h.name,
+        str(h.volume),
+        cost_cell,
+        str(price_cell),
+        _pct(h.pnl_pct) if has_cost else MISSING,
+        _pct(h.day_chg),
+        str(h.avail),
+    ]
+    if show_age:
+        cells.append(MISSING if h.held_days is None else str(h.held_days))
+    return "| " + " | ".join(cells) + " |"
 
 
 def _pool_row_line(p: PoolRow) -> str:
@@ -408,6 +447,16 @@ _HOLDINGS_HEADER = (
     "|------|------|------|------|------|-------|-----------|--------|",
 )
 
+#: 拿到账本 ``buy_ts`` 时才用：多一列「持有天数」（自然日）。没拿到时**整列不出现**
+#: ——legacy/金样路径的提示词必须逐字节不变（见 ``_context_body``）。
+_HOLDINGS_HEADER_AGE = (
+    "【你名下的现有持仓】（成本与盈亏% = 你名下分账账本口径；现价/数量/可卖量 = "
+    "桥账户实时口径，可卖量 0 = 今日买入 T+1 不可卖；持有天数 = 自首次建仓起的自然日）：",
+    "",
+    "| 代码 | 名称 | 数量 | 成本 | 现价 | 盈亏% | 今日涨跌% | 可卖量 | 持有天数 |",
+    "|------|------|------|------|------|-------|-----------|--------|----------|",
+)
+
 _POOL_HEADER = (
     "【候选池】（最新研究池：总分/融合分/备注；池内没有方向标签——"
     "买卖由你按 分数+大盘+板块+新闻分子 综合判断，HOLD/BUY 侧标签一律不作为依据）",
@@ -439,7 +488,7 @@ def _pool_lines(ctx: RebalanceContext) -> list[str]:
 
 
 def _decision_rule_lines(ctx: RebalanceContext) -> list[str]:
-    return [
+    rules = [
         "",
         "【决策规则】",
         "1. 逐只现有持仓判断：hold（继续持有）/ sell（减仓或清仓换股）。"
@@ -450,9 +499,23 @@ def _decision_rule_lines(ctx: RebalanceContext) -> list[str]:
         f"（每票 ≤{ctx.per_stock_pct:.0%}，当日新开仓 ≤{ctx.max_new_buys} 只；"
         f"超出的会被闸门裁掉）。" + budget_filter_note(ctx.per_stock_pct),
         "4. T+1：可卖量 0 的持仓不能卖。ST/*ST/退市整理股与黑名单标的**不可买入**（闸门硬拦）。",
-        "5. 输出**严格 JSON**（不要 markdown 代码块、不要额外文字），格式：",
-        REBALANCE_SCHEMA_JSON,
     ]
+    if any(h.held_days is not None for h in _display_holdings(ctx)):
+        rules.append(
+            "5. 持有天数 = 自首次建仓起的自然日（见持仓表）。信号模型的持有周期常见为 "
+            "T+5 与 T+10：持有达到 5 天且该票信号分已明显走弱、或已跌出候选池/池内排名"
+            "靠后时，应优先考虑减仓或卖出换仓；持有达到 10 天时，除非信号分仍在池内"
+            "靠前且买入逻辑未破坏，否则优先换入更强候选。信号仍强时不必为凑天数换仓。"
+        )
+        rules.append(
+            "6. 输出**严格 JSON**（不要 markdown 代码块、不要额外文字），格式："
+        )
+    else:
+        rules.append(
+            "5. 输出**严格 JSON**（不要 markdown 代码块、不要额外文字），格式："
+        )
+    rules.append(REBALANCE_SCHEMA_JSON)
+    return rules
 
 
 def _intraday_rule_lines(ctx: RebalanceContext) -> list[str]:
@@ -463,7 +526,7 @@ def _intraday_rule_lines(ctx: RebalanceContext) -> list[str]:
     规则里要把「文字里写了价位就必须落成 watch」说死：不落盘的价位**没有**任何
     分钟级哨兵在盯，等于没设（上游踩过这个坑，见 assets 段原话）。
     """
-    return [
+    rules = [
         "",
         *ANALYSIS_SECTIONS,
         "",
@@ -483,10 +546,25 @@ def _intraday_rule_lines(ctx: RebalanceContext) -> list[str]:
         "必须高于当前 stop_loss，填低了会被忽略；下破触发请用 stop_loss，别用 move_stop）。",
         "4. 「③推理论证」里写了具体价位的持仓，**必须**同步落成 watch 决策"
         "（带 code 与 reason 写明触发价与动作）——只写在文字里等于没设防。",
-        "5. buy/sell 的 reason 必填；buy 还应给出 stop_loss（或 move_stop）与 "
-        "invalidation（退出框架），三者缺一会被判为残缺决策。"
-        "逐只现有持仓都要有判断（hold / sell / watch），包括本轮不动的那几只。",
     ]
+    if any(h.held_days is not None for h in _display_holdings(ctx)):
+        rules.append(
+            "5. 持有天数 = 自首次建仓起的自然日（见持仓表）。信号模型周期常见为 T+5/T+10："
+            "持有达到 5 天且信号分走弱、或跌出候选池/排名靠后时，考虑减仓或卖出换仓；"
+            "持有达到 10 天时，除非信号分仍在池内靠前且逻辑未破坏，否则优先换入更强候选。"
+        )
+        rules.append(
+            "6. buy/sell 的 reason 必填；buy 还应给出 stop_loss（或 move_stop）与 "
+            "invalidation（退出框架），三者缺一会被判为残缺决策。"
+            "逐只现有持仓都要有判断（hold / sell / watch），包括本轮不动的那几只。"
+        )
+    else:
+        rules.append(
+            "5. buy/sell 的 reason 必填；buy 还应给出 stop_loss（或 move_stop）与 "
+            "invalidation（退出框架），三者缺一会被判为残缺决策。"
+            "逐只现有持仓都要有判断（hold / sell / watch），包括本轮不动的那几只。"
+        )
+    return rules
 
 
 def _context_body(ctx: RebalanceContext) -> list[str]:
@@ -500,7 +578,10 @@ def _context_body(ctx: RebalanceContext) -> list[str]:
     逐字节对齐隔壁金样（见模块 docstring），这里挪一行就红。带括号的各块是
     QM 补块（Stage 2 两批）——默认空串、数据门控，金样路径不受影响。
     """
-    display = ledger_cost_rows(ctx.holdings, ctx.ledger_positions)
+    display = _display_holdings(ctx)
+    # 整表统一：只要有一只拿到账本 buy_ts 就出「持有天数」列，其余行缺失渲染 —。
+    # 一只都没有 → 整列不出现（legacy/金样逐字节不动）。
+    show_age = any(h.held_days is not None for h in display)
     lines = [
         f"现在是北京时间 {ctx.now:%F %T}（开盘后）。你是 {ctx.agent} 的 A股实盘调仓决策模型，"
         f"管理 ¥{ctx.quota_total:,.0f} 虚拟额度（已用 ¥{ctx.quota_used:,.0f}，"
@@ -511,8 +592,8 @@ def _context_body(ctx: RebalanceContext) -> list[str]:
     # 数据是降级的，再读事实。空串 = 无降级，不出现。
     if ctx.alert_block:
         lines += [ctx.alert_block, ""]
-    lines += [*_HOLDINGS_HEADER]
-    lines += [_holding_row_line(h) for h in display]
+    lines += [*(_HOLDINGS_HEADER_AGE if show_age else _HOLDINGS_HEADER)]
+    lines += [_holding_row_line(h, show_age=show_age) for h in display]
     # 现价取数口径注：只在接上行情面（price_src 有标注）时出现——legacy/金样路径
     # 逐字节不动（见 :data:`PRICE_SRC_NOTE`）。
     if any(h.price_src for h in display):
