@@ -5,9 +5,11 @@
 1. **重叠日比对**（producer 多写前一个交易日，不并入正式库）：把「有限预热
    窗口」复算出来的前一交易日值，与正式库里「全历史计算」的存量值逐列比对。
    预热不足的典型症状是必需列整列变空（长窗 rolling 的 min_periods 不满足），
-   其次是整列漂移。数值级残差只作信息上报——财务数据商改版会让价值类因子
-   合法地小幅变化，硬闸会天天误报；只有「必需列由有值变全空」或「大比例
-   超过容差的漂移」才阻断。
+   其次是覆盖塌陷。**数值级残差不是硬判据**：qfq（``daily_forward``）历史每晚
+   按最新复权因子整段重写，价格派生的比值/相关类因子在重叠日上的相对误差会被
+   近零分母放大（2026-10-20 实测 share_rel_gt 最高 0.66，但秩相关全部 ≥0.985）。
+   结构真的坏了（公式语义变更、单位切换、取错列）秩相关才会掉下来，故硬闸用
+   **秩相关下限 + 覆盖比例下限**；相对误差只作信息上报。
 2. **必需列覆盖**：合并后逐目标日检查契约列至少有一个非空值（结构性全空
    列已在 ``contract.KNOWN_EMPTY_COLUMNS`` 白名单剔除）。
 
@@ -23,9 +25,14 @@ import pandas as pd
 
 LOG = logging.getLogger("factor_materialize.probe")
 
-#: 逐列漂移判据：共同非空值中相对误差超过 1% 的占比
+#: 相对误差的信息口径（**不再作硬闸**，见模块 docstring）
 DRIFT_REL_TOL = 0.01
-DRIFT_SHARE_LIMIT = 0.05
+#: 数值漂移的硬判据：重叠日共同非空值上的秩相关下限。qfq 每晚重算后实测
+#: 0.985~0.9999；语义/单位/取列错误的秩相关会明显掉下来。
+DRIFT_MIN_RANK_CORR = 0.9
+#: 覆盖比例硬判据：staged 非空值数 / 正式库非空值数。预热不足的次生症状是
+#: 长窗列只剩尾部少数值；整列空由 ``required_empty`` 单独判。
+DRIFT_MIN_COVERAGE_RATIO = 0.5
 #: 行集合判据：staged 缺失的正式库标的占比
 UNIVERSE_MISSING_LIMIT = 0.05
 #: 漂移比对至少需要的共同非空值数量（少了只报信息，不设闸）
@@ -123,8 +130,9 @@ def compare_partitions(
     *,
     required: list[str],
     rel_tol: float = DRIFT_REL_TOL,
-    drift_share_limit: float = DRIFT_SHARE_LIMIT,
     min_common: int = DRIFT_MIN_COMMON,
+    min_rank_corr: float = DRIFT_MIN_RANK_CORR,
+    min_coverage_ratio: float = DRIFT_MIN_COVERAGE_RATIO,
     universe_missing_limit: float = UNIVERSE_MISSING_LIMIT,
 ) -> dict[str, object]:
     """同一天「正式库 vs staging 复算」逐列比对，返回问题清单与统计。
@@ -132,10 +140,12 @@ def compare_partitions(
     硬性问题（``issues``）：
     - ``required_empty``：必需列正式库非空、staging 整列空；
     - ``required_absent``：staging 缺必需列；
-    - ``required_drift``：必需列共同非空值里超容差占比过高；
+    - ``required_coverage_drop``：staged 非空值不足正式库的一半（预热不足）；
+    - ``required_drift``：必需列共同非空值上的秩相关跌破 ``min_rank_corr``；
     - ``universe``：staging 相比正式库缺标的超限。
 
-    非必需列的整列变空只进 ``informational``（长窗因子在短预热窗下天然为空）。
+    相对误差（``share_rel_gt``）只进 ``informational``：qfq 每晚重算会让它
+    合法地大幅波动，拿它做硬闸会天天误报。
     """
     official_frame = _read(Path(official))
     staged_frame = _read(Path(staged))
@@ -194,36 +204,49 @@ def compare_partitions(
         common = int(both.sum())
         max_abs = 0.0
         share_rel_gt = 0.0
+        rank_corr: float | None = None
         # 元数据列（time/date）是 timestamp，非数值列只做空值检查：
         # 直接 astype("float64") 会抛 TypeError，曾让每个真实库的重叠探针必崩。
         numeric = pd.api.types.is_numeric_dtype(left) and pd.api.types.is_numeric_dtype(
             right
         )
         if common and numeric:
-            diff = (left[both].astype("float64") - right[both].astype("float64")).abs()
+            left_values = left[both].astype("float64")
+            right_values = right[both].astype("float64")
+            diff = (left_values - right_values).abs()
             max_abs = float(diff.max())
-            scale = left[both].astype("float64").abs().clip(lower=1e-12)
+            scale = left_values.abs().clip(lower=1e-12)
             share_rel_gt = float((diff / scale > rel_tol).mean())
+            # 常数序列（全 0 的 IF 分支等）秩相关是 NaN，不能当结构损坏
+            if common >= min_common and left_values.nunique() > 1:
+                corr = left_values.rank().corr(right_values.rank())
+                if pd.notna(corr):
+                    rank_corr = float(corr)
         elif common:
             common = 0  # 非数值列不参与漂移判据
         is_required = column in required_set
+        coverage_ratio = right_nonnull / left_nonnull if left_nonnull > 0 else 1.0
         entry = {
             "column": column,
             "required": is_required,
             "official_nonnull": left_nonnull,
             "staged_nonnull": right_nonnull,
+            "coverage_ratio": round(coverage_ratio, 4),
             "common": common,
             "max_abs_diff": max_abs,
             "share_rel_gt": round(share_rel_gt, 4),
+            "rank_corr": None if rank_corr is None else round(rank_corr, 4),
         }
         if is_required and left_nonnull > 0 and right_nonnull == 0:
             issues.append({"kind": "required_empty", **entry})
-        elif is_required and common >= min_common and share_rel_gt > drift_share_limit:
+        elif is_required and left_nonnull > 0 and coverage_ratio < min_coverage_ratio:
+            issues.append({"kind": "required_coverage_drop", **entry})
+        elif is_required and rank_corr is not None and rank_corr < min_rank_corr:
             issues.append({"kind": "required_drift", **entry})
         elif not is_required and right_nonnull == 0 and left_nonnull > 0:
             informational.append({"kind": "column_empty", **entry})
-        elif is_required and common >= min_common and share_rel_gt > 0:
-            informational.append({"kind": "required_small_drift", **entry})
+        elif is_required and (share_rel_gt > 0 or coverage_ratio < 1.0):
+            informational.append({"kind": "required_numeric_drift", **entry})
         elif max_abs > 0:
             informational.append({"kind": "diff", **entry})
     informational.sort(key=lambda item: item["share_rel_gt"], reverse=True)

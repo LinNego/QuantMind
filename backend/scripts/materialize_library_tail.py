@@ -11,18 +11,27 @@
 ============  =====================================================
 l1_batch1     ``backend/scripts/l1_factors_dev/build_production.py``
 rd_mined      ``rd_mined_materialize --refresh-since``（容器内，scipy 依赖）
-factor_defs   ``factor_defs_factors.py``（1338 列，预热 900 个交易日）
+factor_defs   ``factor_defs_factors.py``（1336 列，两遍物化）
 cand_factors  由 factor_defs 派生（本包 ``cand_factors.py``）
-factor1300    ``data/factor1300/scripts/f1300_compute.py``（预热 400 日）
+factor1300    ``data/factor1300/scripts/f1300_compute.py``（两遍物化）
 gap_mined     ``factor_materialize.gap_mined build``
 ============  =====================================================
+
+两遍物化（2026-10-20 起）：清单里的 ``window`` 只是单层窗口，嵌套 rolling 的
+需求是**相加**（``REF(504)+TSRANK(504)=1008``）。第一遍按 900/400 日跑全库
+（长窗列自然为空，``skip_empty_columns`` 不覆盖存量）；第二遍用独立 staging
+``--only`` 重算这批因子（factor_defs 1 条 1008 日、factor1300 41 条 ≤1220 日），
+探针通过后列级合并。超过 ``MAX_DAILY_WARMUP_DAYS`` 的非必需因子延后到每周
+长窗档（见 ``docs/自有因子库每日物化_实施细案_20261019.md`` §六）。
 
 执行纪律：
 
 - **串行**：生产者之间共享 ``_partial_pilot`` 与内存预算，绝不并行；
 - **staging 隔离**：生产者写 ``_staging_<库>``，正式库只经列级合并改动；
 - **重叠日探针**：生产者多写前一个交易日（不并入），用「短预热复算值」与
-  「正式库全历史值」比对；必需列由有值变全空即判失败（预热不足的典型症状）；
+  「正式库全历史值」比对；必需列由有值变全空、覆盖跌到一半以下、秩相关跌破
+  0.9 即判失败（预热不足/取错列/单位切换）；qfq 每晚重算带来的数值级相对
+  误差只报信息（实测秩相关 0.985~0.9999，相对误差最高 0.66）；
 - **回补**：近 ``--repair-window`` 个交易日里必需列「前一日有值、当日全空」的
   日期自动重算（典型场景：两融分区当晚未同步，MG2 当日只能写 NaN）；
 - **不吞错**：任一步骤失败照常写状态与日志，进程退出码非 0，由外层告警。
@@ -41,6 +50,7 @@ gap_mined     ``factor_materialize.gap_mined build``
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
 import os
@@ -49,6 +59,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -61,6 +72,7 @@ from backend.scripts.factor_materialize import cand_factors  # noqa: E402
 from backend.scripts.factor_materialize import contract as model_contract  # noqa: E402
 from backend.scripts.factor_materialize import library_ops as ops  # noqa: E402
 from backend.scripts.factor_materialize import probe  # noqa: E402
+from backend.scripts.factor_materialize import warmup  # noqa: E402
 from backend.scripts.factor_materialize.merge import (  # noqa: E402
     backup_partition,
     merge_day_columns,
@@ -75,11 +87,20 @@ PARTIAL_PILOT = "_partial_pilot"
 #: 修复/回填前的正式分区快照（首次快照保留，供人工回滚）
 REPAIR_BACKUP = "_repair_backup"
 DEFAULT_F1300_SCRIPT = REPO / "data" / "factor1300" / "scripts" / "f1300_compute.py"
-#: 各库预热交易日数（覆盖该库必需列的最大 rolling 窗口 + 余量）
+#: 各库第一遍（全库）预热交易日数：覆盖绝大多数公式的单层窗口。
+#: 嵌套窗口相加后仍超出它的因子，由第二遍 ``--only`` 长窗复算补齐
+#: （见 ``factor_materialize.warmup``）。
 WARMUP_DAYS = {
     "factor_defs": 900,
     "factor1300": 400,
 }
+#: 第二遍预热余量：rolling(H) 在窗口首日已需 H 日（含当日），留几天吸收停牌/
+#: 非交易日错位；``_max_days`` 另有日期跨度补足。
+WARMUP_MARGIN_DAYS = 8
+#: 每晚第二遍可承受的最长预热（交易日）。超过它的非必需因子不进入日更链，
+#: 由每周长窗档补齐（细案 §六）：1300 日网格实测算力约 26GB RSS，
+#: 再往上会与 05:30/06:30 alpha 补池、盘前推理抢内存。模型契约列不受此限。
+MAX_DAILY_WARMUP_DAYS = 1300
 #: 单次回填允许的最大交易日数（防止误把 ``--since`` 写成很久以前）
 MAX_BACKFILL_DAYS = 60
 #: 新建当日分区时，全市场标的数相对上一正式分区的最低比例。低于它说明
@@ -210,9 +231,54 @@ def _start_year(calendar: list[str], first: str, warmup: int) -> int:
     return int(anchor[:4]) - 1
 
 
+def split_long_factors(
+    windows: dict[str, int],
+    fast_warmup: int,
+    required: Iterable[str],
+    *,
+    cap: int = MAX_DAILY_WARMUP_DAYS,
+) -> tuple[list[str], list[str], int]:
+    """把「嵌套窗口超出第一遍预热」的因子拆成日更第二遍与延后两档。
+
+    返回 ``(daily_long, deferred, long_warmup)``：
+
+    - ``daily_long``：所需历史 ``> fast_warmup`` 且 ``<= cap`` 的因子；
+      **模型契约列无条件进入**（推理要读，不能延后）。
+    - ``deferred``：超过 ``cap`` 的其余因子（每周长窗档补，见细案 §六）。
+    - ``long_warmup``：第二遍应使用的预热（最长需求 + 余量）。
+    """
+    needed = warmup.select_long(windows, fast_warmup)
+    required_set = set(required)
+    daily = [name for name in needed if windows[name] <= cap or name in required_set]
+    daily_set = set(daily)
+    deferred = [name for name in needed if name not in daily_set]
+    long_warmup = (
+        warmup.longest_requirement(windows, daily) + WARMUP_MARGIN_DAYS
+        if daily
+        else fast_warmup
+    )
+    return daily, deferred, long_warmup
+
+
 # ---------------------------------------------------------------------------
 # 子进程与合并
 # ---------------------------------------------------------------------------
+
+
+def producer_env(ctx: Context) -> dict[str, str]:
+    """子进程环境：仓库根必须在 ``PYTHONPATH`` 上。
+
+    ``build_production.py`` 直接以脚本路径执行时 ``sys.path[0]`` 是脚本目录，
+    ``import backend`` 必崩（2026-10-20 真实回填复现：0.4s 失败）。其余生产者
+    虽自行插了 sys.path，统一注入也避免下一个生产者重踩同一坑。
+    """
+    env = dict(os.environ)
+    env.setdefault("QM_QUANTDB_DATA_DIR", str(ctx.quantdb))
+    env.setdefault("QM_QUANTCUSTOM_DATA_DIR", str(ctx.custom))
+    repo = str(ctx.repo)
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = repo if not existing else f"{repo}{os.pathsep}{existing}"
+    return env
 
 
 def run_command(
@@ -228,9 +294,7 @@ def run_command(
     LOG.info("$ %s", " ".join(cmd))
     if ctx.dry_run:
         return {"dry_run": True, "cmd": cmd}
-    env = dict(os.environ)
-    env.setdefault("QM_QUANTDB_DATA_DIR", str(ctx.quantdb))
-    env.setdefault("QM_QUANTCUSTOM_DATA_DIR", str(ctx.custom))
+    env = producer_env(ctx)
     started = time.time()
     start_offset = log_path.stat().st_size if log_path.is_file() else 0
     with log_path.open("a", encoding="utf-8") as sink:
@@ -297,9 +361,10 @@ def merge_staged(
     *,
     skip_empty_columns: bool,
     pass_symbols: bool = True,
+    staging: Path | None = None,
 ) -> dict[str, object]:
     """staging → 正式库列级合并；只合并生产者真的写出来的日期。"""
-    staging = ctx.staging(library)
+    staging = staging or ctx.staging(library)
     root = ops.library_root(ctx.quantdb, library)
     merged: list[str] = []
     missing: list[str] = []
@@ -375,10 +440,9 @@ def merge_staged(
     }
 
 
-def cleanup_staging(ctx: Context, library: str, dates: list[str]) -> None:
+def cleanup_staging(ctx: Context, staging: Path, dates: list[str]) -> None:
     if ctx.keep_staging or ctx.dry_run:
         return
-    staging = ctx.staging(library)
     for dt in dates:
         shutil.rmtree(staging / f"dt={dt}", ignore_errors=True)
 
@@ -399,13 +463,15 @@ def _finish_step(
     required: list[str],
     *,
     pass_symbols: bool = True,
+    staging: Path | None = None,
 ) -> None:
     """生产者跑完后的判活与合并：重叠探针先行，失败/探针未过一律不合并。
 
     失败时**保留 staging**（下一轮 prepare_staging 会清）：半批产物或探针
     样本是事后排查的唯一证据。
     """
-    probe_report = _overlap_probe(ctx, library, root, start, required)
+    staging = staging or ctx.staging(library)
+    probe_report = _overlap_probe(ctx, library, root, start, required, staging=staging)
     result.detail = {"run": run, "producer_start": start, "probe": probe_report}
     blocked = not ctx.dry_run and (
         run.get("returncode") != 0 or probe_report.get("ok") is False
@@ -416,13 +482,18 @@ def _finish_step(
         merged: dict[str, object] = {"missing": []}
     else:
         merged = merge_staged(
-            ctx, library, dates, skip_empty_columns=True, pass_symbols=pass_symbols
+            ctx,
+            library,
+            dates,
+            skip_empty_columns=True,
+            pass_symbols=pass_symbols,
+            staging=staging,
         )
         result.detail.update(merged)
-        manifest = {} if ctx.dry_run else _manifest_summary(ctx, library)
+        manifest = {} if ctx.dry_run else _manifest_summary(ctx, library, staging)
         if manifest:
             result.detail["manifest"] = manifest
-        cleanup_staging(ctx, library, sorted({start, *dates}))
+        cleanup_staging(ctx, staging, sorted({start, *dates}))
     result.dates = dates
     result.status = _step_status(run, merged, probe_report, manifest)
 
@@ -469,6 +540,12 @@ def step_l1(ctx: Context) -> StepResult:
     return result
 
 
+def rd_mined_target_ready(custom: Path, target: str) -> bool:
+    """refresh 失败时判断目标日是否已落盘（写出一半也必须镜像，不能整批丢弃）。"""
+    path = custom / "6_ml_datasets" / "rd_mined" / f"dt={target}" / "data.parquet"
+    return path.is_file() and path.stat().st_size > 0
+
+
 def step_rd_mined(ctx: Context) -> StepResult:
     library = "rd_mined"
     result = StepResult(library)
@@ -497,11 +574,13 @@ def step_rd_mined(ctx: Context) -> StepResult:
         # 否则会照常 promote 一份没刷新的旧库。
         fail_markers=("另一个物化进程正在运行",),
     )
-    promote = {
-        "returncode": 0,
-        "skipped": True,
-    }
-    if not ctx.dry_run and run.get("returncode") == 0:
+    # 单个因子超时会让 refresh 整体 rc≠0，但其余因子与目标日分区已经写好
+    # （2026-10-20 实测 120/122）。目标日落盘就 promote，状态按 partial 告警；
+    # 只有「什么都没写出来」才是 failed。
+    target_ready = ctx.dry_run or rd_mined_target_ready(ctx.custom, ctx.target)
+    needs_promote = not ctx.dry_run and (run.get("returncode") == 0 or target_ready)
+    promote: dict[str, object] = {"returncode": 0, "skipped": True}
+    if needs_promote:
         promote = run_command(
             ctx,
             [
@@ -516,51 +595,65 @@ def step_rd_mined(ctx: Context) -> StepResult:
             description="rd_mined promote → quantdb",
         )
     result.dates = dates
-    result.detail = {"run": run, "promote": promote}
+    result.detail = {
+        "run": run,
+        "promote": promote,
+        "target_partition_ready": target_ready,
+    }
     result.elapsed_s = time.time() - started
     if ctx.dry_run:
         result.status = "skipped"
+    elif promote.get("returncode") != 0:
+        result.status = "failed"
+    elif run.get("returncode") == 0:
+        result.status = "ok"
+    elif target_ready:
+        result.status = "partial"
     else:
-        ok = run.get("returncode") == 0 and promote.get("returncode") == 0
-        result.status = "ok" if ok else "failed"
+        result.status = "failed"
     return result
+
+
+def _load_script_module(path: Path, name: str):
+    """按路径加载仓外脚本（只取清单函数，不执行 main）。"""
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载脚本：{path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_factor_defs_records() -> list[dict]:
+    # 用生产者自己的清单函数：可行性/不可用变量的过滤口径只此一份
+    from backend.scripts import factor_defs_factors as producer
+
+    return producer.load_factors()
+
+
+def _load_factor1300_records(ctx: Context) -> list[dict]:
+    module = _load_script_module(ctx.f1300_script, "_f1300_compute_warmup")
+    return module.load_factors()
 
 
 def step_factor_defs(ctx: Context) -> StepResult:
-    return _run_python_producer(ctx, "factor_defs", WARMUP_DAYS["factor_defs"])
+    return _run_two_pass(
+        ctx,
+        "factor_defs",
+        WARMUP_DAYS["factor_defs"],
+        _load_factor_defs_records,
+        _factor_defs_cmd,
+    )
 
 
 def step_factor1300(ctx: Context) -> StepResult:
-    library = "factor1300"
-    root = ops.library_root(ctx.quantdb, library)
-    required = list(model_contract.gate_columns(library, ctx.contract))
-    result = StepResult(library)
-    started = time.time()
-    dates = ctx.dates.get(library)
-    if not dates:
-        return result
-    start = _producer_start(ctx.calendar, dates)
-    warmup = WARMUP_DAYS[library]
-    staging = ctx.staging(library)
-    prepare_staging(ctx, staging, sorted({start, *dates}))
-    cmd = [
-        ctx.python,
-        str(ctx.f1300_script),
-        "--start-dt",
-        start,
-        "--start-year",
-        str(_start_year(ctx.calendar, start, warmup)),
-        "--max-days",
-        str(_max_days(ctx.calendar, start, ctx.target, warmup)),
-        "--bank-size",
-        str(ctx.bank_size),
-        "--out-root",
-        str(staging),
-    ]
-    run = run_command(ctx, cmd, log_path=ctx.log_path, description=library)
-    _finish_step(ctx, result, library, root, dates, start, run, required)
-    result.elapsed_s = time.time() - started
-    return result
+    return _run_two_pass(
+        ctx,
+        "factor1300",
+        WARMUP_DAYS["factor1300"],
+        lambda: _load_factor1300_records(ctx),
+        _factor1300_cmd,
+    )
 
 
 def step_cand_factors(ctx: Context) -> StepResult:
@@ -627,7 +720,81 @@ def step_gap_mined(ctx: Context) -> StepResult:
     return result
 
 
-def _run_python_producer(ctx: Context, library: str, warmup: int) -> StepResult:
+def _factor_defs_cmd(
+    ctx: Context,
+    staging: Path,
+    start: str,
+    warmup_days: int,
+    only: list[str] | None,
+) -> list[str]:
+    cmd = [
+        ctx.python,
+        str(ctx.repo / "backend/scripts/factor_defs_factors.py"),
+        "--start-dt",
+        start,
+        "--start-year",
+        str(_start_year(ctx.calendar, start, warmup_days)),
+        "--max-days",
+        str(_max_days(ctx.calendar, start, ctx.target, warmup_days)),
+        "--bank-size",
+        str(ctx.bank_size),
+        "--out-root",
+        str(staging),
+    ]
+    if only:
+        cmd += ["--only", ",".join(only)]
+    return cmd
+
+
+def _factor1300_cmd(
+    ctx: Context,
+    staging: Path,
+    start: str,
+    warmup_days: int,
+    only: list[str] | None,
+) -> list[str]:
+    cmd = [
+        ctx.python,
+        str(ctx.f1300_script),
+        "--start-dt",
+        start,
+        "--start-year",
+        str(_start_year(ctx.calendar, start, warmup_days)),
+        "--max-days",
+        str(_max_days(ctx.calendar, start, ctx.target, warmup_days)),
+        "--bank-size",
+        str(ctx.bank_size),
+        "--out-root",
+        str(staging),
+    ]
+    if only:
+        cmd += ["--only", ",".join(only)]
+    return cmd
+
+
+#: 步骤终态排序（跨多遍取最坏）
+_STATUS_RANK = {"skipped": 0, "ok": 1, "partial": 2, "failed": 3}
+
+
+def _worst_status(statuses: list[str]) -> str:
+    return max(statuses, key=_STATUS_RANK.__getitem__) if statuses else "skipped"
+
+
+def _run_two_pass(
+    ctx: Context,
+    library: str,
+    fast_warmup: int,
+    load_records: Callable[[], list[dict]],
+    build_cmd: Callable[[Context, Path, str, int, list[str] | None], list[str]],
+    *,
+    pass_symbols: bool = True,
+) -> StepResult:
+    """两遍物化：全库短预热 + 长窗因子 ``--only`` 长预热。
+
+    第一遍保持原成本（全库），只把「嵌套窗口 > 短预热」的列留空；第二遍用独立
+    staging 只算这批长窗因子，再列级合并进正式库。两遍各自做重叠日探针，
+    第一遍的必需列集合剔除长窗列，避免把「本轮故意留空」误判成预热不足。
+    """
     root = ops.library_root(ctx.quantdb, library)
     required = list(model_contract.gate_columns(library, ctx.contract))
     result = StepResult(library)
@@ -636,24 +803,90 @@ def _run_python_producer(ctx: Context, library: str, warmup: int) -> StepResult:
     if not dates:
         return result
     start = _producer_start(ctx.calendar, dates)
-    staging = ctx.staging(library)
-    prepare_staging(ctx, staging, sorted({start, *dates}))
-    cmd = [
-        ctx.python,
-        str(ctx.repo / "backend/scripts/factor_defs_factors.py"),
-        "--start-dt",
-        start,
-        "--start-year",
-        str(_start_year(ctx.calendar, start, warmup)),
-        "--max-days",
-        str(_max_days(ctx.calendar, start, ctx.target, warmup)),
-        "--bank-size",
-        str(ctx.bank_size),
-        "--out-root",
-        str(staging),
+    windows = warmup.windows_for(load_records())
+    daily_long, deferred, long_warmup = split_long_factors(
+        windows, fast_warmup, required
+    )
+    long_set = set(daily_long)
+    all_long = set(warmup.select_long(windows, fast_warmup))
+    passes: list[tuple[str, Path, int, list[str] | None, list[str]]] = [
+        (
+            "fast",
+            ctx.staging(library),
+            fast_warmup,
+            None,
+            [column for column in required if column not in all_long],
+        )
     ]
-    run = run_command(ctx, cmd, log_path=ctx.log_path, description=library)
-    _finish_step(ctx, result, library, root, dates, start, run, required)
+    if daily_long:
+        passes.append(
+            (
+                "long",
+                ctx.staging(f"{library}_long"),
+                long_warmup,
+                daily_long,
+                [column for column in required if column in long_set],
+            )
+        )
+    statuses: list[str] = []
+    pass_details: dict[str, object] = {}
+    dirty_dates = sorted({start, *dates})
+    for name, staging, warmup_days, only, pass_required in passes:
+        prepare_staging(ctx, staging, dirty_dates)
+        cmd = build_cmd(ctx, staging, start, warmup_days, only)
+        run = run_command(
+            ctx, cmd, log_path=ctx.log_path, description=f"{library}[{name}]"
+        )
+        probe_report = _overlap_probe(
+            ctx, library, root, start, pass_required, staging=staging
+        )
+        blocked = not ctx.dry_run and (
+            run.get("returncode") != 0 or probe_report.get("ok") is False
+        )
+        detail: dict[str, object] = {
+            "run": run,
+            "producer_start": start,
+            "warmup": warmup_days,
+            "probe": probe_report,
+        }
+        if only is not None:
+            detail["only"] = only
+        merged: dict[str, object] = {"missing": []}
+        manifest: dict[str, object] = {}
+        if blocked:
+            detail["merge_skipped"] = "生产者失败或重叠探针未通过"
+        else:
+            merged = merge_staged(
+                ctx,
+                library,
+                dates,
+                skip_empty_columns=True,
+                pass_symbols=pass_symbols,
+                staging=staging,
+            )
+            detail.update(merged)
+            manifest = {} if ctx.dry_run else _manifest_summary(ctx, library, staging)
+            if manifest:
+                detail["manifest"] = manifest
+            cleanup_staging(ctx, staging, dirty_dates)
+        statuses.append(_step_status(run, merged, probe_report, manifest))
+        pass_details[name] = detail
+    if deferred:
+        LOG.warning(
+            "%s 长窗因子 %d 个超出日更预热上限 %d 日，本轮延后（每周长窗档补）：%s",
+            library,
+            len(deferred),
+            MAX_DAILY_WARMUP_DAYS,
+            deferred,
+        )
+    result.dates = dates
+    result.detail = {
+        "passes": pass_details,
+        "long_factors": daily_long,
+        "long_warmup": long_warmup if daily_long else None,
+        "deferred_long": deferred,
+    }
+    result.status = _worst_status(statuses)
     result.elapsed_s = time.time() - started
     return result
 
@@ -669,12 +902,14 @@ def _overlap_probe(
     root: Path,
     start: str,
     required: list[str],
+    *,
+    staging: Path | None = None,
 ) -> dict[str, object]:
     """重叠日（生产者多写的前置日）复算值与正式库存量值比对。"""
     if ctx.dry_run:
         return {"dry_run": True, "date": start}
     official = partition_path(root, start)
-    staged = partition_path(ctx.staging(library), start)
+    staged = partition_path(staging or ctx.staging(library), start)
     if not official.is_file():
         # 正式库还没这一日（新库首日）→ 无基线可比，不阻断
         return {"skipped": "正式库无前置日分区", "date": start}
@@ -707,9 +942,11 @@ def _step_status(
     return "ok"
 
 
-def _manifest_summary(ctx: Context, library: str) -> dict[str, object]:
+def _manifest_summary(
+    ctx: Context, library: str, staging: Path | None = None
+) -> dict[str, object]:
     """读生产者 MANIFEST.json：求值失败的因子中，命中模型必需列的降级为 partial。"""
-    path = ctx.staging(library) / "MANIFEST.json"
+    path = (staging or ctx.staging(library)) / "MANIFEST.json"
     if not path.is_file():
         return {}
     try:
@@ -971,7 +1208,15 @@ def main(argv: list[str] | None = None) -> int:
         if result.status == "ok" and not coverage.get("ok", True):
             result.status = "partial"  # 写了但覆盖不达标 → 同样要告警
         results.append(result)
-        run_detail = result.detail.get("run") or {}
+        runs = [result.detail.get("run") or {}]
+        if isinstance(result.detail.get("passes"), dict):
+            runs = [
+                (pass_detail or {}).get("run") or {}
+                for pass_detail in result.detail["passes"].values()
+            ]
+        peak_rss = max(
+            (int(run.get("child_peak_rss_mb") or 0) for run in runs), default=0
+        )
         coverage_text = (
             "跳过"
             if coverage.get("dry_run") or coverage.get("skipped")
@@ -983,7 +1228,7 @@ def main(argv: list[str] | None = None) -> int:
             result.status,
             result.dates,
             result.elapsed_s,
-            run_detail.get("child_peak_rss_mb", "?"),
+            peak_rss or "?",
             coverage_text,
         )
 

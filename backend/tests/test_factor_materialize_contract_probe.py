@@ -157,18 +157,67 @@ def test_compare_partitions_ignores_non_required_empty_as_info(
 
 
 @pytest.mark.unit
-def test_compare_partitions_flags_large_required_drift(tmp_path: Path) -> None:
+def test_compare_partitions_flags_rank_collapse_as_required_drift(
+    tmp_path: Path,
+) -> None:
+    # Arrange：秩结构被破坏（顺序反转）才是真漂移；纯比例缩放不算
     n = 120
-    frame = pd.DataFrame({"symbol": [f"S{i}" for i in range(n)], "x": [1.0] * n})
-    drifted = pd.DataFrame({"symbol": [f"S{i}" for i in range(n)], "x": [2.0] * n})
+    values = [float(i) for i in range(n)]
+    frame = pd.DataFrame({"symbol": [f"S{i}" for i in range(n)], "x": values})
+    reversed_frame = pd.DataFrame(
+        {"symbol": [f"S{i}" for i in range(n)], "x": values[::-1]}
+    )
     official = _partition(tmp_path / "official", "20261015", frame)
-    staged = _partition(tmp_path / "staged", "20261015", drifted)
+    staged = _partition(tmp_path / "staged", "20261015", reversed_frame)
+
+    # Act
+    report = probe.compare_partitions(official, staged, required=["x"])
+
+    # Assert
+    assert report["ok"] is False
+    kinds = {issue["kind"] for issue in report["issues"]}
+    assert "required_drift" in kinds
+
+
+@pytest.mark.unit
+def test_compare_partitions_treats_uniform_scale_as_informational(
+    tmp_path: Path,
+) -> None:
+    # qfq 每晚重算会让相对误差大幅波动，但秩相关不变 → 只报信息，不阻合并
+    n = 120
+    frame = pd.DataFrame(
+        {"symbol": [f"S{i}" for i in range(n)], "x": [float(i + 1) for i in range(n)]}
+    )
+    scaled = frame.assign(x=frame["x"] * 1.5)
+    official = _partition(tmp_path / "official", "20261015", frame)
+    staged = _partition(tmp_path / "staged", "20261015", scaled)
+
+    report = probe.compare_partitions(official, staged, required=["x"])
+
+    assert report["ok"] is True
+    kinds = {item["kind"] for item in report["informational"]}
+    assert "required_numeric_drift" in kinds
+
+
+@pytest.mark.unit
+def test_compare_partitions_flags_required_coverage_collapse(
+    tmp_path: Path,
+) -> None:
+    # 预热不足的长窗列常常不是整列空，而是只剩尾部少量非空 → 覆盖塌陷硬闸
+    n = 200
+    frame = pd.DataFrame(
+        {"symbol": [f"S{i}" for i in range(n)], "x": [float(i) for i in range(n)]}
+    )
+    sparse = frame.copy()
+    sparse.loc[sparse.index >= 40, "x"] = float("nan")
+    official = _partition(tmp_path / "official", "20261015", frame)
+    staged = _partition(tmp_path / "staged", "20261015", sparse)
 
     report = probe.compare_partitions(official, staged, required=["x"])
 
     assert report["ok"] is False
     kinds = {issue["kind"] for issue in report["issues"]}
-    assert "required_drift" in kinds
+    assert "required_coverage_drop" in kinds
 
 
 @pytest.mark.unit
