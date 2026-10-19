@@ -808,7 +808,7 @@ async def test_c02_batch_runs_at_threshold_is_ok_with_ready_marker():
     ctx = FakeCtx(
         {
             "max(trade_date)": [{"d": date(2026, 9, 24)}],
-            _C02_RUNS_SQL_KEY: [{"n": 2}],
+            _C02_RUNS_SQL_KEY: [{"n": 2, "models": 2}],
         },
         values={ready_key("CN", "2026-09-24"): '{"run_id": "run_x", "symbols": 3274}'},
     )
@@ -817,6 +817,38 @@ async def test_c02_batch_runs_at_threshold_is_ok_with_ready_marker():
     assert r.level == "ok", r.detail
     assert "同日多 run" not in r.detail
     assert r.metrics["runs"] == 2
+    assert r.metrics["models"] == 2
+
+
+@pytest.mark.asyncio
+async def test_c02_five_models_one_run_each_is_not_multi_run():
+    """2026-10-19 实测形态：5 个模型各跑一次 = 5 个 run_id，**不是**同日多 run。
+
+    旧实现数全市场 distinct run_id（5 > 2）→ 天天误报「检查竞态/回填」。
+    按模型分组后最大值 = 1，必须 ok。
+    """
+    from backend.shared.inference_lock import ready_key
+
+    ctx = FakeCtx(
+        {
+            "max(trade_date)": [{"d": date(2026, 10, 19)}],
+            _C02_RUNS_SQL_KEY: [{"n": 1, "models": 5}],
+        },
+        values={
+            ready_key("CN", "2026-10-19"): '{"run_id": "run_x", "symbols": 3273}'
+        },
+    )
+    r = await check_c02_signal_readiness(ctx)
+
+    assert r.level == "ok", r.detail
+    assert "同日多 run" not in r.detail
+    assert "（5 个模型）" in r.detail
+    assert r.metrics == {
+        "trade_date": "2026-10-19",
+        "runs": 1,
+        "models": 5,
+        "market": "CN",
+    }
 
 
 def test_c02_runs_sql_filters_to_batch_source():
@@ -824,6 +856,13 @@ def test_c02_runs_sql_filters_to_batch_source():
     否则把子句删掉全部行为用例仍绿（假通过形态）。"""
     src = _HEALTH_PY.read_text(encoding="utf-8")
     assert "COALESCE(source, 'batch') = 'batch'" in src
+
+
+def test_c02_runs_sql_counts_per_model_not_globally():
+    """多模型常态化后，runs 必须按模型分组取 max；全局 distinct 会天天误报。"""
+    src = _HEALTH_PY.read_text(encoding="utf-8")
+    assert "COALESCE(NULLIF(feature_version, ''), run_id)" in src
+    assert "SELECT max(n) AS n, count(*) AS models" in src
 
 
 @pytest.mark.asyncio
@@ -858,13 +897,13 @@ async def test_c02_no_markers_at_all_is_warn():
 
 @pytest.mark.asyncio
 async def test_c02_three_batch_runs_is_multi_run_warn():
-    """阈值仍要能报：3 个批量 run 同日才是真异常（重跑/竞态）。"""
+    """阈值仍要能报：同一模型 3 个批量 run 才是真异常（重跑/竞态）。"""
     from backend.shared.inference_lock import ready_key
 
     ctx = FakeCtx(
         {
             "max(trade_date)": [{"d": date(2026, 9, 24)}],
-            _C02_RUNS_SQL_KEY: [{"n": 3}],
+            _C02_RUNS_SQL_KEY: [{"n": 3, "models": 1}],
         },
         values={ready_key("CN", "2026-09-24"): '{"run_id": "run_x"}'},
     )

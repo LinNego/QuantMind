@@ -64,8 +64,8 @@ fail-closed 分层（每一层的姿态都是**选的**，不是顺手写的）
 =========================  ==========================================
 账户身份（user_id）           abort：不问模型也不下单
 持仓（real_account_snapshots）abort：模型看不到持仓就不该动它
-资金面（cash/market_value）   abort：额度三数不许编（``build_context``
-                             的默认 100k 会把真账户编成假额度）
+资金面（cash/market_value）   abort：真实账户现金/市值仍是内部风控与持仓一致性
+                             判据；提示词额度只认分账授予额度（见 ⑦）
 分账账本段（P2.7）            abort：读不到就不知道哪些票是自己的
                              （当成空账本 ⇒ 该卖的卖不掉；回退全账户
                              持仓 ⇒ 2026-09-08 跨 agent 卖仓）
@@ -412,12 +412,16 @@ async def _run_once_inner(
         notes.append(excluded.note)
 
     # ⑦ 闸门的候选侧：先按「买得起一手」筛池，再交给模型
-    quota_total = account.quota_total
-    quota_used = account.quota_used
+    # 额度口径（2026-10-19 用户拍板）：**只认用户授予的分账额度**（¥10 万/agent），
+    # 不把真实账户的 cash/市值/总资产喂给模型——账户里有多少钱是账户主人的隐私，
+    # 模型只需要知道「这条线还能动用多少」。真实账户三数仍进内部风控（执行段的
+    # `l1.available_cash`、桥可卖量）与审计 `context_meta.account`，但不进提示词。
+    quota_total = ledger.quota_total
+    quota_used = ledger.quota_used
     # 单票预算取**两个口径中更紧的那个**（与隔壁 `min(remaining*PER_STOCK_PCT,
-    # agent_virtual_cash)` 同形）：真实账户口径决定「这座账户还有多少钱」，分账虚拟
-    # 现金决定「这条线还能买多少」。只取前者，一条线可以把共用账户的钱花光；只取
-    # 后者，会在真账户已无现金时给出买不起的池面。
+    # agent_virtual_cash)` 同形）：授予额度口径决定「这条线还能动用多少」，分账虚拟
+    # 现金决定「账上还有多少现钱」。只取前者，会在现金已不足时给出买不起的池面；
+    # 只取后者，盈利卖出会让可动用额度超过用户授予的上限。
     per_stock_budget = round((quota_total - quota_used) * per_stock_pct, 2)
     if virtual_cash < per_stock_budget:
         per_stock_budget = round(virtual_cash, 2)
@@ -586,11 +590,12 @@ async def _run_once_inner(
                 quotes=exec_quotes,
                 gate=gate,
                 # 腿的**尺度口径**取两个额度里更紧的那个（``per_stock_budget`` 同式）：
-                # 执行段按 ``quota × pct`` 算股数（``execution._Plan.buy``），拿真实账户
-                # 的剩余额度当尺子会把腿算大到超出子账户线，而超出只是被 ``l2.vcash``
-                # 否决——本可成交的腿变成一条否决记录。取更紧的那个之后，vcash 闸退回
-                # 它真正的职责：``per_stock_pct`` 未配置（=不夹取）时的最后一道兜底。
-                quota=min(quota_total - quota_used, virtual_cash),
+                # 执行段按 ``quota × pct`` 算股数（``execution._Plan.buy``）。授予额度
+                # 的剩余量是用户允许这条线动用的上限；``virtual_cash`` 是账上现钱。
+                # 取更紧的那个之后，vcash 闸退回它真正的职责：``per_stock_pct``
+                # 未配置（=不夹取）时的最后一道兜底。真实账户现金不参与这个数——
+                # 它由执行段的 ``l1.available_cash`` 内部把关。
+                quota=min(ledger.quota_remaining, virtual_cash),
                 new_buys_round=0,  # 本轮已产生数：单轮一次规划＝0；别传档位上限（会全否）
                 inflight=inflight,
                 agent=agent,
@@ -782,10 +787,13 @@ async def _run_once_inner(
             },
             # 告警判据：非交易时段的零腿是**设计内**（盘前规划轮不发腿）。
             "in_session": bool(in_session),
+            # 对外状态面（前端/告警）也只暴露授予额度口径：真实账户三数只留在
+            # 审计行 ``context_meta.account`` 里，供运维复盘，不进任何模型可见面。
             "quota": {
-                "cash": account.cash,
-                "market_value": account.market_value,
-                "total_asset": account.total_asset,
+                "total": quota_total,
+                "used": quota_used,
+                "remaining": ledger.quota_remaining,
+                "cash": virtual_cash,
             },
         },
     )

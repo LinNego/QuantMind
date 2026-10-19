@@ -100,6 +100,7 @@ __all__ = [
     "holding_days",
     "mine_of",
     "parse_legacy_ledger",
+    "positions_cost",
     "reconcile_seed_with_bridge",
     "record_buy",
     "record_sell",
@@ -198,6 +199,26 @@ def position_cost(ledger: Any, agent: str, code: str) -> float:
     return round(v * c, 2)
 
 
+def positions_cost(positions: Any) -> float:
+    """``{后缀码: {volume, cost_price}}`` 的持仓成本合计（与 :func:`agent_used` 同口径）。
+
+    脏行（非映射/NaN/Inf/非数）**逐条跳过**：一条坏账本行不许把整轮额度算成 NaN
+    （``NaN`` 参与比较恒为 False，会把单票预算与执行额度同时放开）。
+    """
+    if not isinstance(positions, Mapping):
+        return 0.0
+    total = 0.0
+    for held in positions.values():
+        if not isinstance(held, Mapping):
+            continue
+        volume = _finite(held.get("volume"))
+        cost = _finite(held.get("cost_price"))
+        if volume is None or cost is None:
+            continue
+        total += round(volume * cost, 2)
+    return round(total, 2)
+
+
 def agent_used(ledger: Any, agent: str) -> float:
     """**已用额度 = 现持仓成本合计**（不是累计买入额：卖出即释放）。
 
@@ -205,10 +226,7 @@ def agent_used(ledger: Any, agent: str) -> float:
     是「账上还剩多少钱」。隔壁两条线都要（单票预算取两者与比例的最小值），
     对「已实现亏损把现金打下去、但仓位还很重」的账户，只判一条会放开买入。
     """
-    total = 0.0
-    for code in agent_positions(ledger, agent):
-        total += position_cost(ledger, agent, code)
-    return round(total, 2)
+    return positions_cost(agent_positions(ledger, agent))
 
 
 def agent_remaining(

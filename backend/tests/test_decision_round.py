@@ -1091,6 +1091,44 @@ def test_tier_numbers_reads_only_real_numbers():
     )  # bool 是 int 的子类：不挡会变成 pct=1.0（满仓）
 
 
+def test_agent_ledger_quota_is_grant_minus_position_cost():
+    """授予额度口径：总量恒为 ¥10 万，已用 = 名下持仓成本（卖出即释放）。
+
+    ``virtual_cash`` 不参与「已用」——它是账上现钱（含已实现盈亏），
+    与「买了多少货」是两个数（见 ``agent_ledger.agent_used`` 的 docstring）。
+    """
+    ledger = AgentLedgerRead(
+        ok=True,
+        known=True,
+        positions={
+            "600036.SH": {"volume": 1000, "cost_price": 38.0},
+            "000001.SZ": {"volume": 4000, "cost_price": 10.05},
+        },
+        virtual_cash=1.0,
+    )
+    assert ledger.quota_total == 100_000.0
+    assert ledger.quota_used == 78_200.0  # 38000 + 40200
+    assert ledger.quota_remaining == 21_800.0
+
+
+def test_agent_ledger_quota_skips_dirty_rows_instead_of_turning_nan():
+    """一行脏账本不许把整轮额度算成 NaN：NaN 参与比较恒 False = 放开所有闸门。"""
+
+    ledger = AgentLedgerRead(
+        ok=True,
+        known=True,
+        positions={
+            "600036.SH": {"volume": 1000, "cost_price": 38.0},
+            "000001.SZ": {"volume": float("nan"), "cost_price": 10.0},
+            "000002.SZ": {"volume": 100, "cost_price": float("inf")},
+            "000003.SZ": {"volume": "坏值", "cost_price": 10.0},
+            "000004.SZ": "不是 dict",
+        },
+    )
+    assert ledger.quota_used == 38_000.0
+    assert ledger.quota_remaining == 62_000.0
+
+
 def test_snap_price_prefers_standard_key_and_rejects_nonpositive():
     assert snap_price({"Now": 40.0, "now": 39.0}) == 40.0
     assert snap_price({"now": 39.0}) == 39.0  # 原始推送字段兜底
@@ -1293,8 +1331,8 @@ async def test_run_once_happy_path_wires_round_quota_and_audit():
 
     sent = h.log["exec"][0]
     assert sent["round_id"] == "rnd-20260924-0935"  # 进腿幂等键的 round 段
-    # 额度：额度三数同源 ⇒ 剩余额度 ≡ 可用现金，逐元一致
-    assert sent["quota"] == 50000.0
+    # 额度：授予额度剩余 100,000−38,000=62,000（与虚拟现金 100,000 取更紧者）
+    assert sent["quota"] == 62000.0
     # ``new_buys_round`` 是「本轮**已**产生的新开仓数」：单轮一次规划，调用前必为 0，
     # 计数在 ``_Plan`` 内过闸自增。把档位上限本身传进来 = 首单即 ``used >= cap``，
     # **每一笔**新开仓都被「已达上限」全否（2026-10-09 实盘 13:00 轮 legs=0 实锤）。
@@ -1313,8 +1351,8 @@ async def test_run_once_happy_path_wires_round_quota_and_audit():
     assert meta["round"]["round_id"] == "rnd-20260924-0935"
     assert meta["round"]["model"] == "fake-model" and meta["round"]["mode"] == "sim"
     assert meta["quota"] == {
-        "total": 170000.0,
-        "used": 120000.0,
+        "total": 100_000.0,
+        "used": 38_000.0,
         "per_stock_pct": 0.15,
         "max_new_buys": 2,
     }
@@ -1339,12 +1377,19 @@ async def test_run_once_happy_path_wires_round_quota_and_audit():
 
 
 @pytest.mark.asyncio
-async def test_run_once_prompt_carries_the_real_account_numbers():
-    """提示词首行必须是真账户口径：管理 ¥总资产 / 已用 ¥市值 / 剩余 ¥现金。"""
+async def test_run_once_prompt_carries_the_granted_quota_not_the_account_total():
+    """提示词首行只认**授予额度**：¥100,000 / 已用 ¥38,000 / 剩余 ¥62,000。
+
+    真实账户三数（170,000 / 120,000 / 50,000）**一个字都不许进提示词**——
+    账户里有多少钱是账户主人的隐私（2026-10-19 用户拍板）。
+    """
     h = make_harness()
     await run_once(SLOT_0935, deps=h.deps, now=NOW)
     prompt = h.log["llm"][0]["prompt"]
-    assert "170,000" in prompt and "120,000" in prompt and "50,000" in prompt
+    assert "100,000" in prompt and "38,000" in prompt and "62,000" in prompt
+    assert "170,000" not in prompt
+    assert "120,000" not in prompt
+    assert "50,000" not in prompt
 
 
 @pytest.mark.asyncio
@@ -4262,6 +4307,7 @@ def test_modules_stay_within_the_file_budget_and_layering():
         ).read_text(encoding="utf-8")
         for name in (
             "core",
+            "ledger",
             "io",
             "blocks",
             "round",
@@ -4310,6 +4356,14 @@ def test_modules_stay_within_the_file_budget_and_layering():
     # 「谁都能抓谁」的泥球——逐层钉死它不许 import 上层的模块路径。
     forbidden = {
         "core": (
+            "decision_round_io import",
+            "services.trade.services.decision_round import",
+            "decision_round_tick import",
+            "decision_round_runner import",
+        ),
+        # 账本 DTO 是**叶子**（只 import shared）：反向拉任何编排/取数层都会成环。
+        "ledger": (
+            "decision_round_core import",
             "decision_round_io import",
             "services.trade.services.decision_round import",
             "decision_round_tick import",

@@ -204,7 +204,10 @@ class RebalanceContext:
     stage2_block: str = ""
     #: 丁7【风险预算档位】（当前 tiers 五键）。空串 = 未接线。
     tier_block: str = ""
+    #: 授予额度（**只认分账额度**，不是真实账户总资产）：2026-10-19 用户拍板，
+    #: agent 不得看见账户总金额。真实账户三数只走内部风控/审计。
     quota_total: float = AGENT_QUOTA_TOTAL
+    #: 已用额度 = 本 agent 名下持仓成本合计（卖出即释放）。
     quota_used: float = 0.0
     per_stock_pct: float = DEFAULT_PER_STOCK_PCT
     max_new_buys: int = DEFAULT_MAX_NEW_BUYS

@@ -601,17 +601,25 @@ async def check_c02_signal_readiness(ctx: HealthContext) -> CheckResult:
 
     ready_raw = ctx.redis_get(ready_key(ctx.market, latest_str), REDIS_DB_GENERAL)
     marker = ctx.redis_get(f"qm:inference:completed:{latest_str}", REDIS_DB_GENERAL)
-    # 残 run 迹象：单日多 run（>2 说明重跑/竞态频发）。只数批量行：
+    # 残 run 迹象：同一**模型**单日多 run（>2 说明重跑/竞态频发）。只数批量行：
     # 实时推理每天每模型一个 rt- run_id，与批量重跑/竞态无关，计进来会把
     # 「2 批量 + N 实时」的常态顶过阈值天天误报（2026-09-24 实测 runs=3）。
+    # 也不能数全市场的 distinct run_id：多模型调度下每个模型各有一个 run_id，
+    # 5 个模型 = 5 个 run 是常态（2026-10-19 实测 5 个模型恰好 5 个 run，健康页
+    # 却报「同日多 run」）。按模型（feature_version）分组取最大值；老行没有
+    # feature_version 时退化为按 run_id 分组（各自独立，不误报）。
     run_rows = ctx.query(
-        "SELECT count(DISTINCT run_id) AS n FROM engine_signal_scores "
+        "SELECT max(n) AS n, count(*) AS models FROM ("
+        "SELECT COALESCE(NULLIF(feature_version, ''), run_id) AS mk, "
+        "count(DISTINCT run_id) AS n FROM engine_signal_scores "
         "WHERE trade_date = :d AND COALESCE(market, 'CN') = :m "
-        "AND COALESCE(source, 'batch') = 'batch'",
+        "AND COALESCE(source, 'batch') = 'batch' "
+        "GROUP BY 1) t",
         d=latest,
         m=ctx.market,
     )
-    runs = int(run_rows[0]["n"]) if run_rows else 0
+    runs = int(run_rows[0].get("n") or 0) if run_rows else 0
+    models = int(run_rows[0].get("models") or 0) if run_rows else 0
     if not ready_raw and not marker:
         return CheckResult(
             "C02",
@@ -619,13 +627,23 @@ async def check_c02_signal_readiness(ctx: HealthContext) -> CheckResult:
             "warn",
             f"{ctx.market} {latest_str} 无就绪/完成标记（runs={runs}）",
             "确认推理调度执行；标记键 qm:signal:ready:{market}:{date}",
-            {"trade_date": latest_str, "runs": runs, "market": ctx.market},
+            {
+                "trade_date": latest_str,
+                "runs": runs,
+                "models": models,
+                "market": ctx.market,
+            },
         )
     ready_desc = (
         f"就绪标记={str(ready_raw)[:48]}…" if ready_raw else "无就绪标记（回退读完成标记）"
     )
-    detail = f"{latest_str} {ready_desc} runs={runs}"
-    metrics = {"trade_date": latest_str, "runs": runs, "market": ctx.market}
+    detail = f"{latest_str} {ready_desc} runs={runs}（{models} 个模型）"
+    metrics = {
+        "trade_date": latest_str,
+        "runs": runs,
+        "models": models,
+        "market": ctx.market,
+    }
     if runs > 2:
         return CheckResult(
             "C02", "信号就绪", "warn", detail + "（同日多 run，检查竞态/回填）", metrics=metrics

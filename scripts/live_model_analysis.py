@@ -2,10 +2,15 @@
 """实盘模型对话轮（「模型对话」tab「立即分析」的宿主执行端）。
 
 上游 ``live_hourly_analysis.py``（quant-Trader）随平台退役后，「立即分析」按钮
-一直置灰（A6）。本脚本是其**对话语义的最小复活**：读 QM 桥的实盘账户 + 持仓
-（只读），连同当日的新闻分子摘要，喂给各模型各出一轮分析，按 arena 日志格式
-落盘 ``data/agent_data_astock/{sig}/log/{date}/log.jsonl`` → 前端「模型对话」
-直接可读（复用 news_brief.append_log 的同一结构）。
+一直置灰（A6）。本脚本是其**对话语义的最小复活**：读 **每个 agent 自己的分账
+账本**（``qm_agent_ledger_*``：授予额度 + 该 agent 名下持仓，只读），现价/可卖量
+按代码从 QM 桥取，连同当日的新闻分子摘要，喂给各模型各出一轮分析，按 arena
+日志格式落盘 ``data/agent_data_astock/{sig}/log/{date}/log.jsonl`` → 前端
+「模型对话」直接可读（复用 news_brief.append_log 的同一结构）。
+
+**隐私边界（2026-10-19 用户拍板）**：agent 只能动用用户授予的额度，**不得看见
+真实账户的总资产/可用资金/持仓市值**；可见面只有「授予额度 / 已用 / 剩余」与
+它自己名下的持仓。部分模式允许看对手的买卖与盈亏，但同样不含账户总金额。
 
 安全边界：**只读查询 + LLM 调用，绝不下单**——本脚本不 import 任何交易执行
 代码。真在拍板下单的是**决策轮**（容器内 trade 服务的 P2.8 槽位回路，开关
@@ -27,15 +32,15 @@
   **永不让位**。
 
 真话纪律（T3-2，审计 C5/H13）：
-* **桥挂 = 无账户模板**：没有账户数据时提示词**禁止要求点评持仓**（也不许模型
-  编造持仓/账户数字），并给日志落 ``data_gaps=['account_unreachable']`` 机器
-  可读标记 → 前端卡片挂「无实盘账户数据」横幅；
+* **账本挂 = 无账户模板**：分账账本读不到时提示词**禁止要求点评持仓**（也不许
+  模型编造持仓/账户数字），并给日志落 ``data_gaps=['account_unreachable']``
+  机器可读标记 → 前端卡片挂「无实盘账户数据」横幅；
 * **截断不落盘**：``finish_reason=='length'`` 的回复整轮作废（重试 1 次**并追加
   「精简输出」提示**——2026-10-12 实测同一 payload 原样重试再撞上限；仍截断
   即放弃并如实报错）——半截分析混进「模型对话」与完整分析无法区分。
 
 提醒（2026-10-12 补：当日桥失联 5 轮、截断 3 轮全程无任何告警）：
-* 桥失联/恢复：状态翻转沿各推一条 QQ（状态持久化在
+* 分账账本失联/恢复：状态翻转沿各推一条 QQ（状态持久化在
   ``data/logs/.live_model_analysis_alert_state.json``，不重复刷）；
 * 轮次不满员（或全败）：推一条 QQ，1 小时限流（每小时一轮 = 每轮最多一条）；
 * 复盘轮卡片：``--mode review`` 完成后推「📋 收盘复盘」合集（每模型一段摘要）。
@@ -47,7 +52,7 @@
     python3 scripts/live_model_analysis.py --force         # 无视「让位决策轮」强跑一轮
 
 开关（``.env``，缺省全开；写 ``0/false/no/off`` 关，词表同 switch_enabled）：
-    QM_DIALOGUE_ALERTS=off        # 桥失联/恢复 + 轮次不满员 两类提醒
+    QM_DIALOGUE_ALERTS=off        # 账本失联/恢复 + 轮次不满员 两类提醒
     QM_DIALOGUE_REVIEW_PUSH=off   # 收盘复盘 QQ 卡片
     QM_DIALOGUE_MAX_TOKENS=8000   # 输出上限覆盖（默认 8000）
     QM_DIALOGUE_YIELD_TO_DECISION_ROUND=off  # 关掉「决策轮在岗就让位」（回到双写）
@@ -58,6 +63,8 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import math
+import os
 import re
 import sys
 import time
@@ -135,7 +142,11 @@ def _session_label(now: datetime) -> str:
 
 
 def _bridge_account(env: dict[str, str]) -> dict | None:
-    """只读拉账户 + 持仓；桥不可达返回 None（提示词降级为「无账户数据」）。"""
+    """只读拉账户 + 持仓；桥不可达返回 None（现价/可卖量降级为 —）。
+
+    **本函数只用于可卖量与现价，调用方不得把 asset 三数写进提示词**：
+    账户总额是账户主人的隐私，agent 可见面只认分账账本（见 ``read_agent_ledgers``）。
+    """
     import requests
 
     url = (env.get("TDX_BRIDGE_URL") or "").rstrip("/")
@@ -155,6 +166,161 @@ def _bridge_account(env: dict[str, str]) -> dict | None:
     except Exception as e:  # noqa: BLE001 桥不可达 → 降级提示词，不中断本轮
         print(f"⚠️ 桥账户查询失败（降级为无持仓上下文）: {e}")
         return None
+
+
+# ── 分账账本（agent 可见面的唯一账户口径）──────────────────────────────
+# 2026-10-19 用户拍板：agent 只能动用授予额度，**不得看见账户总金额**。
+# 故本脚本不再把 ``/api/v1/account/query`` 的 asset 三数写进提示词——
+# 持仓/额度一律读 ``qm_agent_ledger_*``（每个 agent 自己的账），与决策轮同源。
+# 桥只用于两件事：每只票的实时价、可卖量（T+1 口径），且都按代码取，不取总额。
+LEDGER_TENANT = "default"
+DEFAULT_LEDGER_USER = "10000001"
+LEDGER_CONNECT_TIMEOUT_S = 5
+
+
+def _ledger_identity(env: dict[str, str]) -> tuple[str, str]:
+    """(tenant, user)：与决策轮 ``resolve_db_account_user`` 同口径。"""
+    from backend.shared.simulation_account_keys import normalize_runtime_user
+
+    raw = str(env.get("QM_DECISION_ACCOUNT_USER_ID") or "").strip()
+    return LEDGER_TENANT, normalize_runtime_user(raw or DEFAULT_LEDGER_USER)
+
+
+def _pg_connect(env: dict[str, str]):
+    """宿主/容器都能连的 PG 连接；凭据只在内存里过一遍，不落盘。"""
+    import psycopg2
+
+    import host_env
+
+    host = (
+        os.environ.get("POSTGRES_HOST", "").strip()
+        or host_env.resolve_postgres_host()
+        or env.get("DB_HOST")
+        or "127.0.0.1"
+    )
+    return psycopg2.connect(
+        host=host,
+        port=int(env.get("DB_PORT") or 5432),
+        dbname=env.get("DB_NAME") or "quantmind",
+        user=env.get("DB_USER") or "quantmind",
+        password=env.get("DB_PASSWORD") or "",
+        connect_timeout=LEDGER_CONNECT_TIMEOUT_S,
+    )
+
+
+def read_agent_ledgers(
+    env: dict[str, str], agents: list[str] | tuple[str, ...]
+) -> dict[str, dict | None]:
+    """本轮各 agent 的分账账本段；读失败 → 该 agent 为 ``None``（降级模板）。
+
+    返回 ``{agent: {"quota", "used", "remaining", "known", "positions": [...]}}``。
+    **任何失败都不回退到桥账户**——回退就是把账户总额喂给模型的那条泄漏路径。
+    """
+    wanted = [str(a).strip() for a in agents if str(a).strip()]
+    out: dict[str, dict | None] = dict.fromkeys(wanted)
+    if not wanted:
+        return out
+    tenant, user = _ledger_identity(env)
+    conn = None
+    try:
+        from backend.shared.decision.agent_ledger import DEFAULT_AGENT_QUOTA
+
+        conn = _pg_connect(env)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT p.agent, p.code, p.volume, p.cost_price,
+                       COALESCE(s.name, '') AS name
+                  FROM qm_agent_ledger_position p
+                  LEFT JOIN stocks s ON s.symbol = p.code
+                 WHERE p.tenant_id = %s AND p.user_id = %s AND p.agent = ANY(%s)
+                 ORDER BY p.agent, p.code
+                """,
+                (tenant, user, wanted),
+            )
+            rows = cur.fetchall()
+            cur.execute(
+                """
+                SELECT agent FROM qm_agent_ledger_account
+                 WHERE tenant_id = %s AND user_id = %s AND agent = ANY(%s)
+                """,
+                (tenant, user, wanted),
+            )
+            account_rows = cur.fetchall()
+    except Exception as exc:  # noqa: BLE001 账本不可达 → 本轮降级，不中断整轮
+        print(f"⚠️ 分账账本查询失败（降级为无持仓上下文）: {exc}")
+        return out
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 关闭失败不改变本轮结论
+                pass
+
+    return _ledger_view(wanted, rows, account_rows, DEFAULT_AGENT_QUOTA)
+
+
+def _ledger_view(
+    agents: list[str],
+    rows: list[tuple],
+    account_rows: list[tuple],
+    quota: float,
+) -> dict[str, dict]:
+    """把账本查询行映射成提示词要的视图（纯函数，脏行逐条跳过）。
+
+    ``rows`` = ``(agent, code, volume, cost_price, name)``；
+    ``account_rows`` = ``(agent,)``（账本里有账户行、但名下无货的 agent）。
+    """
+    known = {str(row[0]) for row in account_rows}
+    grouped: dict[str, list[dict]] = {agent: [] for agent in agents}
+    for agent, code, volume, cost, name in rows:
+        agent_s = str(agent)
+        try:
+            volume_f = float(volume)
+            cost_f = float(cost)
+        except (TypeError, ValueError):
+            continue
+        if volume_f <= 0 or not math.isfinite(volume_f) or not math.isfinite(cost_f):
+            continue
+        grouped.setdefault(agent_s, []).append(
+            {
+                "code": str(code),
+                "name": str(name or ""),
+                "volume": volume_f,
+                "cost_price": cost_f,
+            }
+        )
+
+    out: dict[str, dict] = {}
+    for agent in agents:
+        positions = grouped.get(agent, [])
+        used = round(sum(p["volume"] * p["cost_price"] for p in positions), 2)
+        out[agent] = {
+            "quota": quota,
+            "used": used,
+            "remaining": round(quota - used, 2),
+            "known": agent in known or bool(positions),
+            "positions": positions,
+        }
+    return out
+
+
+def _bridge_availability(env: dict[str, str]) -> dict[str, int]:
+    """每只票的桥实时可卖量（T+1）。**只取代码→可卖量，不读 asset 三数。**"""
+    acct = _bridge_account(env)
+    out: dict[str, int] = {}
+    if not acct:
+        return out
+    for p in acct.get("positions") or []:
+        code = str(p.get("stock_code") or "").strip()
+        if not code:
+            continue
+        try:
+            available = int(float(p.get("available_volume")))
+        except (TypeError, ValueError):
+            continue
+        out[code] = max(0, available)
+    return out
 
 
 def _bridge_snapshot(env: dict[str, str], code: str) -> dict:
@@ -237,30 +403,41 @@ def _news_block() -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+_UNSET = object()
+
+
 def build_user_content(
     env: dict[str, str],
     *,
-    account_reader=None,
+    agent: str = "",
+    ledger: dict | None | object = _UNSET,
+    availability: dict[str, int] | None = None,
     price_reader=None,
     snapshot_reader=None,
     mode: str = "intraday",
 ) -> tuple[str, list[str]]:
-    """拼账户 + 持仓 + 新闻的提示词正文（供所有模型共用）。
+    """拼**本 agent 的分账额度 + 持仓** + 新闻的提示词正文。
 
-    返回 ``(正文, data_gaps)``——``data_gaps`` 是**机器可读的数据缺口标记**
-    （当前唯一取值 ``account_unreachable``），随日志落盘供前端挂横幅；提示词
-    同时降级为「无账户模板」（**绝不要求点评持仓**，C5：编出来的持仓点评比
-    不分析更坏）。
+    账户口径（2026-10-19 用户拍板）：只认 ``qm_agent_ledger_*`` 里这家 agent
+    自己的授予额度与持仓。提示词里**绝不出现真实账户的总资产/可用资金/持仓
+    市值**——账户里有多少钱是账户主人的隐私，模型只需要知道「这条线还能动用
+    多少」。可卖量（T+1）与现价按代码从桥取，同样不涉及总额。
+
+    返回 ``(正文, data_gaps)``：``ledger is None``（账本不可达）时落
+    ``data_gaps=['account_unreachable']`` 并降级为「无账户模板」（**绝不要求
+    点评持仓**，C5：编出来的持仓点评比不分析更坏）。
 
     ``mode='review'``（盘后复盘轮）：附三大指数当日表现，持仓表加「今日」涨跌
     列，要求模板换成复盘三问（今日复盘 / 持仓回顾 / 明日计划 + 开头 ≤120 字摘要）。
 
-    ``account_reader``/``price_reader``/``snapshot_reader`` 缺省走真实桥；
-    测试注入替身。
+    ``ledger`` 缺省才现读（单测/一次性调用）；生产轮次由 ``main`` 一次读好传入，
+    避免逐模型重复连库。``price_reader``/``snapshot_reader`` 缺省走真实桥。
     """
-    read_account = account_reader or _bridge_account
+    if ledger is _UNSET:
+        ledger = read_agent_ledgers(env, [agent]).get(agent) if agent else None
     read_price = price_reader or _bridge_price
     read_snapshot = snapshot_reader or _bridge_snapshot
+    available_map = availability or {}
     is_review = mode == "review"
     now = datetime.now(CN_TZ)
     gaps: list[str] = []
@@ -286,36 +463,54 @@ def build_user_content(
             else "【收盘行情】指数数据不可用（只按新闻面复盘）"
         )
 
-    acct = read_account(env)
+    has_account = ledger is not None
     has_positions = False
-    if acct:
-        asset = acct.get("asset") or {}
-        positions = acct.get("positions") or []
+    if has_account and isinstance(ledger, dict):
+        quota = float(ledger.get("quota") or 0.0)
+        used = float(ledger.get("used") or 0.0)
+        remaining = float(ledger.get("remaining") or 0.0)
         parts.append(
-            "【实盘账户】\n"
-            f"- 总资产 {asset.get('asset', '?')} ｜ 可用资金 {asset.get('cash', '?')} "
-            f"｜ 持仓市值 {asset.get('market_value', '?')}"
+            "【你的分账额度】\n"
+            f"- 用户授予 ¥{quota:,.0f} ｜ 已用（持仓成本） ¥{used:,.0f} "
+            f"｜ 剩余 ¥{remaining:,.0f}\n"
+            "- 你只能在这个额度内决策；账户总资产、可用资金与其他 agent 的额度"
+            "不是你的可见范围。"
         )
+        positions = list(ledger.get("positions") or [])
         if positions:
             has_positions = True
             if is_review:
                 rows = [
-                    "【当前持仓】",
+                    "【你名下的持仓】",
                     "| 代码 | 名称 | 持仓 | 可用 | 成本 | 现价 | 浮动盈亏 | 今日 |",
                     "|---|---|---|---|---|---|---|---|",
                 ]
             else:
                 rows = [
-                    "【当前持仓】",
+                    "【你名下的持仓】",
                     "| 代码 | 名称 | 持仓 | 可用 | 成本 | 现价 | 浮动盈亏 |",
                     "|---|---|---|---|---|---|---|",
                 ]
             for p in positions:
-                code = str(p.get("stock_code") or "")
-                name = str(p.get("stock_name") or p.get("name") or "")
-                total = p.get("total_volume")
-                avail = p.get("available_volume")
-                cost = float(p.get("cost_price") or 0)
+                code = str(p.get("code") or "")
+                name = str(p.get("name") or "—")
+                try:
+                    total_f = float(p.get("volume") or 0)
+                    cost = float(p.get("cost_price") or 0)
+                except (TypeError, ValueError):
+                    continue
+                total = f"{total_f:.0f}"
+                # 可卖量按代码从桥取（T+1 口径）；桥不可达 → —（绝不拿持仓量冒充）。
+                # 但桥的 available 是**真实账户**的整只可卖量，可能大于本 agent 名下的
+                # 持仓（共用账户，别家也持有同一只）→ 必须夹到本账持仓，否则模型会
+                # 以为自己能卖出超过持仓的量（2026-10-19 实测 601857：持仓 700 / 桥 1500）。
+                avail = available_map.get(code)
+                avail_s = "—"
+                if avail is not None:
+                    try:
+                        avail_s = str(min(int(avail), int(total_f)))
+                    except (TypeError, ValueError, OverflowError):
+                        avail_s = str(avail)
                 if is_review:
                     snap = read_snapshot(env, code) if code else {}
                     last = float(snap.get("now") or 0)
@@ -334,18 +529,22 @@ def build_user_content(
                 else:
                     pnl, last_s = "—", "—"
                 row = (
-                    f"| {code} | {name} | {total} | {avail} | {cost:.3f} | "
+                    f"| {code} | {name} | {total} | {avail_s} | {cost:.3f} | "
                     f"{last_s} | {pnl}"
                 )
                 if is_review:
                     row += f" | {day_pct}"
                 rows.append(row + " |")
             parts.append("\n".join(rows))
+        elif ledger.get("known"):
+            parts.append("【你名下的持仓】空仓")
         else:
-            parts.append("【当前持仓】空仓")
+            parts.append("【你名下的持仓】空仓（分账账本里暂无你的成交记录）")
     else:
         gaps.append("account_unreachable")
-        parts.append("【实盘账户】桥不可达，本轮无账户/持仓数据（只按新闻面分析）")
+        parts.append(
+            "【你的分账额度】分账账本不可达，本轮无额度/持仓数据（只按新闻面分析）"
+        )
 
     news = _news_block()
     if news:
@@ -353,7 +552,7 @@ def build_user_content(
 
     parts.append(
         _requirement_block(
-            has_account=bool(acct), has_positions=has_positions, mode=mode
+            has_account=has_account, has_positions=has_positions, mode=mode
         )
     )
     return "\n\n".join(parts), gaps
@@ -371,8 +570,8 @@ def _requirement_block(
 ) -> str:
     """尾段要求模板——**随数据齐缺三态降级**（C5 核心）。
 
-    无账户数据时逐字禁止「点评持仓/编造持仓」：桥挂的轮次只许按新闻面说话。
-    ``mode='review'`` 换成收盘复盘三问（今日复盘 / 持仓回顾 / 明日计划）。
+    无账户数据时逐字禁止「点评持仓/编造持仓」：账本不可达的轮次只许按新闻面
+    说话。``mode='review'`` 换成收盘复盘三问（今日复盘 / 持仓回顾 / 明日计划）。
     """
     tail = (
         "输出中文 markdown，简洁、先结论后理由；你的输出展示在实盘看板的「模型对话」里，"
@@ -382,7 +581,7 @@ def _requirement_block(
     if not has_account:
         if is_review:
             return (
-                "【要求】本轮**没有**实盘账户与持仓数据（桥不可达），给出今日收盘复盘：\n"
+                "【要求】本轮**没有**分账额度与持仓数据（分账账本不可达），给出今日收盘复盘：\n"
                 "1) **禁止**点评持仓、禁止编造任何持仓或账户数字——你没有这些数据；\n"
                 "2) 按上述指数与新闻面复盘今日大盘与板块；\n"
                 "3) 给出明日关注方向（仅为观察，不是指令）；\n"
@@ -390,7 +589,7 @@ def _requirement_block(
                 "一段话），随后再展开全文；并在文中明确说明缺少账户上下文。\n" + tail
             )
         return (
-            "【要求】本轮**没有**实盘账户与持仓数据（桥不可达），给出本轮盘中分析：\n"
+            "【要求】本轮**没有**分账额度与持仓数据（分账账本不可达），给出本轮盘中分析：\n"
             "1) **禁止**点评持仓、禁止编造任何持仓或账户数字——你没有这些数据；\n"
             "2) 只按上述新闻面分析大盘与板块的风险与机会；\n"
             "3) 明确说明本轮结论缺少账户上下文，仅供参考。\n" + tail
@@ -415,14 +614,14 @@ def _requirement_block(
         )
     if is_review:
         return (
-            "【要求】围绕上述实盘账户给出今日收盘复盘：\n"
+            "【要求】围绕上述你的分账额度与持仓给出今日收盘复盘：\n"
             "1) 复盘今日大盘与板块（结合指数与新闻面）；\n"
             "2) 逐一回顾持仓今日表现，判断各持仓逻辑是否变化；\n"
             "3) 给出明日计划：持仓处置倾向（持有/减仓/加仓）与候选方向/触发条件"
             "（仅为观察，不是指令）；\n" + REVIEW_SUMMARY_INSTRUCTION + "\n" + tail
         )
     return (
-        "【要求】围绕上述实盘账户给出本轮盘中分析：\n"
+        "【要求】围绕上述你的分账额度与持仓给出本轮盘中分析：\n"
         "1) 逐一点评持仓（结合成本与现价）；\n"
         "2) 结合新闻面指出风险与机会；\n"
         "3) 给出操作倾向（加仓/减仓/持有）与触发条件。\n" + tail
@@ -734,40 +933,55 @@ def main() -> int:
             print("没有可运行的模型")
             return 2
 
-        user_content, data_gaps = build_user_content(env, mode=mode)
-        bridge_down = "account_unreachable" in data_gaps
-        if data_gaps:
-            print(
-                "⚠️ 数据缺口："
-                + ",".join(data_gaps)
-                + "（提示词已降级为无账户模板，日志将带缺口标记）"
-            )
-        # 桥失联/恢复：只在翻转沿推（状态文件去重，morning 失联 5 轮只吵一次）
+        # 一轮读一次分账账本（每家一份），再按模型拼各自的提示词：额度与持仓
+        # **只出现该 agent 自己的那本账**，不读真实账户总额。
+        ledgers = read_agent_ledgers(env, runnable)
+        availability = _bridge_availability(env)
+        account_down = bool(runnable) and all(
+            ledgers.get(sig) is None for sig in runnable
+        )
+        if account_down:
+            print("⚠️ 分账账本不可达：本轮提示词降级为无账户模板")
+        # 账本失联/恢复：只在翻转沿推（状态文件去重，morning 失联 5 轮只吵一次）。
+        # 状态键沿用 ``bridge_down``（历史键名），语义 =「账户上下文不可达」。
         if alerts_on:
             state = _load_alert_state()
             transition = decide_transition_alert(
-                bool(state.get("bridge_down")), bridge_down
+                bool(state.get("bridge_down")), account_down
             )
             if transition == "down":
                 notify_qq(
                     "⚠️ 模型对话轮降级",
-                    f"{now.strftime('%H:%M')} 起 TDX 桥不可达，模型对话轮已降级为"
-                    "无持仓上下文（恢复前每轮都如此）。请检查桥机（Windows）开机"
-                    "状态、桥进程与看门狗。",
+                    f"{now.strftime('%H:%M')} 起分账账本不可达（PG 查询失败），"
+                    "模型对话轮已降级为无持仓上下文（恢复前每轮都如此）。"
+                    "请检查 DB/网络与容器状态。",
                 )
             elif transition == "up":
                 notify_qq(
                     "✅ 模型对话轮恢复",
-                    f"{now.strftime('%H:%M')} 桥已恢复，模型对话轮恢复正常持仓上下文。",
+                    f"{now.strftime('%H:%M')} 分账账本已恢复，模型对话轮恢复正常持仓上下文。",
                 )
             if transition:
-                state["bridge_down"] = bridge_down
+                state["bridge_down"] = account_down
                 _save_alert_state(state)
 
         ok, failed, summaries = [], [], []
         for sig in runnable:
             _, model = ROSTER[sig]
             try:
+                user_content, data_gaps = build_user_content(
+                    env,
+                    agent=sig,
+                    ledger=ledgers.get(sig),
+                    availability=availability,
+                    mode=mode,
+                )
+                if data_gaps:
+                    print(
+                        f"⚠️ {sig} 数据缺口："
+                        + ",".join(data_gaps)
+                        + "（提示词已降级为无账户模板）"
+                    )
                 content, usage = call_model(env, sig, model, user_content)
                 append_log(user_content, content, sig, usage, data_gaps, mode=mode)
                 ok.append(f"{sig} {len(content)}字")

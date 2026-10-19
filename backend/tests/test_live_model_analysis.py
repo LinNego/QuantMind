@@ -28,24 +28,26 @@ _CN_TZ = timezone(timedelta(hours=8))
 
 @pytest.fixture(scope="module")
 def lma():
-    spec = importlib.util.spec_from_file_location("live_model_analysis_under_test", _SCRIPT)
+    spec = importlib.util.spec_from_file_location(
+        "live_model_analysis_under_test", _SCRIPT
+    )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-def _fake_account(code: str = "601000.SH") -> dict:
+def _pos(code: str = "601000.SH", cost: float = 4.5, volume: float = 1000) -> dict:
+    return {"code": code, "name": "唐山港", "volume": volume, "cost_price": cost}
+
+
+def _ledger(*positions: dict, quota: float = 100_000.0, known: bool = True) -> dict:
+    used = round(sum(p["volume"] * p["cost_price"] for p in positions), 2)
     return {
-        "asset": {"asset": 100000, "cash": 50000, "market_value": 50000},
-        "positions": [
-            {
-                "stock_code": code,
-                "stock_name": "唐山港",
-                "total_volume": 1000,
-                "available_volume": 1000,
-                "cost_price": 4.5,
-            }
-        ],
+        "quota": quota,
+        "used": used,
+        "remaining": round(quota - used, 2),
+        "known": known,
+        "positions": list(positions),
     }
 
 
@@ -65,7 +67,8 @@ def test_review_content_has_index_block_positions_day_pct_and_requirement(lma):
 
     content, gaps = lma.build_user_content(
         {},
-        account_reader=lambda env: _fake_account(),
+        ledger=_ledger(_pos()),
+        availability={"601000.SH": 1000},
         price_reader=price_reader,
         snapshot_reader=snapshot_reader,
         mode="review",
@@ -79,6 +82,10 @@ def test_review_content_has_index_block_positions_day_pct_and_requirement(lma):
     # 持仓表「今日」列 + 行尾值
     assert "| 浮动盈亏 | 今日 |" in content
     assert "| +122.22% | +5.26% |" in content
+    # 隐私边界：只给授予额度，不给账户总额（2026-10-19 用户拍板）
+    assert "用户授予 ¥100,000 ｜ 已用（持仓成本） ¥4,500 ｜ 剩余 ¥95,500" in content
+    assert "账户总资产、可用资金与其他 agent 的额度不是你的可见范围" in content
+    assert "1,015,484" not in content  # 真实账户总额绝不入提示词
     # 复盘要求：三问 + 摘要指令
     assert "收盘复盘" in content
     assert "收盘复盘摘要" in content
@@ -90,7 +97,7 @@ def test_review_content_index_unavailable_degrades_honestly(lma):
     """指数快照全失败：明说不可用，不编数。"""
     content, _ = lma.build_user_content(
         {},
-        account_reader=lambda env: None,
+        ledger=_ledger(),
         snapshot_reader=lambda env, code: {},
         mode="review",
     )
@@ -101,7 +108,8 @@ def test_intraday_content_unchanged_shape(lma):
     """盘中轮不回归：无指数块、无「今日」列、现价走 price_reader。"""
     content, gaps = lma.build_user_content(
         {},
-        account_reader=lambda env: _fake_account(),
+        ledger=_ledger(_pos()),
+        availability={"601000.SH": 1000},
         price_reader=lambda env, code: 10.0,
         snapshot_reader=lambda env, code: (_ for _ in ()).throw(
             AssertionError("intraday 不应调用 snapshot_reader")
@@ -116,9 +124,7 @@ def test_intraday_content_unchanged_shape(lma):
 
 def test_account_unreachable_still_forbids_position_commentary_both_modes(lma):
     for mode in ("intraday", "review"):
-        content, gaps = lma.build_user_content(
-            {}, account_reader=lambda env: None, mode=mode
-        )
+        content, gaps = lma.build_user_content({}, ledger=None, mode=mode)
         assert gaps == ["account_unreachable"]
         assert "禁止" in content and "编造" in content
 
@@ -137,7 +143,9 @@ def test_requirement_block_review_vs_intraday_summary_instruction(lma):
 
 
 def test_extract_summary_takes_first_paragraph_and_strips_markdown(lma):
-    content = "# 收盘复盘摘要\n**今日大盘**微跌 `0.3%`。\n\n## 详细展开\n后面还有很多字…"
+    content = (
+        "# 收盘复盘摘要\n**今日大盘**微跌 `0.3%`。\n\n## 详细展开\n后面还有很多字…"
+    )
     assert lma.extract_summary(content) == "收盘复盘摘要 今日大盘微跌 0.3%。"
 
 
@@ -264,7 +272,9 @@ def test_call_model_retry_appends_brevity_note(lma, monkeypatch):
 
     monkeypatch.setattr(requests, "post", fake_post)
     env = {"OPENAI_API_BASE": "https://x.test/v1", "OPENAI_API_KEY": "k"}
-    content, usage = lma.call_model(env, "deepseek-v4-flash", "deepseek-v4-flash", "正文")
+    content, usage = lma.call_model(
+        env, "deepseek-v4-flash", "deepseek-v4-flash", "正文"
+    )
     assert content == "完整回复" and usage["total_tokens"] == 30
     assert len(calls) == 2
     first, second = calls[0], calls[1]
@@ -338,6 +348,12 @@ def _run_main(lma, monkeypatch, tmp_path, argv, *, env=None):
     monkeypatch.setattr(lma, "build_user_content", lambda e, **kw: ("提示词", []))
     monkeypatch.setattr(lma, "notify_qq", lambda *a, **kw: False)
     monkeypatch.setattr(lma, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(lma, "ALERT_STATE_FILE", tmp_path / ".alert_state.json")
+    # 账本/桥都是外部依赖：测试里给一本空账，绝不连真 PG/桥
+    monkeypatch.setattr(
+        lma, "read_agent_ledgers", lambda e, agents: {a: _ledger() for a in agents}
+    )
+    monkeypatch.setattr(lma, "_bridge_availability", lambda e: {})
     called: list[str] = []
     monkeypatch.setattr(
         lma,

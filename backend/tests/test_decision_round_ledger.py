@@ -262,11 +262,11 @@ async def test_negative_virtual_cash_is_reported_as_is():
 
 @pytest.mark.asyncio
 async def test_budget_and_exec_quota_take_the_tighter_of_the_two():
-    """口径：真实剩余 × pct 与子账户现金，**取更紧的那个**（与隔壁同形）。
+    """口径：授予额度剩余 × pct 与子账户现金，**取更紧的那个**（与隔壁同形）。
 
-    固定量：真实剩余 50000 × 15% = 7500。子账户给 1234（更紧）⇒ 单票预算 1234，
+    固定量：授予额度 100000 × 15% = 15000。子账户给 1234（更紧）⇒ 单票预算 1234，
     600036 一手 4000 买不起，池子被剔空；执行段额度也同步收成 1234。
-    只取真实额度：腿按 7500 算股数，超出子账户线的那部分只会被 ``l2.vcash`` 否决
+    只取授予额度：腿按 15000 算股数，超出子账户线的那部分只会被 ``l2.vcash`` 否决
     ——本可成交的腿变成一条否决记录。
     """
     h = make_harness(ledger=AgentLedgerRead(ok=True, known=True, virtual_cash=1234.0))
@@ -285,7 +285,7 @@ async def test_budget_and_exec_quota_take_the_tighter_of_the_two():
 
 @pytest.mark.asyncio
 async def test_a_rich_sub_account_does_not_shrink_the_pool():
-    """反面对照（证明上一条不是恒真）：子账户钱多时，预算回到真实口径 7500，
+    """反面对照（证明上一条不是恒真）：子账户钱多时，预算回到授予额度口径，
     600036 一手 4000 买得起 ⇒ 池子留下它。两条只差 ``virtual_cash`` 一个变量。"""
     h = make_harness(
         ledger=AgentLedgerRead(ok=True, known=True, virtual_cash=100_000.0)
@@ -293,9 +293,10 @@ async def test_a_rich_sub_account_does_not_shrink_the_pool():
     await run_once(SLOT_0935, deps=h.deps, now=NOW)
 
     meta = h.log["ledger"][0][0].context_meta
-    # 7500 = 真实剩余 50000 × 15%（子账户 10 万不构成约束）；茅台一手 17 万仍买不起
+    # 授予额度剩余 100000 × 15% = 15000（子账户 10 万不构成约束）；
+    # 茅台一手 17 万仍买不起
     assert meta["pool"]["shown"] == 1 and meta["pool"]["dropped"] == 1
-    assert h.log["exec"][0]["quota"] == 50000.0
+    assert h.log["exec"][0]["quota"] == 100_000.0
 
 
 @pytest.mark.asyncio

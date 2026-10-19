@@ -28,33 +28,44 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 仓库根
 import live_model_analysis as lma  # noqa: E402
 
 
-def _acct(*positions: dict) -> dict:
+def _pos(code: str, cost: float = 10.0, volume: float = 100) -> dict:
     return {
-        "asset": {"asset": 100000.0, "cash": 20000.0, "market_value": 80000.0},
-        "positions": list(positions),
-    }
-
-
-def _pos(code: str, cost: float = 10.0) -> dict:
-    return {
-        "stock_code": code,
-        "stock_name": "测试",
-        "total_volume": 100,
-        "available_volume": 100,
+        "code": code,
+        "name": "测试",
+        "volume": volume,
         "cost_price": cost,
     }
 
 
-def _build(account, *, price: float = 12.0):
+def _ledger(*positions: dict, quota: float = 100_000.0, known: bool = True) -> dict:
+    used = round(sum(p["volume"] * p["cost_price"] for p in positions), 2)
+    return {
+        "quota": quota,
+        "used": used,
+        "remaining": round(quota - used, 2),
+        "known": known,
+        "positions": list(positions),
+    }
+
+
+def _build(
+    ledger,
+    *,
+    price: float = 12.0,
+    availability: dict[str, int] | None = None,
+    mode: str = "intraday",
+):
     return lma.build_user_content(
         {},
-        account_reader=lambda env: account,
+        ledger=ledger,
+        availability={"600036.SH": 100} if availability is None else availability,
         price_reader=lambda env, code: price,
+        mode=mode,
     )
 
 
 class TestDataGapTemplate:
-    def test_bridge_down_forbids_position_commentary_and_flags_gap(self):
+    def test_ledger_down_forbids_position_commentary_and_flags_gap(self):
         """验收（C5）：无账户数据 → 模板无「逐一点评持仓」+ 逐字禁止编造 + 缺口标记。"""
         content, gaps = _build(None)
 
@@ -62,23 +73,66 @@ class TestDataGapTemplate:
         assert "逐一点评持仓" not in content  # 要求短语必须消失
         assert "**禁止**点评持仓" in content  # 只有禁止式表达允许存在
         assert "禁止编造" in content
-        assert "桥不可达" in content
+        assert "分账账本不可达" in content
 
     def test_account_with_positions_keeps_the_normal_template(self):
-        content, gaps = _build(_acct(_pos("600036.SH", cost=10.0)), price=12.0)
+        content, gaps = _build(_ledger(_pos("600036.SH", cost=10.0)), price=12.0)
 
         assert gaps == []
         assert "逐一点评持仓" in content
         assert "| 600036.SH | 测试 | 100 | 100 | 10.000 | 12.00 | +20.00% |" in content
 
+    def test_prompt_shows_granted_quota_and_never_the_account_total(self):
+        """用户拍板（2026-10-19）：只出现授予额度/已用/剩余，不出现账户总额。"""
+        content, gaps = _build(_ledger(_pos("600036.SH", cost=10.0)))
+
+        assert gaps == []
+        assert "用户授予 ¥100,000 ｜ 已用（持仓成本） ¥1,000 ｜ 剩余 ¥99,000" in content
+        assert "账户总资产、可用资金与其他 agent 的额度不是你的可见范围" in content
+        assert content.count("总资产") == 1  # 只出现在上面那句否定里
+        for leaked in ("可用资金 20", "持仓市值", "1,015,484", "500,000"):
+            assert leaked not in content
+
     def test_empty_positions_is_not_a_gap_but_still_no_commentary_ask(self):
         """空仓 = 账户数据在（无横幅），但空仓点评无从谈起——模板要换掉。"""
-        content, gaps = _build(_acct())
+        content, gaps = _build(_ledger())
 
         assert gaps == []
         assert "逐一点评持仓" not in content
         assert "空仓" in content
         assert "禁止编造" in content
+
+    def test_unknown_agent_renders_empty_ledger_not_a_gap(self):
+        """账本里查无此 agent = 名下没有货（ok），不是读失败（缺口）。"""
+        content, gaps = _build(_ledger(known=False))
+
+        assert gaps == []
+        assert "分账账本里暂无你的成交记录" in content
+
+    def test_missing_availability_renders_dash_not_volume(self):
+        """桥不可达时可卖量显示 —，绝不拿账本持仓量冒充（会把 T+1 锁仓说成可卖）。"""
+        content, _ = _build(_ledger(_pos("600036.SH", volume=200)), availability={})
+        assert "| 600036.SH | 测试 | 200 | — | 10.000 | 12.00 | +20.00% |" in content
+
+    def test_bridge_availability_is_clamped_to_the_agents_own_volume(self):
+        """桥的可卖量是真实账户整只的量（别家也持有），不得大于本账持仓。
+
+        2026-10-19 实测：本 agent 持中国石油 700 股，桥报可用 1500（共用账户）。
+        照抄会让模型以为自己能卖 1500 股。
+        """
+        content, _ = _build(
+            _ledger(_pos("600036.SH", volume=700)),
+            availability={"600036.SH": 1500},
+        )
+        assert "| 600036.SH | 测试 | 700 | 700 | 10.000 | 12.00 | +20.00% |" in content
+
+    def test_bridge_zero_availability_still_renders_zero(self):
+        """T+1 锁仓是真实约束：桥说 0 就显示 0，不能被夹取逻辑吞掉。"""
+        content, _ = _build(
+            _ledger(_pos("600036.SH", volume=700)),
+            availability={"600036.SH": 0},
+        )
+        assert "| 600036.SH | 测试 | 700 | 0 | 10.000 | 12.00 | +20.00% |" in content
 
     def test_news_block_absence_does_not_change_the_gap_list(self, monkeypatch):
         monkeypatch.setattr(lma, "_news_block", lambda: "")  # 不读真实 latest.json
@@ -87,6 +141,96 @@ class TestDataGapTemplate:
 
         assert gaps == ["account_unreachable"]  # 新闻缺失不是账户缺口（本项范围外）
         assert "【当日新闻分子】" not in content
+
+
+class TestLedgerRead:
+    """分账账本是 agent 可见面的唯一账户口径：脏行跳过、失败即降级、不含总额。"""
+
+    def test_maps_rows_and_computes_grant_usage(self):
+        view = lma._ledger_view(
+            ["a", "b"],
+            [("a", "600036.SH", 100, 10.0, "招商银行")],
+            [("b",)],
+            100_000.0,
+        )
+
+        assert view["a"]["used"] == 1000.0
+        assert view["a"]["remaining"] == 99_000.0
+        assert view["a"]["positions"] == [
+            {
+                "code": "600036.SH",
+                "name": "招商银行",
+                "volume": 100.0,
+                "cost_price": 10.0,
+            }
+        ]
+        assert view["a"]["known"] is True
+        assert view["b"]["known"] is True and view["b"]["positions"] == []
+        # 视图只带额度与持仓：账户总额三数一个都不许出现（用户拍板 2026-10-19）
+        assert set(view["a"]) == {"quota", "used", "remaining", "known", "positions"}
+
+    def test_dirty_rows_are_skipped_not_turned_into_nan(self):
+        view = lma._ledger_view(
+            ["a"],
+            [
+                ("a", "600036.SH", None, 10.0, ""),
+                ("a", "600036.SH", "oops", 10.0, ""),
+                ("a", "600036.SH", 0, 10.0, ""),
+                ("a", "600036.SH", -100, 10.0, ""),
+                ("a", "600036.SH", float("nan"), 10.0, ""),
+                ("a", "600036.SH", float("inf"), 10.0, ""),
+                ("a", "600036.SH", 100, float("nan"), ""),
+                ("a", "600036.SH", 100, 10.0, "招商银行"),
+            ],
+            [],
+            100_000.0,
+        )
+
+        assert view["a"]["used"] == 1000.0  # 只有最后一行是干净的
+        assert len(view["a"]["positions"]) == 1
+        assert view["a"]["remaining"] == 99_000.0
+
+    def test_read_failure_returns_none_for_every_agent(self, monkeypatch):
+        """读失败 = 降级模板；**绝不回退到桥账户**（回退就是泄漏账户总额的路）。"""
+
+        def boom(env):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(lma, "_pg_connect", boom)
+        monkeypatch.setattr(
+            lma, "_bridge_account", lambda env: pytest.fail("不许回退到桥账户")
+        )
+
+        assert lma.read_agent_ledgers({}, ["a", "b"]) == {"a": None, "b": None}
+
+    def test_no_agents_means_no_database_roundtrip(self, monkeypatch):
+        monkeypatch.setattr(lma, "_pg_connect", lambda env: pytest.fail("不该连库"))
+        assert lma.read_agent_ledgers({}, []) == {}
+
+
+class TestBridgeAvailability:
+    def test_extracts_only_code_and_available_volume_never_totals(self, monkeypatch):
+        monkeypatch.setattr(
+            lma,
+            "_bridge_account",
+            lambda env: {
+                "asset": {
+                    "asset": 1_015_484,
+                    "cash": 20_000,
+                    "market_value": 995_484,
+                },
+                "positions": [
+                    {"stock_code": "600036.SH", "available_volume": "100"},
+                    {"stock_code": "601000.SH", "available_volume": None},
+                ],
+            },
+        )
+
+        assert lma._bridge_availability({}) == {"600036.SH": 100}
+
+    def test_bridge_down_means_empty_map(self, monkeypatch):
+        monkeypatch.setattr(lma, "_bridge_account", lambda env: None)
+        assert lma._bridge_availability({}) == {}
 
 
 class _FakeResp:
@@ -198,6 +342,12 @@ class TestMainRejectsTruncatedRound:
         monkeypatch.setattr(lma, "LOCK", tmp_path / "lock")
         monkeypatch.setattr(lma, "_load_env", lambda: {})
         monkeypatch.setattr(lma, "build_user_content", lambda env, **kw: ("提示词", []))
+        monkeypatch.setattr(lma, "ALERT_STATE_FILE", tmp_path / ".alert_state.json")
+        # 账本/桥是外部依赖：测试绝不连真 PG/桥
+        monkeypatch.setattr(
+            lma, "read_agent_ledgers", lambda e, agents: dict.fromkeys(agents)
+        )
+        monkeypatch.setattr(lma, "_bridge_availability", lambda e: {})
         written: list = []
         monkeypatch.setattr(lma, "append_log", lambda *a, **kw: written.append(a))
 
