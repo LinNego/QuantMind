@@ -271,13 +271,24 @@ def _zero_leg_cause(result: RoundResult) -> str:
     meta = result.meta if isinstance(result.meta, Mapping) else {}
     vetoes = int(meta.get("vetoes") or 0)
     duplicates = int(meta.get("duplicates") or 0)
+    noops = int(meta.get("noops") or 0)
+    watches = int(meta.get("watches") or 0)
     if decisions == 0:
         return "本轮模型未提出任何决策（可能全 HOLD）。"
     if legs == 0:
-        return (
-            f"模型给了 {decisions} 条决策但 0 条腿成形"
-            "（可能全被计划层闸门挡回，逐条原因见审计行的结果列）。"
-        )
+        # HOLD/WATCH 本来就不产腿：把它们算进「决策没成形」会把排查引向计划层
+        # 闸门，而真相是模型选择不操作（2026-10-19 09:35 glm 实录：2 条全 HOLD）。
+        if noops + watches >= decisions:
+            return (
+                f"模型 {decisions} 条决策均为 HOLD/WATCH（不操作/仅观察），"
+                "没有提出可执行的买卖腿。"
+            )
+        if vetoes:
+            return (
+                f"模型给了 {decisions} 条决策，其中 {vetoes} 条被计划层闸门否决，"
+                "0 条腿成形（逐条原因见审计行的结果列）。"
+            )
+        return f"模型给了 {decisions} 条决策但 0 条腿成形（逐条原因见审计行的结果列）。"
     if vetoes:
         return f"计划 {legs} 条腿、{vetoes} 条被否决（l2/vcash/行情等闸门），全部未新增提交。"
     if duplicates:

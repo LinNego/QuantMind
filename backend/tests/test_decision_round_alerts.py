@@ -217,7 +217,9 @@ def test_a_bearish_cleared_pool_is_by_design_and_not_pushed() -> None:
     几次之后整条告警链就被静音了。留痕由轮次 note 承担。"""
     assert (
         A.round_alert(
-            _result(decisions=0, legs=0, submitted=0, meta=_ok_meta(0, direction="看空"))
+            _result(
+                decisions=0, legs=0, submitted=0, meta=_ok_meta(0, direction="看空")
+            )
         )
         is None
     )
@@ -241,6 +243,20 @@ def test_zero_submit_on_a_rebalance_round_is_reported() -> None:
     assert alert.level == "warning"
     assert "零提交" in alert.title and "30" in alert.title
     assert "未提出任何决策" in alert.content  # 头号成因分流：全 HOLD
+
+
+def test_zero_submit_with_all_hold_or_watch_names_that_fact() -> None:
+    """2 条决策全是 HOLD/WATCH 时，不能说「有决策但没成形」——模型本来就没提腿。
+
+    2026-10-19 09:35 glm-5.3-flash 就是这一形态（2 条 HOLD），旧文案把人引向
+    「计划层闸门」，而真正的原因是模型选择不操作。
+    """
+    alert = A.round_alert(
+        _result(decisions=2, legs=0, submitted=0, meta=_ok_meta(20, noops=2))
+    )
+    assert alert is not None and alert.kind == A.ALERT_NO_LEGS
+    assert "HOLD" in alert.content and "WATCH" in alert.content
+    assert "0 条腿成形" not in alert.content
 
 
 def test_zero_submit_with_vetoes_names_the_vetoes() -> None:
@@ -1374,6 +1390,9 @@ async def test_the_worker_loop_asks_the_stall_question_every_cycle(monkeypatch) 
         return ()
 
     monkeypatch.setattr(RUNNER, "round_tick", empty_tick)
+    # 唤醒评估要读写 Redis/DB，首个循环可能耗到几十毫秒——本用例只钉「循环有没有
+    # 问停滞问题」，不该被前一步的 I/O 时序卡住（换事件循环池后首个连接更慢）。
+    monkeypatch.setattr(RUNNER, "wake_tick", empty_tick)
     seen_calls: list[int] = []
 
     async def spy_watch() -> None:
