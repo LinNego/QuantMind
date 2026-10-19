@@ -359,7 +359,7 @@ async def _run_once_inner(
     except Exception as exc:  # noqa: BLE001
         quotes_failure = f"行情客户端不可用：{type(exc).__name__}: {exc}"
         logger.warning("[DecisionRound] %s", quotes_failure)
-    regime, snapped, series, quotes_failure = load_round_snapshots(
+    regime, snapped, series, quotes_failure = await load_round_snapshots(
         deps, round_id, quote_client, positions_list, pool_rows, quotes_failure
     )
     holding_rows = positions_to_holding_rows(

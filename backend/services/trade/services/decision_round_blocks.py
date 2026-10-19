@@ -53,6 +53,7 @@ from backend.shared.decision_risk_blocks import (
     build_industry_caution_block,
     build_risk_block,
 )
+from backend.shared.env_flags import env_flag
 from backend.shared.freshness import FRESH, quote_policy
 from backend.shared.stock_utils import StockCodeUtil
 
@@ -75,7 +76,41 @@ def _snap_ts(snap: Mapping[str, Any] | None) -> float | None:
     return ts if ts > 0 else None
 
 
-def load_round_snapshots(
+async def _refresh_quotes_before_prompt(codes: Sequence[str], round_id: str) -> None:
+    """提示词前按需直取 TDX 快照（best-effort，**绝不抛出**）。
+
+    **为什么存在**（2026-10-19 用户口径「行情都喂给 agent」）：热集轮转
+    ~0.18s/只 × 500+ 只 ≈ 100s 才刷新同一只票一次，而轮首读快照是一瞬间——
+    池票在提示词里的期望年龄 ≈50s，模型看到的是「上一轮的市场」。这里对
+    持仓+池+指数现查现写 ``market:snapshot/series``，让**提示词与随后的风控
+    读同一份新鲜行情**（提交前的逐腿刷新仍保留，见 ``decision_executor``）。
+
+    边界：``QM_DECISION_ROUND_PROMPT_REFRESH=false`` 整体关闭（桥维护时不必
+    每轮多等 ≤8s）；桥未配置/限流/单只失败都静默放行——行情是增益面，
+    刷不到就按既有快照继续，绝不因刷新失败中止本轮。
+    """
+    if not env_flag("QM_DECISION_ROUND_PROMPT_REFRESH", default=True):
+        return
+    try:
+        from backend.services.live_trading.services.tdx_quote_feed import (
+            refresh_symbols_now,
+        )
+
+        result = await refresh_symbols_now(codes) or {}
+    except Exception as exc:  # noqa: BLE001 刷新失败按既有快照继续
+        logger.warning("[DecisionRound] %s 提示词前行情刷新异常: %s", round_id, exc)
+        return
+    if result:
+        ok = sum(1 for hit in result.values() if hit)
+        logger.info(
+            "[DecisionRound] %s 提示词前行情刷新 %d/%d 只成功",
+            round_id,
+            ok,
+            len(result),
+        )
+
+
+async def load_round_snapshots(
     deps: RoundDeps,
     round_id: str,
     quote_client: Any,
@@ -94,6 +129,10 @@ def load_round_snapshots(
     regime（db0 ``qm:regime:intraday``）是**增益块**：未接线/读失败 → ``None``
     （不拦轮、指数不进清单），降级渲染与留痕在
     :func:`enrich_quotes_with_blocks` 收口。
+
+    **读之前先刷**（2026-10-19）：要价清单装配好后先
+    :func:`_refresh_quotes_before_prompt` 现查现写（best-effort），再 ``read_snaps``
+    ——顺序反了等于没刷。
 
     **持仓行情序列**（``market:series`` 摘要，2026-10-15 审计修）在快照之外
     单独取一份给持仓行现价用：快照面当日每轮存活性抖动（flash 12:00 全空），
@@ -117,14 +156,20 @@ def load_round_snapshots(
         }
     )
     index = str((regime or {}).get("index") or "").strip()
+    pool_set = {
+        StockCodeUtil.to_suffix(str(r.code))
+        for r in pool_rows
+        if str(getattr(r, "code", "") or "").strip()
+    }
     codes = sorted(
         set(held)
-        | {str(r.code) for r in pool_rows}
+        | pool_set
         | ({StockCodeUtil.to_suffix(index)} if index else set())
         | set(INDEX_CODES)
     )
     snapped: Mapping[str, Mapping[str, Any]] = {}
     if quote_client is not None and codes:
+        await _refresh_quotes_before_prompt(codes, round_id)
         try:
             snapped = deps.read_snaps(quote_client, codes) or {}
         except Exception as exc:  # noqa: BLE001 读失败先记因，是否中止见 ⑦ 的行情闸门
@@ -290,13 +335,18 @@ async def enrich_quotes_with_blocks(
     orderbook_block = minute_block = l2_block = ""
     if enabled:
         series: Mapping[str, Any] = {}
-        if holdings:
+        # 序列一次读持仓+池（2026-10-19：池票的五分钟涨速与持仓同口径；
+        # 30 个键对一条管线是小数，见 feeds.series_summaries 的容量注释）。
+        series_codes = list(dict.fromkeys(held_codes + pool_codes))
+        if series_codes:
             try:
-                series = deps.read_series_summary(held_codes) or {}
+                series = deps.read_series_summary(series_codes) or {}
             except Exception as exc:  # noqa: BLE001 序列读不到按不可得降级
                 logger.warning("[DecisionRound] %s 行情序列读取异常: %s", round_id, exc)
                 series = {}
-        orderbook_block = build_orderbook_block(holdings, snapped, series, now)
+        orderbook_block = build_orderbook_block(
+            holdings, snapped, series, now, pool=scored_seq
+        )
         minute_block = build_minute_block(holdings, series, now)
         l2_block = build_l2_block()
         if holdings and not series:

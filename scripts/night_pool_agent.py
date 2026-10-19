@@ -24,6 +24,7 @@ cron：北京 02:30 周二~周六（JST 03:30）→ 等 quantdb 当日分区落�
 """
 import argparse
 import json
+import re
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -323,6 +324,123 @@ def filter_risk_candidates(cands: list, risk: dict) -> tuple:
     return kept, dropped
 
 
+#: 池代码三种可接受写法：``600000.SH`` / ``SH600000`` / 裸 6 位（市场由主表反查确定）
+_POOL_CODE_RE = re.compile(r"^(?:(SH|SZ|BJ)(\d{6})|(\d{6})\.(SH|SZ|BJ))$")
+
+
+def normalize_pool_code(raw: object) -> str:
+    """池代码 → ``600000.SH`` 后缀式（quantdb/行情层口径）；无法识别返回 ``""``。
+
+    **不猜市场**：裸 6 位码不在这里补后缀（同样开头既有 SH 也有 SZ 的历史遗留不存在，
+    但猜错市场等于造一个幽灵码），交给 :func:`validate_pool_rows` 用证券主表反查。
+    """
+    code = str(raw or "").strip().upper()
+    m = _POOL_CODE_RE.fullmatch(code)
+    if not m:
+        return ""
+    if m.group(3):  # 已经是 6 位 + 后缀
+        return code
+    return f"{m.group(2)}.{m.group(1)}"
+
+
+def _resolve_pool_code(
+    raw_code: str,
+    name: str,
+    known: dict,
+    by_six: dict,
+    by_name: dict,
+) -> tuple[str, str]:
+    """单行代码解析 → ``(正确代码, 失败原因)``（成功时代码非空、原因空）。"""
+    canon = normalize_pool_code(raw_code)
+    if canon and canon in known:
+        return canon, ""
+    if re.fullmatch(r"\d{6}", raw_code):
+        hits = by_six.get(raw_code) or []
+        if len(hits) == 1:
+            return hits[0], ""
+    hits = (by_name.get(name) or []) if name else []
+    if len(hits) == 1:
+        return hits[0], ""
+    if len(hits) > 1:
+        return "", f"名称「{name}」对应多个代码 {sorted(hits)}，无法确定"
+    if canon or re.fullmatch(r"\d{6}", raw_code):
+        return (
+            "",
+            f"代码 {canon or raw_code} 不在证券主表，名称「{name or '空'}」无法反查",
+        )
+    return "", f"代码「{raw_code or '空'}」格式非法，名称「{name or '空'}」无法反查"
+
+
+def validate_pool_rows(
+    rows: object, names: dict
+) -> tuple[list[dict], list[tuple[dict, str]], list[str]]:
+    """大脑池行 name↔code 交叉校验：拦截幽灵代码，回填可唯一确定的错码。
+
+    ``names`` = 证券主表 ``symbol → name``（``load_names_industry()``，候选初筛条目
+    另行并入——两者都是系统数据，互为兜底）。
+
+    规则（**代码是权威键**，名称只在代码不可信时用来救回）：
+    1. code 命中主表 → 保留，名称以主表为准（模型写错名称不毁代码）；
+    2. code 不可识别/不在主表 → 用 name 反查：唯一命中则回填正确代码
+       （2026-10-19 事故：模型把亿田智能写成 ``600930.SZ``，理由里甚至写了
+       「300911.SZ更正」，但 code 字段没回填）；无命中/多命中则**丢弃该行**；
+    3. 回填后重复代码去重（保留首次出现——池行本身按得分排序）。
+
+    返回 ``(保留行, [(被拦行, 原因)], [校正说明])``。纯函数：不做 IO、不改入参。
+
+    **空主表时必须由调用方跳过校验**（本函数拿到空表会把整池拦光）：主表不可用
+    时幽灵码风险仍在，但「没有池」比「池里有一只查不到行情的票」坏得多。
+    """
+    known: dict[str, str] = {}
+    by_six: dict[str, list[str]] = {}
+    by_name: dict[str, list[str]] = {}
+    for sym, nm in (names or {}).items():
+        code = normalize_pool_code(sym) or str(sym or "").strip().upper()
+        if not code:
+            continue
+        known[code] = str(nm or "").strip()
+        by_six.setdefault(code.split(".")[0], []).append(code)
+        label = str(nm or "").strip()
+        if label:
+            by_name.setdefault(label, []).append(code)
+
+    kept: list[dict] = []
+    blocked: list[tuple[dict, str]] = []
+    notes: list[str] = []
+    seen: set[str] = set()
+    for row in rows or ():
+        if not isinstance(row, dict):
+            blocked.append(({}, f"非对象行：{row!r}"))
+            continue
+        raw_code = str(row.get("code") or "").strip()
+        raw_name = str(row.get("name") or "").strip()
+        code, why = _resolve_pool_code(raw_code, raw_name, known, by_six, by_name)
+        if not code:
+            blocked.append((dict(row), why))
+            continue
+        if code in seen:
+            blocked.append((dict(row), f"重复代码 {code}（保留首次出现）"))
+            continue
+        canon_name = known.get(code) or raw_name
+        if normalize_pool_code(raw_code) != code and raw_code.upper() != code:
+            notes.append(f"{raw_code or '空'}→{code}（{canon_name}）")
+        elif raw_name and canon_name and raw_name != canon_name:
+            notes.append(
+                f"名称「{raw_name}」→「{canon_name}」（代码 {code}，以主表为准）"
+            )
+        seen.add(code)
+        kept.append({**row, "code": code, "name": canon_name})
+    return kept, blocked, notes
+
+
+def _safe_score(value: object) -> float:
+    """大脑分的容错转换：非数字按 0 记（一行脏分数不该丢整池）。"""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _load_env() -> dict:
     """环境变量优先，repo .env 补缺（``live_model_analysis._load_env`` 同口径）。"""
     import os
@@ -478,8 +596,9 @@ def run(session: str, target: str, dry: bool = False) -> int:
 本池将用于 {_dash8(target)} 开盘后的实盘决策（行情数据止于 {_dash8(d0)} 收盘）。
 
 要求（时间盒约 {time_box} 秒，单次调用完成，无逐只取数环节）：
-1. 初筛数据已系统算好（涨跌/成交额/复合分/名称），直接使用；
-   只有当名称缺失或分数明显异常（如 ST/涨跌停残留）时，在 reason 里标注存疑。
+1. 初筛数据已系统算好（涨跌/成交额/复合分/名称），直接使用；池行的 code 必须
+   逐字照抄候选初筛（含 .SH/.SZ 后缀），name 必须与 code 对应，不得凭记忆改写或
+   自行补全代码；只有当名称缺失或分数明显异常（如 ST/涨跌停残留）时，在 reason 里标注存疑。
 2. 新闻输入只来自『新闻 agent 管线』（门卫→宏观/板块/持仓→主编），引用其结论时注明；
    不要臆测管线之外的新闻。
 3. 推进股票池**不看任何 HOLD/BUY 侧标签**（历史占位标签，无信息量）：
@@ -534,13 +653,40 @@ def run(session: str, target: str, dry: bool = False) -> int:
     # 空壳会把在产池整个遮蔽成「当天无池」（2026-09-15 事故）——没有池 ≠ 没有股票。
     produced = False
     try:
+        # 代码校验（2026-10-19）：模型会在结构化输出里写错 code（当日 600930.SZ/
+        # 亿田智能，正确是 300911.SZ），旧实现逐字落盘 → 下游按码查行情恒空，
+        # 该票整日无人监控。真值表 = 证券主表 + 候选初筛（都是系统数据）。
+        # 主表与候选同时为空时**放行**并告警：宁可有未校验的码，不可整池丢失。
+        try:
+            known_names = load_names_industry()
+        except Exception as exc:  # noqa: BLE001 主表读失败不阻塞写池
+            known_names = {}
+            print(f"⚠️ 证券主表读取失败，代码校验降级: {exc}")
+        for c in cands:
+            _code = normalize_pool_code(c.get("code")) or str(c.get("code") or "")
+            if _code and c.get("name"):
+                known_names.setdefault(_code, str(c.get("name")))
+        raw_rows = [r for r in (payload.get("pool") or []) if isinstance(r, dict)]
+        if known_names:
+            rows, blocked_rows, notes = validate_pool_rows(raw_rows, known_names)
+            for bad, why in blocked_rows:
+                print(f"  ⛔ 拦截池行 {bad.get('code')} {bad.get('name') or ''}：{why}")
+            for note in notes:
+                print(f"  🔧 池行校正：{note}")
+        else:
+            rows, blocked_rows, notes = raw_rows, [], []
+            print("⚠️ 证券主表与候选均为空，池代码未经校验直接落盘")
+        _events = {
+            (normalize_pool_code(c.get("code")) or str(c.get("code") or "")): (
+                c.get("事件") or ""
+            )
+            for c in cands
+        }
         pool = []
-        for p in (payload.get("pool") or [])[:20]:
-            _ev = next((c.get("事件") or "" for c in cands
-                        if str(c.get("code")) == str(p.get("code"))), "")
+        for p in rows[:20]:
             pool.append({"code": p.get("code"), "name": p.get("name"),
-                         "side": "HOLD", "score": float(p.get("score") or 0),
-                         "events": _ev,
+                         "side": "HOLD", "score": _safe_score(p.get("score")),
+                         "events": _events.get(str(p.get("code")), ""),
                          "reason": str(p.get("reason") or "")[:160]})
         if pool:
             out = {"date": target, "session": session,

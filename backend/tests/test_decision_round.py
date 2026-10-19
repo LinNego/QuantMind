@@ -2302,7 +2302,7 @@ async def test_round_renders_batch2_blocks_when_wired():
 
     # 丁1 盘口（五档缺失 → 不渲染失衡段；5 分钟涨速来自 series）
     assert "【实时盘口】" in prompt
-    assert "- 招商银行(600036.SH) 现价 40.00（+1.27%）" in prompt
+    assert "- [持仓] 招商银行(600036.SH) 现价 40.00（+1.27%）" in prompt
     assert " ｜ 5分钟涨速 +0.40%" in prompt
     # 丁3 分钟特征（12300 股 = 123 手）
     assert "【分钟特征】" in prompt

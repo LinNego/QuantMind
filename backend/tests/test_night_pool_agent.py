@@ -132,6 +132,12 @@ def sandbox(npa, monkeypatch, tmp_path):
         ),
     )
     monkeypatch.setattr(npa, "_news_block", lambda d0: "")
+    # 证券主表桩：与候选同口径（真实环境里候选代码本身就来自这张表）
+    monkeypatch.setattr(
+        npa,
+        "load_names_industry",
+        lambda: {"600338.SH": "西藏珠峰", "688183.SH": "生益电子"},
+    )
     _install_stub_modules(monkeypatch)
     return root
 
@@ -314,7 +320,8 @@ def test_valid_pool_writes_agent_picks_with_usage_row(npa, sandbox, monkeypatch)
     doc = json.loads(_picks_file(sandbox).read_text(encoding="utf-8"))
     assert doc["date"] == TARGET  # 池按**目标交易日**命名（09:35 消费的就是当日池）
     assert doc["session"] == SESSION
-    assert [p["code"] for p in doc["picks"]] == ["600338.SH", "688183"]
+    # 裸 6 位码按主表规范化成后缀式（2026-10-19 代码校验：下游行情键是后缀式）
+    assert [p["code"] for p in doc["picks"]] == ["600338.SH", "688183.SH"]
     assert doc["picks"][0]["side"] == "HOLD"  # 占位侧，无信息量（读侧不展示）
     assert doc["picks"][0]["reason"] == "板块主线"
     rows = _dialogue_rows(sandbox)
@@ -334,3 +341,137 @@ def test_filter_risk_candidates_matches_suffix_codes_by_6_digits(npa):
     kept, dropped = npa.filter_risk_candidates(cands, {"600338": {"reason": "解禁"}})
     assert [c["code"] for c in kept] == ["688183"]
     assert dropped[0][0]["code"] == "600338.SH"
+
+
+# ── 5. 池行代码校验（2026-10-19：模型写错 code，旧实现逐字落盘） ────────
+
+_NAMES = {
+    "300911.SZ": "亿田智能",
+    "600930.SH": "华电新能",
+    "600338.SH": "西藏珠峰",
+    "688183.SH": "生益电子",
+    "600000.SH": "浦发银行",
+}
+
+
+def test_validate_pool_rows_corrects_ghost_code_by_unique_name(npa):
+    """当日事故原样复现：code=600930.SZ、name=亿田智能、理由里写着 300911.SZ 更正。
+
+    代码不在主表（600930.SZ 不存在）→ 用名称反查唯一命中 → 回填 300911.SZ。
+    """
+    rows = [{"code": "600930.SZ", "name": "亿田智能", "score": 26.9, "reason": "—"}]
+    kept, blocked, notes = npa.validate_pool_rows(rows, _NAMES)
+
+    assert blocked == []
+    assert [r["code"] for r in kept] == ["300911.SZ"]
+    assert kept[0]["name"] == "亿田智能"
+    assert notes and "600930.SZ→300911.SZ" in notes[0]
+    assert rows[0]["code"] == "600930.SZ"  # 纯函数：不改入参
+
+
+def test_validate_pool_rows_blocks_unknown_code_and_name(npa):
+    rows = [{"code": "999999.SZ", "name": "查无此股", "score": 10}]
+    kept, blocked, _ = npa.validate_pool_rows(rows, _NAMES)
+
+    assert kept == []
+    assert blocked and "不在证券主表" in blocked[0][1]
+
+
+def test_validate_pool_rows_blocks_ambiguous_name(npa):
+    """同名多码（主板/中小板历史并存）无法判定 → 拦下而不是赌一个。"""
+    names = {**_NAMES, "000001.SZ": "同名股", "600001.SH": "同名股"}
+    rows = [{"code": "888888.SZ", "name": "同名股", "score": 10}]
+    kept, blocked, _ = npa.validate_pool_rows(rows, names)
+
+    assert kept == []
+    assert blocked and "对应多个代码" in blocked[0][1]
+
+
+def test_validate_pool_rows_code_wins_over_wrong_name(npa):
+    """代码命中主表时以代码为准、名称按主表回填（名称错不毁代码）。"""
+    rows = [{"code": "600000.SH", "name": "亿田智能", "score": 10}]
+    kept, blocked, notes = npa.validate_pool_rows(rows, _NAMES)
+
+    assert blocked == []
+    assert (kept[0]["code"], kept[0]["name"]) == ("600000.SH", "浦发银行")
+    assert notes and "浦发银行" in notes[0]
+
+
+def test_validate_pool_rows_normalizes_bare_and_prefixed_codes(npa):
+    rows = [
+        {"code": "688183", "name": "生益电子", "score": 10},
+        {"code": "SH600338", "name": "西藏珠峰", "score": 9},
+    ]
+    kept, blocked, _ = npa.validate_pool_rows(rows, _NAMES)
+
+    assert blocked == []
+    assert [r["code"] for r in kept] == ["688183.SH", "600338.SH"]
+
+
+def test_validate_pool_rows_dedupes_after_correction(npa):
+    """同一只票被模型写了两遍（一遍错码）→ 校正后去重，保留首次出现。"""
+    rows = [
+        {"code": "300911.SZ", "name": "亿田智能", "score": 30},
+        {"code": "600930.SZ", "name": "亿田智能", "score": 26},
+    ]
+    kept, blocked, _ = npa.validate_pool_rows(rows, _NAMES)
+
+    assert [r["code"] for r in kept] == ["300911.SZ"]
+    assert blocked and "重复代码" in blocked[0][1]
+
+
+def test_run_corrects_and_blocks_before_writing_picks(npa, sandbox, monkeypatch):
+    """写盘前校验：错码行被更正，幽灵行被拦，其余池行照常落盘。"""
+    payload = {
+        "date": "2026-10-13",
+        "market_view": "震荡",
+        "pool": [
+            {"code": "600338.SH", "name": "西藏珠峰", "score": 88, "reason": "主线"},
+            {
+                "code": "600930.SZ",
+                "name": "亿田智能",
+                "score": 26,
+                "reason": "小盘动量",
+            },
+            {"code": "999999.SZ", "name": "查无此股", "score": 5, "reason": "幽灵"},
+        ],
+    }
+    monkeypatch.setattr(
+        npa, "call_brain", lambda task, *a, **k: (json.dumps(payload), None)
+    )
+    monkeypatch.setattr(
+        npa,
+        "load_names_industry",
+        lambda: {
+            "300911.SZ": "亿田智能",
+            "600930.SH": "华电新能",
+            "600338.SH": "西藏珠峰",
+            "688183.SH": "生益电子",
+        },
+    )
+    assert npa.run(SESSION, TARGET) == 0
+
+    doc = json.loads(_picks_file(sandbox).read_text(encoding="utf-8"))
+    assert [p["code"] for p in doc["picks"]] == ["600338.SH", "300911.SZ"]
+    assert "999999" not in _picks_file(sandbox).read_text(encoding="utf-8")
+
+
+def test_run_fails_open_when_security_master_is_empty(npa, sandbox, monkeypatch):
+    """主表与候选都为空 → 不校验、照写（宁可有未校验码，不可整池丢失）。"""
+    monkeypatch.setattr(npa, "load_names_industry", lambda: {})
+    # 候选行也提供不了真值（脏行）——否则候选代码本身就会把真值表撑起来
+    monkeypatch.setattr(
+        npa, "build_candidates", lambda session: ([{"code": "", "name": ""}], session)
+    )
+    payload = {
+        "date": "2026-10-13",
+        "market_view": "震荡",
+        "pool": [{"code": "600000.SH", "name": "浦发银行", "score": 10, "reason": "—"}],
+    }
+    monkeypatch.setattr(
+        npa, "call_brain", lambda task, *a, **k: (json.dumps(payload), None)
+    )
+
+    assert npa.run(SESSION, TARGET) == 0
+    doc = json.loads(_picks_file(sandbox).read_text(encoding="utf-8"))
+    assert [p["code"] for p in doc["picks"]] == ["600000.SH"]

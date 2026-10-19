@@ -409,17 +409,59 @@ class TestBuildOrderbookBlock:
 
         assert text.startswith("【实时盘口】")
         assert "量比：5 日均量源未接入，不渲染" in text
-        assert "招商银行(600036.SH) 现价 40.00（+1.27%）" in text
-        assert "买一 39.99×300手 卖一 40.01×100手" in text
+        assert "[持仓] 招商银行(600036.SH) 现价 40.00（+1.27%）" in text
+        assert "买 39.99×300" in text and "卖 40.01×100" in text
         assert "五档失衡 +50.0%" in text and "买盘强" in text
         assert "跳空 +0.76%（开 39.80）" in text
         assert "5分钟涨速 -0.42%" in text
+
+    def test_renders_full_five_level_ladder(self):
+        """两档以上必须全部喂给模型（2026-10-19 用户口径：L2 盘口都喂）。"""
+        snap = _book_snap(
+            extra_bids=((39.98, 200.0), (39.97, 100.0), (39.96, 50.0)),
+            extra_asks=((40.02, 80.0), (40.03, 60.0)),
+        )
+        text = build_orderbook_block((_holding(),), {"600036.SH": snap}, {}, NOW)
+
+        assert "买 39.99×300 39.98×200 39.97×100 39.96×50" in text
+        assert "卖 40.01×100 40.02×80 40.03×60" in text
+
+    def test_pool_rows_get_the_same_depth(self):
+        """候选池与持仓同口径：带 [池] 标记、五档/失衡/跳空/成交额都渲染。"""
+        snap = _book_snap(
+            extra_bids=((39.98, 200.0),),
+            extra_asks=((40.02, 80.0),),
+        )
+        snap["Amount"] = 35200.0  # 万元 → 3.52 亿
+        text = build_orderbook_block((), {"600036.SH": snap}, {}, NOW, pool=(_quote(),))
+
+        assert "[池] 测试票(600036.SH)" in text
+        assert "买 39.99×300 39.98×200" in text
+        assert "卖 40.01×100 40.02×80" in text
+        # (500−180)/(500+180) = +47.1%
+        assert "五档失衡 +47.1%" in text
+        assert "成交额 3.52 亿" in text
+
+    def test_pool_and_holding_overlap_is_rendered_once(self):
+        """同一只票同时是持仓和池票 → 只出行一次（持仓口径优先）。"""
+        text = build_orderbook_block(
+            (_holding(),), {"600036.SH": _book_snap()}, {}, NOW, pool=(_quote(),)
+        )
+
+        assert text.count("(600036.SH)") == 1
+        assert "测试票" not in text
 
     def test_missing_speed_renders_dash_not_zero(self):
         text = build_orderbook_block(
             (_holding(),), {"600036.SH": _book_snap()}, {}, NOW
         )
         assert "5分钟涨速 —" in text
+
+    def test_unverifiable_book_renders_dash_not_silence(self):
+        # 五档全是 0（指数垃圾/单边帧）→ 失衡行显式「—」，不编数也不消失
+        snap = _book_snap(bid1=0.0, ask1=0.0, bid_vol1=0.0, ask_vol1=0.0)
+        text = build_orderbook_block((_holding(),), {"600036.SH": snap}, {}, NOW)
+        assert "五档失衡 —" in text
 
     def test_all_snapshots_missing_says_unavailable(self):
         text = build_orderbook_block((_holding(),), {}, {}, NOW)
@@ -431,10 +473,10 @@ class TestBuildOrderbookBlock:
         text = build_orderbook_block(
             (_holding(), _holding("600519.SH", "贵州茅台")), snaps, {}, NOW
         )
-        assert "另有 1 只持仓本轮快照未取到" in text
+        assert "另有 1 只标的（持仓/池）本轮快照未取到" in text
 
-    def test_no_holdings_and_unwired_are_empty(self):
-        # 无持仓 → 空串；整段不进提示词（未接线/无对象一律字节中性）
+    def test_no_holdings_and_no_pool_is_empty(self):
+        # 无对象 → 空串；整段不进提示词（未接线/无对象一律字节中性）
         assert build_orderbook_block((), {"600036.SH": _book_snap()}, {}, NOW) == ""
 
 
@@ -550,13 +592,14 @@ class TestBuildNewsBlock:
 class TestBuildIndicesBlock:
     def test_renders_four_indices_and_sector_gated_line(self):
         snaps = {
-            "000300.SH": {"Now": 4590.12, "PreClose": 4615.5},
+            # Amount 口径 = 万元（TDX 快照契约），渲染折亿元
+            "000300.SH": {"Now": 4590.12, "PreClose": 4615.5, "Amount": 34445960.0},
             "000001.SH": {"Now": 3300.0, "PreClose": 3289.0},
         }
         text = build_indices_block(snaps, NOW)
 
-        assert "沪深300：4,590.12（-0.55%）" in text
-        assert "上证指数：3,300.00（+0.33%）" in text
+        assert "沪深300：4,590.12（-0.55%）｜成交额 3,444.60 亿" in text
+        assert "上证指数：3,300.00（+0.33%）｜成交额 —" in text
         assert "深证成指：本轮未取到" in text
         assert "创业板指：本轮未取到" in text
         assert "板块涨幅源未接入" in text

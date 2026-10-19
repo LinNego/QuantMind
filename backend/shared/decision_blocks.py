@@ -318,6 +318,9 @@ NEWS_BLOCK_STALE_H = 8.0
 #: 个股档位×100 以内都远小于此——用它把「指数五档」等坏值挡在渲染外。
 _BOOK_PRICE_CAP = 1e7
 
+#: 快照 ``timestamp`` 契约是秒；>1e12 一律按毫秒折算（与 decision_round_blocks 同口径）。
+_MS_TS_CUTOFF = 1e12
+
 
 def book_imbalance(snap: Mapping[str, Any] | None, *, levels: int = 5) -> float | None:
     """快照 → 五档失衡 ``(Σ买量−Σ卖量)/(Σ买量+Σ卖量)``；不可验证一律 ``None``。
@@ -374,6 +377,44 @@ def _snap_now(snap: Mapping[str, Any] | None) -> float | None:
     return _f(snap.get("Now") if snap.get("Now") is not None else snap.get("now"))
 
 
+def _book_ladder(snap: Mapping[str, Any], side: str, levels: int = 5) -> str:
+    """买/卖 1→5 档 ``价×量`` 串（量=手）；坏价/0 价逐档跳过，整侧无有效档 → ``—``。"""
+    parts: list[str] = []
+    for i in range(1, levels + 1):
+        px = _f(snap.get(f"{side}{i}"))
+        if px is None or not 0 < px < _BOOK_PRICE_CAP:
+            continue
+        vol = _f(snap.get(f"{side}_vol{i}"))
+        if vol is not None and vol >= 0:
+            parts.append(f"{px:.2f}×{vol:,.0f}")
+        else:
+            parts.append(f"{px:.2f}")
+    return " ".join(parts) or "—"
+
+
+def _amount_text(snap: Mapping[str, Any]) -> str:
+    """快照成交额（TDX 契约单位=万元）→ 亿元文本；缺失/坏值 → ``—``。"""
+    amt = _f(snap.get("Amount"))
+    if amt is None or amt <= 0:
+        return "—"
+    return f"{amt / 1e4:,.2f} 亿"
+
+
+def _snap_age_s(snap: Mapping[str, Any] | None, now: datetime) -> float | None:
+    """快照 ``timestamp`` → 距 ``now`` 的秒数（毫秒戳自动折算）；坏值 → ``None``。"""
+    if not isinstance(snap, Mapping):
+        return None
+    try:
+        ts = float(snap.get("timestamp"))
+    except (TypeError, ValueError):
+        return None
+    if ts > _MS_TS_CUTOFF:
+        ts /= 1000.0
+    if ts <= 0:
+        return None
+    return max(0.0, now.timestamp() - ts)
+
+
 @dataclass(frozen=True, slots=True)
 class SeriesSummary:
     """``market:series`` 每码摘要（feeds 层产出、本层消费）。
@@ -396,68 +437,73 @@ def build_orderbook_block(
     snaps: Mapping[str, Mapping[str, Any]] | None,
     series: Mapping[str, SeriesSummary] | None,
     now: datetime,
+    pool: Sequence[Any] = (),
 ) -> str:
-    """丁1【实时盘口】：持仓逐股五档失衡/跳空/5 分钟涨速（量比无源不渲染）。
+    """丁1【实时盘口】：持仓 + 候选池逐股五档买卖盘/失衡/跳空/短涨速。
 
-    指数/坏值（五档垃圾）→ 该股不进行中= ``—``；快照整段缺失 → 「本轮不可得」。
-    无持仓 → 空串（块无对象）。空串即整段不出现在提示词（字节冻结纪律）。
+    ``pool``（2026-10-19 用户口径「L2 盘口都喂」）：候选池票与持仓同口径渲染
+    （买/卖各 1–5 档 价×量），行首 ``[持仓]``/``[池]`` 区分；同一代码两处都有
+    时只出一行（持仓优先）。指数帧的五档实测是垃圾大数，``book_imbalance``
+    与 ``_book_ladder`` 都逐档拒掉，坏帧绝不会被当成盘口。
+
+    快照/字段缺失一律显式 ``—``；整段无快照 → 「本轮不可得」；无对象 → 空串
+    （空串即整段不出现在提示词，字节冻结纪律）。
     """
-    if not holdings:
+    if not holdings and not pool:
         return ""
     snaps = snaps or {}
     series = series or {}
+    held = {str(h.code) for h in holdings}
+    entries: list[tuple[str, Any]] = [("持仓", h) for h in holdings]
+    entries.extend(("池", q) for q in pool if str(q.code) not in held)
     lines: list[str] = []
     missing = 0
-    for h in holdings:
-        snap = snaps.get(str(h.code))
+    for role, item in entries:
+        code = str(item.code)
+        snap = snaps.get(code)
         if not snap:
             missing += 1
             continue
         now_px = _snap_now(snap)
         chg = day_change_pct(snap)
-        head = f"- {h.name}({h.code})"
+        head = f"- [{role}] {item.name}({code})"
         if now_px is not None and now_px > 0:
             head += f" 现价 {now_px:.2f}（{_pct2(chg)}）"
+        head += f" ｜ 买 {_book_ladder(snap, 'bid')} ｜ 卖 {_book_ladder(snap, 'ask')}"
         imb = book_imbalance(snap)
-        if imb is not None:
-            b1 = _f(snap.get("bid1"))
-            a1 = _f(snap.get("ask1"))
-            bv1 = _f(snap.get("bid_vol1"))
-            av1 = _f(snap.get("ask_vol1"))
-            book = " ｜ 买一 " + (f"{b1:.2f}" if b1 is not None else "—")
-            if bv1 is not None:
-                book += f"×{bv1:,.0f}手"
-            book += " 卖一 " + (f"{a1:.2f}" if a1 is not None else "—")
-            if av1 is not None:
-                book += f"×{av1:,.0f}手"
+        if imb is None:
+            head += " ｜ 五档失衡 —（盘口不可验证）"
+        else:
             strength = ""
             if abs(imb) >= OB_IMB_STRONG:
                 strength = "，买盘强" if imb > 0 else "，卖盘强"
-            head += (
-                book + f" ｜ 五档失衡 {imb:+.1%}（强阈 ±{OB_IMB_STRONG:.0%}{strength}）"
-            )
+            head += f" ｜ 五档失衡 {imb:+.1%}（强阈 ±{OB_IMB_STRONG:.0%}{strength}）"
         # 跳空：开盘 vs 昨收；两个价都在才算。
         open_px = _f(snap.get("Open"))
         pre_close = _f(snap.get("PreClose"))
         if open_px and pre_close and pre_close > 0 and open_px > 0:
             gap = (open_px - pre_close) / pre_close * 100.0
             head += f" ｜ 跳空 {gap:+.2f}%（开 {open_px:.2f}）"
-        summary = series.get(str(h.code))
+        head += f" ｜ 成交额 {_amount_text(snap)}"
+        summary = series.get(code)
         head += f" ｜ 5分钟涨速 {_pct2(summary.mom5m_pct if summary else None)}"
+        age = _snap_age_s(snap, now)
+        if age is not None:
+            head += f" ｜ 快照 {age:.0f}s"
         lines.append(head)
     if not lines:
         if missing:
             return (
-                "【实时盘口】本轮不可得（持仓快照缺失——行情源或热集未覆盖持仓标的）。"
+                "【实时盘口】本轮不可得（持仓/池快照缺失——行情源或热集未覆盖这些标的）。"
                 "五档/跳空/短涨速均无数据，不要凭记忆里的价格判断盘口。"
             )
         return ""
     header = (
-        "【实时盘口】（持仓逐股五档；单位手。量比：5 日均量源未接入，不渲染。"
-        "指数五档在行情帧里是坏值，天然不出现）"
+        "【实时盘口】（持仓+候选池逐股五档；买/卖各列 1–5 档，格式 价×量、量单位手。"
+        "量比：5 日均量源未接入，不渲染。指数五档在行情帧里是坏值，天然不出现）"
     )
     if missing:
-        lines.append(f"- （另有 {missing} 只持仓本轮快照未取到）")
+        lines.append(f"- （另有 {missing} 只标的（持仓/池）本轮快照未取到）")
     return "\n".join([header] + lines)
 
 
@@ -582,15 +628,20 @@ def build_indices_block(
     snaps: Mapping[str, Mapping[str, Any]] | None,
     now: datetime,
 ) -> str:
-    """丁5【大盘指数】：四只指数现价+涨跌；板块行门控（无源，如实标注）。"""
+    """丁5【大盘指数】：四只指数现价+涨跌+成交额；板块行门控（无源，如实标注）。"""
     snaps = snaps or {}
-    lines = ["【大盘指数】（实时快照；板块涨幅源未接入——行业面见「行业风险」段）"]
+    lines = [
+        "【大盘指数】（实时快照；成交额=指数当日累计成交额，"
+        "板块涨幅源未接入——行业面见「行业风险」段）"
+    ]
     for code, name in INDEX_DISPLAY:
         snap = snaps.get(code)
         price = _snap_now(snap)
         if price is not None and price > 0:
             chg = day_change_pct(snap)
-            lines.append(f"- {name}：{price:,.2f}（{_pct2(chg)}）")
+            lines.append(
+                f"- {name}：{price:,.2f}（{_pct2(chg)}）｜成交额 {_amount_text(snap)}"
+            )
         else:
             lines.append(f"- {name}：本轮未取到")
     return "\n".join(lines)
