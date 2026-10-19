@@ -106,17 +106,39 @@ def load_st_symbols(asof_dt: str = ST_ASOF_DT) -> pd.Series:
     return pd.Series(True, index=pd.Index(sorted(st.unique())), dtype=bool)
 
 
-def _read_stored_predictions(run_dir: Path, start: str) -> pd.DataFrame:
+def load_stored_predictions(
+    run_dir: Path, start: str, end: str | None = None
+) -> pd.DataFrame:
+    """读取训练产物 ``pred.parquet`` 的闭区间切片。
+
+    ``end`` 为空时读到文件末尾；多模型统一评估必须传 ``end``，否则不同训练
+    任务的外推长度差异会污染配对比较。
+    """
     path = run_dir / "pred.parquet"
-    frame = pq.read_table(
-        path,
-        columns=["symbol", "trade_date", "pred", "label_return"],
-        filters=[("trade_date", ">=", pd.Timestamp(start))],
-    ).to_pandas()
+    available = set(pq.read_schema(path).names)
+    has_label_return = "label_return" in available
+    columns = ["symbol", "trade_date", "pred"]
+    if has_label_return:
+        columns.append("label_return")
+    filters: list[tuple[str, str, pd.Timestamp]] = [
+        ("trade_date", ">=", pd.Timestamp(start))
+    ]
+    if end is not None:
+        filters.append(("trade_date", "<=", pd.Timestamp(end)))
+    frame = pq.read_table(path, columns=columns, filters=filters).to_pandas()
     frame["symbol"] = normalize_symbol(frame["symbol"])
     frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+    if not has_label_return:
+        # 部分深度模型产物只落 rank 目标 ``label``，没有真实收益列。这里补
+        # 一列 NaN 并打标记，绝不把 rank 值冒充成收益率。
+        frame["label_return"] = np.nan
     frame["source"] = "stored"
+    frame.attrs["label_return_available"] = has_label_return
     return frame
+
+
+def _read_stored_predictions(run_dir: Path, start: str) -> pd.DataFrame:
+    return load_stored_predictions(run_dir, start)
 
 
 def read_first_seen(run_dir: Path) -> pd.Series:
@@ -264,6 +286,7 @@ __all__ = [
     "load_prediction_panel",
     "load_price_matrices",
     "load_st_symbols",
+    "load_stored_predictions",
     "normalize_symbol",
     "read_first_seen",
 ]
