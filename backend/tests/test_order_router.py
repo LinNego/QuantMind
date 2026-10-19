@@ -241,3 +241,168 @@ def test_five_paths_route_through_router():
 def test_router_outcome_shape():
     r = RouterOutcome(success=True, order_id="o", duplicate=False, mirror={"status": "queued"})
     assert r.success and r.mirror["status"] == "queued"
+
+
+# --- 实盘直连（真实轮无模拟腿） ----------------------------------------------
+
+
+class _MirrorRecorder:
+    captured: dict = {}
+    response: dict = {}
+
+    @classmethod
+    async def __call__(cls, **kwargs):
+        _MirrorRecorder.captured = kwargs
+        return _MirrorRecorder.response
+
+
+@pytest.fixture
+def mirror_recorder(monkeypatch):
+    from backend.services.live_trading.services import real_mirror_service
+
+    recorder = _MirrorRecorder()
+    _MirrorRecorder.captured = {}
+    _MirrorRecorder.response = {"status": "submitted", "order_id": "real-1"}
+    monkeypatch.setattr(real_mirror_service, "mirror_virtual_fill", recorder)
+    return recorder
+
+
+@pytest.mark.asyncio
+async def test_direct_real_never_touches_simulation_leg(
+    monkeypatch, risk_gate_passes, mirror_recorder
+):
+    """真实轮**不得**建模拟单：模拟台账只是镜子，镜子缺仓会假拒，挡住真单。
+
+    2026-10-15 SH600338 即此形态——模拟腿成交、真单被 ``price_drift`` 跳过，
+    两边账面越跑越歪。
+    """
+    from backend.services.simulation.services import order_submission_service
+
+    class _Boom:
+        def __init__(self, *a, **kw):
+            raise AssertionError("direct_real 不许构造模拟提交服务")
+
+    monkeypatch.setattr(
+        order_submission_service, "SimulationOrderSubmissionService", _Boom
+    )
+
+    out = await submit_order(
+        db=object(),
+        redis=object(),
+        req=OrderRequest(
+            tenant_id="default",
+            user_id=7,
+            symbol="600338.SH",
+            side="sell",
+            quantity=800,
+            price=11.21,
+            real_limit_price=11.20,
+            client_order_id="mir-lld-1",
+            direct_real=True,
+        ),
+    )
+
+    assert out.success is True and out.order_id == "real-1"
+    assert out.duplicate is False
+    captured = _MirrorRecorder.captured
+    assert captured["sim_order_id"] == ""
+    assert captured["quantity"] == 800 and captured["price"] == 11.20
+    assert captured["client_order_id"] == "mir-lld-1"
+
+
+@pytest.mark.asyncio
+async def test_direct_real_sell_bypasses_price_gate(mirror_recorder, risk_gate_passes):
+    """卖出是出逃意图：偏离闸门按盘口价豁免（仍有 20% 脏数据上界在 mirror 内）。"""
+    await submit_order(
+        db=object(),
+        redis=object(),
+        req=OrderRequest(
+            tenant_id="default",
+            user_id=7,
+            symbol="600338.SH",
+            side="sell",
+            quantity=100,
+            price=9.0,
+            direct_real=True,
+        ),
+    )
+    assert _MirrorRecorder.captured["bypass_price_gate"] is True
+
+
+@pytest.mark.asyncio
+async def test_direct_real_buy_does_not_bypass_price_gate(
+    mirror_recorder, risk_gate_passes
+):
+    """追价不是出逃：买入腿照走偏离闸门。"""
+    await submit_order(
+        db=object(),
+        redis=object(),
+        req=OrderRequest(
+            tenant_id="default",
+            user_id=7,
+            symbol="600036.SH",
+            side="buy",
+            quantity=100,
+            price=35.8,
+            direct_real=True,
+        ),
+    )
+    assert _MirrorRecorder.captured["bypass_price_gate"] is False
+
+
+@pytest.mark.asyncio
+async def test_direct_real_without_price_does_not_guess(
+    mirror_recorder, risk_gate_passes
+):
+    """没价不下单（不猜价）；mirror 不得被调用。"""
+    out = await submit_order(
+        db=object(),
+        redis=object(),
+        req=OrderRequest(
+            tenant_id="default",
+            user_id=7,
+            symbol="600036.SH",
+            side="buy",
+            quantity=100,
+            price=None,
+            direct_real=True,
+        ),
+    )
+    assert out.success is False and "价格" in out.message
+    assert _MirrorRecorder.captured == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,accepted",
+    [
+        ("submitted", True),
+        ("queued", True),
+        ("duplicate", True),
+        ("skipped", False),
+        ("failed", False),
+        ("error", False),
+    ],
+)
+async def test_direct_real_status_mapping(
+    status, accepted, mirror_recorder, risk_gate_passes
+):
+    """受理（submitted/queued/duplicate）≠ 成交，但都不是失败；其余一律如实失败。"""
+    _MirrorRecorder.response = {"status": status, "reason": "price_drift"}
+    out = await submit_order(
+        db=object(),
+        redis=object(),
+        req=OrderRequest(
+            tenant_id="default",
+            user_id=7,
+            symbol="600036.SH",
+            side="buy",
+            quantity=100,
+            price=35.8,
+            direct_real=True,
+        ),
+    )
+    assert out.success is accepted
+    assert out.duplicate is (status == "duplicate")
+    if not accepted:
+        assert "price_drift" in out.message

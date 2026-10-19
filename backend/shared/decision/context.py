@@ -272,6 +272,11 @@ def ledger_cost_rows(
     **只改展示**：返回新对象，绝不改入参。桥口径的 ``pnl_pct`` 在别处还被
     波动触发基线、强制减仓与执行路径消费，交易判定一律不动。
 
+    数量同口径：账本记了 ``volume`` 时，展示的 ``volume`` 取账本量、``avail``
+    取 ``min(桥可卖, 账本量)``——共享账户里桥的合计是**多家模型的总和**，照抄
+    会让模型按别人的股数报卖（601985 实测 500/800/800）。账本没记量（legacy/
+    金样）→ 保持桥值。
+
     ``positions`` = ``{code: {"volume", "cost_price", "buy_ts", ...}}``（账本里该
     agent 的持仓段）。类型坏值（不是 Mapping、``cost_price`` 不是数）一律走回退
     分支，不许炸穿提示词——提示词构建失败等于该轮 0 决策。
@@ -293,17 +298,30 @@ def ledger_cost_rows(
         if held_days is None and now is not None:
             buy_ts = pos.get("buy_ts") if isinstance(pos, Mapping) else None
             held_days = holding_age_days(buy_ts, now)
+        # 数量/可卖量按**本 agent 的账本持有量**展示（桥的 volume/avail 是整座
+        # 共享账户的合计）。同一只票可以被多家模型同时持有，照抄桥口径会让模型
+        # 以为 601985 的 2100 股全是自己的，进而按 100% 报出三倍超卖。账本没有
+        # 这一行（legacy/金样路径）→ 保持桥值，逐字节不变。
+        volume, avail = r.volume, r.avail
+        if isinstance(pos, Mapping):
+            try:
+                own = float(pos.get("volume") or 0)
+            except (TypeError, ValueError):
+                own = 0.0
+            if math.isfinite(own) and own > 0:
+                volume = int(own)
+                avail = int(max(0.0, min(float(r.avail), own)))
         if math.isfinite(lc) and lc > 0:
             out.append(
                 HoldingRow(
                     code=r.code,
                     name=r.name,
-                    volume=r.volume,
+                    volume=volume,
                     cost=round(lc, 2),
                     price=r.price,
                     pnl_pct=round((r.price - lc) / lc * 100, 2),
                     day_chg=r.day_chg,
-                    avail=r.avail,
+                    avail=avail,
                     cost_src=COST_SRC_LEDGER,
                     price_src=r.price_src,
                     held_days=held_days,
@@ -314,12 +332,12 @@ def ledger_cost_rows(
                 HoldingRow(
                     code=r.code,
                     name=r.name,
-                    volume=r.volume,
+                    volume=volume,
                     cost=r.cost,
                     price=r.price,
                     pnl_pct=r.pnl_pct,
                     day_chg=r.day_chg,
-                    avail=r.avail,
+                    avail=avail,
                     cost_src=COST_SRC_BRIDGE,
                     price_src=r.price_src,
                     held_days=held_days,

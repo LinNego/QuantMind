@@ -1763,3 +1763,113 @@ async def test_no_legs_never_triggers_refresh(quote_refresh_spy) -> None:
     )
     assert outcome.receipts == ()
     assert quote_refresh_spy == []
+
+
+# ---------------------------------------------------------------------------
+# 5. 真实轮 = 实盘直连（无模拟腿、不注资模拟执行户）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_submitter_direct_real_marks_the_order_request(
+    monkeypatch,
+) -> None:
+    """真实轮的默认提交器把 ``direct_real`` 落到每条腿（买入腿也算）。
+
+    这一位决定 Router 走哪条链：True = 不建模拟单、直接真单；漏传就退回老路径，
+    模拟腿的假拒单会重新挡住真单（2026-10-15 SH600338 形态）。
+    """
+    from backend.services.simulation.services import order_router as router
+
+    captured: list[object] = []
+
+    async def _fake_submit_order(db, redis, req):  # noqa: ANN001
+        captured.append(req)
+        return _FakeOutcome(order_id="ord-1")
+
+    monkeypatch.setattr(router, "submit_order", _fake_submit_order)
+    submit = dx._make_default_submitter(
+        db=object(),
+        redis=object(),
+        tenant_id="default",
+        user_id=str(_ACCOUNT),
+        source="llm_decision",
+        agent="deepseek-v4-flash",
+        direct_real=True,
+    )
+    leg = Leg(
+        index=0,
+        symbol="600338.SH",
+        side="sell",
+        quantity=800.0,
+        limit_price=11.2,
+        reason="止盈",
+    )
+    await submit(leg, "lld-rnd1-600338.SH-sell", True)
+    assert captured[0].direct_real is True
+    # 模拟档腿（real=False）不许带 direct_real——那会绕过模拟台账直发真单。
+    await submit(leg, "lld-rnd1-600338.SH-sell", False)
+    assert captured[1].direct_real is False
+
+
+@pytest.mark.asyncio
+async def test_real_round_default_submitter_does_not_fund_the_sim_account(
+    monkeypatch,
+) -> None:
+    """实盘直连不注资：要注的是真账户现金，模拟执行户的余额与本轮无关。
+
+    注资是给**模拟腿**垫现金墙的（2026-10-09）；真实轮没有模拟腿，再注资只会
+    在模拟账上凭空多出一笔现金，污染台账。
+    """
+    funded: list[tuple] = []
+
+    async def _funder(market, floor, round_id, agent):  # noqa: ANN001
+        funded.append((market, floor, round_id, agent))
+        return {"success": True, "funded": floor}
+
+    submitter = _FakeSubmitter()
+    monkeypatch.setattr(dx, "_make_default_submitter", lambda **kw: submitter)
+    outcome = await dx.execute_batch(
+        _batch(_buy("600036.SH", 0.5)),
+        round_id="rnd-20261019",
+        holdings={},
+        quotes={"600036.SH": Quote(symbol="600036.SH", price=35.8)},
+        gate=_buy_gate("600036.SH"),
+        quota=10000.0,
+        real=True,
+        funder=_funder,
+        tenant_id="default",
+        user_id=_ACCOUNT,
+    )
+    assert funded == []
+    assert outcome.summary()["submitted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_real_round_with_a_custom_submitter_still_funds() -> None:
+    """反向钉子：自定义提交器（测试/特殊调用点）保持旧语义，真轮照常注资。
+
+    ``direct_real`` 只对**默认提交器**成立；不能因为引入直连就把所有真实轮
+    的注资一刀切掉——那条线服务的是仍走模拟腿的调用点。
+    """
+    funded: list[tuple] = []
+
+    async def _funder(market, floor, round_id, agent):  # noqa: ANN001
+        funded.append((market, floor, round_id, agent))
+        return {"success": True, "funded": floor}
+
+    submitter = _FakeSubmitter()
+    await dx.execute_batch(
+        _batch(_buy("600036.SH", 0.5)),
+        round_id="rnd-20261019",
+        holdings={},
+        quotes={"600036.SH": Quote(symbol="600036.SH", price=35.8)},
+        gate=_buy_gate("600036.SH"),
+        quota=10000.0,
+        real=True,
+        submitter=submitter,
+        funder=_funder,
+        tenant_id="default",
+        user_id=_ACCOUNT,
+    )
+    assert len(funded) == 1 and funded[0][2] == "rnd-20261019"

@@ -613,13 +613,21 @@ Submitter = Callable[[Leg, str | None, bool], Any]
 
 
 def _make_default_submitter(
-    *, db, redis, tenant_id: str, user_id: object, source: str, agent: str = ""
+    *,
+    db,
+    redis,
+    tenant_id: str,
+    user_id: object,
+    source: str,
+    agent: str = "",
+    direct_real: bool = False,
 ) -> Submitter:
     """默认提交器：``OrderRouter.submit_order``（唯一入口，链内含风控/幂等/落账）。
 
-    ``real`` 决定是否镜像真单：**模拟腿的成交价仍取服务端快照价**（``order_type``
-    用 market），``price``/``real_limit_price`` 只约束镜像出去的那一笔——与
-    ``push_orders`` 的候选推送完全同形，别在这里另创一套。
+    ``real`` 决定是否镜像真单。``direct_real=True``（真实轮）时**不建模拟腿**：
+    桥账户/模型账本是真相，模拟账缺仓或 T+1 锁定会把一张合法的卖出腿拦在真单之前
+    （2026-10-19 卖出链诊断）。委托价 ``leg.limit_price`` 直接作为真单限价，卖出
+    腿在镜像侧豁免昨收偏离闸门（见 ``OrderRouter._submit_direct_real``）。
 
     ``agent`` 由构造时闭合（同 ``tenant_id``：它属于「这一轮是谁在跑」，不是每笔
     腿各自决定的事），随 ``OrderRequest`` 落台账并跟着镜像进真单——成交回报只能
@@ -653,6 +661,7 @@ def _make_default_submitter(
                 mirror_source=source if real else "",
                 real_limit_price=leg.limit_price if real else None,
                 agent=agent,
+                direct_real=bool(real and direct_real),
             ),
         )
 
@@ -873,7 +882,8 @@ async def execute_batch(
     ``funder`` 只在 real 轮且本轮有买单腿时被调用（每市场一次，金额 =
     :func:`buy_funding_floor`），**发生在任何提交之前**：卖单腿的成交回款可能先
     到账，但地板按保守口径不含它。注资失败 fail-open（记 ERROR 后照常提交）；
-    ``None`` = 本调用不注资——``run_round`` 会构造默认件。
+    ``None`` = 本调用不注资——``run_round`` 会构造默认件。真实轮的默认提交器走
+    **实盘直连**（无模拟腿），此时不注资：要注的是真账户现金，由券商闸门自己判。
 
     ``agent`` 进幂等键（见 :func:`~backend.shared.order_contract.
     build_llm_decision_client_order_id`）：**一轮里有多个 agent 必须传**，否则两家
@@ -897,7 +907,11 @@ async def execute_batch(
 
         real = is_real_trading_enabled()
 
-    if real and funder is not None and plan.buys:
+    # 真实轮默认提交器走**实盘直连**（无模拟腿）：模拟执行户的注资也就没有意义。
+    # 自定义提交器（测试/特殊调用点）保持旧语义，仍按其 ``real`` 口径注资。
+    direct_real = bool(real) and submitter is None
+
+    if real and funder is not None and plan.buys and not direct_real:
         # 注资在任何提交之前（且不跨持撮合锁——``ensure_cash_floor`` 内部自持自放）。
         await _fund_round_buys(
             funder=funder,
@@ -935,6 +949,7 @@ async def execute_batch(
             # 归属与幂等键同源（同一个 ``agent`` 既进 cid 也落订单列）：成交回报回来时
             # 只认订单，届时靠 ``orders.agent`` 才知道这笔该记进哪本分账（P2.7）。
             agent=agent,
+            direct_real=direct_real,
         )
 
     receipts: list[LegReceipt] = []

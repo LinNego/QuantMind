@@ -329,7 +329,6 @@ async def _run_once_inner(
             + "；".join(ledger.errors or ("未报告原因",))
             + "（本轮不问模型）",
         )
-    mine = ledger.mine()
     virtual_cash = float(ledger.virtual_cash)
     #: 必须可见的说明（没判/口径回退…）：先于裁剪持仓建表（不能等到 ⑥）——它是「模型为什么对这几只票视而不见」的唯一答案。
     notes: list[str] = []
@@ -369,7 +368,7 @@ async def _run_once_inner(
     # ④b 分账裁剪（P2.7）：只看本 agent 名下的持仓（归属/可卖两条口径见
     # `clip_holdings_to_ledger`：账本管归属、桥管 T+1 可卖，绝不互相回退）。
     all_rows = holding_rows
-    holding_rows, hidden = clip_holdings_to_ledger(all_rows, mine)
+    holding_rows, hidden = clip_holdings_to_ledger(all_rows, ledger.positions)
     if hidden:
         # 一定要说出来：迁移未完成（历史仓位尚未导入分账账本）时，这一行的存在就是
         # 「模型为什么对这几只票视而不见」的答案。

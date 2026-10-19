@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -640,22 +640,39 @@ def account_meta(account: Any) -> dict[str, Any]:
 
 
 def clip_holdings_to_ledger(
-    rows: Sequence[Any], mine: Iterable[str]
+    rows: Sequence[Any], positions: Mapping[str, Any]
 ) -> tuple[tuple[Any, ...], int]:
-    """按本 agent 分账账本的归属集合裁剪持仓：``(可见行, 被隐藏只数)``。
+    """按本 agent 分账账本裁剪持仓：``(可见行, 被隐藏只数)``。
 
     **只把本 agent 名下的持仓交给模型与执行段**。桥账户是共用的，传入 ``rows``
-    通常是整座账户的持仓；``mine`` 是这本分账账本里属于本 agent 的代码（与
-    ``HoldingRow.code`` 同形态）。模型看不见的仓位它就卖不掉——这是**可见性**
-    防线，不是权限判断。2026-09-08：空账本的 agent 拿到全账户持仓，把另一家模型
-    的票卖了。故这里**没有**「``mine`` 为空就回退全量」的分支。
+    通常是整座账户的持仓；``positions`` 是这本分账账本里属于本 agent 的
+    ``{后缀码: {volume, ...}}``（与 ``HoldingRow.code`` 同形态）。模型看不见的
+    仓位它就卖不掉——这是**可见性**防线，不是权限判断。2026-09-08：空账本的
+    agent 拿到全账户持仓，把另一家模型的票卖了。故这里**没有**「账本为空就回退
+    全量」的分支。
 
-    数量口径不变（可卖量仍取桥的 ``avail``）：账本是「归属」的事实源，桥是
-    「今天能不能卖」的事实源——T+1 锁定只有桥知道。
+    可卖量取 **账本持有量与桥可卖量的较小值**：
+
+    * 账本管**归属**——同一只票可以被多家模型同时持有（601985 实测 500/800/800），
+      桥的 ``avail`` 是**合计**。原样交给执行段，每一家都会看到 2100 股可卖，
+      三家各报 2100 就是三倍超卖（2026-10-19 直连实盘后风险放大）；
+    * 桥管**今天能不能卖**——T+1 锁定只有桥知道，所以上限仍是桥的 ``avail``。
+
+    两者都取不到 → 0（不可卖），绝不回退出「全可卖」。
     """
-    owned = set(mine)
-    visible = tuple(row for row in rows if getattr(row, "code", "") in owned)
-    return visible, len(rows) - len(visible)
+    ledger_positions = positions if isinstance(positions, Mapping) else {}
+    visible: list[Any] = []
+    for row in rows:
+        code = str(getattr(row, "code", "") or "")
+        pos = ledger_positions.get(code)
+        if not isinstance(pos, Mapping):
+            continue
+        owned = as_float(pos.get("volume"))
+        if owned is None or owned <= 0:
+            continue
+        bridge_avail = as_float(getattr(row, "avail", None)) or 0.0
+        visible.append(replace(row, avail=int(max(0.0, min(bridge_avail, owned)))))
+    return tuple(visible), len(rows) - len(visible)
 
 
 def snap_price(snap: Mapping[str, Any] | None) -> float | None:

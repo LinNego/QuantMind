@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -52,6 +53,10 @@ class OrderRequest:
     #: P2.7 分账：这条腿属于哪家模型（LLM 决策腿由执行段传入）。落 ``sim_orders.agent``
     #: 并随镜像 payload 传给真单——成交回报只能从订单上读归属，别处都读不到。
     agent: str = ""
+    #: **实盘直连**（真实轮专用）：不建模拟单、不落模拟账，直接走真单链。
+    #: 2026-10-19 用户口径「所有操作也是下单到实盘、没有模拟盘」——真实轮的持仓与
+    #: 可卖量已在执行段按**真实账户**校验过，模拟腿只会制造账面分叉与假拒单。
+    direct_real: bool = False
 
     def resolved_strict(self) -> bool:
         if self.strict_market is not None:
@@ -103,6 +108,11 @@ async def submit_order(db, redis, req: OrderRequest) -> RouterOutcome:
             success=False,
             message=f"风控拒单[{risk.rule_id or 'risk'}]：{risk.reason}"[:300],
         )
+
+    if req.direct_real:
+        # 真实轮：**没有模拟腿**（用户 2026-10-19 口径）。风控照过，真单链直连；
+        # 归属随 ``agent`` 落 ``orders.agent``，成交回报照旧记进分账账本。
+        return await _submit_direct_real(redis, req)
 
     manager = SimulationAccountManager(redis)
     # bar **不再切换执行链**，只经即时链传给取价（`bar → submit_and_fill → execute_order
@@ -196,6 +206,92 @@ async def _submit_immediate(db, manager, req: OrderRequest) -> RouterOutcome:
         price_source=outcome.price_source,
         message=str(outcome.message or ""),
         duplicate=is_duplicate_message(outcome.message),
+    )
+
+
+async def _submit_direct_real(redis, req: OrderRequest) -> RouterOutcome:
+    """实盘直连：``mirror_virtual_fill`` 的真单链，**不经模拟台账**。
+
+    为什么另开这一支（2026-10-19 卖出链诊断）：
+
+    1. **历史/外部仓位不在共享模拟账上**。模型账本（``qm_agent_ledger_position``）
+       与桥账户是真相，共享模拟账只是镜子；镜子缺这只票时，模拟腿会以
+       ``Insufficient holdings`` 拒掉，镜像永远轮不到（10/13 SZ002074、10/15
+       SH601857 即此）。
+    2. **T+1 可卖量只有桥知道**。执行段已按真实账户的 ``available_volume`` 判过
+       ``l1.t1_sellable``；模拟账的 T+1 状态是第二份口径，不该再拦一次。
+    3. **卖出的价格偏离闸门以昨收为锚**。下跌日出逃单必然偏离 >2% 被
+       ``price_drift`` 跳过，而模拟腿已经成交——真账没动、模拟账少了仓，越跑越歪
+       （10/15 SH600338 三次都是这个形态）。卖出腿在这里走
+       ``bypass_price_gate=True``：以**盘口价**为限价基准，另设 20% 脏数据上界。
+
+    价格口径：优先 ``real_limit_price``（决策段按盘口算的限价），缺则用 ``price``。
+    两者都不可用 → **不下**（不猜价）。买入腿不豁免偏离闸门：追价不是出逃。
+    """
+    from backend.services.live_trading.services.real_mirror_service import (
+        mirror_virtual_fill,
+    )
+    from backend.services.simulation.services.market_rules import infer_market
+
+    side = str(req.side or "").strip().lower()
+    raw_price = req.real_limit_price if req.real_limit_price is not None else req.price
+    try:
+        price = float(raw_price) if raw_price is not None else 0.0
+    except (TypeError, ValueError):
+        price = 0.0
+    if not math.isfinite(price) or price <= 0:
+        return RouterOutcome(
+            success=False,
+            message="实盘直连缺少可用价格（不猜价，本腿不下）",
+            client_order_id=req.client_order_id,
+        )
+
+    try:
+        mirror = await mirror_virtual_fill(
+            db=None,
+            redis=redis,
+            tenant_id=req.tenant_id,
+            user_id=str(req.user_id),
+            symbol=req.symbol,
+            side=side,
+            quantity=float(req.quantity or 0.0),
+            price=price,
+            client_order_id=str(req.client_order_id or ""),
+            sim_order_id="",
+            run_id=req.run_id,
+            strategy_id=str(req.strategy_id or ""),
+            market=infer_market(req.symbol).value,
+            source=req.mirror_source or req.source,
+            # 卖出 = 出逃意图：偏离闸门按盘口价豁免（仍有 20% 脏数据上界）。
+            bypass_price_gate=side == "sell",
+            trigger="LLM 决策腿直接下单到实盘（不经模拟台账）",
+            limit_price=req.real_limit_price,
+            agent=req.agent,
+        )
+    except Exception as exc:  # noqa: BLE001 - mirror 自身吞异常，这里是兜底
+        logger.error("[OrderRouter] 实盘直连异常 %s %s: %s", req.symbol, side, exc)
+        return RouterOutcome(
+            success=False,
+            message=f"实盘直连异常：{type(exc).__name__}: {exc}"[:300],
+            client_order_id=req.client_order_id,
+        )
+
+    status = str(mirror.get("status") or "")
+    # 「已提交/排队/重复」都是**受理**（真单已出门或不会重复出门），不是已成交；
+    # 成交与否由 ``orders``/成交流水回答。跳过/失败/异常一律如实算失败。
+    accepted = status in {"submitted", "queued", "duplicate"}
+    message = ""
+    if not accepted:
+        reason = str(mirror.get("reason") or status or "unknown")
+        prefix = "实盘闸门未放行" if status == "skipped" else "实盘真单未成功"
+        message = f"{prefix}：{reason}"[:300]
+    return RouterOutcome(
+        success=accepted,
+        order_id=str(mirror.get("order_id") or "") or None,
+        client_order_id=req.client_order_id,
+        message=message,
+        duplicate=status == "duplicate",
+        mirror=mirror,
     )
 
 

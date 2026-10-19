@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from backend.shared.decision.context import DirectionBlock, PoolRow
+from backend.shared.decision.context import DirectionBlock, HoldingRow, PoolRow
 from backend.shared.decision.contract import (
     BUY,
     HOLD,
@@ -73,6 +73,7 @@ from backend.services.trade.services.decision_round_core import (
     RoundSlot,
     as_float,
     build_pool_stamps,
+    clip_holdings_to_ledger,
     due_slots,
     gate_row_to_pool_row,
     merge_outcomes,
@@ -4458,3 +4459,70 @@ async def test_llm_decide_runs_off_the_event_loop_thread():
     assert threads[0] != threading.get_ident(), (
         "decide 跑在事件循环主线程——to_thread 下放缺失，阻塞即冻结 trade"
     )
+
+
+# ---------------------------------------------------------------------------
+# 分账裁剪：账本管归属、桥管可卖量
+# ---------------------------------------------------------------------------
+
+
+def _holding_row(code: str, volume: int, avail: int) -> HoldingRow:
+    return HoldingRow(
+        code=code,
+        name="测试",
+        volume=volume,
+        cost=10.0,
+        price=10.0,
+        pnl_pct=0.0,
+        day_chg=0.0,
+        avail=avail,
+    )
+
+
+def test_clip_holds_only_codes_the_agent_owns() -> None:
+    """桥账户有、账本没有的票**不可见**：模型的提示词与执行段都不该看到别人的仓。"""
+    rows = (
+        _holding_row("601985.SH", 2100, 2100),
+        _holding_row("600036.SH", 1200, 1200),
+    )
+    visible, hidden = clip_holdings_to_ledger(
+        rows, {"601985.SH": {"volume": 800, "cost_price": 9.0}}
+    )
+    assert hidden == 1
+    assert [r.code for r in visible] == ["601985.SH"]
+
+
+def test_clip_caps_avail_to_the_agents_own_shares() -> None:
+    """同一只票三家共持（500/800/800，桥 avail=2100）：每家只见自己的可卖量。
+
+    不设上限，三家各按 2100 报卖 → 合计三倍超卖，桥侧后两家只能拒单。
+    """
+    rows = (_holding_row("601985.SH", 2100, 2100),)
+    for own in (500, 800, 800):
+        (row,), hidden = clip_holdings_to_ledger(
+            rows, {"601985.SH": {"volume": own, "cost_price": 9.0}}
+        )
+        assert hidden == 0
+        assert row.avail == own
+
+
+def test_clip_keeps_bridge_t1_lock() -> None:
+    """桥的 avail 更小 = 今日 T+1 锁定，账本持有量再大也只能按桥可卖量出。"""
+    rows = (_holding_row("600036.SH", 5000, 300),)
+    (row,), _ = clip_holdings_to_ledger(rows, {"600036.SH": {"volume": 5000}})
+    assert row.volume == 5000 and row.avail == 300
+
+
+def test_clip_hides_zero_or_broken_ledger_rows() -> None:
+    """账本量为 0/脏值不能当成「持有」：否则会生成一张无中生有的卖单。"""
+    rows = (_holding_row("600036.SH", 1200, 1200), _holding_row("601857.SH", 700, 700))
+    visible, hidden = clip_holdings_to_ledger(
+        rows, {"600036.SH": {"volume": 0}, "601857.SH": "oops"}
+    )
+    assert visible == () and hidden == 2
+
+
+def test_clip_empty_ledger_hides_everything() -> None:
+    """账本为空 ≠ 看到全账户：宁可不给模型看，也不能把别人的仓算成本 agent 的。"""
+    rows = (_holding_row("600036.SH", 1200, 1200),)
+    assert clip_holdings_to_ledger(rows, {}) == ((), 1)

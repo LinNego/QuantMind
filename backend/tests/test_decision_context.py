@@ -313,6 +313,35 @@ def test_ledger_cost_rows_does_not_mutate_input() -> None:
     assert rows[0].pnl_pct == _row().pnl_pct
 
 
+def test_ledger_volume_caps_displayed_position() -> None:
+    """数量/可卖量按**本 agent 账本持有量**展示，不照抄共享桥账户的合计。
+
+    同一只票可被多家模型同时持有（601985 实测 500/800/800，桥 avail=2100）。
+    照抄桥值，模型会以为自己手里有 2100 股并按 100% 报卖 → 三家合计三倍超卖。
+    """
+    bridge = replace(_row(code="601985.SH"), volume=2100, avail=2100)
+    (out,) = ledger_cost_rows(
+        [bridge], {"601985.SH": {"cost_price": 9.0, "volume": 800}}
+    )
+    assert out.volume == 800
+    assert out.avail == 800
+
+
+def test_ledger_volume_never_exceeds_bridge_availability() -> None:
+    """T+1 锁定只有桥知道：账本 1200 股、桥今天只可卖 300 → 展示 300。"""
+    (out,) = ledger_cost_rows(
+        [replace(_row(), avail=300)],
+        {"600036.SH": {"cost_price": 31.05, "volume": 1200}},
+    )
+    assert out.volume == 1200 and out.avail == 300
+
+
+def test_ledger_without_volume_keeps_bridge_quantities() -> None:
+    """账本只记成本（旧数据/测试桩）→ 数量口径保持桥值，避免凭空归零。"""
+    (out,) = ledger_cost_rows([_row()], {"600036.SH": {"cost_price": 31.05}})
+    assert out.volume == 1200 and out.avail == 1200
+
+
 def test_broken_positions_payload_does_not_crash() -> None:
     """账本结构坏了（不是 Mapping / 值是字符串）→ 回退，提示词不许炸。"""
     for payload in (None, [], "oops", {"600036.SH": "not-a-dict"}):
