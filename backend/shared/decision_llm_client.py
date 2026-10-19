@@ -98,6 +98,25 @@ def looks_like_placeholder(value: str) -> bool:
     return (not low) or any(m in low for m in _PLACEHOLDER_MARKERS)
 
 
+def effective_env() -> dict[str, str]:
+    """决策 LLM 配置的**唯一读法**：``runtime.env`` 覆盖进程环境（文件优先）。
+
+    管理台保存的名册/调参由 trade 进程写进 ``runtime.env`` 与它自己的环境；子进程
+    重启时只继承 supervisor 启动那一刻的旧快照，纯读 ``os.environ`` 会把刚保存的
+    值静默回退（2026-10-19 实测：max_tokens 16384 在 trade 重启后变回缺省 4000，
+    下一轮又顶格截断、解析失败）。文件优先与 ``get_jwt_secret`` 同取向；空值不覆盖
+    进程环境（compose 显式注入的值仍然优先于文件里的空行）。
+    """
+    src = dict(os.environ)
+    try:
+        from backend.shared.runtime_secrets import read_runtime_env
+
+        src.update({k: v for k, v in read_runtime_env().items() if v.strip()})
+    except Exception:  # noqa: BLE001 - 运维面读失败按进程环境跑，不拖垮决策
+        pass
+    return src
+
+
 @dataclass(frozen=True)
 class DecisionLLMConfig:
     """一次决策调用的供应商配置。``base_url`` **含** ``/v1``（我们只接 ``/chat/completions``）。"""
@@ -136,7 +155,7 @@ def resolve_config(env: Mapping[str, str] | None = None) -> DecisionLLMConfig:
     ``env`` 可注入（测试用），默认 ``os.environ``。**错误文案只点名变量名，不带值**——
     异常会被写进日志与审计表，key 不能跟着进去。
     """
-    src = os.environ if env is None else env
+    src = effective_env() if env is None else env
     missing = [
         name
         for name in (_ENV_BASE, _ENV_KEY, _ENV_MODEL)
@@ -264,7 +283,7 @@ def resolve_roster(
     东西三样——第几项、哪家模型、哪个变量名；**绝不打印变量值**（异常会进日志、
     状态键与审计表）。
     """
-    src = os.environ if env is None else env
+    src = effective_env() if env is None else env
     raw = str(src.get(ENV_ROSTER, "")).strip()
     if not raw:
         return (resolve_config(src),)

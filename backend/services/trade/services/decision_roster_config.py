@@ -7,8 +7,8 @@
 
 **为什么这个端点必须挂在 trade 服务**
 --------------------------------------
-``resolve_roster`` 读的是 ``os.environ``（不是 ``get_secret``），而 ``set_secret``
-写文件的同时也写**本进程**的 ``os.environ``。所以：
+``resolve_roster`` 读的是配置环境（``effective_env``：``runtime.env`` 优先），而
+``set_secret`` 写文件的同时也写**本进程**的 ``os.environ``。所以：
 
 * 由 **trade 进程自己**写 → 下一轮 tick 调 ``default_roster()`` 时就读到新名册，
   **不用重启**（决策轮每 ``POLL_S`` 醒一次，名册是每轮取一次）；
@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -41,6 +40,7 @@ from backend.shared.decision_llm_client import (
     AGENT_LIMIT,
     ENV_ROSTER,
     LLMNotConfigured,
+    effective_env,
     looks_like_placeholder,
     resolve_roster,
 )
@@ -70,7 +70,12 @@ _TUNING_KEYS = ("timeout", "max_tokens", "temperature")
 
 
 def _src(env: Mapping[str, str] | None) -> Mapping[str, str]:
-    return os.environ if env is None else env
+    """配置来源：注入优先；生产走 :func:`effective_env`（runtime.env 文件优先）。
+
+    与决策轮实际解析**同一读法**：否则重启后界面显示 4000、实际跑 16384（或反之），
+    配置页就不再有真相。
+    """
+    return effective_env() if env is None else env
 
 
 def key_var_name(agent: str) -> str:
@@ -431,7 +436,7 @@ def apply_roster(
 
     # 回读复验：真解析器读**落盘后**的环境。失败就回滚并如实报（不留下一个「显示已保存、
     # 实际一轮都跑不动」的名册）。
-    verify_src = os.environ if env is None else env
+    verify_src = _src(env)
     try:
         resolved = resolve_roster(verify_src)
     except Exception as exc:  # noqa: BLE001

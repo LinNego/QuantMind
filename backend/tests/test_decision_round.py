@@ -1624,6 +1624,102 @@ async def test_intraday_with_watch_arms_rules_and_counts_them():
 
 
 @pytest.mark.asyncio
+async def test_watch_rule_entry_price_comes_from_agent_ledger_not_bridge():
+    """规则写入时带上分账成本价（2026-10-19 601000.SH：账本有成本，规则却是 None）。
+
+    判据取**账本与桥不同值**的持仓：桥是共享账户的混合成本（38.0），账本才是本
+    agent 的真实建仓价（36.5）。填进规则的是后者——执行器拿到成本就不必每轮向
+    柜台要，柜台读不到的瞬时窗口不会再让整条规则被跳过。
+    """
+    h = make_harness(
+        decision_text=WATCH_TEXT,
+        ledger=AgentLedgerRead(
+            ok=True,
+            known=True,
+            positions={
+                "600036.SH": {
+                    "volume": 1000.0,
+                    "cost_price": 36.5,
+                    "buy_ts": "2026-09-20T01:30:00Z",
+                    "last_ts": "2026-09-20T01:30:00Z",
+                }
+            },
+        ),
+    )
+    result = await run_once(SLOT_1000, deps=h.deps, now=TEN_05)
+
+    assert result.status == R.STATUS_OK and result.watch_armed == 1
+    rule = h.log["watch"][0]["plan"].rules[0].rule
+    assert rule["entry_price"] == 36.5
+    notes = h.log["ledger"][0][0].context_meta["notes"]
+    assert any("回填分账成本价 1 条" in n for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_watch_rule_without_ledger_cost_leaves_entry_price_empty():
+    """账本没有可用成本（0/缺失）时不瞎填：留 None，由执行器走柜台兜底。"""
+    h = make_harness(
+        decision_text=WATCH_TEXT,
+        ledger=AgentLedgerRead(
+            ok=True,
+            known=True,
+            positions={
+                "600036.SH": {
+                    "volume": 1000.0,
+                    "cost_price": 0.0,
+                    "buy_ts": "2026-09-20T01:30:00Z",
+                    "last_ts": "2026-09-20T01:30:00Z",
+                }
+            },
+        ),
+    )
+    result = await run_once(SLOT_1000, deps=h.deps, now=TEN_05)
+
+    assert result.status == R.STATUS_OK and result.watch_armed == 1
+    rule = h.log["watch"][0]["plan"].rules[0].rule
+    assert rule["entry_price"] is None
+    notes = h.log["ledger"][0][0].context_meta["notes"]
+    assert not any("回填分账成本价" in n for n in notes)
+
+
+@pytest.mark.unit
+def test_entry_price_backfill_keeps_explicit_value_and_rounds(monkeypatch):
+    """回填只补空缺：规则已带成本价时不动它；补进去的值归一到三位小数。"""
+    from backend.shared.decision import watch_map
+
+    def fake_plan(decisions, *, agent=""):  # noqa: ARG001
+        return watch_map.WatchPlan(
+            rules=(
+                watch_map.WatchRule(
+                    symbol="600036.SH", rule={"entry_price": 40.0}, agent=agent
+                ),
+                watch_map.WatchRule(
+                    symbol="601000.SH", rule={"entry_price": None}, agent=agent
+                ),
+            ),
+            agent=agent,
+        )
+
+    monkeypatch.setattr(watch_map, "plan_watch", fake_plan)
+    h = make_harness()
+    notes: list[str] = []
+
+    IO.maybe_write_watch(
+        deps=h.deps,
+        slot=SLOT_1000,
+        decisions=[],
+        agent="fake-model",
+        notes=notes,
+        entry_prices={"600036.SH": 36.5, "601000.SH": 4.5412},
+    )
+
+    rules = h.log["watch"][0]["plan"].rules
+    assert rules[0].rule["entry_price"] == 40.0  # 显式值不覆盖
+    assert rules[1].rule["entry_price"] == 4.541  # 缺失值回填 + 三位小数
+    assert any("回填分账成本价 1 条" in n for n in notes)
+
+
+@pytest.mark.asyncio
 async def test_intraday_without_any_watch_keeps_the_existing_rules():
     """空集不写：一次「模型只吐 hold」不该把该 agent 的全部守护规则摘掉。"""
     h = make_harness()
@@ -4104,13 +4200,14 @@ def test_write_status_never_raises_on_a_broken_client():
     IO.write_status(_Broken(), result, at=NOW)  # 不抛就是通过
 
 
-def test_default_roster_stays_empty_until_the_roster_env_is_set(monkeypatch):
+def test_default_roster_stays_empty_until_the_roster_env_is_set(monkeypatch, tmp_path):
     """未开名册 ⇒ ``()``（**单家路径**）：不能把全局那一家也包进名册。
 
     包进来的后果不是「多跑一家」，而是**键形变了**：认领/done 键从
     ``…:{schema}`` 变成 ``…:{schema}:{模型名}``，升级当天已跑过的槽在 done 键上
     查无此人 ⇒ 补跑槽把出过决策的槽再跑一遍真钱（见 ``slot_keys``）。
     """
+    monkeypatch.setenv("QM_RUNTIME_ENV_FILE", str(tmp_path / "missing.env"))
     for name in ("QM_DECISION_LLM_ROSTER", "QM_DECISION_LLM_MODEL"):
         monkeypatch.delenv(name, raising=False)
     assert IO.default_roster() == ()
@@ -4129,6 +4226,35 @@ def test_default_roster_stays_empty_until_the_roster_env_is_set(monkeypatch):
         "deepseek-v4-pro",
         "deepseek-v4-flash",
     ]
+
+
+def test_default_roster_prefers_runtime_env_over_the_stale_process_env(
+    monkeypatch, tmp_path
+):
+    """重启后的进程环境是 supervisor 的旧快照；runtime.env 才是管理台写入口。
+
+    2026-10-19 实测：trade 被杀后 watchdog 重启的子进程继承 supervisor 启动时的名册
+    （无 ``max_tokens``），刚在管理台保存的 16384 被静默回退成缺省 4000，下一轮决策
+    又顶格截断、解析失败。文件优先是这条重启链的唯一兜底。
+    """
+    monkeypatch.setenv(
+        "QM_DECISION_LLM_ROSTER",
+        '[{"model": "old-model", "base_url_env": "U", "api_key_env": "K"}]',
+    )
+    monkeypatch.setenv("U", "https://example.invalid/v1")
+    monkeypatch.setenv("K", "sk-x")
+    env_file = tmp_path / "runtime.env"
+    env_file.write_text(
+        'QM_DECISION_LLM_ROSTER=[{"model": "deepseek-v4-pro", "base_url_env": "U", '
+        '"api_key_env": "K", "max_tokens": 16384}]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("QM_RUNTIME_ENV_FILE", str(env_file))
+
+    runs = IO.default_roster()
+
+    assert [r.agent for r in runs] == ["deepseek-v4-pro"]
+    assert runs[0].load_llm().model == "deepseek-v4-pro"
 
 
 def test_default_round_deps_fills_every_injection_point(monkeypatch):

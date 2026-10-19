@@ -159,6 +159,7 @@ from backend.services.trade.services.decision_round_blocks import (
     load_round_snapshots,
 )
 from backend.services.trade.services.decision_round_io import (
+    entry_prices_from_ledger,
     maybe_write_watch,
     record_round_dialogue,
     record_round_position,
@@ -378,6 +379,7 @@ async def _run_once_inner(
         )
         notes.append(note)
         logger.info("[DecisionRound] %s %s", round_id, note)
+
         if not holding_rows:
             logger.warning(
                 "[DecisionRound] %s 本 agent（%s）名下**一只都没有**，而桥账户持有 %d 只："
@@ -609,8 +611,14 @@ async def _run_once_inner(
                 )
                 notes.append("执行段 aborted 且零提交：守护规则表整组保留")
             else:
+                # 守护规则成本价只认分账账本（桥成本是共享账户混合口径；601000.SH 实测）
                 watch_result = maybe_write_watch(
-                    deps=deps, slot=slot, decisions=decisions, agent=agent, notes=notes
+                    deps=deps,
+                    slot=slot,
+                    decisions=decisions,
+                    agent=agent,
+                    notes=notes,
+                    entry_prices=entry_prices_from_ledger(ledger),
                 )
             # 「取不到」与「真的是空」必须分开（同 ``summary`` 那条纪律）：没有
             # ``outcomes`` 属性时合并结果只剩守护段，审计行会显示「这一轮什么也没发生」

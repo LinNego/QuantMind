@@ -323,13 +323,21 @@ def default_roster() -> tuple[AgentRun, ...]:
 
     ``LLMNotConfigured`` **不接住**：名册写错一项时，编排层要按「一家都跑不动」如实
     记录每一槽的失败原因（那层合成一个抛错的家）；在这里吞掉只剩单家三家变一家，
-    正是迁移计划里「迁完只剩一个模型」那条警告的形态。
+    正是迁移计划里「迁完只剩一个模型」那条警告的形态。名册串**文件优先**（见实现）。
     """
-    from backend.shared.decision_llm_client import ENV_ROSTER, resolve_roster
+    from backend.shared.decision_llm_client import (
+        ENV_ROSTER,
+        effective_env,
+        resolve_roster,
+    )
 
-    if not str(os.getenv(ENV_ROSTER) or "").strip():
+    # 文件优先：子进程重启继承的是 supervisor 启动那一刻的旧环境，只读
+    # ``os.environ`` 会让管理台保存过的名册在重启后静默回退（2026-10-19 实测：
+    # max_tokens 16384 在 trade 重启后变回缺省 4000，下一轮又顶格截断）。
+    src = effective_env()
+    if not str(src.get(ENV_ROSTER) or "").strip():
         return ()
-    return tuple(_run_for(config) for config in resolve_roster())
+    return tuple(_run_for(config) for config in resolve_roster(src))
 
 
 def _load_pool_with_overlay(day: str) -> Any:
@@ -706,6 +714,22 @@ def record_round_position(
         notes.append("arena 持仓落盘未完成（持仓/净值文件面本轮无新行，详见日志）")
 
 
+def entry_prices_from_ledger(ledger: Any) -> dict[str, float]:
+    """账本成本价 → ``{后缀码: cost_price}``（``maybe_write_watch`` 的回填源）。
+
+    **只认分账账本**：桥账户的成本是共享账户的混合口径，不是本 agent 的建仓价。
+    成本缺失/≤0 的持仓跳过（执行器会退回柜台成本，不会拿到一个假成本）。
+    """
+    out: dict[str, float] = {}
+    for code, pos in (getattr(ledger, "positions", None) or {}).items():
+        if not isinstance(pos, Mapping):
+            continue
+        cost = as_float(pos.get("cost_price"))
+        if cost is not None and cost > 0:
+            out[str(code)] = cost
+    return out
+
+
 def maybe_write_watch(
     *,
     deps: RoundDeps,
@@ -713,6 +737,7 @@ def maybe_write_watch(
     decisions: Sequence[Any],
     agent: str,
     notes: list[str],
+    entry_prices: Mapping[str, float] | None = None,
 ) -> Any:
     """守护规则（``watch`` → 规则表，整组替换）。
 
@@ -725,6 +750,12 @@ def maybe_write_watch(
       摘掉。零条 watch 更可能是「模型这轮没提守护」而不是「撤销全部守护」——要撤
       也得先有一条明确的规则。这一条是本仓**有意**比隔壁保守的地方（隔壁整组替换
       不问空集）。
+
+    ``entry_prices``：``{后缀码: 本 agent 分账成本价}``。模型给的 watch 规则通常
+    只有绝对止损/止盈价、不带建仓成本；写规则时把账本成本一并落进 ``entry_price``，
+    执行器就不必每轮依赖柜台持仓成本——柜台读不到的瞬时窗口会让**已挂的规则整体
+    跳过**（2026-10-19 601000.SH 实测：成本 4.54 明明记在账本里，规则却是
+    ``entry_price=None``）。规则已显式带成本时不覆盖。
     """
     if slot.schema != SCHEMA_INTRADAY:
         return None
@@ -734,6 +765,18 @@ def maybe_write_watch(
     if not getattr(watch_plan, "rules", ()):
         notes.append("本轮无 watch 决策：守护规则表**整组保留**（不写空集）")
         return None
+    if entry_prices:
+        filled = 0
+        for w in watch_plan.rules:
+            if w.rule.get("entry_price") is not None:
+                continue
+            cost = as_float(entry_prices.get(str(w.symbol or "")))
+            if cost is None or cost <= 0:
+                continue
+            w.rule["entry_price"] = round(float(cost), 3)
+            filled += 1
+        if filled:
+            notes.append(f"守护规则回填分账成本价 {filled} 条（来源：agent 账本）")
     try:
         result = deps.write_watch(agent, watch_plan)
     except Exception as exc:  # noqa: BLE001 守护段失败不拖垮买卖段

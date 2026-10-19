@@ -58,10 +58,16 @@ def request_golden() -> dict:
 
 
 @pytest.fixture
-def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """清掉本模块读的全部 env——金样断言不能受宿主机上真配的 key 影响。"""
+def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """清掉本模块读的全部 env——金样断言不能受宿主机上真配的 key 影响。
+
+    ``resolve_config`` / ``resolve_roster`` 走 ``effective_env()``（``runtime.env``
+    文件优先），所以路径也要钉到**不存在**的临时文件：否则宿主机真实名册（含实际
+    max_tokens / key）会漏进这里，金样与「没配」用例都会随宿主机配置飘。
+    """
     for name in _ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("QM_RUNTIME_ENV_FILE", str(tmp_path / "missing.env"))
 
 
 def _cfg(**kw: object) -> DecisionLLMConfig:
