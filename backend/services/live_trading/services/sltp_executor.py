@@ -78,6 +78,9 @@ MAX_RULES = 50
 #: **测试与文档都按字符串**：不要引入 Enum——``str`` 子类的 ``==`` 在本仓踩过坑。
 OWNER_MANUAL = ""
 OWNER_LLM_PREFIX = "llm:"
+#: 自动布防补挂的规则归属。**不是** LLM 组：决策层的整组替换按 ``llm:`` 前缀
+#: 收拾自己的规则，auto 规则不在其中，不会被下一轮决策整组抹掉。
+OWNER_AUTO = "auto"
 
 # 规则状态机
 ST_ARMED = "armed"
@@ -118,6 +121,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "pending_alert_sec": 300,  # 未成交告警 + 余量策略触发阈值（秒，0=立即）
     "remainder_policy": "alert_only",  # alert_only | cancel | requote_at_protect_price
     "close_reminder_sec": 300,  # 收盘前提醒窗口（秒）
+    # 未配规则的持仓自动补挂保护（owner="auto"）：阈值留空则回落设置页
+    # ``trade:sltp_config``；两者都没有时不补挂（没有阈值的规则是空保护）。
+    # 目的：持仓不是从本页建仓的（决策轮/人工/桥直下）时也要有防守，而不是
+    # 只对「有人在规则表里手填过的票」生效。
+    "auto_arm": False,
+    #: 自动布防扫描节拍（秒）。补挂要拉一次柜台持仓；主循环是 3s 一拍，
+    #: 每拍都拉会白占桥的共享限流预算（600/min，与持仓馈送/热集/采集共用）。
+    #: 60s 足够让新仓位在一分钟内获得保护，且每分钟只多一次持仓查询。
+    "auto_arm_interval_sec": 60,
+    "auto_arm_stop_loss_pct": None,
+    "auto_arm_take_profit_pct": None,
+    "auto_arm_trailing_stop_pct": None,
+    #: 自动布防的排除名单（后缀/前缀式均可）：用户删掉某只票的 auto 规则后，
+    #: 把它加进来即可阻止下一轮重新补挂。
+    "auto_arm_exclude": [],
     "rules": [],
 }
 
@@ -936,6 +954,128 @@ def _position_entry_price(position: dict[str, Any] | None) -> float | None:
     return None
 
 
+def _effective_config(cfg: dict[str, Any], deps: SltpDeps) -> dict[str, Any]:
+    """按柜台能力收敛保护价模式。
+
+    通达信快照没有 ``DownStopPrice``（涨跌停价），``limit_floor`` 的「原样报
+    跌停价」拿不到权威值，只能本地重算——重算值一旦与柜台口径差一分就是废单。
+    选定券商是通达信时把遗留的 ``limit_floor`` 改成 ``market``（柜台映射最新价）；
+    ``aggressive`` / ``market`` 原样保留。
+    """
+    broker = str((deps.extras or {}).get("broker") or "").strip().lower()
+    if broker.startswith("tdx") and _resolve_mode(cfg) == "limit_floor":
+        return {**cfg, "protect_price_mode": "market"}
+    return cfg
+
+
+async def auto_arm_missing_rules(
+    deps: SltpDeps, cfg: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """给「有持仓、无启用规则」的标的补挂保护（``owner="auto"``，只补不删）。
+
+    为什么要它：持仓并不都从规则页面建仓——决策轮、人工直下、桥端操作都会留下
+    仓位；没有规则的仓位在触发器里**根本不存在**，于是「只提醒不下单」看起来像
+    执行器坏了，实际是它压根没被武装。
+
+    口径：
+    * 已有任意**启用**规则（人工/LLM/auto）的标的一律跳过，不改动既有规则；
+    * 阈值优先级 ``auto_arm_*`` > 设置页 ``trade:sltp_config``；两者都没有 →
+      不补挂（没有阈值的规则是空保护，挂着只会每轮空转）；
+    * ``auto_arm_exclude`` 里的标的不补挂（用户删掉 auto 规则后的退出阀）。
+
+    返回新增规则列表；**本函数不写配置**——调用方负责落盘并发通知。
+    """
+    if not cfg.get("auto_arm"):
+        return []
+    rules = list(cfg.get("rules") or [])
+    covered = {
+        normalize_symbol(str(rule.get("symbol") or ""))
+        for rule in rules
+        if rule.get("enabled", True)
+    }
+    excluded = {
+        normalize_symbol(str(symbol))
+        for symbol in (cfg.get("auto_arm_exclude") or [])
+        if str(symbol or "").strip()
+    }
+    try:
+        fallback = (
+            deps.fallback_config(
+                str(cfg.get("tenant_id") or "default"),
+                str(cfg.get("user_id") or "1"),
+            )
+            or {}
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[SltpExec] 自动布防读取设置页阈值失败: %s", exc)
+        fallback = {}
+    if fallback.get("enabled") is False:
+        fallback = {}
+
+    def _threshold(key: str, fallback_key: str) -> float | None:
+        value = _to_float(cfg.get(key))
+        return value if value is not None else _to_float(fallback.get(fallback_key))
+
+    stop_pct = _threshold("auto_arm_stop_loss_pct", "stop_loss_pct")
+    take_pct = _threshold("auto_arm_take_profit_pct", "take_profit_pct")
+    trail_pct = _threshold("auto_arm_trailing_stop_pct", "trailing_stop_pct")
+    if stop_pct is None and take_pct is None and trail_pct is None:
+        logger.info(
+            "[SltpExec] 自动布防已开启但无可用阈值（auto_arm_* 与设置页均为空），跳过"
+        )
+        return []
+
+    positions = await _fetch_positions(deps)
+    added: list[dict[str, Any]] = []
+    for position in positions or ():
+        symbol = normalize_symbol(
+            str(position.get("stock_code") or position.get("symbol") or "")
+        )
+        # ``volume`` 是柜台总持仓；缺该字段的替身/旧实现用可用量兜底——两者
+        # 任一 >0 就说明这是一笔真实持仓，值得布防。
+        volume = _to_float(position.get("volume")) or _to_float(
+            position.get("can_use_volume")
+        )
+        if (
+            not symbol
+            or not volume
+            or volume <= 0
+            or symbol in covered
+            or symbol in excluded
+        ):
+            continue
+        rule = normalize_rule(
+            {
+                "symbol": symbol,
+                "owner": OWNER_AUTO,
+                "enabled": True,
+                "side": "SELL",
+                "entry_price": _position_entry_price(position),
+                "stop_loss_pct": stop_pct,
+                "take_profit_pct": take_pct,
+                "trailing_stop_pct": trail_pct,
+            }
+        )
+        rules.append(rule)
+        covered.add(symbol)
+        added.append(rule)
+    if added:
+        cfg["rules"] = rules
+    return added
+
+
+def _auto_rule_brief(rule: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if rule.get("stop_loss_pct") is not None:
+        parts.append(f"止损 {rule['stop_loss_pct']:.0%}")
+    if rule.get("take_profit_pct") is not None:
+        parts.append(f"止盈 {rule['take_profit_pct']:.0%}")
+    if rule.get("trailing_stop_pct") is not None:
+        parts.append(f"移动 {rule['trailing_stop_pct']:.0%}")
+    label = "/".join(parts) if parts else "阈值缺失"
+    return f"{rule.get('symbol')}（{label}）"
+
+
 # --------------------------------------------------------------------------
 # 主循环
 # --------------------------------------------------------------------------
@@ -943,13 +1083,15 @@ async def run_sltp_cycle(
     deps: SltpDeps, *, config: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """单轮：监控在途单 → 评估触发 → 下单。返回本轮摘要（便于日志/测试）。"""
-    cfg = config or load_config(deps.redis)
+    cfg = _effective_config(config or load_config(deps.redis), deps)
     summary: dict[str, Any] = {
         "enabled": bool(cfg.get("enabled")),
         "evaluated": 0,
         "triggered": 0,
         "submitted": 0,
         "failed": 0,
+        #: T+1 当日买入不可卖：不是失败（下一交易日自动继续），单列便于观察。
+        "t1_locked": 0,
         #: 本轮登记的暂时性失败重试（不落终态；终态才进 ``failed``）。它不是「失败」
         #: 也不是「成功」：日志/测试按它观察保护性重试，人不再需要从 status 猜。
         "retry_scheduled": 0,
@@ -1242,10 +1384,29 @@ async def _execute_trigger(
 ) -> None:
     symbol = rule["symbol"]
     can_use = _to_float((position or {}).get("can_use_volume")) or 0.0
+    held = _to_float((position or {}).get("volume")) or 0.0
     quantity, note = plan_sell_quantity(symbol, rule, can_use)
     if quantity <= 0:
         st["status"] = ST_SKIPPED
         st["skip_reason"] = note
+        if held > 0 and can_use <= 0:
+            # T+1 不是「今天没卖成，明天重来一遍」的普通跳过：当日买入的仓位
+            # 柜台根本不允许卖。状态当日终态，**高水位与防守位跨日保留**
+            # （load_state 的既有语义），下一交易日自动以 ARMED 重新评估。
+            # 旧文案「规则当日不再重试」会让人以为要手动重新武装，或以为
+            # 明天不会自动执行——两件都不对。
+            st["t1_locked"] = True
+            summary["t1_locked"] += 1
+            await deps.notify(
+                user_id,
+                f"{symbol} 触发但 T+1 锁定",
+                f"{reason}；持仓 {held:g} 股、当日可用 0 股（当日买入，T+1 不可卖）。"
+                "已保留移动止损高水位与防守位，下一交易日开盘自动继续评估并执行，"
+                "无需人工重新武装。若明日开盘价已远离触发线，则按新价格重新判定。",
+                "warning",
+                tenant_id=tenant_id,
+            )
+            return
         summary["failed"] += 1
         await deps.notify(
             user_id,
@@ -1761,20 +1922,47 @@ def build_state_snapshot(redis: Any) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 # 生产依赖与常驻任务
 # --------------------------------------------------------------------------
+def _active_broker() -> str:
+    """当前选定券商（``broker:selected:CN`` → env 兜底）；读不到返回空串。
+
+    读失败**不能**当成 QMT：本部署选的是通达信，误选 QMT 客户端会让
+    ``configured=False`` 把整条止损链静默关掉（执行器只空转）。
+    """
+    try:
+        from backend.shared.real_positions import active_broker_type
+
+        return str(active_broker_type() or "").strip().lower()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[SltpExec] 读取选定券商失败，按未识别处理: %s", exc)
+        return ""
+
+
+def _build_sltp_client(broker: str) -> Any:
+    if broker.startswith("tdx"):
+        from backend.services.live_trading.services.sltp_tdx_client import (
+            TdxSltpClient,
+        )
+
+        return TdxSltpClient()
+    from backend.services.live_trading.services.qmt_exec_client import (
+        get_qmt_exec_client,
+    )
+
+    return get_qmt_exec_client()
+
+
 def _build_default_deps(redis: Any, tenant_id: str = "default") -> SltpDeps:
     from sqlalchemy import select
 
     from backend.services.live_trading.services.internal_strategy_dispatcher import (
         dispatch_internal_strategy_order,
     )
-    from backend.services.live_trading.services.qmt_exec_client import (
-        get_qmt_exec_client,
-    )
     from backend.shared.database_manager_v2 import get_session
     from backend.shared.notification_publisher import publish_notification_async
     from backend.services.trade_shared.models.order import Order
 
-    client = get_qmt_exec_client()
+    broker = _active_broker()
+    client = _build_sltp_client(broker)
 
     async def dispatch(order_data: dict[str, Any], user_id: str) -> dict[str, Any]:
         async with get_session() as db:
@@ -1837,6 +2025,7 @@ def _build_default_deps(redis: Any, tenant_id: str = "default") -> SltpDeps:
         notify=notify,
         order_reader=order_reader,
         cancel_order=cancel_order,
+        extras={"broker": broker},
     )
 
 
@@ -1846,6 +2035,9 @@ async def run_qmt_sltp_executor_task() -> None:
 
     logger.info("[SltpExec] 止盈止损执行器任务启动")
     last_error = ""
+    #: 上次自动布防的 monotonic 时间。补挂要拉柜台持仓，不能按 3s 主节拍每拍都拉
+    #: （桥的 600/min 是持仓馈送/热集/采集共享预算），按 ``auto_arm_interval_sec`` 收敛。
+    last_auto_arm = 0.0
     while True:
         interval = float(DEFAULT_CONFIG["poll_interval_sec"])
         try:
@@ -1856,6 +2048,42 @@ async def run_qmt_sltp_executor_task() -> None:
                 deps = _build_default_deps(
                     redis, tenant_id=str(cfg.get("tenant_id") or "default")
                 )
+                arm_interval = _to_float(cfg.get("auto_arm_interval_sec"))
+                if arm_interval is None or arm_interval <= 0:
+                    arm_interval = float(DEFAULT_CONFIG["auto_arm_interval_sec"])
+                auto_added: list[dict[str, Any]] = []
+                now_mono = time.monotonic()
+                if cfg.get("auto_arm") and now_mono - last_auto_arm >= arm_interval:
+                    last_auto_arm = now_mono
+                    # 自动布防是增强面：它失败时本轮的真单保护必须照常评估，
+                    # 不能因为「补挂没补上」把已经武装的规则一起跳过。
+                    try:
+                        auto_added = await auto_arm_missing_rules(deps, cfg)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "[SltpExec] 自动布防失败（本轮仍执行既有规则）: %s",
+                            exc,
+                            exc_info=True,
+                        )
+                if auto_added:
+                    try:
+                        cfg = save_config_strict(redis, cfg)
+                    except Exception as exc:  # noqa: BLE001
+                        # 落盘失败不阻断本轮：规则已在内存 cfg 里，本轮照常评估；
+                        # 下一轮会再次补挂并重试落盘（补挂按 symbol 幂等）。
+                        logger.error(
+                            "[SltpExec] 自动布防规则落盘失败: %s", exc, exc_info=True
+                        )
+                    detail = "、".join(_auto_rule_brief(r) for r in auto_added)
+                    await deps.notify(
+                        str(cfg.get("user_id") or "1"),
+                        "已自动布防持仓止盈止损",
+                        f"为 {len(auto_added)} 只无规则持仓补挂保护：{detail}。"
+                        "阈值来自执行器 auto_arm_* 或设置页；触发即报真单卖出，"
+                        "T+1 当日买入的仓位会在下一交易日自动继续评估。",
+                        "info",
+                        tenant_id=str(cfg.get("tenant_id") or "default"),
+                    )
                 summary = await run_sltp_cycle(deps, config=cfg)
                 last_error = ""
                 if (
@@ -1863,6 +2091,7 @@ async def run_qmt_sltp_executor_task() -> None:
                     or summary.get("submitted")
                     or summary.get("failed")
                     or summary.get("retry_scheduled")
+                    or summary.get("t1_locked")
                 ):
                     logger.info(
                         "[SltpExec] 本轮：%s", json.dumps(summary, ensure_ascii=False)

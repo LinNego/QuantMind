@@ -1211,3 +1211,196 @@ class TestHardening:
         with pytest.raises(ValidationError):
             SltpRule(symbol="600036.SH", side="BUY")
         assert SltpRule(symbol="600036.SH", side="sell").side == "SELL"
+
+
+# --------------------------------------------------------------------------
+# 12. 通达信实盘：自动布防 / T+1 语义 / 柜台适配
+# --------------------------------------------------------------------------
+class TestTdxRealExecution:
+    def test_effective_config_turns_legacy_limit_floor_into_market(self) -> None:
+        h = Harness(cfg=_cfg([]))
+        deps = h.deps()
+        deps.extras = {"broker": "tdx"}
+
+        tdx_cfg = ex._effective_config(_cfg([], protect_price_mode="limit_floor"), deps)
+        assert tdx_cfg["protect_price_mode"] == "market"
+        # aggressive / market 原样保留（aggressive 有本地可算的合法报价）
+        assert (
+            ex._effective_config(_cfg([], protect_price_mode="aggressive"), deps)[
+                "protect_price_mode"
+            ]
+            == "aggressive"
+        )
+        # 非通达信柜台不动遗留口径
+        qmt_deps = h.deps()
+        qmt_deps.extras = {"broker": "qmt"}
+        assert (
+            ex._effective_config(_cfg([], protect_price_mode="limit_floor"), qmt_deps)[
+                "protect_price_mode"
+            ]
+            == "limit_floor"
+        )
+
+    def test_auto_arm_adds_missing_position_with_fallback_thresholds(self) -> None:
+        h = Harness(
+            cfg=_cfg([], auto_arm=True),
+            positions=[
+                {
+                    "stock_code": "002469.SZ",
+                    "volume": 100,
+                    "can_use_volume": 0,  # T+1 冻结也要布防（下一交易日可用）
+                    "cost_price": 6.77,
+                }
+            ],
+            fallback={
+                "stop_loss_pct": 0.08,
+                "take_profit_pct": 0.15,
+                "trailing_stop_pct": 0.02,
+            },
+        )
+        cfg = ex.merge_config(_cfg([], auto_arm=True))
+        added = asyncio.run(ex.auto_arm_missing_rules(h.deps(), cfg))
+
+        assert [r["symbol"] for r in added] == ["002469.SZ"]
+        rule = added[0]
+        assert rule["owner"] == ex.OWNER_AUTO
+        assert rule["entry_price"] == pytest.approx(6.77)
+        assert rule["stop_loss_pct"] == pytest.approx(0.08)
+        assert rule["trailing_stop_pct"] == pytest.approx(0.02)
+        # 规则进了本次配置（落盘由调用方负责）
+        assert cfg["rules"][0]["symbol"] == "002469.SZ"
+
+    def test_auto_arm_skips_covered_and_excluded(self) -> None:
+        h = Harness(
+            cfg=_cfg([_rule("600036.SH")], auto_arm=True, auto_arm_exclude=["000001.SZ"]),
+            positions=[
+                _position("600036.SH"),
+                _position("000001.SZ"),
+                _position("002469.SZ"),
+            ],
+            fallback={"stop_loss_pct": 0.08, "trailing_stop_pct": 0.02},
+        )
+        cfg = ex.merge_config(
+            _cfg([_rule("600036.SH")], auto_arm=True, auto_arm_exclude=["000001.SZ"])
+        )
+        added = asyncio.run(ex.auto_arm_missing_rules(h.deps(), cfg))
+        assert [r["symbol"] for r in added] == ["002469.SZ"]
+
+    def test_auto_arm_without_thresholds_does_not_arm(self) -> None:
+        h = Harness(cfg=_cfg([], auto_arm=True), positions=[_position()])
+        cfg = ex.merge_config(_cfg([], auto_arm=True))
+        assert asyncio.run(ex.auto_arm_missing_rules(h.deps(), cfg)) == []
+        assert cfg["rules"] == []
+
+    def test_t1_locked_notifies_next_session_and_never_dispatches(self) -> None:
+        h = Harness(
+            cfg=_cfg([_rule(stop_loss_pct=0.05)]),
+            ticks={"600036.SH": {"lastPrice": 90.0}},
+            positions=[_position(can_use=0) | {"volume": 1000}],
+        )
+        summary = h.cycle()
+
+        assert h.dispatched == []
+        assert summary["t1_locked"] == 1
+        assert summary["failed"] == 0
+        st = h.state()["rules"]["600036.SH"]
+        assert st["status"] == ex.ST_SKIPPED
+        assert st["t1_locked"] is True
+        notice = next(n for n in h.notices if "T+1 锁定" in n["title"])
+        assert "下一交易日" in notice["content"]
+
+    def test_tdx_client_positions_map_available_volume_and_cost(self) -> None:
+        from backend.services.live_trading.services.sltp_tdx_client import (
+            TdxSltpClient,
+        )
+
+        class Pusher:
+            enabled = True
+
+            async def pull_positions(self):
+                return [
+                    {
+                        "stock_code": "002469.SZ",
+                        "stock_name": "三维化学",
+                        "total_volume": 100,
+                        "available_volume": 0,
+                        "cost_price": 6.772,
+                    }
+                ]
+
+        client = TdxSltpClient(pusher=Pusher())
+        positions = asyncio.run(client.get_positions())
+        assert positions[0]["can_use_volume"] == 0
+        assert positions[0]["open_price"] == pytest.approx(6.772)
+        assert positions[0]["stock_code"] == "002469.SZ"
+
+    def test_tdx_client_prefers_fresh_cached_quote_and_falls_back_to_bridge(self) -> None:
+        from backend.services.live_trading.services.sltp_tdx_client import (
+            TdxSltpClient,
+        )
+
+        calls: list[str] = []
+
+        class Pusher:
+            enabled = True
+
+            async def tdx_call(self, method: str, params: dict):
+                calls.append(params["stock_code"])
+                return {"Now": 6.79, "LastClose": 6.90, "Open": 6.80, "Max": 6.93, "Min": 6.70}
+
+        async def only_cached(self, suffixes):
+            return {
+                "002469.SZ": {
+                    "lastPrice": 6.78,
+                    "lastClose": 6.90,
+                    "quote_ts": 1.0,
+                    "source": "cache",
+                }
+            }
+
+        client = TdxSltpClient(pusher=Pusher())
+        with patch.object(TdxSltpClient, "_read_cached", new=only_cached):
+            ticks = asyncio.run(client.get_full_tick(["002469.SZ"]))
+        assert ticks["002469.SZ"]["lastPrice"] == pytest.approx(6.78)
+        assert calls == []
+
+        async def empty_cache(self, suffixes):
+            return {}
+
+        with patch.object(TdxSltpClient, "_read_cached", new=empty_cache):
+            ticks = asyncio.run(client.get_full_tick(["002469.SZ"]))
+        assert ticks["002469.SZ"]["lastPrice"] == pytest.approx(6.79)
+        assert ticks["002469.SZ"]["source"] == "bridge"
+        assert calls == ["002469.SZ"]
+
+    def test_tdx_client_cached_quote_is_visible_under_both_code_forms(self) -> None:
+        """缓存命中也必须两种代码口径都能查到。
+
+        实际调用方既有后缀式（规则表）也有原样码（``get_instrument_detail``
+        先转后缀再回查）——只塞原样码会让详情查询静默落空。
+        """
+        from backend.services.live_trading.services.sltp_tdx_client import (
+            TdxSltpClient,
+        )
+
+        class Pusher:
+            enabled = True
+
+        async def only_cached(self, suffixes):
+            return {
+                "002469.SZ": {
+                    "lastPrice": 6.78,
+                    "lastClose": 6.90,
+                    "quote_ts": 1.0,
+                    "source": "cache",
+                }
+            }
+
+        client = TdxSltpClient(pusher=Pusher())
+        with patch.object(TdxSltpClient, "_read_cached", new=only_cached):
+            ticks = asyncio.run(client.get_full_tick(["SZ002469"]))
+            detail = asyncio.run(client.get_instrument_detail("SZ002469"))
+
+        assert ticks["SZ002469"]["lastPrice"] == pytest.approx(6.78)
+        assert ticks["002469.SZ"]["lastPrice"] == pytest.approx(6.78)
+        assert detail["PreClose"] == pytest.approx(6.90)

@@ -829,10 +829,31 @@ async def _check_sltp_alerts(
     except Exception:
         redis_client = None
 
+    # 执行器（真单）已武装的标的不再发「仅提醒」：同一触发条件会同时产生一条
+    # 不下单的警告和一张真单，用户看到的是自相矛盾的两条消息。规则优先；
+    # 没有规则的持仓仍走本条提醒（它是 auto_arm 开启前的兜底面）。
+    covered: set[str] = set()
+    if redis_client is not None:
+        try:
+            from backend.services.live_trading.services import sltp_executor as _sltp
+
+            exec_cfg = _sltp.load_config(redis_client)
+            if exec_cfg.get("enabled"):
+                covered = {
+                    _sltp.normalize_symbol(str(rule.get("symbol") or ""))
+                    for rule in (exec_cfg.get("rules") or [])
+                    if rule.get("enabled", True)
+                }
+        except Exception as exc:  # noqa: BLE001 - 提醒面不因执行器配置读失败而中断
+            logger.debug("[TdxFeed] 读取执行器规则失败（提醒面继续）: %s", exc)
+            covered = set()
+
     for p in positions:
         price = prices.get(p["symbol"])
         entry = float(p.get("cost_price") or 0)
         if price is None or entry <= 0:
+            continue
+        if _to_suffix(p["symbol"]) in covered:
             continue
         trigger_cfg = dict(cfg)
         trigger_cfg["highest_price"] = highest.get(p["symbol"], entry)
