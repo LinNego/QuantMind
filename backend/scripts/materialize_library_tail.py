@@ -98,9 +98,24 @@ WARMUP_DAYS = {
 #: 非交易日错位；``_max_days`` 另有日期跨度补足。
 WARMUP_MARGIN_DAYS = 8
 #: 每晚第二遍可承受的最长预热（交易日）。超过它的非必需因子不进入日更链，
-#: 由每周长窗档补齐（细案 §六）：1300 日网格实测算力约 26GB RSS，
-#: 再往上会与 05:30/06:30 alpha 补池、盘前推理抢内存。模型契约列不受此限。
+#: 由每周长窗档补齐（细案 §六）。2026-10-20 全标的 1228 日实测峰值 10.19GB
+#: （172 帧；固定开销约 2.8GB，其余随标的数增长），不再是早期按快档合并峰值
+#: 外推的 26GB。模型契约列不受此限。
 MAX_DAILY_WARMUP_DAYS = 1300
+#: 第二遍开跑前的最小可用内存（GB）。长窗遍实测峰值 10.19GB，写入/合并另需
+#: 余量；不足时**只跳过第二遍**并记 partial（第一遍照常合并，缺失列由下一轮
+#: 近窗回补自愈），绝不整轮失败或静默留空。
+LONG_PASS_MIN_MEM_GB = float(os.environ.get("QM_MATERIALIZE_LONG_MIN_MEM_GB", "11"))
+#: 长窗遍求值驻留：每批 8 条（1234 日 × 5579 标的每条约 55MB）。默认 30 条会
+#: 多占 1.2GB，把实测 10.19GB 峰值推过 11GB 闸门。
+LONG_PASS_BANK_SIZE = 8
+#: alpha 刷新/补池的 flock 文件（与 scripts/factor_materialize_daily.sh 同源）。
+#: 补池重试可能在日更链起跑**之后**才拿锁；长窗遍开跑前再探一次，避免 24GB
+#: 峰值与本链 10GB 峰值叠加。
+ALPHA_LOCKS = (
+    Path(os.environ.get("QM_ALPHA_LOCK", "/tmp/.qm_alpha_refresh.lock")),
+    Path(os.environ.get("QM_ALPHA_RETRY_LOCK", "/tmp/.qm_alpha_retry.lock")),
+)
 #: 单次回填允许的最大交易日数（防止误把 ``--since`` 写成很久以前）
 MAX_BACKFILL_DAYS = 60
 #: 新建当日分区时，全市场标的数相对上一正式分区的最低比例。低于它说明
@@ -763,7 +778,7 @@ def _factor1300_cmd(
         "--max-days",
         str(_max_days(ctx.calendar, start, ctx.target, warmup_days)),
         "--bank-size",
-        str(ctx.bank_size),
+        str(LONG_PASS_BANK_SIZE if only else ctx.bank_size),
         "--out-root",
         str(staging),
     ]
@@ -778,6 +793,64 @@ _STATUS_RANK = {"skipped": 0, "ok": 1, "partial": 2, "failed": 3}
 
 def _worst_status(statuses: list[str]) -> str:
     return max(statuses, key=_STATUS_RANK.__getitem__) if statuses else "skipped"
+
+
+def _parse_mem_available(text: str) -> float | None:
+    """``/proc/meminfo`` 文本 → MemAvailable（GB）；解析失败返回 None。"""
+    for line in text.splitlines():
+        if not line.startswith("MemAvailable:"):
+            continue
+        try:
+            return int(line.split()[1]) / 1024 / 1024
+        except (IndexError, ValueError):
+            return None
+    return None
+
+
+def available_mem_gb() -> float | None:
+    """宿主机可用内存（GB）。读不到时返回 None（调用方按「不拦」处理）。"""
+    try:
+        text = Path("/proc/meminfo").read_text(encoding="ascii")
+    except OSError:
+        return None
+    return _parse_mem_available(text)
+
+
+def alpha_busy() -> bool:
+    """alpha 刷新/补池是否持锁（非阻塞探测，不创建锁文件）。"""
+    import fcntl
+
+    for path in ALPHA_LOCKS:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            return True
+        finally:
+            os.close(fd)
+    return False
+
+
+def long_pass_blocker(min_mem_gb: float = LONG_PASS_MIN_MEM_GB) -> dict | None:
+    """长窗遍开跑闸：alpha 补池占用或可用内存不足 → 返回原因字典。
+
+    两个闸都只影响**第二遍**：第一遍结果照常合并；缺的必需列由下一轮
+    ``repair_dates`` 回补（状态记 partial，不静默）。
+    """
+    if alpha_busy():
+        return {"reason": "alpha_busy"}
+    avail = available_mem_gb()
+    if avail is not None and avail < min_mem_gb:
+        return {
+            "reason": "low_memory",
+            "available_mem_gb": round(avail, 2),
+            "min_mem_gb": min_mem_gb,
+        }
+    return None
 
 
 def _run_two_pass(
@@ -832,6 +905,25 @@ def _run_two_pass(
     pass_details: dict[str, object] = {}
     dirty_dates = sorted({start, *dates})
     for name, staging, warmup_days, only, pass_required in passes:
+        if name == "long" and not ctx.dry_run:
+            blocker = long_pass_blocker()
+            if blocker:
+                LOG.warning(
+                    "%s 长窗遍跳过（%s）：可用内存 %.1fGB，alpha 占用=%s；"
+                    "第一遍结果照常合并，缺失列下一轮回补",
+                    library,
+                    blocker["reason"],
+                    blocker.get("available_mem_gb") or -1.0,
+                    blocker["reason"] == "alpha_busy",
+                )
+                pass_details["long"] = {
+                    "skipped": blocker["reason"],
+                    "warmup": warmup_days,
+                    "only": only,
+                    **blocker,
+                }
+                statuses.append("partial")
+                continue
         prepare_staging(ctx, staging, dirty_dates)
         cmd = build_cmd(ctx, staging, start, warmup_days, only)
         run = run_command(

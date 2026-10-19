@@ -8,12 +8,17 @@ from pathlib import Path
 
 import pytest
 
+import backend.scripts.materialize_library_tail as materializer
 from backend.scripts.materialize_library_tail import (
+    LONG_PASS_BANK_SIZE,
     WARMUP_MARGIN_DAYS,
     Context,
+    _factor1300_cmd,
     _normalize_dt_text,
+    _parse_mem_available,
     _step_status,
     _worst_status,
+    long_pass_blocker,
     producer_env,
     rd_mined_target_ready,
     split_long_factors,
@@ -151,6 +156,79 @@ def test_worst_status_orders_failed_over_partial() -> None:
     assert _worst_status(["partial", "failed"]) == "failed"
     assert _worst_status(["ok", "skipped"]) == "ok"
     assert _worst_status([]) == "skipped"
+
+
+@pytest.mark.unit
+def test_factor1300_long_pass_shrinks_bank_size(tmp_path: Path) -> None:
+    # 长窗遍每批 30 条会多占 1.2GB，把实测 10.19GB 峰值推过 11GB 闸门
+    ctx = _context(tmp_path)
+    ctx.calendar = [f"202610{day:02d}" for day in range(1, 20)]
+
+    long_cmd = _factor1300_cmd(ctx, tmp_path / "s", "20261001", 1234, ["f13_0645"])
+    fast_cmd = _factor1300_cmd(ctx, tmp_path / "s", "20261001", 406, None)
+
+    assert long_cmd[long_cmd.index("--bank-size") + 1] == str(LONG_PASS_BANK_SIZE)
+    assert fast_cmd[fast_cmd.index("--bank-size") + 1] == str(ctx.bank_size)
+    assert long_cmd[-2:] == ["--only", "f13_0645"]
+
+
+@pytest.mark.unit
+def test_parse_mem_available_reads_gb() -> None:
+    text = "MemTotal:  61866 MB\nMemAvailable:  13107200 kB\n"
+    assert _parse_mem_available(text) == pytest.approx(12.5)
+
+
+@pytest.mark.unit
+def test_parse_mem_available_returns_none_when_missing_or_bad() -> None:
+    assert _parse_mem_available("MemTotal: 1 kB\n") is None
+    assert _parse_mem_available("MemAvailable: oops\n") is None
+
+
+@pytest.mark.unit
+def test_long_pass_blocker_reports_alpha_busy_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(materializer, "alpha_busy", lambda: True)
+    monkeypatch.setattr(materializer, "available_mem_gb", lambda: 64.0)
+
+    assert long_pass_blocker() == {"reason": "alpha_busy"}
+
+
+@pytest.mark.unit
+def test_long_pass_blocker_reports_low_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(materializer, "alpha_busy", lambda: False)
+    monkeypatch.setattr(materializer, "available_mem_gb", lambda: 9.5)
+
+    blocker = long_pass_blocker(min_mem_gb=11.0)
+
+    assert blocker == {
+        "reason": "low_memory",
+        "available_mem_gb": 9.5,
+        "min_mem_gb": 11.0,
+    }
+
+
+@pytest.mark.unit
+def test_long_pass_blocker_allows_run_with_enough_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(materializer, "alpha_busy", lambda: False)
+    monkeypatch.setattr(materializer, "available_mem_gb", lambda: 12.5)
+
+    assert long_pass_blocker(min_mem_gb=11.0) is None
+
+
+@pytest.mark.unit
+def test_long_pass_blocker_does_not_block_when_meminfo_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 读不到内存 → 不拦（宁可跑，由 OOM/告警兜底），但 alpha 仍可拦
+    monkeypatch.setattr(materializer, "alpha_busy", lambda: False)
+    monkeypatch.setattr(materializer, "available_mem_gb", lambda: None)
+
+    assert long_pass_blocker(min_mem_gb=11.0) is None
 
 
 @pytest.mark.unit
