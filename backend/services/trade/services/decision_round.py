@@ -139,7 +139,9 @@ from backend.services.trade.services.decision_round_core import (
     RoundResult,
     RoundSlot,
     abort_result,
+    account_meta,
     build_pool_stamps,
+    clip_holdings_to_ledger,
     context_meta,
     gate_row_to_pool_row,
     merge_outcomes,
@@ -261,11 +263,7 @@ async def _run_once_inner(
             day,
             slot,
             "资金面不可信：" + "；".join(account.errors),
-            account={
-                "source": account.source,
-                "broker": account.broker,
-                "snapshot_at": account.snapshot_at,
-            },
+            account=account_meta(account),
         )
     if account.age_min is not None and account.age_min > ACCOUNT_AGE_WARN_MIN:
         logger.warning(
@@ -289,11 +287,7 @@ async def _run_once_inner(
             day,
             slot,
             pos_issue,
-            account={
-                "source": account.source,
-                "broker": account.broker,
-                "snapshot_at": account.snapshot_at,
-            },
+            account=account_meta(account),
             positions=pos_meta or {},
         )
 
@@ -372,15 +366,10 @@ async def _run_once_inner(
         positions_list, snaps=snapped, series=series
     )
 
-    # ④b 分账裁剪（P2.7）：**只把本 agent 名下的持仓交给模型与执行段**。
-    # 桥账户是共用的，`positions_list` 是整座账户的持仓；`mine` 是这本分账账本里属于
-    # 本 agent 的那些代码（后缀式，与 `HoldingRow.code` 同形态）。模型看不见的仓位它
-    # 就卖不掉——这是**可见性**防线，不是权限判断。2026-09-08：空账本的 agent 拿到
-    # 全账户持仓，把另一家模型的票卖了。故这里**没有**「mine 为空就回退全量」的分支。
-    # 数量口径不变（可卖量仍取桥的 `avail`）：账本是「归属」的事实源，桥是「今天能不能卖」的事实源——T+1 锁定只有桥知道。
+    # ④b 分账裁剪（P2.7）：只看本 agent 名下的持仓（归属/可卖两条口径见
+    # `clip_holdings_to_ledger`：账本管归属、桥管 T+1 可卖，绝不互相回退）。
     all_rows = holding_rows
-    holding_rows = tuple(h for h in all_rows if h.code in mine)
-    hidden = len(all_rows) - len(holding_rows)
+    holding_rows, hidden = clip_holdings_to_ledger(all_rows, mine)
     if hidden:
         # 一定要说出来：迁移未完成（历史仓位尚未导入分账账本）时，这一行的存在就是
         # 「模型为什么对这几只票视而不见」的答案。
@@ -542,9 +531,7 @@ async def _run_once_inner(
             usage = dict(getattr(attempt, "usage", None) or {})
             got = usage.get("completion_tokens")
             detail = f"，completion_tokens={got}" if got is not None else ""
-            note += (
-                f"（供应商输出顶格截断{detail}，非解析问题：调大该家 max_tokens）"
-            )
+            note += f"（供应商输出顶格截断{detail}，非解析问题：调大该家 max_tokens）"
         return RoundResult(
             status=STATUS_LLM_FAILED,
             day=day,

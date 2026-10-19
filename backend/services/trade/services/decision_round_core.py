@@ -626,6 +626,38 @@ def positions_consistency_issue(
     )
 
 
+def account_meta(account: Any) -> dict[str, Any]:
+    """账户快照的审计段（``source``/``broker``/``snapshot_at``）。
+
+    同一形状在「资金面不可信」与「持仓面自相矛盾」两条 abort 分支都要写一遍——
+    收在这里，免得审计字段在一处加、另一处忘。
+    """
+    return {
+        "source": getattr(account, "source", ""),
+        "broker": getattr(account, "broker", ""),
+        "snapshot_at": getattr(account, "snapshot_at", None),
+    }
+
+
+def clip_holdings_to_ledger(
+    rows: Sequence[Any], mine: Iterable[str]
+) -> tuple[tuple[Any, ...], int]:
+    """按本 agent 分账账本的归属集合裁剪持仓：``(可见行, 被隐藏只数)``。
+
+    **只把本 agent 名下的持仓交给模型与执行段**。桥账户是共用的，传入 ``rows``
+    通常是整座账户的持仓；``mine`` 是这本分账账本里属于本 agent 的代码（与
+    ``HoldingRow.code`` 同形态）。模型看不见的仓位它就卖不掉——这是**可见性**
+    防线，不是权限判断。2026-09-08：空账本的 agent 拿到全账户持仓，把另一家模型
+    的票卖了。故这里**没有**「``mine`` 为空就回退全量」的分支。
+
+    数量口径不变（可卖量仍取桥的 ``avail``）：账本是「归属」的事实源，桥是
+    「今天能不能卖」的事实源——T+1 锁定只有桥知道。
+    """
+    owned = set(mine)
+    visible = tuple(row for row in rows if getattr(row, "code", "") in owned)
+    return visible, len(rows) - len(visible)
+
+
 def snap_price(snap: Mapping[str, Any] | None) -> float | None:
     """快照 → 现价（标准键 ``Now`` 优先，原始推送 ``now`` 兜底）。"""
     if not isinstance(snap, Mapping):
