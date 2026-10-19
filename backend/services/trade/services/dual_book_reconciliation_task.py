@@ -6,7 +6,9 @@
 
 本任务每日收盘后（默认 15:10）对比：
   1) 模拟台账成交（``sim_trades``）按 (symbol, side) 聚合；
-  2) 真实镜像单（``orders.client_order_id LIKE 'mir-%'``）按 (symbol, side) 聚合；
+  2) 真实镜像单（``orders.client_order_id LIKE 'mir-%'``，**排除真实轮直连腿**
+     ``mir-lld-%``）按 (symbol, side) 聚合——直连腿按设计没有模拟腿，见
+     :data:`_DIRECT_REAL_CID_PREFIX`；数量另计，不参与双轨比对；
   3) 当日镜像跳过记录（Redis ``mirror:skipped:{YYYYMMDD}``，见 real_mirror_service）；
   4) 当日镜像**提交失败**台账（Redis ``mirror:failed:{YYYYMMDD}``，同上）。
 
@@ -35,7 +37,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 
 from backend.services.live_trading.services.trading_session import TZ
 from backend.shared.stock_utils import StockCodeUtil
@@ -221,36 +223,79 @@ async def collect_sim_rows(date_str: str) -> list[tuple[str, str, float]]:
     ]
 
 
-async def collect_real_rows(date_str: str) -> list[tuple[str, str, float]]:
-    """当日真实镜像单成交（orders，``mir-`` 前缀）。
+#: 真实轮直连实盘的 client_order_id 前缀（``mir-`` + 决策腿幂等号 ``lld-``）。
+#:
+#: ``_submit_direct_real`` 为不建模拟腿的真实轮腿复用了 ``mirror_virtual_fill``，
+#: 于是订单号变成 ``mir-lld-…``；但 sim 侧**没有**对应成交（按设计）。对账若把
+#: 它们计入真单，sim=0 会让每笔真实轮卖单都变成 ``excess``（2026-10-19 实测假告警：
+#: 601857.SH 卖 1300 股、603213.SH 卖 700 股被判「多出」）。
+_DIRECT_REAL_CID_PREFIX = "mir-lld-%"
 
-    ``created_at`` 为 naive 北京时间（容器 TZ=Asia/Shanghai），直接用北京窗口。
-    """
+
+def _real_rows_select(date_str: str):
+    """当日**模拟镜像**真单的查询（排除真实轮直连腿）。"""
     from backend.services.trade_shared.models.order import Order, TradingMode
 
     start, end = cst_day_window(date_str)
     naive_start = start.replace(tzinfo=None)
     naive_end = end.replace(tzinfo=None)
 
+    return select(Order.symbol, Order.side, Order.filled_quantity).where(
+        and_(
+            Order.trading_mode == TradingMode.REAL,
+            Order.client_order_id.like("mir-%"),
+            Order.client_order_id.not_like(_DIRECT_REAL_CID_PREFIX),
+            Order.created_at >= naive_start,
+            Order.created_at < naive_end,
+        )
+    )
+
+
+async def collect_real_rows(date_str: str) -> list[tuple[str, str, float]]:
+    """当日真实镜像单成交（orders，``mir-`` 前缀但排除 ``mir-lld-`` 直连腿）。
+
+    ``created_at`` 为 naive 北京时间（容器 TZ=Asia/Shanghai），直接用北京窗口。
+    """
     from backend.shared.database_manager_v2 import get_session
 
     async with get_session(read_only=True) as db:
-        rows = (
-            await db.execute(
-                select(Order.symbol, Order.side, Order.filled_quantity).where(
-                    and_(
-                        Order.trading_mode == TradingMode.REAL,
-                        Order.client_order_id.like("mir-%"),
-                        Order.created_at >= naive_start,
-                        Order.created_at < naive_end,
-                    )
-                )
-            )
-        ).all()
+        rows = (await db.execute(_real_rows_select(date_str))).all()
     return [
         (str(symbol), str(getattr(side, "value", side) or "").upper(), float(qty or 0))
         for symbol, side, qty in rows
     ]
+
+
+def _direct_real_count_select(date_str: str):
+    """当日真实轮直连腿的计数查询（可见性用，不参与比对）。"""
+    from backend.services.trade_shared.models.order import Order, TradingMode
+
+    start, end = cst_day_window(date_str)
+    naive_start = start.replace(tzinfo=None)
+    naive_end = end.replace(tzinfo=None)
+
+    return (
+        select(func.count())
+        .select_from(Order)
+        .where(
+            and_(
+                Order.trading_mode == TradingMode.REAL,
+                Order.client_order_id.like(_DIRECT_REAL_CID_PREFIX),
+                Order.created_at >= naive_start,
+                Order.created_at < naive_end,
+            )
+        )
+    )
+
+
+async def count_direct_real_orders(date_str: str) -> int:
+    """当日真实轮直连实盘的订单数（不参与双轨数量比对，只做可见性计数）。"""
+    from backend.shared.database_manager_v2 import get_session
+
+    async with get_session(read_only=True) as db:
+        return int(
+            (await db.execute(_direct_real_count_select(date_str))).scalar() or 0
+        )
 
 
 def _save_report(redis, report: dict) -> None:
@@ -297,6 +342,7 @@ async def run_dual_book_reconciliation(redis, date_str: str | None = None) -> di
 
     sim_rows: list[tuple[str, str, float]] = []
     real_rows: list[tuple[str, str, float]] = []
+    direct_real_events = 0
     skips: dict[str, int] = {}
     failures: dict[str, int] = {}
     errors: list[str] = []
@@ -311,6 +357,11 @@ async def run_dual_book_reconciliation(redis, date_str: str | None = None) -> di
     except Exception as exc:  # noqa: BLE001
         logger.error("[Reconcile] 读取真单成交失败: %s", exc, exc_info=True)
         errors.append(f"real_query_failed: {exc}")
+    try:
+        direct_real_events = await count_direct_real_orders(date_str)
+    except Exception as exc:  # noqa: BLE001
+        # 只是可见性计数：读不到不改变对账结论，但要留下痕迹（否则报表像「今天没有直连腿」）
+        logger.warning("[Reconcile] 读取真实轮直连腿计数失败: %s", exc)
     try:
         skips = load_skips(redis, date_str)
     except Exception as exc:  # noqa: BLE001
@@ -330,6 +381,8 @@ async def run_dual_book_reconciliation(redis, date_str: str | None = None) -> di
         skips=skips,
         failures=failures,
     )
+    # 真实轮直连腿（无模拟对应）单独计数：报表要能自证「真单笔数 = 镜像 + 直连」
+    report["direct_real_events"] = direct_real_events
     if errors:
         report["errors"] = errors
         report["ok"] = False
@@ -391,6 +444,9 @@ async def _notify_report(redis, report: dict) -> None:
     if len(unexplained) > 5:
         lines.append(f"……另有 {len(unexplained) - 5} 项")
     content = f"{date_str} 模拟盘与真单成交不一致：\n" + "\n".join(lines)
+    direct_real = int(report.get("direct_real_events") or 0)
+    if direct_real:
+        content += f"\n（另有 {direct_real} 笔真实轮直连实盘，按设计无模拟对应，不参与双轨比对）"
     if report.get("errors"):
         content += f"\n对账任务异常：{'; '.join(report['errors'])}"
     try:

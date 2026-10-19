@@ -473,12 +473,15 @@ class TestFailureLedgerWiring:
     """参数没人传就是死代码 —— 真跑一次任务，看失败台账有没有进报表。"""
 
     @staticmethod
-    def _patch_pipeline(*, failures, skips=None, real_rows=None):
+    def _patch_pipeline(*, failures, skips=None, real_rows=None, direct_real_events=0):
         async def _sim_rows(*_a, **_k):
             return [("600036.SH", "SELL", 1000.0)]
 
         async def _real_rows(*_a, **_k):
             return real_rows or []
+
+        async def _direct_rows(*_a, **_k):
+            return direct_real_events
 
         return (
             patch.object(reconcile, "collect_sim_rows", _sim_rows),
@@ -488,13 +491,22 @@ class TestFailureLedgerWiring:
             patch.object(mirror, "load_failures", failures),
             patch.object(mirror, "load_config", lambda *_a, **_k: {}),
             patch.object(mirror, "mirror_enabled", lambda *_a, **_k: False),
+            patch.object(reconcile, "count_direct_real_orders", _direct_rows),
         )
 
     def test_the_task_reads_the_failure_ledger(self) -> None:
         patches = self._patch_pipeline(
             failures=lambda *_a, **_k: {"600036.SH:TDX_UNAVAILABLE": 1}
         )
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+        ):
             report = asyncio.run(
                 reconcile.run_dual_book_reconciliation(FakeRedis(), "20260911")
             )
@@ -507,13 +519,90 @@ class TestFailureLedgerWiring:
             raise RuntimeError("redis down")
 
         patches = self._patch_pipeline(failures=_boom)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+        ):
             report = asyncio.run(
                 reconcile.run_dual_book_reconciliation(FakeRedis(), "20260911")
             )
 
         assert report["ok"] is False
         assert any("failures_query_failed" in e for e in report["errors"])
+
+    def test_direct_real_events_ride_along_without_changing_the_verdict(self) -> None:
+        """真实轮直连腿只计数、不解释缺口：sim 侧仍有 shortfall 时照旧不 ok。"""
+        patches = self._patch_pipeline(
+            failures=lambda *_a, **_k: {}, direct_real_events=4
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+        ):
+            report = asyncio.run(
+                reconcile.run_dual_book_reconciliation(FakeRedis(), "20260919")
+            )
+
+        assert report["direct_real_events"] == 4
+        assert report["ok"] is False
+        assert report["unexplained"][0]["symbol"] == "600036.SH"
+
+
+class TestDirectRealExclusion:
+    """真实轮直连腿（``mir-lld-…``）不得进入双轨真单侧。
+
+    背景（2026-10-19 实测假告警）：真实轮卖出腿经 ``_submit_direct_real`` 直连
+    实盘，订单号是 ``mir-lld-…``；sim 侧按设计没有对应成交。旧查询把所有
+    ``mir-%`` 当真单，于是 601857.SH 卖 1300 股、603213.SH 卖 700 股全被判
+    ``excess``（「疑似重复下单，严重」）。
+    """
+
+    @staticmethod
+    def _sql(select_stmt) -> str:
+        return str(select_stmt.compile(compile_kwargs={"literal_binds": True}))
+
+    def test_mirror_rows_query_excludes_direct_real_prefix(self) -> None:
+        sql = self._sql(reconcile._real_rows_select("20261019")).upper()
+        assert "NOT LIKE 'MIR-LLD-%'" in sql
+        # 正向对照：仍只取 mir- 前缀的镜像单
+        assert "LIKE 'MIR-%'" in sql
+
+    def test_direct_real_count_query_uses_the_same_prefix(self) -> None:
+        sql = self._sql(reconcile._direct_real_count_select("20261019")).upper()
+        assert "LIKE 'MIR-LLD-%'" in sql
+        assert "COUNT" in sql
+
+    def test_notification_names_direct_real_count(self) -> None:
+        published: list[dict] = []
+
+        async def _fake_publish(**kwargs):
+            published.append(kwargs)
+
+        report = reconcile.build_reconciliation_report(
+            date_str="20261019",
+            sim_rows=[],
+            real_rows=[("601857.SH", "SELL", 1300)],
+            skips={},
+        )
+        report["direct_real_events"] = 4
+        with patch(
+            "backend.shared.notification_publisher.publish_notification_async",
+            _fake_publish,
+        ):
+            asyncio.run(reconcile._notify_report(FakeRedis(), report))
+
+        assert published
+        assert "4 笔真实轮直连实盘" in published[0]["content"]
 
 
 class TestReconcileDayWindow:
