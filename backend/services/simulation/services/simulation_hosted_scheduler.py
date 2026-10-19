@@ -32,6 +32,22 @@ from backend.shared.market_sessions import (
 logger = logging.getLogger(__name__)
 
 _SH_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _job_naive_shanghai(value: datetime) -> datetime:
+    """瞬时 → ``simulation_rebalance_jobs`` 的时间口径（naive 上海墙钟）。
+
+    作业表三列（planned_run_at/window_start_at/window_end_at）都是
+    ``timestamp without time zone``，而 ``expire_outdated_jobs`` 也按 naive
+    上海比较。传 aware datetime 会让 asyncpg 在 INSERT 前就抛
+    ``DataError: can't subtract offset-naive and offset-aware datetimes``
+    ——2026-10-19 托管调度每 30s 崩在 planned_run_at 上，整日一轮都没跑成。
+    """
+    if value.tzinfo is None:
+        return value.replace(microsecond=0)
+    return value.astimezone(_SH_TZ).replace(microsecond=0, tzinfo=None)
+
+
 _DEFAULT_LIVE_TRADE_CONFIG: dict[str, Any] = {
     "rebalance_days": 3,
     "schedule_type": "interval",
@@ -198,6 +214,7 @@ def report_to_hosted_result(report: Any) -> dict[str, Any]:
         "order_count": getattr(report, "order_count", 0),
         "filled_count": getattr(report, "filled_count", 0),
         "rejected_count": getattr(report, "rejected_count", 0),
+        "capped_count": getattr(report, "capped_order_count", 0),
     }
 
 
@@ -229,6 +246,7 @@ async def run_simulation_cycle_for_active(
         exclude_symbols=exclude_symbols,
         quantity_overrides=quantity_overrides,
         log_source=log_source,
+        max_orders=cfg.get("max_orders_per_cycle"),
     )
     result = report_to_hosted_result(report)
     # T-FE-05 v2：人工改量裁定随报告透传（前端如实展示 applied/ignored）
@@ -265,6 +283,8 @@ async def preview_simulation_plan_for_active(
         pool_id=cfg.get("pool_id"),
         dry_run=True,
         exclude_symbols=exclude_symbols,
+        # 预演必须与执行同口径（同上限），否则预演条数是假预告
+        max_orders=cfg.get("max_orders_per_cycle"),
     )
     return {
         "available": True,
@@ -673,7 +693,7 @@ class SimulationHostedScheduler:
         triggered = 0
         current = now or datetime.now(_SH_TZ)
         await SimulationRebalanceJobService.expire_outdated_jobs(
-            now=current.astimezone(_SH_TZ).replace(microsecond=0, tzinfo=None)
+            now=_job_naive_shanghai(current)
         )
         for raw_key in self.redis.client.scan_iter(
             match="trade:active_strategy:*", count=500
@@ -773,7 +793,7 @@ class SimulationHostedScheduler:
             user_id=user_id,
             strategy_id=strategy_id,
             schedule_type=str(live_trade_config.get("schedule_type") or "interval"),
-            planned_run_at=now.astimezone(_SH_TZ).replace(microsecond=0),
+            planned_run_at=_job_naive_shanghai(now),
             window_seconds=max(
                 30, _to_int(live_trade_config.get("trigger_window_seconds"), 90)
             ),

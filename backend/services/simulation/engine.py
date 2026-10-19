@@ -119,6 +119,8 @@ class ExecutionReport:
     planned_orders: list[dict[str, Any]] = field(default_factory=list)
     # T-FE-05 可调 v2：人工改量的逐条裁定记录（applied/ignored，含原因——不静默）
     quantity_adjustments: list[dict[str, Any]] = field(default_factory=list)
+    #: 单轮委托上限（``max_orders_per_cycle``）截掉的调仓腿数量（退出规则单不截断）
+    capped_order_count: int = 0
 
 
 def apply_quantity_overrides(
@@ -202,6 +204,34 @@ def apply_quantity_overrides(
     return result, records
 
 
+def apply_order_cap(
+    orders: list[Order],
+    *,
+    exit_order_count: int,
+    max_orders: int | None,
+) -> tuple[list[Order], int]:
+    """单轮委托上限（``live_trade_config.max_orders_per_cycle``）的**唯一实现**。
+
+    2026-10-19 实测：策略配置写了 20，但引擎一轮能出 122–158 条腿（模拟账与
+    目标组合偏离后是全量重建），而镜像到实盘是逐腿真单——上限形同虚设。
+
+    纪律：
+    - **退出规则单（前 ``exit_order_count`` 条）不截断**：风控动作是用来减风险的，
+      被上限吞掉等于止损停半路。上限约束的是调仓腿。
+    - 调仓腿按计算顺序保留前 ``max(0, max_orders - 退出数)`` 条；RebalanceCalculator
+      先卖后买，截断天然优先保卖出（降杠杆先于加仓）。
+    - ``None`` / ≤0 = 不设上限（回测、每日批处理等非执行链）。
+    - 返回 (保留的单, 被截掉的调仓腿数)——调用方必须把截断如实记账/打日志。
+    """
+    if max_orders is None or int(max_orders) <= 0:
+        return list(orders), 0
+    exit_n = max(0, min(int(exit_order_count), len(orders)))
+    budget = max(0, int(max_orders) - exit_n)
+    rebalance = orders[exit_n:]
+    keep_n = min(len(rebalance), budget)
+    return list(orders[: exit_n + keep_n]), len(rebalance) - keep_n
+
+
 class SimulationEngine:
     """
     统一模拟盘引擎：
@@ -258,6 +288,7 @@ class SimulationEngine:
         quantity_overrides: dict[tuple[str, str], int] | None = None,
         signal_run_id: str | None = None,
         log_source: str | None = None,
+        max_orders: int | None = None,
     ) -> ExecutionReport:
         """
         执行一次模拟盘调仓周期。
@@ -281,6 +312,9 @@ class SimulationEngine:
                 逐条裁定记入 ``report.quantity_adjustments``（见 ``apply_quantity_overrides``）。
             log_source: 运行日志来源（T-RC-14，``hosted_sim``/``manual``）；None 表示
                 **不写运行日志**（dry-run 预演与每日批处理走这条，避免污染用户视图）。
+            max_orders: 单轮委托上限（``live_trade_config.max_orders_per_cycle``）。
+                只截调仓腿、不截退出规则单；``None`` = 不设上限。**预演必须传同一个值**，
+                否则预演条数与实际执行对不上（假预告）。见 ``apply_order_cap``。
 
         Returns:
             执行报告（dry_run 时 executed_at 仅为计算时刻）
@@ -509,7 +543,39 @@ class SimulationEngine:
                     orders, tenant=tenant, user_id=uid, strategy_id=strategy_id
                 )
                 orders = exit_orders + orders
+                # 5.5 单轮委托上限（2026-10-19）：调仓腿按配置截断，退出规则单不截。
+                # 2026-10-19 前该配置只被读到、从未被执行：一轮 122–158 条腿原样出链，
+                # 镜像开着时等于逐腿真单。
+                orders, capped_count = apply_order_cap(
+                    orders,
+                    exit_order_count=len(exit_orders),
+                    max_orders=max_orders,
+                )
+                report.capped_order_count = capped_count
                 report.order_count = len(orders)
+                if capped_count:
+                    _runtime_log(
+                        log_source=log_source,
+                        tenant=tenant,
+                        user_id=uid,
+                        strategy_id=strategy_id,
+                        line=(
+                            f"单轮委托上限 {int(max_orders or 0)} 条：本轮计划 "
+                            f"{len(orders) + capped_count} 条，截掉 {capped_count} 条调仓腿"
+                            f"（退出规则单 {len(exit_orders)} 条不截断，先卖后买）"
+                        ),
+                        level="warning",
+                        stage="order_cap",
+                        status="capped",
+                        run_id=exec_run_id,
+                        summary={
+                            "max_orders": int(max_orders or 0),
+                            "planned": len(orders) + capped_count,
+                            "kept": len(orders),
+                            "capped": capped_count,
+                            "exit_orders": len(exit_orders),
+                        },
+                    )
 
                 # 4.6 人工改量（T-FE-05 v2）：只动调仓单的数量，退出规则单与价格/方向不可改；
                 #     逐条裁定进 report（未命中/拒改不静默）
