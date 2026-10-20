@@ -146,10 +146,40 @@ def get_service_ports() -> dict:
     }
 
 
+#: 在线服务（API / 交易 / 行情）在**容器内**的 OOM 偏好。因子挖掘子进程 anon-rss 峰值
+#: 20–30GB，且与在线服务同处一个 ``quantmind`` 容器（SERVICE_MODE=all）。容器内存打满
+#: 触发 memcg OOM 时，内核按 ``oom_score_adj + RSS`` 挑人：体量最大的挖掘子进程通常先中，
+#: 但同容器里还有 8 个 tdx_aidata worker 等评分接近的进程——一旦挑中交易/API 就是用户
+#: 可见故障，而挑中挖掘只是本轮重算。故给在线服务负分保命；挖掘子进程继承 engine 的 0 分，
+#: 压力下优先被回收。（2026-10-14 整机假死事故加固）
+ONLINE_SERVICE_OOM_SCORE_ADJ = -500
+
+#: 因子挖掘宿主（engine）的 OOM 偏好：**正分** = 压力下优先被回收。RD-Agent 子进程
+#: 由 engine 派生、继承此值，因此容器内存打满时被 SIGKILL 的是挖掘而不是在线服务
+#: （挖掘被杀=本轮重算，交易被杀=真金白银的事故）。调**高** oom_score_adj 不需要
+#: 任何 capability，故这条在没有 CAP_SYS_RESOURCE 的容器里也一定生效——
+#: 它是 -500 之外的第二道保险。（2026-10-14 防假死事故加固）
+ENGINE_OOM_SCORE_ADJ = 500
+
+
+def _set_own_oom_score_adj(adj: int) -> None:
+    """把当前进程的 OOM 偏好调成 ``adj``（越小越不容易被 OOM killer 选中）。
+
+    写 ``/proc/self/oom_score_adj`` 失败（非 Linux / 无权限 / 只读 ``/proc``）不影响
+    服务启动，仅记一条 warning。
+    """
+    try:
+        with open("/proc/self/oom_score_adj", "w", encoding="ascii") as handle:
+            handle.write(str(adj))
+    except OSError as exc:
+        logger.warning("设置 oom_score_adj=%s 失败（不影响启动）: %s", adj, exc)
+
+
 def run_api_service(port: int, workers: int = 1):
     """运行 API 服务"""
     import uvicorn
 
+    _set_own_oom_score_adj(ONLINE_SERVICE_OOM_SCORE_ADJ)
     logger.info(f"Starting API service on port {port} with {workers} workers")
     uvicorn.run(
         "backend.services.api.main:app",
@@ -164,6 +194,7 @@ def run_engine_service(port: int, workers: int = 4):
     """运行 Engine 服务"""
     import uvicorn
 
+    _set_own_oom_score_adj(ENGINE_OOM_SCORE_ADJ)
     logger.info(f"Starting Engine service on port {port} with {workers} workers")
     uvicorn.run(
         "backend.services.engine.main:app",
@@ -178,6 +209,7 @@ def run_trade_service(port: int, workers: int = 1):
     """运行 Trade 服务"""
     import uvicorn
 
+    _set_own_oom_score_adj(ONLINE_SERVICE_OOM_SCORE_ADJ)
     logger.info(f"Starting Trade service on port {port} with {workers} workers")
     uvicorn.run(
         "backend.services.trade.main:app",
@@ -192,6 +224,7 @@ def run_stream_service(port: int, workers: int = 1):
     """运行 Stream 服务"""
     import uvicorn
 
+    _set_own_oom_score_adj(ONLINE_SERVICE_OOM_SCORE_ADJ)
     logger.info(f"Starting Stream service on port {port} with {workers} workers")
     uvicorn.run(
         "backend.services.stream.main:app",

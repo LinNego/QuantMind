@@ -17,6 +17,10 @@ services:
     image: quantmind-futu-opend:latest
     container_name: futu-opend
     restart: unless-stopped
+    # 内存上限（2026-10-14 防假死）：此前零上限，一个容器即可吃光 60GB 拖垮宿主机。
+    # 该容器多为手工 `docker run` 起的，重建时这份 compose 是唯一能带上限额的路径。
+    mem_limit: 3g
+    memswap_limit: 3g
     ports:
       - "127.0.0.1:11111:11111"   # 只回环；quantmind 容器走 docker 网络按名字直连 futu-opend:11111
     volumes:

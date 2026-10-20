@@ -10,6 +10,9 @@ services:
     # 离线镜像包也以此标签导入，避免 Compose 再次联网拉取。
     image: postgres:15-alpine
     container_name: quantmind-db
+    # 内存上限（同上，2026-10-14 防假死）。
+    mem_limit: 4g
+    memswap_limit: 4g
     shm_size: 256mb
     environment:
       - POSTGRES_DB=${DB_NAME:-quantmind}
@@ -37,11 +40,15 @@ services:
   redis:
     image: redis:7-alpine
     container_name: quantmind-redis
+    # 内存上限（2026-10-14 防假死；2026-10-15 顶格写拒绝风暴后 maxmemory 512mb→1024mb）。
+    # 容器上限必须显著高于 --maxmemory，否则 Redis 进程未到软上限先被 OOM-kill。
+    mem_limit: 2g
+    memswap_limit: 2g
     ports:
       - "127.0.0.1:6379:6379"
     # maxmemory-policy 必须为 noeviction：本实例同时承载 Celery broker/result backend，
     # allkeys-lru 会在内存压力下静默淘汰队列消息（定时任务表现为"没跑"）。
-    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --databases 16 --bind 0.0.0.0
+    command: redis-server --appendonly yes --maxmemory 1024mb --maxmemory-policy noeviction --databases 16 --bind 0.0.0.0
     volumes:
       - redis-data:/data
     healthcheck:
@@ -79,6 +86,19 @@ services:
     #           count: all
     #           capabilities: [gpu]
     container_name: quantmind
+    # 内存上限（2026-10-14 防假死事故修复）。此前全栈无上限，因子挖掘子进程
+    # 峰值 20–30GB/路，几路并发即可吃光 60GB 物理内存 → 全局 OOM → 页缓存被抽空
+    # → jbd2 日志提交饿死 → 所有写操作 block >122s → sshd 连 banner 都发不出，
+    # 整机"假死"（CPU/网络其实健康）。加限后超限只在本 cgroup 内 OOM，爆炸半径
+    # 收敛到容器，不再拖垮宿主机。memswap=50g 留 5G 交换余量吸收瞬时尖峰。
+    mem_limit: 45g
+    memswap_limit: 50g
+    # SYS_RESOURCE：仅供 main_oss.py 里在线服务把自身 oom_score_adj 调**低**用
+    # （内核规定：调低 oom_score_adj 需 CAP_SYS_RESOURCE，调高不需要）。容器级
+    # memcg OOM 时会优先牺牲因子挖掘子进程(+500)而不是交易/API(-500)。
+    # （2026-10-14 防假死事故加固；不加这个能力时那条写 /proc 会 Permission denied）
+    cap_add:
+      - SYS_RESOURCE
     depends_on:
       db:
         condition: service_healthy
@@ -697,6 +717,9 @@ services:
     image: quantmind-oss:latest
     platform: linux/amd64
     container_name: quantmind-celery-beat
+    # 内存上限（同上）。beat 只做调度，1G 足够。
+    mem_limit: 1g
+    memswap_limit: 1g
     depends_on:
       db:
         condition: service_healthy
@@ -763,6 +786,9 @@ services:
       args:
         APT_MIRROR: ${APT_MIRROR:-mirrors.tuna.tsinghua.edu.cn}
     container_name: quantmind-data-gateway
+    # 内存上限（同上，2026-10-14 防假死）。
+    mem_limit: 2g
+    memswap_limit: 2g
     ports:
       - "127.0.0.1:${DATA_GATEWAY_PORT:-8004}:8004"
     environment:
@@ -787,8 +813,12 @@ services:
   huntly:
     image: lcomplete/huntly:latest
     container_name: quantmind-huntly
+    # 内存上限（同上，2026-10-14 防假死）。Java 服务，观察峰值约 1G。
+    mem_limit: 3g
+    memswap_limit: 3g
     ports:
-      - "127.0.0.1:${HUNTLY_PORT:-8090}:80"
+      # 2026-10-19 开放局域网访问（原为 127.0.0.1 仅回环）
+      - "0.0.0.0:${HUNTLY_PORT:-8090}:80"
     volumes:
       - ./data/huntly:/data
     environment:
@@ -811,6 +841,9 @@ services:
   rsshub:
     image: diygod/rsshub:latest
     container_name: quantmind-rsshub
+    # 内存上限（同上，2026-10-14 防假死）。
+    mem_limit: 2g
+    memswap_limit: 2g
     ports:
       - "127.0.0.1:${RSSHUB_PORT:-1200}:1200"
     environment:
@@ -856,6 +889,9 @@ services:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: quantmind-dsh:latest
     container_name: quantmind-dsh
+    # 内存上限（同上，2026-10-14 防假死）。
+    mem_limit: 2g
+    memswap_limit: 2g
     ports:
       # DSH_PORT 必须保持 8088：前端 iframe 硬编码该端口（QuantBotPage.tsx）。
       # 免登录（同旧 qwenpaw），浏览器/Electron 直连；请配合云安全组/防火墙限制来源 IP。
@@ -948,6 +984,9 @@ services:
   ib-gateway:
     image: ghcr.io/gnzsnz/ib-gateway:latest
     container_name: ib-gateway
+    # 内存上限（同上，2026-10-14 防假死）。
+    mem_limit: 2g
+    memswap_limit: 2g
     environment:
       IB_ACCOUNT: ${IB_ACCOUNT:-}
       IB_PASSWORD: ${IB_PASSWORD:-}
