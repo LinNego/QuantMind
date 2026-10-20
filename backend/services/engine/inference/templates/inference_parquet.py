@@ -66,6 +66,15 @@ logger = logging.getLogger("inference_parquet")
 # ── 默认路径 ──────────────────────────────────────────────────────────────
 _DEFAULT_DATA_DIR = "/app/db/feature_snapshots"
 
+# 与 docker/training/data/splits.py::FEATURE_ABS_CLIP 保持同一口径：尺度敏感
+# 模型（Ridge 组正规方程、sklearn MLP、Qlib TabNet）训练时把特征裁剪到
+# ±1e14，否则 float32 下平方/方差溢出。推理端漏裁剪时，修订后的因子数据
+# （Cross300 入选列 absmax 达 9e23）会让 Ridge 直接外推出 1e7 量级
+# （2026-10-19 实测 LIN 在 SH600613 上的 pred=3.7e7）。树/序列模型训练端
+# 不裁剪，这里也保持原样。
+_FEATURE_ABS_CLIP = 1e14
+_CLIP_MODEL_TYPES = {"linear", "mlp", "tabnet"}
+
 
 def _quantdb_reader(meta: dict, data_dir: Path):
     """Open the immutable raw QuantDB source for new direct-read models."""
@@ -683,7 +692,9 @@ def _cross_sectional_preprocess_inline(X_df: pd.DataFrame, meta: dict) -> pd.Dat
     feats = [c for c in X_df.columns if c not in _exclude and c != "symbol"]
     for c in feats:
         col = pd.to_numeric(X_df[c], errors="coerce").to_numpy(dtype=np.float64)
-        valid = ~np.isnan(col)
+        # ±inf 与 NaN 同口径视作缺失（训练端 _fill 的同一约定）：
+        # 否则缩尾分位数会取到 inf，Z-score 得 NaN/inf 再喂给模型。
+        valid = np.isfinite(col)
         if valid.sum() == 0:
             X_df[c] = 0.0
             continue
@@ -737,6 +748,10 @@ def preprocess(df: pd.DataFrame, meta: dict) -> tuple[pd.DataFrame, list[str]]:
             df[c] = 0.0
 
     X_df = df[feature_cols].copy()
+    # 训练端 docker/training/data/splits.py::_fill 把 ±inf 与 NaN 当同一种缺失
+    # （如 gap_mined:HD_NUMCHG_YOY 的除零产物）。推理端不清洗时：
+    # LightGBM 默认把 inf 当缺失，静默掩盖；XGBoost/sklearn/TabNet 直接报错。
+    X_df = X_df.replace([np.inf, -np.inf], np.nan)
 
     prep = meta.get("preprocessing")
     if isinstance(prep, dict) and prep.get("enabled"):
@@ -749,6 +764,11 @@ def preprocess(df: pd.DataFrame, meta: dict) -> tuple[pd.DataFrame, list[str]]:
             if col in X_df.columns:
                 X_df[col] = X_df[col].fillna(val)
         X_df = X_df.fillna(0.0)
+
+    # 训练端 _fill 的顺序是「填缺失 → 裁剪」，这里逐位复现。裁剪只影响
+    # linear/mlp/tabnet：树模型训练端不裁剪，序列模型自带 z-score。
+    if str(meta.get("model_type") or "").strip().lower() in _CLIP_MODEL_TYPES:
+        X_df = X_df.clip(lower=-_FEATURE_ABS_CLIP, upper=_FEATURE_ABS_CLIP)
 
     symbols = df["symbol"].tolist()
     return X_df, symbols
