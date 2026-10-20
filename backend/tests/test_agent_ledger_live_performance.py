@@ -367,6 +367,66 @@ def test_merge_keeps_file_line_when_seam_within_tolerance():
     assert [p["value"] for p in pts] == [100000.0, 103000.0, 104000.0]
 
 
+def test_load_equity_preserves_point_source(tmp_path, monkeypatch):
+    """load_equity 必须保留 source：merge_live_equity 靠它识别当日真实分钟点。
+
+    2026-10-20 线上故障：加载器重建点字典时漏掉 ``source``，``source=pg`` 的
+    当日采样尾巴整段被判为非 PG 点，图表当天只剩一个单点（曲线无盘中形状）。
+    """
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "live_equity.jsonl").write_text(
+        '{"date":"2026-10-20","ts":"2026-10-20T09:30:00+08:00","value":100000,'
+        '"agent":"flash","source":"pg"}\n'
+        '{"date":"2026-10-20","ts":"2026-10-20T09:31:00+08:00","value":100010,'
+        '"agent":"flash"}\n'
+        '{"date":"2026-10-20","ts":"2026-10-20T09:32:00+08:00","value":900000}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("QM_ARENA_DATA_ROOT", str(tmp_path))
+
+    data = lf.load_equity()
+
+    assert data["agents"]["flash"][0]["source"] == "pg"
+    assert data["agents"]["flash"][1].get("source") is None
+    assert data["total"][0]["value"] == 900000.0
+
+
+def test_load_then_merge_keeps_today_intraday_tail(tmp_path, monkeypatch):
+    """端到端锁：文件里的当日 ``source=pg`` 分钟点必须用作曲线收尾。
+
+    只测 merge 不够——旧测试直接喂字典，绕过了 load_equity；线上正是加载器
+    丢字段导致今日尾巴退化成一个 PG 单点。
+    """
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    rows = [
+        '{"date":"2026-09-29","ts":"2026-09-29T15:00:00+08:00","value":100000,'
+        '"agent":"flash"}',
+        '{"date":"2026-10-20","ts":"2026-10-20T09:30:00+08:00","value":100200,'
+        '"agent":"flash","source":"pg"}',
+        '{"date":"2026-10-20","ts":"2026-10-20T13:05:00+08:00","value":100150,'
+        '"agent":"flash","source":"pg"}',
+    ]
+    (logs / "live_equity.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    monkeypatch.setenv("QM_ARENA_DATA_ROOT", str(tmp_path))
+
+    pg_series = {
+        "flash": [
+            {"date": "2026-09-30", "ts": "2026-09-30T15:00:00+08:00", "equity": 100100.0},
+            {"date": "2026-10-20", "ts": "2026-10-20T10:30:00+08:00", "equity": 100190.0},
+        ]
+    }
+    pts = lf.merge_live_equity(lf.load_equity(), pg_series)["agents"]["flash"]
+    today = [p for p in pts if p["date"] == "2026-10-20"]
+
+    assert [p["ts"] for p in today] == [
+        "2026-10-20T09:30:00+08:00",
+        "2026-10-20T13:05:00+08:00",
+    ]
+    assert pts[-1]["ts"] == "2026-10-20T13:05:00+08:00"
+
+
 def test_merge_live_equity_keeps_agents_without_pg_series():
     file_data = {
         "total": [],

@@ -94,7 +94,8 @@ const tsToText = (t: number, tickFmt: TickFmt): string => {
   }
   if (tickFmt === 'HH:mm') return d.toISOString().slice(11, 16);
   if (tickFmt === 'YYYY-MM') return d.toISOString().slice(0, 7);
-  return dayjs(t).format('MM-DD');
+  // 日期也按 +8h 切：本机可能是 JST/UTC，走 dayjs 本地时区会在 00:00 附近串日
+  return d.toISOString().slice(5, 10);
 };
 
 /** tooltip 用全精度：轴刻度跨年时省略年份（YYYY-MM），浮层不能省 */
@@ -104,14 +105,15 @@ const tsToFull = (t: number): string => new Date(t + 8 * 3600000).toISOString().
  *  悬停只把 hoverId 传进来（换线高亮才需要重建整层）；
  *  同一条线上的 x 轴滑动只走 HoverTip 浮层，不触碰这里。 */
 const ChartStatic = memo(function ChartStatic({
-  iw, ih, display, allTimes, tToIdx,
+  iw, ih, display, xToTime, tToIdx,
   xScale, yScale, rightScale, yOf, tickFmt,
   winStartIdx, winEndIdx, focus, hoverId, mode, currency,
 }: {
   iw: number;
   ih: number;
   display: DisplayLines;
-  allTimes: number[];
+  /** 轴坐标 → 墙钟时间（日槽内线性插值），刻度文本用 */
+  xToTime: (x: number) => number;
   tToIdx: Map<number, number>;
   xScale: NumScale;
   yScale: NumScale;
@@ -129,10 +131,10 @@ const ChartStatic = memo(function ChartStatic({
   currency: string;
 }) {
   const idxOf = (t: number) => tToIdx.get(t) ?? 0;
-  // 序号 → 真实时间（轴刻度与 invert 反查都用它）
+  // 轴坐标（日槽位 + 槽内时间比例）→ 真实时间（刻度文本用）
   const tsOfIdx = (v: number) => {
-    const t = allTimes[Math.round(Number(v))];
-    return t != null ? tsToText(t, tickFmt) : '';
+    const t = xToTime(Number(v));
+    return Number.isFinite(t) ? tsToText(t, tickFmt) : '';
   };
   // 刻度文本去重：连续同文刻度只标首个。启动早期实盘只有同分钟若干点
   // （20s 采样 00:00:00–00:00:40）时，HH:mm 下 10 个刻度全是 00:00 → 一排同文噪声轴。
@@ -308,7 +310,7 @@ const ChartStatic = memo(function ChartStatic({
                 if (f.t < t0 || f.t > t1) return null;
                 const idx = nearestIdxOfTime(l.points, f.t);
                 if (idx < 0) return null;
-                // x 轴是「采样点序号」的**多线并集**空间（allTimes）：折线每点都经
+                // x 轴是**多线共用**的日槽坐标（tToIdx，按交易日等宽）：折线每点都经
                 // idxOf(p.t) 换算，标记也必须走同一换算——nearestIdxOfTime 给的是
                 // **本线**序号，直接 xScale(idx) 会把近端成交画到早得多的位置
                 // （2026-10-07 实测 9/29 的成交标记横移 ~260px，看起来"不在线上"）。
@@ -580,7 +582,8 @@ interface ChartInnerProps {
   width: number;
   height: number;
   display: DisplayLines;
-  allTimes: number[];
+  /** 轴坐标 → 墙钟时间（日槽内线性插值），刻度文本用 */
+  xToTime: (x: number) => number;
   tToIdx: Map<number, number>;
   domain: { idxMin: number; idxMax: number };
   focus: string | null;
@@ -597,7 +600,7 @@ interface ChartInnerProps {
  *  内部：几何/刻度都收敛进 geo useMemo（平移缩放/数据变化才变），
  *  静态层 ChartStatic 只认 geo 引用 + hoverId；悬停滑动只更新 HoverTip。 */
 const ChartInner = memo(function ChartInner({
-  width, height, display, allTimes, tToIdx, domain,
+  width, height, display, xToTime, tToIdx, domain,
   focus, mode, currency, events, holdings, names, priceMap,
 }: ChartInnerProps) {
   const iw = Math.max(width - margin.left - margin.right, 10);
@@ -713,35 +716,31 @@ const ChartInner = memo(function ChartInner({
     const yOf = (l: { abs?: boolean }, v: number) =>
       l.abs && rightScale ? rightScale(v) : yScale(v);
 
-    // 刻度格式: 先按「相邻采样平均墙钟间隔」识别数据粒度——
-    // 日线级(≥12h/点)只看日期; 低频(≥90min/点)必须带日期, 隔日同时刻才不重影;
-    // 分钟级沿用点数启发式(断轴后点数≈交易分钟): ≤240 点≈一个交易时段→HH:mm;
-    // ≤1920 点≈8 交易日→MM-DD HH:mm; 更久→MM-DD。
-    // （纯点数启发式会把 30 天日线(30 点@15:00)套成 HH:mm → 整轴同时刻重复, 2026-09-07 修复）
-    const winPoints = Math.round(winEndIdx - winStartIdx) + 1;
-    const iLo = Math.min(allTimes.length - 1, Math.max(0, Math.round(winStartIdx)));
-    const iHi = Math.min(allTimes.length - 1, Math.max(0, Math.round(winEndIdx)));
-    const tLo = allTimes[iLo] ?? allTimes[0];
-    const tHi = allTimes[iHi] ?? allTimes[allTimes.length - 1];
-    const spanMs = Math.max(1, (tHi ?? 0) - (tLo ?? 0));
-    const avgStepMs = spanMs / Math.max(1, winPoints - 1);
+    // 刻度格式按「可见日槽数 + 真实跨度」判定：
+    // 多日视图只看日期（跨年改 YYYY-MM），单日视图看时分。
+    // 轴已按交易日等宽（见 daySlots），窗口宽度本身就是日数，不再点数启发。
+    const visibleDays = winEndIdx - winStartIdx;
+    const tLo = xToTime(winStartIdx);
+    const tHi = xToTime(winEndIdx);
+    const spanMs = Math.max(1, (Number.isFinite(tHi) ? tHi : 0) - (Number.isFinite(tLo) ? tLo : 0));
     const tickFmt: TickFmt =
-      avgStepMs >= 12 * 3600000
-        // 日线：跨年窗口只显示 MM-DD 会分不清年份（回测 10 年净值曲线），改 YYYY-MM
-        ? (spanMs >= 365 * 86400000 ? 'YYYY-MM' : 'MM-DD')
-      : avgStepMs >= 90 * 60000 ? 'MM-DD HH:mm'
-      : winPoints <= 240 ? 'HH:mm'
-      : winPoints <= 1920 ? 'MM-DD HH:mm'
-      : 'MM-DD';
+      spanMs >= 365 * 86400000
+        // 跨年窗口只显示 MM-DD 会分不清年份（回测 10 年净值曲线），改 YYYY-MM
+        ? 'YYYY-MM'
+        : visibleDays >= 2
+          ? 'MM-DD'
+          : spanMs >= 20 * 3600000
+            ? 'MM-DD HH:mm'
+            : 'HH:mm';
     return { winStartIdx, winEndIdx, xScale, yScale, rightScale, yOf, tickFmt };
-  }, [iw, ih, view, domain, tToIdx, allTimes, display, mode]);
+  }, [iw, ih, view, domain, tToIdx, xToTime, display, mode]);
   const { winStartIdx, winEndIdx, xScale, yScale, rightScale, yOf, tickFmt } = geo;
 
   return (
     <svg width={width} height={height} role="img" aria-label="净值对比图">
       <Group left={margin.left} top={margin.top}>
         <ChartStatic
-          iw={iw} ih={ih} display={display} allTimes={allTimes} tToIdx={tToIdx}
+          iw={iw} ih={ih} display={display} xToTime={xToTime} tToIdx={tToIdx}
           xScale={xScale} yScale={yScale} rightScale={rightScale} yOf={yOf} tickFmt={tickFmt}
           winStartIdx={winStartIdx} winEndIdx={winEndIdx}
           focus={focus} hoverId={hover?.id ?? null} mode={mode} currency={currency}
@@ -901,27 +900,64 @@ export default function EquityChart({
     };
   }, [lines, benchmark, mode, timeRange]);
 
-  // 断轴：把绝对时间压成连续序号——隔夜/隔周末在 X 轴上紧挨，不画非交易空白。
-  // 收盘 15:00 → 次日 09:30 之间 18.5h 没有数据点，scaleTime 会拉成大片空白平线，
-  // 用「采样点序号」等距分布即可剪掉。刻度仍经 allTimes 反查显示真实北京时间。
-  const allTimes = useMemo(() => {
-    const set = new Set<number>();
-    for (const l of display.lines) for (const p of l.points) set.add(p.t);
-    if (display.bench) for (const p of display.bench.points) set.add(p.t);
-    return [...set].sort((a, b) => a - b);
+  // 断轴（按交易日等宽）：隔夜/隔周末不画空白；每个交易日在 X 轴上占**一个槽**，
+  // 槽内按墙钟时间线性铺开。旧实现用「采样点序号并集」——分钟级历史密集的
+  // 交易日会独占 90%+ 轴宽，只有日线点的新 agent 被挤到最后几个像素
+  // （2026-10-20 实测 pro/glm 只剩 5–10px，看起来"只有 deepv4"）。
+  const daySlots = useMemo(() => {
+    const byDay = new Map<string, { start: number; end: number }>();
+    const add = (t: number) => {
+      if (!Number.isFinite(t)) return;
+      const key = new Date(t + 8 * 3600000).toISOString().slice(0, 10);
+      const cur = byDay.get(key);
+      if (!cur) byDay.set(key, { start: t, end: t });
+      else {
+        cur.start = Math.min(cur.start, t);
+        cur.end = Math.max(cur.end, t);
+      }
+    };
+    for (const l of display.lines) for (const p of l.points) add(p.t);
+    if (display.bench) for (const p of display.bench.points) add(p.t);
+    return [...byDay.entries()]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, span]) => ({ key, start: span.start, end: span.end }));
   }, [display]);
+  const dayIndex = useMemo(() => {
+    const m = new Map<string, number>();
+    daySlots.forEach((d, i) => m.set(d.key, i));
+    return m;
+  }, [daySlots]);
+  // 点时间 → 轴坐标（日槽号 + 槽内比例）。同一天只有一个点时放槽中，避免压边。
   const tToIdx = useMemo(() => {
     const m = new Map<number, number>();
-    allTimes.forEach((t, i) => m.set(t, i));
+    const put = (t: number) => {
+      if (m.has(t)) return;
+      const key = new Date(t + 8 * 3600000).toISOString().slice(0, 10);
+      const i = dayIndex.get(key) ?? 0;
+      const d = daySlots[i];
+      if (!d) return;
+      const span = d.end - d.start;
+      m.set(t, i + (span > 0 ? (t - d.start) / span : 0.5));
+    };
+    for (const l of display.lines) for (const p of l.points) put(p.t);
+    if (display.bench) for (const p of display.bench.points) put(p.t);
     return m;
-  }, [allTimes]);
+  }, [display, dayIndex, daySlots]);
+  // 轴坐标 → 墙钟时间（刻度文本反查）；无数据返回 NaN。
+  const xToTime = useCallback((x: number) => {
+    if (!daySlots.length) return NaN;
+    const i = Math.min(daySlots.length - 1, Math.max(0, Math.floor(x)));
+    const d = daySlots[i];
+    const frac = Math.max(0, Math.min(1, x - i));
+    return d.start + frac * (d.end - d.start);
+  }, [daySlots]);
 
-  // X 域用序号；基准指数全历史时只作参照，取主曲线序号域，超窗部分 clipPath 裁掉。
+  // X 域 = 日槽总数；基准指数全历史时只作参照，超窗部分 clipPath 裁掉。
   const domain = useMemo(() => {
-    const n = allTimes.length;
-    if (n < 2) return { idxMin: 0, idxMax: 1 };
-    return { idxMin: 0, idxMax: n - 1 };
-  }, [allTimes]);
+    const n = daySlots.length;
+    if (n < 1) return { idxMin: 0, idxMax: 1 };
+    return { idxMin: 0, idxMax: n };
+  }, [daySlots]);
 
   if (!lines.length) {
     return <div className="loading">暂无净值数据</div>;
@@ -953,7 +989,7 @@ export default function EquityChart({
           {({ width, height: h }) => (
             <ChartInner
               width={width} height={h}
-              display={display} allTimes={allTimes} tToIdx={tToIdx} domain={domain}
+              display={display} xToTime={xToTime} tToIdx={tToIdx} domain={domain}
               focus={focus} mode={mode} currency={currency}
               events={events} holdings={holdings} names={names} priceMap={priceMap}
             />
