@@ -1,0 +1,21 @@
+/* ---------- 右侧 540px 面板 ---------- */
+
+.qm-arena-root .right-section {
+  grid-column: 2;
+  grid-row: 1;
+  width: auto; /* 列宽由 --right-panel-w 定 */
+  border-left: 3px solid #000;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  min-height: 0;
+  /* 高度 = 行1（图表）；长内容（对话/决策）由面板内部承接滚动 */
+  max-height: none;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* 关键：size containment 让内容不参与行高计算。
+     否则长对话把行1撑高，图表不动而面板底边脱开图例（2026-10-20 对齐修复）。 */
+  contain: size;
+}
+
+.qm-arena-root .trade-tabs {

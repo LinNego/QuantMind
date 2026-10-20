@@ -1,0 +1,7 @@
+        const open = !!exp[expKey(i, 'prompt')];
+        return (
+          <>
+            <pre className={`mc-code  ${long && !open ? 'mc-clamp' : ''}`}>{renderInline(txt)}</pre>
+            {long && (
+              <button className="mc-more"
+                onClick={() => setExp((e) => ({ ...e, [expKey(i, 'prompt')]: !open }))}>

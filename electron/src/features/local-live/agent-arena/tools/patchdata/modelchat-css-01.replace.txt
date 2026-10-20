@@ -1,0 +1,8 @@
+  box-sizing: border-box;
+  border: 2px solid #000;
+  background: #fff;
+  /* 与「新闻」卡片同一套硬投影：卡片从面板底上立起来，不再是表格行 */
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.9);
+}
+.qm-arena-root .mc-card.open { background: #fcfcfc; }
+

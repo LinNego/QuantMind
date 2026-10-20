@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import ChatStream from '../arena/components/ChatStream';
 import type { LogLine } from '../arena/api/client';
 import {
@@ -119,5 +119,49 @@ describe('总结条不直出机器码 + 卡头日期口径（2026-10-15 排版�
 
     const date = document.querySelector('.mc-date');
     expect(date?.textContent).toBe('10-10 09:30');
+  });
+});
+
+describe('模型对话结构化渲染（2026-10-20「像新闻那样」）', () => {
+  /** 真实输出形态：四段式 + 粗体结论 + 编号链路 + markdown 表格 */
+  const mdRound: LogLine = {
+    timestamp: '2026-10-20T09:35:00',
+    new_messages: [
+      { role: 'user', content: '【要求】盘中决策……' },
+      {
+        role: 'assistant',
+        content: [
+          '【总体总结】**持仓偏防守**：量能不足，控制仓位。',
+          '【分析链路】',
+          '1. 调用行情工具',
+          '2. 计算因子暴露',
+          '【推理论证】',
+          '| 标的 | 权重 |',
+          '| --- | ---: |',
+          '| 600519.SH | 12% |',
+        ].join('\n'),
+      },
+    ],
+  };
+
+  it('总结条：粗体结论提为标题，正文不丢且仍挂在 mc-sum-text 内', () => {
+    // Arrange / Act
+    render(<ChatStream agents={agentsWith(mdRound)} />);
+
+    // Assert
+    const sum = document.querySelector('.mc-sum-text');
+    expect(sum?.querySelector('.mc-sum-headline')?.textContent).toBe('持仓偏防守');
+    expect(sum?.textContent).toContain('量能不足');
+  });
+
+  it('展开后：链路成有序列表、推理表格成 table（不再是等宽文本墙）', () => {
+    render(<ChatStream agents={agentsWith(mdRound)} />);
+
+    fireEvent.click(document.querySelector('.mc-head') as HTMLElement);
+
+    expect(document.querySelector('.mc-code.mc-prose')).toBeTruthy();
+    expect(document.querySelector('ol.mc-md-ol')).toBeTruthy();
+    expect(document.querySelector('table.mc-md-table')).toBeTruthy();
+    expect(document.querySelector('.mc-card pre')).toBeNull();
   });
 });

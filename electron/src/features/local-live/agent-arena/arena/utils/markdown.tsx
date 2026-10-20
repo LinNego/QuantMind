@@ -40,34 +40,133 @@ export function renderInline(text: string): ReactNode[] {
   });
 }
 
+/** GFM 表格分隔行：| --- | ---: |（至少两列，冒号可选） */
+const TABLE_SEP = /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$/;
+/** 围栏代码块起始/结束：```lang */
+const FENCE = /^```([\w+-]*)\s*$/;
+const BULLET = /^(\s*)[-•]\s+(.*)$/;
+const ORDERED = /^(\s*)\d+[.)]\s+(.*)$/;
+
+type Align = 'left' | 'right' | 'center' | undefined;
+
+function splitRow(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map((c) => c.trim());
+}
+
+function alignsOf(sep: string): Align[] {
+  return splitRow(sep).map((c) => {
+    const left = c.startsWith(':');
+    const right = c.endsWith(':');
+    return left && right ? 'center' : right ? 'right' : left ? 'left' : undefined;
+  });
+}
+
+/** 缩进层级（markdown 常写 2~4 空格一级，封顶 2 级防深坑） */
+const depthOf = (indent: string) => Math.min(2, Math.floor(indent.replace(/\t/g, '  ').length / 2));
+
 /**
- * 块级 markdown 渲染（用于思考链/提示词长文，排版结构化）：
- *   `### 标题` → 黑底白字小节头；`- ` 连续项 → <ul> 列表；
- *   `⚠️`/`【】` 开头行 → 警示条（黄底左竖条）；普通行 → 段落。
+ * 块级 markdown 渲染（用于提示词/思考链长文，排版结构化）：
+ *   `### 标题` → 黑底白字小节头；`- ` 连续项 → <ul>；`1. ` 连续项 → <ol>；
+ *   `| a | b |` + 分隔行 → <table>（真表格，不再是一排竖线）；
+ *   ```lang 围栏 → <pre>（内部原样，不做行内解析）；
+ *   `⚠️` 开头行 → 警示条（黄底左竖条）；`【段标】` 开头行 → 小节标题；
+ *   普通行 → 段落。
  * 行内 `**粗体**`/`code`/`*斜体*` 沿用 renderParts。
  */
 export function renderMarkdown(text: string): ReactNode[] {
   const lines = text.split('\n');
   const out: ReactNode[] = [];
-  let list: string[] | null = null;
+  let list: { text: string; depth: number }[] | null = null;
+  let listOrdered = false;
 
   const flushList = (key: number) => {
-    if (list) {
-      out.push(
-        <ul key={key} className="mc-md-list">
-          {list.map((item, j) => (
-            <li key={j}>{renderParts(item)}</li>
-          ))}
-        </ul>
-      );
-      list = null;
-    }
+    if (!list) return;
+    const Tag = listOrdered ? 'ol' : 'ul';
+    out.push(
+      <Tag key={key} className={`mc-md-list${listOrdered ? ' mc-md-ol' : ''}`}>
+        {list.map((item, j) => (
+          <li key={j} className={item.depth ? `mc-md-li-d${item.depth}` : undefined}>
+            {renderParts(item.text)}
+          </li>
+        ))}
+      </Tag>
+    );
+    list = null;
   };
 
-  lines.forEach((line, i) => {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const trimmed = line.trim();
+
+    // 围栏代码块：原样收集到闭合围栏（模型常贴 ```json 决策/行情片段）
+    const fence = trimmed.match(FENCE);
+    if (fence) {
+      flushList(i);
+      const body: string[] = [];
+      let j = i + 1;
+      while (j < lines.length && !/^```\s*$/.test(lines[j].trim())) {
+        body.push(lines[j]);
+        j++;
+      }
+      out.push(
+        <pre key={i} className="mc-md-pre" data-lang={fence[1] || undefined}>
+          <code>{body.join('\n')}</code>
+        </pre>
+      );
+      i = j; // 跳过闭合围栏（缺失闭合时 j 已到文末）
+      continue;
+    }
+
+    // GFM 表格：表头行 + 分隔行 + 连续 | 行
+    if (trimmed.startsWith('|') && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1].trim())) {
+      flushList(i);
+      const header = splitRow(trimmed);
+      const aligns = alignsOf(lines[i + 1].trim());
+      const rows: string[][] = [];
+      let j = i + 2;
+      while (j < lines.length && lines[j].trim().startsWith('|')) {
+        rows.push(splitRow(lines[j]));
+        j++;
+      }
+      out.push(
+        <div key={i} className="mc-md-table-wrap">
+          <table className="mc-md-table">
+            <thead>
+              <tr>
+                {header.map((cell, k) => (
+                  <th key={k} className={aligns[k] ? `ta-${aligns[k]}` : undefined}>
+                    {renderParts(cell)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, ri) => (
+                <tr key={ri}>
+                  {header.map((_, ci) => (
+                    <td key={ci} className={aligns[ci] ? `ta-${aligns[ci]}` : undefined}>
+                      {renderParts(row[ci] ?? '')}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+      i = j - 1;
+      continue;
+    }
+
     const heading = line.match(/^#{1,6}\s+(.*)$/);
-    const bullet = trimmed.match(/^[-•]\s+(.*)$/);
+    const bullet = line.match(BULLET);
+    const ordered = line.match(ORDERED);
+
     if (heading) {
       flushList(i);
       const level = heading[0].match(/^#+/)?.[0].length ?? 3;
@@ -76,15 +175,37 @@ export function renderMarkdown(text: string): ReactNode[] {
           {renderParts(heading[1])}
         </div>
       );
-    } else if (bullet) {
-      (list ??= []).push(bullet[1]);
+    } else if (bullet || ordered) {
+      const isOrdered = !!ordered;
+      if (list && isOrdered !== listOrdered) flushList(i);
+      listOrdered = isOrdered;
+      const m = (ordered ?? bullet)!;
+      (list ??= []).push({ text: m[2], depth: depthOf(m[1]) });
     } else if (trimmed === '') {
       flushList(i);
-    } else if (trimmed.startsWith('⚠️') || trimmed.startsWith('【')) {
+    } else if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      flushList(i);
+      out.push(<hr key={i} className="mc-md-hr" />);
+    } else if (trimmed.startsWith('⚠')) {
       flushList(i);
       out.push(
         <div key={i} className="mc-md-warn">
           {renderParts(trimmed)}
+        </div>
+      );
+    } else if (/^【[^】]{1,24}】/.test(trimmed)) {
+      // 【持仓】【要求】【风险】这类段标 → 小节标题；不再一律染黄当警告
+      flushList(i);
+      out.push(
+        <div key={i} className="mc-md-sub">
+          {renderParts(trimmed)}
+        </div>
+      );
+    } else if (trimmed.startsWith('> ')) {
+      flushList(i);
+      out.push(
+        <div key={i} className="mc-md-quote">
+          {renderParts(trimmed.slice(2))}
         </div>
       );
     } else {
@@ -95,7 +216,7 @@ export function renderMarkdown(text: string): ReactNode[] {
         </div>
       );
     }
-  });
+  }
   flushList(lines.length);
   return out;
 }

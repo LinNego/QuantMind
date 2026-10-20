@@ -1,0 +1,8 @@
+.qm-arena-root .mc-summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 10px 14px 11px;
+  border-bottom: 1px dashed #bbb;
+  background: #f7f9f7;
+}

@@ -1,0 +1,22 @@
+
+/* ---------- 主区左右分栏 ---------- */
+
+/* 主区两行：行1 = 图表 + 右侧面板（同高），行2 = 模型卡（仅左栏宽）。
+   右面板高度由行1（图表）决定 → 面板底边 = 图例 chips 底边。 */
+.qm-arena-root .main-content {
+  --right-panel-w: 540px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--right-panel-w);
+  grid-template-rows: auto auto;
+  align-items: stretch;
+}
+
+.qm-arena-root .chart-area {
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+  /* 底部不留 padding：面板底边要与图例 chips 底边严丝合缝 */
+  padding: 16px 20px 0;
+}
+
+/* ---------- 图表头部 ---------- */

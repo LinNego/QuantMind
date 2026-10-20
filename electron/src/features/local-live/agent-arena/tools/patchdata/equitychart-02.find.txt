@@ -1,0 +1,7 @@
+ *  静态层 ChartStatic 只认 geo 引用 + hoverId；悬停滑动只更新 HoverTip。 */
+const ChartInner = memo(function ChartInner({
+  width, height, display, allTimes, tToIdx, domain,
+  focus, mode, currency, events, holdings, names, priceMap,
+}: ChartInnerProps) {
+  const iw = Math.max(width - margin.left - margin.right, 10);
+  const ih = Math.max(height - margin.top - margin.bottom, 10);

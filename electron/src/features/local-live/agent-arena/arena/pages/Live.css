@@ -317,16 +317,22 @@
 
 /* ---------- 主区左右分栏 ---------- */
 
+/* 主区两行：行1 = 图表 + 右侧面板（同高），行2 = 模型卡（仅左栏宽）。
+   右面板高度由行1（图表）决定 → 面板底边 = 图例 chips 底边。 */
 .qm-arena-root .main-content {
-  display: flex;
-  gap: 0;
+  --right-panel-w: 540px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--right-panel-w);
+  grid-template-rows: auto auto;
   align-items: stretch;
 }
 
 .qm-arena-root .chart-area {
-  flex: 1;
+  grid-column: 1;
+  grid-row: 1;
   min-width: 0;
-  padding: 16px 20px;
+  /* 底部不留 padding：面板底边要与图例 chips 底边严丝合缝 */
+  padding: 16px 20px 0;
 }
 
 /* ---------- 图表头部 ---------- */
@@ -393,9 +399,13 @@
 /* ---------- 模型横排 mini 卡 ---------- */
 
 .qm-arena-root .model-cards-section {
+  grid-column: 1;
+  grid-row: 2;
   display: flex;
   gap: 12px;
   margin-top: 16px;
+  /* 图表区已无横向 padding（它是 grid 单元），卡片自己补回左栏内边距 */
+  padding: 0 20px 16px;
   flex-wrap: wrap;
 }
 
@@ -473,17 +483,21 @@
 /* ---------- 右侧 540px 面板 ---------- */
 
 .qm-arena-root .right-section {
-  width: 540px;
-  flex-shrink: 0;
+  grid-column: 2;
+  grid-row: 1;
+  width: auto; /* 列宽由 --right-panel-w 定 */
   border-left: 3px solid #000;
   display: flex;
   flex-direction: column;
   background: #fff;
-  min-height: 600px;
-  /* 长内容（对话/决策）由右侧面板承接滚动，页面联动跟随 */
-  max-height: calc(100vh - 190px);
+  min-height: 0;
+  /* 高度 = 行1（图表）；长内容（对话/决策）由面板内部承接滚动 */
+  max-height: none;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* 关键：size containment 让内容不参与行高计算。
+     否则长对话把行1撑高，图表不动而面板底边脱开图例（2026-10-20 对齐修复）。 */
+  contain: size;
 }
 
 .qm-arena-root .trade-tabs {
@@ -1026,17 +1040,24 @@
 /* ---------- 响应式 ---------- */
 
 @media (max-width: 1024px) {
-  .qm-arena-root .right-section { width: 380px; }
+  .qm-arena-root .main-content { --right-panel-w: 380px; }
   .qm-arena-root .model-card-mini { min-width: 150px; }
 }
 
 @media (max-width: 820px) {
-  .qm-arena-root .main-content { flex-direction: column; }
-  /* 列布局下右面板按内容自适应，不再用桌面端 600px 最小高度撑出底部空白 */
-  .qm-arena-root .live .right-section { min-height: 0; }
-  .qm-arena-root .right-section { width: 100%; border-left: none; border-top: 2px solid #000; }
+  /* 窄屏回到单列：图表 → 模型卡 → 右侧面板 */
+  .qm-arena-root .main-content { display: flex; flex-direction: column; }
+  .qm-arena-root .chart-area { padding: 12px 12px 0; }
+  .qm-arena-root .model-cards-section { padding: 0 12px 12px; }
+  .qm-arena-root .right-section {
+    width: 100%;
+    border-left: none;
+    border-top: 2px solid #000;
+    /* 单列下不再与图表等高：按内容自适应，长列表面板内滚动 */
+    contain: none;
+    max-height: calc(100vh - 190px);
+  }
   .qm-arena-root .trade-list { max-height: 420px; }
-  .qm-arena-root .chart-area { padding: 12px 12px; }
   .qm-arena-root .price-item { font-size: 10px; }
 }
 

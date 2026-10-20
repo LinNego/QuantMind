@@ -1,0 +1,24 @@
+/* ---------- 响应式 ---------- */
+
+@media (max-width: 1024px) {
+  .qm-arena-root .main-content { --right-panel-w: 380px; }
+  .qm-arena-root .model-card-mini { min-width: 150px; }
+}
+
+@media (max-width: 820px) {
+  /* 窄屏回到单列：图表 → 模型卡 → 右侧面板 */
+  .qm-arena-root .main-content { display: flex; flex-direction: column; }
+  .qm-arena-root .chart-area { padding: 12px 12px 0; }
+  .qm-arena-root .model-cards-section { padding: 0 12px 12px; }
+  .qm-arena-root .right-section {
+    width: 100%;
+    border-left: none;
+    border-top: 2px solid #000;
+    /* 单列下不再与图表等高：按内容自适应，长列表面板内滚动 */
+    contain: none;
+    max-height: calc(100vh - 190px);
+  }
+  .qm-arena-root .trade-list { max-height: 420px; }
+  .qm-arena-root .price-item { font-size: 10px; }
+}
+

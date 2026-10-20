@@ -1,0 +1,7 @@
+            <ChartInner
+              width={width} height={h}
+              display={display} allTimes={allTimes} tToIdx={tToIdx} domain={domain}
+              focus={focus} mode={mode} currency={currency}
+              events={events} holdings={holdings} names={names} priceMap={priceMap}
+            />
+          )}

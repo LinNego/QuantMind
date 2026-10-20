@@ -1,0 +1,9 @@
+/* ---------- 模型横排 mini 卡 ---------- */
+
+.qm-arena-root .model-cards-section {
+  display: flex;
+  gap: 12px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+

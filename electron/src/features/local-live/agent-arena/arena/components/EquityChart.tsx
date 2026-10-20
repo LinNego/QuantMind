@@ -580,6 +580,8 @@ interface ChartInnerProps {
   domain: { idxMin: number; idxMax: number };
   focus: string | null;
   mode: 'pct' | 'dollar';
+  /** 金额轴下限（仅 dollar 模式生效）：Y 域至少向下扩到该值，线不贴轴底 */
+  yFloor?: number;
   currency: string;
   events?: HoverEvent[];
   holdings?: HoldingSpan[];
@@ -593,7 +595,7 @@ interface ChartInnerProps {
  *  静态层 ChartStatic 只认 geo 引用 + hoverId；悬停滑动只更新 HoverTip。 */
 const ChartInner = memo(function ChartInner({
   width, height, display, xToTime, tToIdx, domain,
-  focus, mode, currency, events, holdings, names, priceMap,
+  focus, mode, yFloor, currency, events, holdings, names, priceMap,
 }: ChartInnerProps) {
   const iw = Math.max(width - margin.left - margin.right, 10);
   const ih = Math.max(height - margin.top - margin.bottom, 10);
@@ -686,7 +688,14 @@ const ChartInner = memo(function ChartInner({
     if (!Number.isFinite(vMin) || vMin === vMax) { vMin = 0; vMax = 1; }
     if (mode === 'dollar' && vMin < 0) vMin = 0; // 绝对净值不画负区
     const padY = (vMax - vMin) * 0.07 || 1;
-    const yScale = scaleLinear({ domain: [vMin - padY, vMax + padY], range: [ih, 0] });
+    // 金额轴下限（可选）：把 Y 域向下扩到该值，线不贴轴底。
+    // 2026-10-20 用户口径：日终账本要见 ¥0 基线（否则末端贴底像钱亏光了），
+    // 盘中实况金额轴要到 ¥5 万。数据本身低于下限时仍以数据为准 → 取 min，绝不裁线。
+    const yMin =
+      mode === 'dollar' && yFloor != null && Number.isFinite(yFloor)
+        ? Math.min(vMin - padY, yFloor)
+        : vMin - padY;
+    const yScale = scaleLinear({ domain: [yMin, vMax + padY], range: [ih, 0] });
     // 右侧独立刻度（绝对金额线，如分账合计 ¥30 万量级——与 pct 线不同轴）
     const absLines = display.lines.filter((l) => l.abs);
     let rMin = Infinity, rMax = -Infinity;
@@ -725,7 +734,7 @@ const ChartInner = memo(function ChartInner({
             ? 'MM-DD HH:mm'
             : 'HH:mm';
     return { winStartIdx, winEndIdx, xScale, yScale, rightScale, yOf, tickFmt };
-  }, [iw, ih, view, domain, tToIdx, xToTime, display, mode]);
+  }, [iw, ih, view, domain, tToIdx, xToTime, display, mode, yFloor]);
   const { winStartIdx, winEndIdx, xScale, yScale, rightScale, yOf, tickFmt } = geo;
 
   return (
@@ -842,6 +851,7 @@ export default function EquityChart({
   mode = 'pct',
   timeRange = 'all',
   height = 380,
+  yFloor,
   events,
   holdings,
   names,
@@ -854,6 +864,8 @@ export default function EquityChart({
   timeRange?: 'all' | '5d';
   /** 数字 = 固定 px；字符串 = 任意 CSS 值（如 clamp(...) 响应式高度） */
   height?: number | string;
+  /** 金额轴下限（仅 dollar 模式）：Y 域至少向下扩到该值（数据更低时以数据为准） */
+  yFloor?: number;
   /** 悬停补充：成交事件（拖尾时间窗内展示买卖） */
   events?: HoverEvent[];
   /** 悬停补充：持仓时间线（该时刻各 agent 持有代码/数量） */
@@ -982,7 +994,7 @@ export default function EquityChart({
             <ChartInner
               width={width} height={h}
               display={display} xToTime={xToTime} tToIdx={tToIdx} domain={domain}
-              focus={focus} mode={mode} currency={currency}
+              focus={focus} mode={mode} yFloor={yFloor} currency={currency}
               events={events} holdings={holdings} names={names} priceMap={priceMap}
             />
           )}

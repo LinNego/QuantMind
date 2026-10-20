@@ -1,0 +1,13 @@
+/* ---------- 模型横排 mini 卡 ---------- */
+
+.qm-arena-root .model-cards-section {
+  grid-column: 1;
+  grid-row: 2;
+  display: flex;
+  gap: 12px;
+  margin-top: 16px;
+  /* 图表区已无横向 padding（它是 grid 单元），卡片自己补回左栏内边距 */
+  padding: 0 20px 16px;
+  flex-wrap: wrap;
+}
+

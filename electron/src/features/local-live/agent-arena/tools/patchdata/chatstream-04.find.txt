@@ -1,0 +1,6 @@
+        const proto: ProtoSpec | null = protoSpecOf(r.modelId);
+        const isNews = !!proto || isGateAgent(r.modelId);
+        const newsSum = isNews ? protoSummary(r.thought, r.modelId) : '';
+        return (
+          <div
+            className={`mc-card ${isOpen ? 'open' : ''}`} data-card={i}

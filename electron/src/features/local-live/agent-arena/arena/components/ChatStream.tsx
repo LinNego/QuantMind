@@ -1,7 +1,7 @@
 import { useMemo, useState, type CSSProperties } from 'react';
 import { LogLine } from '../api/client';
 import { logoOf, modelColor, shortName } from './ModelCard';
-import { renderInline } from '../utils/markdown';
+import { renderInline, renderMarkdown } from '../utils/markdown';
 import { fmtMonthDayClock } from '../utils/datetime';
 import './ModelChat.css';
 import { modeOf } from '../utils/modeTag';
@@ -40,6 +40,18 @@ function McDisclaimer() {
       <ComplianceStrip className="mt-0.5" />
     </div>
   );
+}
+
+/** 总结条拆「标题 + 正文」：模型习惯把结论写成 **短语**：正文…
+ *  标题只做视觉强调，正文仍全部留在 .mc-sum-text 内（不丢文本、测试与搜索都不受影响）。 */
+function splitSummary(text: string): { headline: string; body: string } {
+  const t = text.trim();
+  const bold = t.match(/^\*\*([^*]{2,80})\*\*\s*[：:，,。.\-—]?\s*([\s\S]*)$/);
+  if (bold && bold[2].trim()) return { headline: bold[1].trim(), body: bold[2].trim() };
+  // 无粗体：首句（≤42 字）提为标题，避免摘要整段糊成一团
+  const sentence = t.match(/^([^。！？!?\n]{6,42})[。！？!?]\s*([\s\S]*)$/);
+  if (sentence && sentence[2].trim()) return { headline: sentence[1].trim(), body: sentence[2].trim() };
+  return { headline: '', body: t };
 }
 
 /** 模型对话 — 全部模型混合流：
@@ -164,6 +176,12 @@ export default function ChatStream({
         const proto: ProtoSpec | null = protoSpecOf(r.modelId);
         const isNews = !!proto || isGateAgent(r.modelId);
         const newsSum = isNews ? protoSummary(r.thought, r.modelId) : '';
+        const sumText = isReview
+          ? '盘后复盘：展开查看逐笔归因 / 行为审计 / 明日预案'
+          : isNews
+            ? newsSum || (r.thought || r.user).replace(/\s+/g, ' ').trim()
+            : pa.summary || (r.thought || r.user).replace(/\s+/g, ' ').trim();
+        const { headline: sumHeadline, body: sumBody } = splitSummary(sumText);
         return (
           <div
             className={`mc-card ${isOpen ? 'open' : ''}`} data-card={i}
@@ -208,13 +226,18 @@ export default function ChatStream({
                 ⚠️ 本轮无实盘账户数据（桥不可达）：分析仅基于新闻面，未点评持仓
               </div>
             )}
-            <div className="mc-summary"><span className="mc-sum-label">总结</span><span className="mc-sum-text">
-                  {isReview
-                    ? '盘后复盘：展开查看逐笔归因 / 行为审计 / 明日预案'
-                    : isNews
-                      ? newsSum || renderInline((r.thought || r.user).replace(/\s+/g, ' ').trim())
-                      : renderInline(pa.summary || (r.thought || r.user).replace(/\s+/g, ' ').trim())}
-                </span></div>
+            <div className="mc-summary">
+              <span className="mc-sum-label">总结</span>
+              <span className="mc-sum-text">
+                {sumHeadline && (
+                  <>
+                    <b className="mc-sum-headline">{renderInline(sumHeadline)}</b>
+                    <br />
+                  </>
+                )}
+                {renderInline(sumBody)}
+              </span>
+            </div>
             {isOpen && (
               <div className="mc-body">
                 {r.user && (
@@ -229,7 +252,7 @@ export default function ChatStream({
         const open = !!exp[expKey(i, 'prompt')];
         return (
           <>
-            <pre className={`mc-code  ${long && !open ? 'mc-clamp' : ''}`}>{renderInline(txt)}</pre>
+            <div className={`mc-code mc-prose ${long && !open ? 'mc-clamp' : ''}`}>{renderMarkdown(txt)}</div>
             {long && (
               <button className="mc-more"
                 onClick={() => setExp(asUpdater((e) => ({ ...e, [expKey(i, 'prompt')]: !open })))}>
@@ -266,7 +289,7 @@ export default function ChatStream({
         const open = !!exp[expKey(i, 'chain')];
         return (
           <>
-            <pre className={`mc-code  ${long && !open ? 'mc-clamp' : ''}`}>{renderInline(txt)}</pre>
+            <div className={`mc-code mc-prose ${long && !open ? 'mc-clamp' : ''}`}>{renderMarkdown(txt)}</div>
             {long && (
               <button className="mc-more"
                 onClick={() => setExp(asUpdater((e) => ({ ...e, [expKey(i, 'chain')]: !open })))}>
@@ -333,7 +356,7 @@ export default function ChatStream({
         const open = !!exp[expKey(i, 'reason')];
         return (
           <>
-            <pre className={`mc-code mc-thought ${long && !open ? 'mc-clamp' : ''}`}>{renderInline(txt)}</pre>
+            <div className={`mc-code mc-prose mc-thought ${long && !open ? 'mc-clamp' : ''}`}>{renderMarkdown(txt)}</div>
             {long && (
               <button className="mc-more"
                 onClick={() => setExp(asUpdater((e) => ({ ...e, [expKey(i, 'reason')]: !open })))}>

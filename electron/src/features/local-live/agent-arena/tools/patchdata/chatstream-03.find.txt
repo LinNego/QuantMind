@@ -1,0 +1,7 @@
+      };
+      for (const line of ag.lines) {
+        const lineTs = line.timestamp ?? null;
+        if ((line as { kind?: string }).kind === 'review') {
+          const text = (line.new_messages ?? [])
+            .filter((m) => String(m.role) === 'assistant' || String(m.role) === 'ai')
+            .map((m) => String(m.content ?? '')).join('\n\n');

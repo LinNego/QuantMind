@@ -1,0 +1,14 @@
+    if (!Number.isFinite(vMin) || vMin === vMax) { vMin = 0; vMax = 1; }
+    if (mode === 'dollar' && vMin < 0) vMin = 0; // 绝对净值不画负区
+    const padY = (vMax - vMin) * 0.07 || 1;
+    // 金额轴下限（可选）：把 Y 域向下扩到该值，线不贴轴底。
+    // 2026-10-20 用户口径：日终账本要见 ¥0 基线（否则末端贴底像钱亏光了），
+    // 盘中实况金额轴要到 ¥5 万。数据本身低于下限时仍以数据为准 → 取 min，绝不裁线。
+    const yMin =
+      mode === 'dollar' && yFloor != null && Number.isFinite(yFloor)
+        ? Math.min(vMin - padY, yFloor)
+        : vMin - padY;
+    const yScale = scaleLinear({ domain: [yMin, vMax + padY], range: [ih, 0] });
+    // 右侧独立刻度（绝对金额线，如分账合计 ¥30 万量级——与 pct 线不同轴）
+    const absLines = display.lines.filter((l) => l.abs);
+    let rMin = Infinity, rMax = -Infinity;

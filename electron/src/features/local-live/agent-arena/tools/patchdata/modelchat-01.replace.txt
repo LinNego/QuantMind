@@ -1,0 +1,17 @@
+                  <MetaSection round={r} dayTrades={dayTrades} live={live} currency={currency} />
+                  {r.user && (
+                    <Section title="用户提示词" hint={`${r.user.length.toLocaleString('en-US')} 字`}>
+                      <div className="mc-code mc-prose">{renderMarkdown(r.user)}</div>
+                    </Section>
+                  )}
+                  {pa.chain && (
+                    <Section title="分析链路（工具调用）">
+                      <div className="mc-code mc-prose">{renderMarkdown(pa.chain)}</div>
+                    </Section>
+                  )}
+                  {pa.reasoning && pa.reasoning !== r.thought && (
+                    <Section title="推理论证" hint={`${pa.reasoning.length.toLocaleString('en-US')} 字`}>
+                      <div className="mc-code mc-prose mc-thought">{renderMarkdown(pa.reasoning)}</div>
+                    </Section>
+                  )}
+                  <Section

@@ -1,0 +1,17 @@
+/* ---------- 响应式 ---------- */
+
+@media (max-width: 1024px) {
+  .qm-arena-root .right-section { width: 380px; }
+  .qm-arena-root .model-card-mini { min-width: 150px; }
+}
+
+@media (max-width: 820px) {
+  .qm-arena-root .main-content { flex-direction: column; }
+  /* 列布局下右面板按内容自适应，不再用桌面端 600px 最小高度撑出底部空白 */
+  .qm-arena-root .live .right-section { min-height: 0; }
+  .qm-arena-root .right-section { width: 100%; border-left: none; border-top: 2px solid #000; }
+  .qm-arena-root .trade-list { max-height: 420px; }
+  .qm-arena-root .chart-area { padding: 12px 12px; }
+  .qm-arena-root .price-item { font-size: 10px; }
+}
+

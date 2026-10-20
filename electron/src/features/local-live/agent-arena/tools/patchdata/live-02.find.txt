@@ -1,0 +1,6 @@
+  // cn 首帧实盘净值未到前不画图：perfs 是模拟盘回放，先画出来再换源就是用户看到的
+  // 「刷新后图表先是乱的」（X 轴 08-03…08-27 那串）。phase 已归零，等待只剩一次请求。
+  const chartPending = market === 'cn' && liveEquity.loading && !liveEqRef.current;
+
+  // tab 角标：一眼看出哪块有内容（0 也显示，省得点进去才发现是空的）；
+  // 日期筛选生效时随之收窄（与筛完实际看到的条数一致）

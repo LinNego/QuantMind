@@ -366,7 +366,17 @@ export default function RealAccountPanel({
         {curLedgerLine.length ? (
           <div className="real-chart">
             {/* 必须显式传 height：默认 380 会溢出 210px 容器压住下方 L2 表格 */}
-            <EquityChart lines={curLedgerLine} benchmark={null} currency="¥" mode="dollar" timeRange="all" height={180} />
+            {/* yFloor=0：日终总资产轴必须见 ¥0 基线——否则末端回落贴轴底，
+                看着像「钱亏光了」（2026-10-20 用户口径） */}
+            <EquityChart
+              lines={curLedgerLine}
+              benchmark={null}
+              currency="¥"
+              mode="dollar"
+              timeRange="all"
+              height={180}
+              yFloor={0}
+            />
           </div>
         ) : (
           <div className="empty-state" style={{ padding: '18px 0' }}>

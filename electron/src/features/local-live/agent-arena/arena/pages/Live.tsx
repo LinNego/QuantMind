@@ -52,6 +52,10 @@ import './Live.css';
 import { asUpdater } from '../reactCompat';
 
 const BENCH_COLOR = '#10a37f';
+/** 盘中实况金额轴下限（仅「$」模式生效）：¥5 万。
+ *  轴域全自适应时，回撤末端会贴轴底，看着像本金亏光；固定下限给回撤留出视觉空间。
+ *  数据本身低于该值时仍以数据为准（EquityChart 内部取下限，不裁线）。 */
+const LIVE_CHART_DOLLAR_FLOOR = 50_000;
 
 /** 对话日志每次只拉最近 N 个回合：单条 ~6KB，全量可累积到 1MB+，
  *  而新回合每小时才产生一次——全量轮询是页面周期性卡顿的主因（2026-09-08）。 */
@@ -1266,6 +1270,9 @@ export default function Live() {
   // cn 首帧实盘净值未到前不画图：perfs 是模拟盘回放，先画出来再换源就是用户看到的
   // 「刷新后图表先是乱的」（X 轴 08-03…08-27 那串）。phase 已归零，等待只剩一次请求。
   const chartPending = market === 'cn' && liveEquity.loading && !liveEqRef.current;
+  /** 图表区是否已就绪：加载占位与模型卡共用同一判据（模型卡在图表下方，
+   *  首帧未到时先不画，避免占位高度被卡片撑高）。 */
+  const chartReady = !(overview.loading && !rows.length) && !chartPending;
 
   // tab 角标：一眼看出哪块有内容（0 也显示，省得点进去才发现是空的）；
   // 日期筛选生效时随之收窄（与筛完实际看到的条数一致）
@@ -1405,50 +1412,55 @@ export default function Live() {
               <div className="spinner" />实盘净值加载中…
             </div>
           ) : (
-            <>
-              <EquityChart
-                lines={lines}
-                benchmark={benchLine}
-                currency={meta.currency}
-                // 悬停时序补充：当时持仓（账本反推时间线）+ 附近 ±3 分钟成交（cn 实盘）
-                events={market === 'cn' ? (liveTradesFiltered as unknown as import('../components/EquityChart').HoverEvent[]) : undefined}
-                holdings={market === 'cn' && heldSpans.length ? heldSpans : undefined}
-                names={stockNames.data ?? undefined}
-                priceMap={market === 'cn' && holderPriceMap ? holderPriceMap : undefined}
-                mode={chartMode}
-                timeRange={chartRange}
-                height="clamp(360px, 44vw, 560px)"
-              />
-              <div className="model-cards-section">
-                {(perfs.data ?? []).map((p) => (
-                  // 模型卡 = 该市场 performance summary（A股已是 PG 分账实盘口径，
-                  // 与模型详情/总控同源；港美股仍是文件回放）
-                  <ModelCard
-                      key={p.agent}
-                      market={market}
-                      agent={p.agent}
-                      balance={p.summary?.end_equity ?? null}
-                      // A股 PG 账本：区间收益（迁移起点可能低于 ¥10 万额度，
-                      // total_return 会把迁移缺口算成亏损）；港美股沿用原口径
-                      ret={
-                        market === 'cn'
-                          ? p.summary?.period_return ?? null
-                          : p.summary?.total_return ?? null
-                      }
-                      selected={p.agent === effectiveModel}
-                      onClick={() =>
-                        setSelectedModel(asUpdater((cur) => (cur === p.agent ? 'all' : p.agent)))
-                      }
-                      tokens={tokenUsage.data?.agents?.[p.agent] ?? null}
-                  />
-                ))}
-                {!perfs.data?.length && <div className="empty-state">该市场暂无 Agent</div>}
-              </div>
-            </>
+            <EquityChart
+              lines={lines}
+              benchmark={benchLine}
+              currency={meta.currency}
+              // 悬停时序补充：当时持仓（账本反推时间线）+ 附近 ±3 分钟成交（cn 实盘）
+              events={market === 'cn' ? (liveTradesFiltered as unknown as import('../components/EquityChart').HoverEvent[]) : undefined}
+              holdings={market === 'cn' && heldSpans.length ? heldSpans : undefined}
+              names={stockNames.data ?? undefined}
+              priceMap={market === 'cn' && holderPriceMap ? holderPriceMap : undefined}
+              mode={chartMode}
+              // 金额模式左轴下限 ¥5 万：回撤末端不贴轴底（% 模式不受影响）
+              yFloor={LIVE_CHART_DOLLAR_FLOOR}
+              timeRange={chartRange}
+              height="clamp(360px, 44vw, 560px)"
+            />
           )}
         </div>
 
-        {/* 右：540px 面板 */}
+        {/* 模型横排卡：图表下方（左栏宽），不再撑高右侧面板——
+            右侧面板底边与图表图例 chips 底边对齐 */}
+        {chartReady && (
+          <div className="model-cards-section">
+            {(perfs.data ?? []).map((p) => (
+              // 模型卡 = 该市场 performance summary（A股已是 PG 分账实盘口径，
+              // 与模型详情/总控同源；港美股仍是文件回放）
+              <ModelCard
+                  key={p.agent}
+                  market={market}
+                  agent={p.agent}
+                  balance={p.summary?.end_equity ?? null}
+                  // A股 PG 账本：区间收益（迁移起点可能低于 ¥10 万额度，
+                  // total_return 会把迁移缺口算成亏损）；港美股沿用原口径
+                  ret={
+                    market === 'cn'
+                      ? p.summary?.period_return ?? null
+                      : p.summary?.total_return ?? null
+                  }
+                  selected={p.agent === effectiveModel}
+                  onClick={() =>
+                    setSelectedModel(asUpdater((cur) => (cur === p.agent ? 'all' : p.agent)))
+                  }
+                  tokens={tokenUsage.data?.agents?.[p.agent] ?? null}
+              />
+            ))}
+            {!perfs.data?.length && <div className="empty-state">该市场暂无 Agent</div>}
+          </div>
+        )}
+
+        {/* 右：540px 面板（桌面端与图表同高，见 Live.css） */}
         <div className="right-section">
           <div className="trade-tabs">
             {TAB_GROUPS.map((group, gi) => (

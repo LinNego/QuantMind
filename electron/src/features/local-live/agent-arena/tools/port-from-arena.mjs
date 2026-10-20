@@ -39,6 +39,9 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const DEST = path.resolve(HERE, '..', 'arena'); // 搬完的代码落在这里（arena/src 的镜像）
 export const SRC = process.env.ARENA_SRC || '/home/zbox/quant-Trader/arena/src';
 const OVERRIDES = path.resolve(HERE, 'overrides');
+/** 大块改写的锚点/替换词落盘目录（PatchData）：JSX/CSS 里全是反引号与 `${}`，
+ *  内联进本文件的模板字符串要层层转义，既难写又易错；大块一律放这里原样读。 */
+const PATCH_DATA = path.resolve(HERE, 'patchdata');
 const ARENA_REPO = path.resolve(SRC, '..', '..');
 /** JSX 上挂的类名（不含点） */
 const ROOT_CLASS = 'qm-arena-root';
@@ -67,6 +70,23 @@ const ENTRIES = [
  * 相对路径写 import，放在 tools/ 里就地跑 tsc 会解析不到、白报错。脚本复制时去掉 .tpl。
  */
 const OVERRIDE_FILES = new Set(['components/Navbar.tsx']);
+
+/**
+ * 大块改写的成对锚点：`patchdata/<slug>-NN.find.txt` → `<slug>-NN.replace.txt`。
+ * 为什么不全内联：模型对话结构化渲染那块 JSX/CSS 全是反引号与 `${}`，写进模板字符串
+ * 要层层转义（\` 与 \${），改一次错三处；落成纯文本文件后可按生成物逐字节核对。
+ * 仍未放弃「锚点必须命中」：find 失配照样抛错（applyPatches）。
+ */
+const dataPatch = (file, slug, count, why) =>
+  Array.from({ length: count }, (_, k) => {
+    const n = String(k + 1).padStart(2, '0');
+    return {
+      file,
+      why: `${why}（${n}/${count}）`,
+      findFile: `${slug}-${n}.find.txt`,
+      replaceFile: `${slug}-${n}.replace.txt`,
+    };
+  });
 
 /**
  * 逐文件的确定性改写。每条 `find` 必须命中，否则报错 —— 宁可炸也不要静默搬半截。
@@ -741,6 +761,58 @@ export const fetchFutuOrders = async (
     find: `style={{ borderColor: modelColor(model) }}`,
     replace: `style={{ borderColor: modelColor(model), '--mc-accent': modelColor(model) } as CSSProperties}`,
   },
+
+  // ── 2026-10-20 模型对话结构化渲染 + 图表金额轴下限 ──────────────────────
+  // 用户口径：「模型对话也要结构化输出、像新闻那样」「盘中实况金额轴到 ¥5 万」
+  // 「日终账本刻度要到 0」。大块 JSX/CSS 落 patchdata/，逐字节与 arena/ 镜像对齐。
+  ...dataPatch(
+    'utils/markdown.tsx',
+    'markdown',
+    3,
+    '块级 markdown 渲染器升级：GFM 表格/有序列表/围栏代码/缩进层级/【段标】/⚠️ 警示',
+  ),
+  ...dataPatch(
+    'components/ChatStream.tsx',
+    'chatstream',
+    8,
+    '模型对话结构化渲染：正文块级 markdown + 总结条拆「结论标题 + 正文」',
+  ),
+  ...dataPatch(
+    'components/ModelChat.tsx',
+    'modelchat',
+    1,
+    '详情页对话与混合流共用 mc-prose 结构化正文样式',
+  ),
+  ...dataPatch(
+    'components/ModelChat.css',
+    'modelchat-css',
+    4,
+    '对话卡片新闻化：硬投影、无衬线正文、表格/有序列表/围栏/段标样式',
+  ),
+  ...dataPatch(
+    'components/EquityChart.tsx',
+    'equitychart',
+    7,
+    '金额轴可选下限 yFloor（数据更低时不裁线）',
+  ),
+  ...dataPatch(
+    'components/RealAccountPanel.tsx',
+    'realaccount',
+    1,
+    '日终总资产图固定 yFloor=0：末端回落不贴轴底',
+  ),
+  ...dataPatch(
+    'pages/Live.tsx',
+    'live',
+    3,
+    '盘中实况金额轴下限 ¥5 万 + 模型卡移出图表区（右面板与图例底边对齐）',
+  ),
+  ...dataPatch(
+    'pages/Live.css',
+    'live-css',
+    4,
+    '主区改网格：行1=图+右面板同高、行2=模型卡；contain:size 防长对话撑高面板',
+  ),
 ];
 
 // ────────────────────────────── 闭包解析 ──────────────────────────────
@@ -837,18 +909,29 @@ async function scopeCss(css, kfMap) {
 function applyPatches(rel, code) {
   const applied = [];
   for (const p of PATCHES.filter((p) => p.file === rel)) {
-    const isRe = p.find instanceof RegExp;
-    const hit = isRe ? p.find.test(code) : code.includes(p.find);
+    // 大块改写从 patchdata/ 原样读取（findFile/replaceFile），避免反引号/${} 转义地狱。
+    // 读盘失败直接抛（宁可炸，也不要静默少改一处）。
+    const find = p.findFile ? fs.readFileSync(path.join(PATCH_DATA, p.findFile), 'utf8') : p.find;
+    const replace = p.replaceFile
+      ? fs.readFileSync(path.join(PATCH_DATA, p.replaceFile), 'utf8')
+      : p.replace;
+    const isRe = find instanceof RegExp;
+    const hit = isRe ? find.test(code) : code.includes(find);
     if (!hit) {
+      if (process.env.PORT_DEBUG) {
+        for (const line of String(find).split('\n')) {
+          if (!code.includes(line)) console.error('  [miss-line]', JSON.stringify(line.slice(0, 120)));
+        }
+      }
       throw new Error(
-        `[port] 改写锚点未命中：${rel}\n  规则：${p.why}\n  锚点：${String(p.find).slice(0, 120)}`,
+        `[port] 改写锚点未命中：${rel}\n  规则：${p.why}\n  锚点：${String(find).slice(0, 120)}`,
       );
     }
     // 替换词一律按**字面量**插入：字符串形式的 replacement 会把 `$'`/`$&`/`` $` ``/`$$`
     // 当特殊模式展开（2026-09-30 事故：A6 替换文案里的 `'HK$'` 让 `$'` 展开成「匹配点
     // 之后的全串」，channelStatus.ts 被写成 5 份重复+断串）。函数式 replacer 不做任何
     // `$` 展开，锚点与替换词都按字面走——全表无 `$1` 捕获组引用，改成函数式无副作用。
-    code = code.replace(p.find, () => p.replace);
+    code = code.replace(find, () => replace);
     applied.push(p.why);
   }
   return { code, applied };
@@ -872,7 +955,10 @@ export async function renderFile(rel, kfMap) {
   if (rel.endsWith('.css')) {
     const scoped = await scopeCss(fs.readFileSync(path.join(SRC, rel), 'utf8'), kfMap);
     const header = `/* 由 tools/port-from-arena.mjs 从 arena 生成：选择器已作用域化到 ${ROOT_SEL}，勿手改 */\n`;
-    return { content: header + scoped, patchLog: [], wrapLog: [] };
+    // CSS 补丁在**作用域化之后**应用：锚点按生成物里的 `.qm-arena-root …` 写，
+    // 与手改生成物时看到的文本一致（手写选择器 vs 上游选择器的映射不用猜）。
+    const { code, applied } = applyPatches(rel, header + scoped);
+    return { content: code, patchLog: applied.map((why) => `${rel}：${why}`), wrapLog: [] };
   }
   const { code, applied } = applyPatches(rel, fs.readFileSync(path.join(SRC, rel), 'utf8'));
   const { code: wrapped, sites } = wrapFunctionalSetters(code, rel);

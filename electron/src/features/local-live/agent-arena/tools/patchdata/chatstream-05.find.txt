@@ -1,0 +1,13 @@
+                ⚠️ 本轮无实盘账户数据（桥不可达）：分析仅基于新闻面，未点评持仓
+              </div>
+            )}
+            <div className="mc-summary"><span className="mc-sum-label">总结</span><span className="mc-sum-text">
+                  {isReview
+                    ? '盘后复盘：展开查看逐笔归因 / 行为审计 / 明日预案'
+                    : isNews
+                      ? newsSum || renderInline((r.thought || r.user).replace(/\s+/g, ' ').trim())
+                      : renderInline(pa.summary || (r.thought || r.user).replace(/\s+/g, ' ').trim())}
+                </span></div>
+            {isOpen && (
+              <div className="mc-body">
+                {r.user && (

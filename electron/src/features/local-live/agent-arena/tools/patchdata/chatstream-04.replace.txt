@@ -1,0 +1,12 @@
+        const proto: ProtoSpec | null = protoSpecOf(r.modelId);
+        const isNews = !!proto || isGateAgent(r.modelId);
+        const newsSum = isNews ? protoSummary(r.thought, r.modelId) : '';
+        const sumText = isReview
+          ? '盘后复盘：展开查看逐笔归因 / 行为审计 / 明日预案'
+          : isNews
+            ? newsSum || (r.thought || r.user).replace(/\s+/g, ' ').trim()
+            : pa.summary || (r.thought || r.user).replace(/\s+/g, ' ').trim();
+        const { headline: sumHeadline, body: sumBody } = splitSummary(sumText);
+        return (
+          <div
+            className={`mc-card ${isOpen ? 'open' : ''}`} data-card={i}

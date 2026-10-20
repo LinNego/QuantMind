@@ -1,0 +1,8 @@
+  domain: { idxMin: number; idxMax: number };
+  focus: string | null;
+  mode: 'pct' | 'dollar';
+  /** 金额轴下限（仅 dollar 模式生效）：Y 域至少向下扩到该值，线不贴轴底 */
+  yFloor?: number;
+  currency: string;
+  events?: HoverEvent[];
+  holdings?: HoldingSpan[];

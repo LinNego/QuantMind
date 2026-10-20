@@ -1,0 +1,18 @@
+                ⚠️ 本轮无实盘账户数据（桥不可达）：分析仅基于新闻面，未点评持仓
+              </div>
+            )}
+            <div className="mc-summary">
+              <span className="mc-sum-label">总结</span>
+              <span className="mc-sum-text">
+                {sumHeadline && (
+                  <>
+                    <b className="mc-sum-headline">{renderInline(sumHeadline)}</b>
+                    <br />
+                  </>
+                )}
+                {renderInline(sumBody)}
+              </span>
+            </div>
+            {isOpen && (
+              <div className="mc-body">
+                {r.user && (

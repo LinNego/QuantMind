@@ -1,0 +1,6 @@
+  timeRange?: 'all' | '5d';
+  /** 数字 = 固定 px；字符串 = 任意 CSS 值（如 clamp(...) 响应式高度） */
+  height?: number | string;
+  /** 悬停补充：成交事件（拖尾时间窗内展示买卖） */
+  events?: HoverEvent[];
+  /** 悬停补充：持仓时间线（该时刻各 agent 持有代码/数量） */

@@ -1,0 +1,18 @@
+  );
+}
+
+/** 总结条拆「标题 + 正文」：模型习惯把结论写成 **短语**：正文…
+ *  标题只做视觉强调，正文仍全部留在 .mc-sum-text 内（不丢文本、测试与搜索都不受影响）。 */
+function splitSummary(text: string): { headline: string; body: string } {
+  const t = text.trim();
+  const bold = t.match(/^\*\*([^*]{2,80})\*\*\s*[：:，,。.\-—]?\s*([\s\S]*)$/);
+  if (bold && bold[2].trim()) return { headline: bold[1].trim(), body: bold[2].trim() };
+  // 无粗体：首句（≤42 字）提为标题，避免摘要整段糊成一团
+  const sentence = t.match(/^([^。！？!?\n]{6,42})[。！？!?]\s*([\s\S]*)$/);
+  if (sentence && sentence[2].trim()) return { headline: sentence[1].trim(), body: sentence[2].trim() };
+  return { headline: '', body: t };
+}
+
+/** 模型对话 — 全部模型混合流：
+ *  不按模型分组，所有模型的最新分析按时间全局倒序混排（每个模型的最新都排前面），
+ *  卡片边框按模型配色区分。 */

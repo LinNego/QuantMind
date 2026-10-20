@@ -1,0 +1,52 @@
+              <div className="spinner" />实盘净值加载中…
+            </div>
+          ) : (
+            <EquityChart
+              lines={lines}
+              benchmark={benchLine}
+              currency={meta.currency}
+              // 悬停时序补充：当时持仓（账本反推时间线）+ 附近 ±3 分钟成交（cn 实盘）
+              events={market === 'cn' ? (liveTradesFiltered as unknown as import('../components/EquityChart').HoverEvent[]) : undefined}
+              holdings={market === 'cn' && heldSpans.length ? heldSpans : undefined}
+              names={stockNames.data ?? undefined}
+              priceMap={market === 'cn' && holderPriceMap ? holderPriceMap : undefined}
+              mode={chartMode}
+              // 金额模式左轴下限 ¥5 万：回撤末端不贴轴底（% 模式不受影响）
+              yFloor={LIVE_CHART_DOLLAR_FLOOR}
+              timeRange={chartRange}
+              height="clamp(360px, 44vw, 560px)"
+            />
+          )}
+        </div>
+
+        {/* 模型横排卡：图表下方（左栏宽），不再撑高右侧面板——
+            右侧面板底边与图表图例 chips 底边对齐 */}
+        {chartReady && (
+          <div className="model-cards-section">
+            {(perfs.data ?? []).map((p) => (
+              // 模型卡 = 该市场 performance summary（A股已是 PG 分账实盘口径，
+              // 与模型详情/总控同源；港美股仍是文件回放）
+              <ModelCard
+                  key={p.agent}
+                  market={market}
+                  agent={p.agent}
+                  balance={p.summary?.end_equity ?? null}
+                  // A股 PG 账本：区间收益（迁移起点可能低于 ¥10 万额度，
+                  // total_return 会把迁移缺口算成亏损）；港美股沿用原口径
+                  ret={
+                    market === 'cn'
+                      ? p.summary?.period_return ?? null
+                      : p.summary?.total_return ?? null
+                  }
+                  selected={p.agent === effectiveModel}
+                  onClick={() =>
+                    setSelectedModel((cur) => (cur === p.agent ? 'all' : p.agent))
+                  }
+                  tokens={tokenUsage.data?.agents?.[p.agent] ?? null}
+              />
+            ))}
+            {!perfs.data?.length && <div className="empty-state">该市场暂无 Agent</div>}
+          </div>
+        )}
+
+        {/* 右：540px 面板（桌面端与图表同高，见 Live.css） */}

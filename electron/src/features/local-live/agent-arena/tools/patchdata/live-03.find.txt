@@ -1,0 +1,46 @@
+              <div className="spinner" />实盘净值加载中…
+            </div>
+          ) : (
+            <>
+              <EquityChart
+                lines={lines}
+                benchmark={benchLine}
+                currency={meta.currency}
+                // 悬停时序补充：当时持仓（账本反推时间线）+ 附近 ±3 分钟成交（cn 实盘）
+                events={market === 'cn' ? (liveTradesFiltered as unknown as import('../components/EquityChart').HoverEvent[]) : undefined}
+                holdings={market === 'cn' && heldSpans.length ? heldSpans : undefined}
+                names={stockNames.data ?? undefined}
+                priceMap={market === 'cn' && holderPriceMap ? holderPriceMap : undefined}
+                mode={chartMode}
+                timeRange={chartRange}
+                height="clamp(360px, 44vw, 560px)"
+              />
+              <div className="model-cards-section">
+                {(perfs.data ?? []).map((p) => {
+                  // A股实盘: 模型卡显示实盘分账收益(虚拟净值/¥10万基准), 替代模拟盘回放
+                  const eqPts = market === 'cn' ? liveEquity.data?.agents?.[p.agent] : null;
+                  const liveNav = eqPts && eqPts.length ? eqPts[eqPts.length - 1].value : null;
+                  const isLive = market === 'cn' && liveNav != null;
+                  return (
+                    <ModelCard
+                      key={p.agent}
+                      market={market}
+                      agent={p.agent}
+                      balance={isLive ? liveNav : (p.summary?.end_equity ?? null)}
+                      // fmtPct 期望小数（内部 ×100）；这里只算净值/¥10万 的比率
+                      ret={isLive ? liveNav! / 100000 - 1 : (p.summary?.total_return ?? null)}
+                      selected={p.agent === effectiveModel}
+                      onClick={() =>
+                        setSelectedModel((cur) => (cur === p.agent ? 'all' : p.agent))
+                      }
+                      tokens={tokenUsage.data?.agents?.[p.agent] ?? null}
+                    />
+                  );
+                })}
+                {!perfs.data?.length && <div className="empty-state">该市场暂无 Agent</div>}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* 右：540px 面板 */}

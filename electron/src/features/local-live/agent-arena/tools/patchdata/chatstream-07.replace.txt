@@ -1,0 +1,7 @@
+        const open = !!exp[expKey(i, 'chain')];
+        return (
+          <>
+            <div className={`mc-code mc-prose ${long && !open ? 'mc-clamp' : ''}`}>{renderMarkdown(txt)}</div>
+            {long && (
+              <button className="mc-more"
+                onClick={() => setExp((e) => ({ ...e, [expKey(i, 'chain')]: !open }))}>

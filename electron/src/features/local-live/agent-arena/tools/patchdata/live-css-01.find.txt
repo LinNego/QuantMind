@@ -1,0 +1,16 @@
+
+/* ---------- 主区左右分栏 ---------- */
+
+.qm-arena-root .main-content {
+  display: flex;
+  gap: 0;
+  align-items: stretch;
+}
+
+.qm-arena-root .chart-area {
+  flex: 1;
+  min-width: 0;
+  padding: 16px 20px;
+}
+
+/* ---------- 图表头部 ---------- */

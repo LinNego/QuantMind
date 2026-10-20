@@ -17,6 +17,8 @@
   box-sizing: border-box;
   border: 2px solid #000;
   background: #fff;
+  /* 与「新闻」卡片同一套硬投影：卡片从面板底上立起来，不再是表格行 */
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.9);
 }
 .qm-arena-root .mc-card.open { background: #fcfcfc; }
 
@@ -89,8 +91,8 @@
 .qm-arena-root .mc-summary {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
-  padding: 9px 14px;
+  gap: 9px;
+  padding: 10px 14px 11px;
   border-bottom: 1px dashed #bbb;
   background: #f7f9f7;
 }
@@ -101,17 +103,27 @@
   font-weight: 700;
   color: #fff;
   background: #10a37f;
+  border: 1.5px solid #000;
   padding: 2px 6px;
   letter-spacing: 0.1em;
   margin-top: 1px;
 }
+/* 摘要正文走正文字体（新闻卡同口径）：等宽体读长句太费劲，数字/标签仍用等宽 */
 .qm-arena-root .mc-sum-text {
-  font-family: 'Courier New', monospace;
-  font-size: 12px;
-  line-height: 1.65;
-  color: #222;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', sans-serif;
+  font-size: 12.5px;
+  line-height: 1.72;
+  color: #2f2f2f;
   min-width: 0;
   overflow-wrap: anywhere;
+}
+/* 模型惯写 **结论**：正文 —— 结论提为标题行，和新闻卡的粗标题同一层级 */
+.qm-arena-root .mc-sum-headline {
+  font-size: 13.5px;
+  font-weight: 800;
+  color: #000;
+  letter-spacing: 0.01em;
 }
 
 /* ---------- 小节（四段式） ---------- */
@@ -224,19 +236,103 @@
   border-top: 1px dashed #ddd;
 }
 
-/* ---------- markdown 块（保留） ---------- */
-.qm-arena-root .mc-md-p { padding: 2px 0; }
-.qm-arena-root .mc-md-h3, .qm-arena-root .mc-md-h4 {
+/* ---------- 结构化正文（markdown 块） ----------
+   2026-10-20 用户口径「模型对话也要结构化输出，像新闻那样」：
+   正文从等宽 <pre> 文本墙改为块级排版（标题/列表/表格/围栏/警示），
+   中文长句用正文字体，数字与表头维持等宽。 */
+.qm-arena-root .mc-prose {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', sans-serif;
+  font-size: 12.5px;
+  line-height: 1.72;
+  color: #222;
+  white-space: normal;
+}
+.qm-arena-root .mc-prose .mc-thought,
+.qm-arena-root .mc-prose.mc-thought { background: #fbfbf6; }
+.qm-arena-root .mc-md-p { padding: 2px 0; overflow-wrap: anywhere; }
+.qm-arena-root .mc-md-h1,
+.qm-arena-root .mc-md-h2,
+.qm-arena-root .mc-md-h3,
+.qm-arena-root .mc-md-h4 {
   margin: 10px 0 4px;
   padding: 4px 10px;
   background: #000;
   color: #fff;
   font-size: 12.5px;
   font-weight: 700;
+  letter-spacing: 0.02em;
 }
 .qm-arena-root .mc-md-h4 { background: #ececec; color: #000; }
-.qm-arena-root .mc-md-list { margin: 2px 0; padding-left: 20px; }
-.qm-arena-root .mc-md-list li { margin: 3px 0; }
+/* 【持仓】【要求】这类段标：模型色左竖条的小节头，不再是整行黄底警告 */
+.qm-arena-root .mc-md-sub {
+  margin: 9px 0 3px;
+  padding-left: 8px;
+  border-left: 3px solid var(--mc-accent, #10a37f);
+  font-weight: 800;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #111;
+}
+.qm-arena-root .mc-md-list { margin: 3px 0; padding-left: 20px; }
+.qm-arena-root .mc-md-list li { margin: 3px 0; overflow-wrap: anywhere; }
+.qm-arena-root .mc-md-ol { list-style: decimal; }
+.qm-arena-root .mc-md-li-d1 { margin-left: 14px; }
+.qm-arena-root .mc-md-li-d2 { margin-left: 28px; }
+/* GFM 表格：等宽数字 + 黑底表头；列多时横向滚动，不撑破面板 */
+.qm-arena-root .mc-md-table-wrap {
+  margin: 7px 0;
+  border: 1px solid #000;
+  background: #fff;
+  overflow-x: auto;
+}
+.qm-arena-root .mc-md-table {
+  border-collapse: collapse;
+  width: max-content;
+  min-width: 100%;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+.qm-arena-root .mc-md-table th {
+  padding: 4px 8px;
+  background: #000;
+  color: #fff;
+  font-weight: 700;
+  text-align: left;
+  white-space: nowrap;
+}
+.qm-arena-root .mc-md-table td {
+  padding: 4px 8px;
+  border-top: 1px solid #ddd;
+  vertical-align: top;
+}
+.qm-arena-root .mc-md-table tbody tr:nth-child(even) { background: #fafafa; }
+.qm-arena-root .mc-md-table .ta-right { text-align: right; }
+.qm-arena-root .mc-md-table .ta-center { text-align: center; }
+/* 围栏代码：原样等宽，内部不解析行内标记 */
+.qm-arena-root .mc-md-pre {
+  margin: 7px 0;
+  padding: 8px 10px;
+  background: #f4f4f2;
+  border: 1px solid #ddd;
+  border-left: 3px solid #999;
+  overflow-x: auto;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre;
+}
+.qm-arena-root .mc-md-pre code { font: inherit; }
+.qm-arena-root .mc-md-quote {
+  margin: 6px 0;
+  padding: 4px 10px;
+  border-left: 3px solid #bbb;
+  background: #fafafa;
+  color: #555;
+}
+.qm-arena-root .mc-md-hr { margin: 10px 0; border: none; border-top: 1px dashed #bbb; }
 .qm-arena-root .mc-md-warn {
   margin: 8px 0;
   padding: 6px 10px;

@@ -1,0 +1,7 @@
+        {curLedgerLine.length ? (
+          <div className="real-chart">
+            {/* 必须显式传 height：默认 380 会溢出 210px 容器压住下方 L2 表格 */}
+            <EquityChart lines={curLedgerLine} benchmark={null} currency="¥" mode="dollar" timeRange="all" height={180} />
+          </div>
+        ) : (
+          <div className="empty-state" style={{ padding: '18px 0' }}>

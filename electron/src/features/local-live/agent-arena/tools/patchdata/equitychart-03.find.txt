@@ -1,0 +1,7 @@
+    if (!Number.isFinite(vMin) || vMin === vMax) { vMin = 0; vMax = 1; }
+    if (mode === 'dollar' && vMin < 0) vMin = 0; // 绝对净值不画负区
+    const padY = (vMax - vMin) * 0.07 || 1;
+    const yScale = scaleLinear({ domain: [vMin - padY, vMax + padY], range: [ih, 0] });
+    // 右侧独立刻度（绝对金额线，如分账合计 ¥30 万量级——与 pct 线不同轴）
+    const absLines = display.lines.filter((l) => l.abs);
+    let rMin = Infinity, rMax = -Infinity;

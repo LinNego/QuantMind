@@ -1,0 +1,6 @@
+  domain: { idxMin: number; idxMax: number };
+  focus: string | null;
+  mode: 'pct' | 'dollar';
+  currency: string;
+  events?: HoverEvent[];
+  holdings?: HoldingSpan[];

@@ -1,0 +1,7 @@
+  mode = 'pct',
+  timeRange = 'all',
+  height = 380,
+  yFloor,
+  events,
+  holdings,
+  names,
