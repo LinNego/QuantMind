@@ -240,8 +240,13 @@ export default function Control() {
                 {Object.entries(liveLedger.data?.agents ?? {}).map(([name, ag]: [string, AgentLedger]) => {
                   const pts = liveEquity.data?.agents?.[name] ?? [];
                   const nav = pts.length ? pts[pts.length - 1].value : null;
-                  // 百分点数（5 = +5%）：与 Live.tsx / pnl_pct 全局约定一致，勿再喂给 fmtPct（它会 ×100）
-                  const ret = nav != null ? (nav / (ag.quota || 100000) - 1) * 100 : null;
+                  // 区间收益：从序列首点起算（= PG 的 period_return 同口径）。
+                  // 不能用 nav / quota：迁移起点低于 ¥10 万额度，拿额度当基准会把
+                  // 期初持仓未入账的缺口记成一笔亏损（2026-10-20 审查 HIGH）。
+                  const ret =
+                    nav != null && pts.length >= 2 && pts[0].value > 0
+                      ? (nav / pts[0].value - 1) * 100
+                      : null;
                   const posCount = Object.keys(ag.positions ?? {}).length;
                   return (
                     <tr key={name}>
@@ -308,9 +313,7 @@ export default function Control() {
                 <tbody>
                   {qmtPositions.map((p) => {
                     // 成本为负（摊薄成本法）时绝对盈亏有效、百分比无意义 → 只显 ¥；
-                    // 成本/现价任一为 0（桥侧「拿不到」）→ 整格留白
-                    const showPnl = p.last_price > 0 && p.cost_price !== 0;
-                    const showPct = showPnl && p.cost_price > 0;
+                    // 成本/现价任一为 0（桥侧「拿不到」）→ 后端 pnl=null → 整格留白
                     return (
                       <tr key={p.stock_code}>
                         <td className="dim">{p.stock_code}</td>
@@ -320,9 +323,13 @@ export default function Control() {
                         <td className="dim">{p.cost_price !== 0 ? p.cost_price.toFixed(3) : '—'}</td>
                         <td>{p.last_price > 0 ? p.last_price.toFixed(3) : '—'}</td>
                         <td>{fmtMoney(p.position_value, '¥', 0)}</td>
-                        <td className={showPnl ? pnlClass(p.pnl) : 'dim'}>
-                          {showPnl
-                            ? `${p.pnl >= 0 ? '+' : ''}${fmtMoney(p.pnl, '¥', 0)}${showPct ? ` (${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%)` : ''}`
+                        <td className={p.pnl != null ? pnlClass(p.pnl) : 'dim'}>
+                          {p.pnl != null
+                            ? `${p.pnl >= 0 ? '+' : ''}${fmtMoney(p.pnl, '¥', 0)}${
+                                p.pnl_pct != null
+                                  ? ` (${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%)`
+                                  : ''
+                              }`
                             : '—'}
                         </td>
                       </tr>
@@ -383,6 +390,9 @@ export default function Control() {
                   <tbody>
                     {rows.map((r) => {
                       const s = r.summary;
+                      // A 股 PG 账本用区间收益（total_return 以 ¥10 万额度为基，
+                      // 迁移起点低于额度，直接展示会把期初缺口记成亏损）
+                      const ret = m === 'cn' ? s?.period_return ?? null : s?.total_return ?? null;
                       return (
                         <tr
                           key={r.name}
@@ -391,8 +401,8 @@ export default function Control() {
                         >
                           <td style={{ fontWeight: 700 }} title={r.name}>{shortName(r.name)}</td>
                           <td>{s ? fmtMoney(s.end_equity, meta.currency) : '—'}</td>
-                          <td className={s ? pnlClass(s.total_return) : 'dim'}>
-                            {s ? fmtPct(s.total_return) : '—'}
+                          <td className={ret != null ? pnlClass(ret) : 'dim'}>
+                            {ret != null ? fmtPct(ret) : '—'}
                           </td>
                           <td className="dim">{s ? fmtPct(s.max_drawdown, 2, false) : '—'}</td>
                           <td className="dim">{s ? s.records : r.records}</td>

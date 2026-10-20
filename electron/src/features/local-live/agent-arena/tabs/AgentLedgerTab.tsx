@@ -8,7 +8,6 @@ import ArenaSurface from '../ArenaSurface';
 // 显式依赖 > 碰运气加载顺序：本栏自己保证 Live.css 先于渲染到位。
 import '../arena/pages/Live.css';
 import {
-  fetchLiveEquity,
   fetchLogs,
   fetchOverview,
   fetchPerformance,
@@ -33,8 +32,8 @@ import { useArenaNav } from '../arena/arenaNav';
  * 这一栏只回答「每个 agent 现在有多少钱、它上一次决策说了什么」。
  *
  * 数据口径与实况页逐字一致（同一批端点、同一轮询节奏），所以两栏的数字不会打架：
- *   overview → 当前市场的 agent 名单；performance → 模拟盘净值/收益；
- *   live/equity → A股实盘虚拟分账净值（有就用实盘，没有才回落到模拟盘 summary）；
+ *   overview → 当前市场的 agent 名单；performance → A股=PG 实盘账本 summary
+ *   （余额 = end_equity，收益 = period_return），港美=模拟盘净值/收益；
  *   token-usage → 各自累计 token；logs → 对话流（每行一个分析回合）。
  */
 
@@ -66,8 +65,6 @@ const AgentLedgerBody = () => {
     [market, agentsKey],
     30000,
   );
-  // A股实盘分账净值（每分钟采样）：模型卡优先显示实盘口径
-  const liveEquity = usePolling(() => fetchLiveEquity(), [], 60000, 0);
   const tokenUsage = usePolling(() => fetchTokenUsage(), [], 30000, 8000);
   // 对话流：全部模型并行拉，混合成一条时间线（与实况页「模型对话」同款）
   const logs = usePolling<{ name: string; id: string; lines: LogLine[] }[]>(
@@ -96,7 +93,7 @@ const AgentLedgerBody = () => {
         <MarketSwitcher market={market} onChange={(m) => { setMarket(m); setSelected('all'); }} />
         <span style={{ flex: 1 }} />
         <span className="dim" style={{ fontSize: 11 }}>
-          {liveEquity.data ? '余额口径：A股=实盘分账净值，其余=模拟盘' : '余额口径：模拟盘净值'}
+          {market === 'cn' ? '余额口径：通达信实盘分账账本' : '余额口径：模拟盘净值'}
         </span>
       </div>
       <p className="dim" style={{ fontSize: 11, margin: '4px 0 12px' }}>
@@ -104,29 +101,27 @@ const AgentLedgerBody = () => {
       </p>
 
       <div className="model-cards-section" style={{ marginTop: 0 }}>
-        {(perfs.data ?? []).map((p) => {
-          const eqPts = market === 'cn' ? liveEquity.data?.agents?.[p.agent] : null;
-          const liveNav = eqPts && eqPts.length ? eqPts[eqPts.length - 1].value : null;
-          const isLive = market === 'cn' && liveNav != null;
-          return (
-            <ModelCard
-              key={p.agent}
-              market={market}
-              agent={p.agent}
-              balance={isLive ? liveNav : (p.summary?.end_equity ?? null)}
-              ret={isLive ? liveNav! / 100000 - 1 : (p.summary?.total_return ?? null)}
-              selected={p.agent === selected}
-              onClick={() => {
-                if (selected === p.agent) setSelected('all');
-                else {
-                  setSelected(p.agent);
-                  nav(`/model/${market}/${encodeURIComponent(p.agent)}`);
-                }
-              }}
-              tokens={tokenUsage.data?.agents?.[p.agent] ?? null}
-            />
-          );
-        })}
+        {(perfs.data ?? []).map((p) => (
+          <ModelCard
+            key={p.agent}
+            market={market}
+            agent={p.agent}
+            // 与实况页 / 模型详情同一口径：余额 = 账本重建的期末权益；
+            // A 股用区间收益率（total_return 以 ¥10 万额度为基，迁移起点低于额度，
+            // 拿它展示等于把期初持仓未入账的缺口记成亏损）。
+            balance={p.summary?.end_equity ?? null}
+            ret={market === 'cn' ? p.summary?.period_return ?? null : p.summary?.total_return ?? null}
+            selected={p.agent === selected}
+            onClick={() => {
+              if (selected === p.agent) setSelected('all');
+              else {
+                setSelected(p.agent);
+                nav(`/model/${market}/${encodeURIComponent(p.agent)}`);
+              }
+            }}
+            tokens={tokenUsage.data?.agents?.[p.agent] ?? null}
+          />
+        ))}
         {!perfs.data?.length && <div className="empty-state">该市场暂无 Agent</div>}
       </div>
 

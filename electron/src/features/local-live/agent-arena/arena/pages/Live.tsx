@@ -667,6 +667,8 @@ export default function Live() {
   const posCount = useMemo(() => {
     if ((market === 'cn' || market === 'hk') && livePositions.length > 0) return livePosDated.length;
     if (market === 'cn' && tdxPos.length > 0) return tdxPos.length;
+    // A 股只认实盘：账本/桥快照都空就是空仓，不再拿模拟盘回放凑数
+    if (market === 'cn') return 0;
     return simEntries.length;
   }, [market, livePositions, livePosDated, simEntries, tdxPos]);
   // 实盘分账账本（每 agent ¥10 万虚拟子账户，按模型显示各自持仓）
@@ -801,8 +803,10 @@ export default function Live() {
             price: Number(p.last_price),
             date: '',
             prev_close: Number(p.cost_price),
-            // 后端 pnl_pct 是百分数(1.43), fmtPct 期望小数(0.0143) → 除 100
-            change_pct: Number(p.pnl_pct) / 100,
+            // 后端 pnl_pct 是百分数(1.43), fmtPct 期望小数(0.0143) → 除 100；
+            // 缺现价/成本为 0 时后端给 null → 保持 null（ticker 渲染「—」），
+            // 不能 Number(null)→0 伪造「平盘」（2026-10-20 审查 MEDIUM）
+            change_pct: p.pnl_pct != null ? p.pnl_pct / 100 : null,
           },
         }));
     }
@@ -812,9 +816,11 @@ export default function Live() {
   }, [market, livePositions, heldSymbols, prices.data, stockNames.data]);
 
   // ---------- 事件流（成交，/trades 顶层字段） ----------
+  // A 股只认实盘成交（/live/trades 的 PG 真单 + 桥回报）：文件模拟成交不参与
+  // 计数/列表/日期筛选（2026-10-20 用户口径「不统计什么模拟盘」）。
   const tradeEvents: TradeEvt[] = useMemo(
     () =>
-      (trades.data ?? [])
+      (market === 'cn' ? [] : (trades.data ?? []))
         .map((r) => ({
           date: r.date,
           side: (r.action ?? '').toLowerCase() === 'buy' ? 'buy' as const : 'sell' as const,
@@ -827,7 +833,7 @@ export default function Live() {
           agent: (r as { agent?: string | null }).agent ?? null,
         }))
         .sort((a, b) => (a.date < b.date ? 1 : -1)),
-    [trades.data, stockNames.data],
+    [trades.data, stockNames.data, market],
   );
   /** 模拟盘成交按选中模型过滤（'all' = 全部，事件已带 agent 标注） */
   const tradeEventsFiltered = tradeEvents.filter(
@@ -861,8 +867,18 @@ export default function Live() {
   // 展示名映射在 rankPerformers 内：研究线在 cn 下跌行情里常排最高，
   // 直接渲染 r.name 会裸露英文签名（2026-09-12 审查 LOW）
   const performers = useMemo(
-    () => rankPerformers(rows.map((r) => ({ name: r.name, ret: r.summary?.total_return ?? null }))),
-    [rows],
+    () =>
+      rankPerformers(
+        rows.map((r) => ({
+          name: r.name,
+          // A股按 PG 区间收益排名（同模型卡口径）；港美股用文件回放总收益
+          ret:
+            market === 'cn'
+              ? r.summary?.period_return ?? null
+              : r.summary?.total_return ?? null,
+        })),
+      ),
+    [rows, market],
   );
 
   // ---------- 右侧列表渲染 ----------
@@ -915,7 +931,10 @@ export default function Live() {
             : livePosView.shown.filter((p) => !dayOf(p.buy_time)).length;
         const unknownNote = unknownPos > 0 ? ` · 另有 ${unknownPos} 只买入日未知，未参与筛选` : '';
         const shownValue = shownPositions.reduce((s, p) => s + Number(p.position_value ?? 0), 0);
-        const shownPnl = shownPositions.reduce((s, p) => s + Number(p.pnl ?? 0), 0);
+        // 浮盈只累加有盈亏的行（缺价 → pnl=null，按 0 计入会把「未知」说成「平盘」）
+        const pnlRows = shownPositions.filter((p) => p.pnl != null);
+        const missingPnl = shownPositions.length - pnlRows.length;
+        const shownPnl = pnlRows.reduce((s, p) => s + (p.pnl as number), 0);
         return (
           <div style={{ padding: '8px 12px' }}>
             <div className="pos-section-title">
@@ -923,7 +942,7 @@ export default function Live() {
               <span className="pos-section-sub">
                 {ag
                   ? `${shownPositions.length} 只 · 额度已用 ¥${ag.used.toLocaleString('en-US')} / ¥${ag.quota.toLocaleString('en-US')}`
-                  : `${shownPositions.length} 只 · 市值 ${fmtMoney(shownValue, meta.currency)} · 浮盈 ${shownPnl >= 0 ? '+' : ''}${fmtMoney(shownPnl, meta.currency)} · 总资产 ${fmtMoney(liveAcct.data?.asset ?? 0, meta.currency)}`}
+                  : `${shownPositions.length} 只 · 市值 ${fmtMoney(shownValue, meta.currency)} · 浮盈 ${shownPnl >= 0 ? '+' : ''}${fmtMoney(shownPnl, meta.currency)}${missingPnl > 0 ? `（${missingPnl} 只缺价未计）` : ''} · 总资产 ${fmtMoney(liveAcct.data?.asset ?? 0, meta.currency)}`}
                 {dateFilter !== 'all' && unknownNote}
               </span>
               <LiveClock />
@@ -937,14 +956,20 @@ export default function Live() {
                     : '暂无持仓'}
               </div>
             )}
-            {shownPositions.map((p) => (
+            {shownPositions.map((p) => {
+              // 缺价/成本为 0 → 后端 pnl=null：整段留「—」，不能靠 Number(null)=0
+              // 渲染成绿色「+¥0 (+0.00%)」假平盘（2026-10-20 审查 MEDIUM）
+              const hasPnl = p.pnl != null && p.pnl_pct != null;
+              return (
               <div className="live-pos-card" key={p.stock_code}>
                 <div className="live-pos-main">
                   <span className="live-pos-name">{p.name}</span>
                   <span className="live-pos-code">{p.stock_code}</span>
-                  <span className={`live-pos-pnl ${Number(p.pnl) >= 0 ? 'up' : 'down'}`}>
-                    {Number(p.pnl) >= 0 ? '+' : ''}{fmtMoney(Number(p.pnl), meta.currency)}
-                    {' '}({Number(p.pnl_pct) >= 0 ? '+' : ''}{Number(p.pnl_pct).toFixed(2)}%)
+                  <span className={`live-pos-pnl ${hasPnl ? (p.pnl as number) >= 0 ? 'up' : 'down' : 'dim'}`}>
+                    {hasPnl
+                      ? `${(p.pnl as number) >= 0 ? '+' : ''}${fmtMoney(p.pnl as number, meta.currency)}`
+                        + ` (${(p.pnl_pct as number) >= 0 ? '+' : ''}${(p.pnl_pct as number).toFixed(2)}%)`
+                      : '—'}
                   </span>
                 </div>
                 <div className="live-pos-sub">
@@ -956,8 +981,10 @@ export default function Live() {
                   <span>占比 {shownValue > 0 ? `${((Number(p.position_value) / shownValue) * 100).toFixed(1)}%` : '—'}</span>
                 </div>
               </div>
-            ))}
-            {market !== 'hk' && (
+              );
+            })}
+            {/* A 股「都是按实盘来」（2026-10-20 用户口径）：模拟盘持仓整段不展示 */}
+            {market !== 'hk' && market !== 'cn' && (
               <>
                 <div className="pos-section-title" style={{ marginTop: 14 }}>
                   模拟盘持仓
@@ -1034,18 +1061,22 @@ export default function Live() {
           </div>
         );
       }
+      // A 股实盘通道与快照都空 → 空仓就是空仓，不回退模拟盘回放（那不是这个账户）
+      if (market === 'cn') {
+        return (
+          <div style={{ padding: '8px 12px' }}>
+            <div className="pos-section-title">实盘持仓</div>
+            <div className="empty-state" style={{ padding: '24px 0' }}>
+              {dateFilter !== 'all'
+                ? `该日期（${dateFilter.slice(5)}）无实盘持仓`
+                : '实盘账户当前空仓（通达信桥与最近账户快照均无持仓）'}
+            </div>
+          </div>
+        );
+      }
       if (!lastSimSnapshot) return <div className="empty-state">暂无持仓数据</div>;
       return (
         <div style={{ padding: '8px 12px' }}>
-          {market === 'cn' && (
-            /* 桥账户与最近快照都读不到持仓时别默默退化：说清是通道问题，下面只是模拟盘回放 */
-            <div className="mdp-note" style={{ marginBottom: 10 }}>
-              实盘账户无持仓可展示（通达信桥实时通道未返回，最近快照也为空），
-              以下为模拟盘回放快照
-              {lastSimSnapshot.date ? ` · ${String(lastSimSnapshot.date).slice(0, 10)}` : ''}。
-              {dateFilter !== 'all' && '（快照回放无买入日期，不受日期筛选）'}
-            </div>
-          )}
           <div className="pos-row">
             <span className="pos-sym">现金 CASH</span>
             <span className="pos-cash">{fmtMoney(simCash, meta.currency)}</span>
@@ -1389,27 +1420,28 @@ export default function Live() {
                 height="clamp(360px, 44vw, 560px)"
               />
               <div className="model-cards-section">
-                {(perfs.data ?? []).map((p) => {
-                  // A股实盘: 模型卡显示实盘分账收益(虚拟净值/¥10万基准), 替代模拟盘回放
-                  const eqPts = market === 'cn' ? liveEquity.data?.agents?.[p.agent] : null;
-                  const liveNav = eqPts && eqPts.length ? eqPts[eqPts.length - 1].value : null;
-                  const isLive = market === 'cn' && liveNav != null;
-                  return (
-                    <ModelCard
+                {(perfs.data ?? []).map((p) => (
+                  // 模型卡 = 该市场 performance summary（A股已是 PG 分账实盘口径，
+                  // 与模型详情/总控同源；港美股仍是文件回放）
+                  <ModelCard
                       key={p.agent}
                       market={market}
                       agent={p.agent}
-                      balance={isLive ? liveNav : (p.summary?.end_equity ?? null)}
-                      // fmtPct 期望小数（内部 ×100）；这里只算净值/¥10万 的比率
-                      ret={isLive ? liveNav! / 100000 - 1 : (p.summary?.total_return ?? null)}
+                      balance={p.summary?.end_equity ?? null}
+                      // A股 PG 账本：区间收益（迁移起点可能低于 ¥10 万额度，
+                      // total_return 会把迁移缺口算成亏损）；港美股沿用原口径
+                      ret={
+                        market === 'cn'
+                          ? p.summary?.period_return ?? null
+                          : p.summary?.total_return ?? null
+                      }
                       selected={p.agent === effectiveModel}
                       onClick={() =>
                         setSelectedModel(asUpdater((cur) => (cur === p.agent ? 'all' : p.agent)))
                       }
                       tokens={tokenUsage.data?.agents?.[p.agent] ?? null}
-                    />
-                  );
-                })}
+                  />
+                ))}
                 {!perfs.data?.length && <div className="empty-state">该市场暂无 Agent</div>}
               </div>
             </>

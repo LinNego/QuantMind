@@ -57,12 +57,12 @@ describe('reshapeFutuAccount 金样', () => {
     const p = out.positions[0];
     expect(out.channel_used).toBe('futu-real');
     expect(out.asset).toBe(100000);
-    expect(p.pnl).toBe(0);
-    expect(p.pnl_pct).toBe(0);
+    expect(p.pnl).toBeNull();
+    expect(p.pnl_pct).toBeNull();
     expect(p.position_value).toBe(380 * 100); // market_value=0 → 成本兜底
   });
 
-  it('cost<0（摊薄成本）：绝对盈亏有效，百分比归 0（符号会颠倒）', () => {
+  it('cost<0（摊薄成本）：绝对盈亏有效，百分比留空（符号会颠倒）', () => {
     const out = reshapeFutuAccount(
       {
         total_asset: 1,
@@ -84,7 +84,7 @@ describe('reshapeFutuAccount 金样', () => {
     );
     const p = out.positions[0];
     expect(p.pnl).toBe((50 - -10) * 200); // 12000：绝对盈亏仍有效
-    expect(p.pnl_pct).toBe(0);
+    expect(p.pnl_pct).toBeNull();
     expect(p.position_value).toBe(10000); // market_value 优先
   });
 
@@ -108,8 +108,8 @@ describe('reshapeFutuAccount 金样', () => {
       },
       'simulate',
     );
-    expect(out.positions[0].pnl).toBe(0);
-    expect(out.positions[0].pnl_pct).toBe(0);
+    expect(out.positions[0].pnl).toBeNull();
+    expect(out.positions[0].pnl_pct).toBeNull();
   });
 
   it('volume=0 的行被过滤；正常行四舍五入到两位', () => {

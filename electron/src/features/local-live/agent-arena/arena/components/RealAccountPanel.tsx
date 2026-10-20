@@ -103,7 +103,10 @@ export default function RealAccountPanel({
     ) => {
       const fa = acctState.data;
       const positions = (fa?.positions ?? []).filter((p) => Number(p.total_volume) > 0);
-      const totalPnl = positions.reduce((s, p) => s + Number(p.pnl ?? 0), 0);
+      // 缺价 → pnl=null：只累加有盈亏的行，并明示几只未计（0 填充会伪造「平盘」）
+      const pnlRows = positions.filter((p) => p.pnl != null);
+      const missingPnl = positions.length - pnlRows.length;
+      const totalPnl = pnlRows.reduce((s, p) => s + (p.pnl as number), 0);
       return (
         <div className="real-account-card">
           <div className="real-account-head">
@@ -119,24 +122,32 @@ export default function RealAccountPanel({
                 <span className="real-asset-value">{fmtMoney(fa.asset, currency)}</span>
               </div>
               <div className="real-sub-row">
-                <span>总浮盈 {totalPnl >= 0 ? '+' : ''}{fmtMoney(totalPnl, currency)}</span>
+                <span>
+                  总浮盈 {totalPnl >= 0 ? '+' : ''}{fmtMoney(totalPnl, currency)}
+                  {missingPnl > 0 ? `（${missingPnl} 只缺价未计）` : ''}
+                </span>
                 <span>持仓 {positions.length} 只</span>
               </div>
               {positions.length > 0 && (
                 <div className="real-positions">
-                  {positions.map((p) => (
-                    <div className="real-pos-row" key={p.stock_code}>
-                      <span className="real-pos-id">
-                        <span className="real-pos-name">{p.name || p.stock_code}</span>
-                        <span className="real-pos-code">{p.stock_code}</span>
-                      </span>
-                      <span className="real-pos-qty">{Number(p.total_volume).toLocaleString('en-US')}</span>
-                      <span className={`real-pos-val ${Number(p.pnl) >= 0 ? 'real-up' : 'real-down'}`}>
-                        {Number(p.pnl) >= 0 ? '+' : ''}{fmtMoney(Number(p.pnl), currency)}
-                        <span className="real-pos-pct"> {Number(p.pnl_pct) >= 0 ? '+' : ''}{Number(p.pnl_pct).toFixed(2)}%</span>
-                      </span>
-                    </div>
-                  ))}
+                  {positions.map((p) => {
+                    const hasPnl = p.pnl != null && p.pnl_pct != null;
+                    return (
+                      <div className="real-pos-row" key={p.stock_code}>
+                        <span className="real-pos-id">
+                          <span className="real-pos-name">{p.name || p.stock_code}</span>
+                          <span className="real-pos-code">{p.stock_code}</span>
+                        </span>
+                        <span className="real-pos-qty">{Number(p.total_volume).toLocaleString('en-US')}</span>
+                        <span className={`real-pos-val ${hasPnl ? ((p.pnl as number) >= 0 ? 'real-up' : 'real-down') : 'dim'}`}>
+                          {hasPnl ? `${(p.pnl as number) >= 0 ? '+' : ''}${fmtMoney(p.pnl as number, currency)}` : '—'}
+                          <span className="real-pos-pct">
+                            {' '}{hasPnl ? `${(p.pnl_pct as number) >= 0 ? '+' : ''}${(p.pnl_pct as number).toFixed(2)}%` : '—'}
+                          </span>
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </>

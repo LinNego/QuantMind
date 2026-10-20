@@ -1,3 +1,5 @@
+import type { CSSProperties } from 'react';
+import { version as APP_VERSION } from '../../../../../../package.json';
 import './About.css';
 
 /** 色码：颜色只用来标记「属于哪条产线」，不做装饰。
@@ -20,6 +22,25 @@ const SECTIONS: { id: string; title: string; en: string; tone: Tone }[] = [
 ];
 
 const SEC_BY_ID = new Map(SECTIONS.map((s) => [s.id, s]));
+
+/** 目录跳转必须用 scrollIntoView，不能用 href="#about-xx"：
+ *  宿主是 HashRouter（`#/live` 即路由），改 hash 会被路由器当成换页，
+ *  点一下目录就跳出实盘栏。 */
+function goToSection(id: string) {
+  document.getElementById(`about-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+/** 实盘口径提示条：本页唯一会随口径变化而失真的地方，单独高亮。 */
+const LIVE_NOTE: CSSProperties = {
+  margin: '12px 20px 0',
+  border: '1.5px solid #000',
+  borderLeft: '4px solid #c0342b',
+  background: '#fff7f6',
+  padding: '9px 12px',
+  fontSize: '10.5px',
+  lineHeight: 1.85,
+  color: '#333',
+};
 
 function SecHead({ id }: { id: string }) {
   const s = SEC_BY_ID.get(id);
@@ -153,9 +174,9 @@ const NEWS_STAGES: {
 const TL: { t: string; c: string; tone: Tone }[] = [
   { t: '09:10', c: '风险预算定档：波动 / 回撤 / 情绪 → 三档闸门参数（平静 1.5× / 谨慎 1.2× / 防守 1.0×）', tone: 'risk' },
   { t: '09:25', c: '新闻盘前一期：隔夜与早间事件进入当日提示词', tone: 'news' },
-  { t: '09:30–15:00', c: '盘中交易：整点 ×3 agent 分析（注入昨日复盘要点 / 已验证假设 / 盘面状态 / 情绪温度 / 新闻简报）→ JSON 决策 → 确定性闸门 → 桥下单 → 分钟级哨兵', tone: 'trade' },
+  { t: '08:30–14:45', c: '盘中决策轮：11 个槽位（08:30 / 09:00 / 09:35 / 10:00 / 10:05 / 11:00 / 11:05 / 12:00 / 13:00 / 14:00 / 14:45），每轮 3 个 agent 独立分析（注入昨日复盘要点 / 已验证假设 / 盘面状态 / 情绪温度 / 新闻简报 / 通达信 L2 因子）→ JSON 决策 → 确定性闸门 → 桥下单 → 分钟级哨兵', tone: 'trade' },
   { t: '09:55–13:55', c: '新闻盘中四期：每期在整点交易分析前 5 分钟产出', tone: 'news' },
-  { t: '15:35', c: '盘后复盘：逐笔归因 → 记忆沉淀教训 → 明日预案（watch 双条件单）→ 新假设登记', tone: 'trade' },
+  { t: '盘后', c: '复盘管线（宿主机 postmarket_pipeline）：新闻复盘 → 持仓复盘 → 明日候选池；L2 因子次日落地后自动补跑选池', tone: 'trade' },
   { t: '17:00', c: '系统运行日报：表现 / 服务 / 待办一页纸', tone: 'sys' },
   { t: '19:05', c: '新闻收盘全景：全天事件收束，供晚间选池消费', tone: 'news' },
   { t: '19:30', c: '晚间研究总控：板块强度 + 明日 20 只候选池 → 明晨选股优先进池', tone: 'agent' },
@@ -173,7 +194,7 @@ export default function About() {
           <h1>
             ABOUT <span className="accent">/</span> 关于竞技场
           </h1>
-          <span className="about-ver">v0.3.0</span>
+          <span className="about-ver">v{APP_VERSION}</span>
         </div>
         <p className="about-lead">
           多模型、多市场的自主交易平台：交易、新闻、回测三类智能体各司其职，
@@ -182,19 +203,29 @@ export default function About() {
         <div className="about-meta">
           <span className="about-meta-item"><b>市场</b> 美股 · A股 · 港股</span>
           <span className="about-meta-item"><b>模型</b> v4-flash（工具型）/ v4-pro（研究员）/ glm（消息面）</span>
-          <span className="about-meta-item"><b>数据底座</b> QuantDB + 通达信桥 + 同花顺 Fuyao</span>
-          <span className="about-meta-item"><b>实盘通道</b> 通达信桥（下单）· 迅投 QMT 桥（只读复核）</span>
+          <span className="about-meta-item"><b>数据底座</b> QuantDB + 通达信桥 + 通达信 L2 因子</span>
+          <span className="about-meta-item"><b>实盘通道</b> 通达信桥（下单 · 唯一统计源）· 迅投 QMT 桥（只读复核）</span>
+        </div>
+        <div style={LIVE_NOTE}>
+          <b>实盘口径（2026-10-20 起）</b>　智能体台账 / 盘中实况只统计通达信桥实盘：
+          PG 账本 <code>qm_agent_ledger_*</code> 是唯一事实源，成交、持仓、净值、胜率均由它重建；
+          模拟盘不再进入展示与统计。缺价、缺费用一律显示「—」，不填 0、不用成本价冒充。
         </div>
       </div>
 
       {/* 目录 */}
       <nav className="about-toc" aria-label="页内导航">
         {SECTIONS.map((s) => (
-          <a key={s.id} href={`#about-${s.id}`} className="about-toc-item">
+          <button
+            key={s.id}
+            type="button"
+            className="about-toc-item"
+            onClick={() => goToSection(s.id)}
+          >
             <i className={`about-dot ${s.tone}`} />
             <span className="about-toc-num">{s.id}</span>
             {s.title}
-          </a>
+          </button>
         ))}
       </nav>
 
@@ -205,7 +236,7 @@ export default function About() {
           <div className="about-hero-cell agent">
             <div className="about-hero-k">市场并行</div>
             <div className="about-hero-v">3</div>
-            <div className="about-hero-s">NDX100 · SSE50 · 恒指成分</div>
+            <div className="about-hero-s">NDX100 · 当日候选池 · 恒指成分</div>
           </div>
           <div className="about-hero-cell trade">
             <div className="about-hero-k">交易模型对决</div>
@@ -368,7 +399,7 @@ export default function About() {
           </div>
           <div className="about-arch-layer agent">
             <div className="about-arch-tag agent">数据层</div>
-            <pre className="about-arch-body">{`本机 quantmind 量化仓库（quantdb A股后复权 / quantus 美股 / quantHK+腾讯 港股）
+            <pre className="about-arch-body">{`本机 quantmind 量化仓库（quantdb A股 / quantus 美股 / quantHK+腾讯 港股）
         │  scripts/sync_from_quantmind.py（生产）· bootstrap_data.py（新用户初始化）
         ▼
 data/ 价格文件（OHLCV）· 新闻语料 · 跑批产物 —— 与前端共用
@@ -383,18 +414,14 @@ data/ 价格文件（OHLCV）· 新闻语料 · 跑批产物 —— 与前端共
           </div>
           <div className="about-arch-layer trade">
             <div className="about-arch-tag trade">决策与执行 · 交易智能体</div>
-            <pre className="about-arch-body">{`交易 Agent（dsh 编排）→ 读行情 → LLM 推理 → 调 MCP 工具下单
-        ▲
-        │
-MCP 工具组（每市场 5 个：trade / price / math / search / memory）
-  mcp-us 8100-8104    mcp-cn 8200-8204    mcp-hk 8300-8304
+            <pre className="about-arch-body">{`决策轮引擎（QuantMind trade 服务 · 11 槽位/日 · 每轮 3 agent 独立推理）
+  输入：当日候选池 · 通达信 L2 因子快照 · 新闻简报 · 昨日复盘
         │
         ▼
-风控网关（单笔 ≤ 20% / 日亏熔断 5% / 现金保留 / 行情停更硬闸）→ Broker 抽象层
-  sandbox 模拟盘（历史回放成交）· tdx 通达信桥（A股实盘）· qmt 迅投桥（只读复核）
-        │
+风控闸门（单笔 ≤ 20% / 日亏熔断 5% / 现金保留 / 行情停更硬闸）→ 通达信桥下单
+        │  真单成败以订单终态判定；超时保持 submitted，绝不当失败重试
         ▼
-position.jsonl + 决策日志落盘 · 交易记忆 market_memory.md（开盘读 / 收盘写）
+PG 账本 qm_agent_ledger_*（现金 / 持仓 / 成交 / 回合）· 决策日志与记忆落盘
         │
         ▼`}</pre>
           </div>
@@ -414,8 +441,9 @@ position.jsonl + 决策日志落盘 · 交易记忆 market_memory.md（开盘读
           </div>
         </div>
         <p className="about-desc">
-          三个市场各自独立运行：独立 MCP 服务组、独立数据目录、独立资金池与记忆文件；
-          引擎层共用同一套 FastAPI 与风控闸门，交易结果即时汇总到排行榜与实况面板。
+          三个市场各自独立运行：独立数据目录、独立资金池与记忆文件；
+          引擎层共用同一套 FastAPI 与风控闸门。A股决策轮经通达信桥落真单，
+          成交 / 持仓 / 现金写 PG 账本，实况与台账由同一账本重建，不另算一套。
         </p>
       </section>
 
@@ -442,11 +470,12 @@ position.jsonl + 决策日志落盘 · 交易记忆 market_memory.md（开盘读
               / T+1 可卖复核 / 涨跌停不接 / 拒单自动延期重放 / 行情停更硬闸；
               风险预算 meta-agent 每日按波动 / 回撤 / 情绪动态定档</dd>
           <dt>⑤ 执行落盘</dt>
-          <dd>模拟盘按价格文件 + 滑点重算成交；A股实盘经通达信桥在真实券商通道成交；
-              持仓 / 成交 / 决策日志逐日落盘，坏价与越界订单在下单前被拦下</dd>
+          <dd>A股实盘经通达信桥在真实券商通道成交，真单成败以订单终态判定；
+              成交 / 持仓 / 现金即时写 PG 账本，决策日志逐轮落盘；坏价与越界订单在下单前被拦下。
+              A股模拟盘路径保留在代码中，但不再进入展示与统计；港股 / 美股仍为模拟盘回放</dd>
           <dt>⑥ 收盘复盘</dt>
-          <dd>15:35 盘后复盘 agent：逐笔归因 → append_memory 教训沉淀 → 明日预案（watch 双条件单）
-              → 新假设登记；次日首轮分析自动注入「昨日复盘要点」</dd>
+          <dd>15:30 复盘轮：逐笔归因 → 教训沉淀 → 明日预案；宿主机 postmarket_pipeline
+              随后跑新闻复盘 / 持仓复盘 / 明日候选池。次日首轮分析自动注入「昨日复盘要点」</dd>
         </dl>
       </section>
 
@@ -459,7 +488,6 @@ position.jsonl + 决策日志落盘 · 交易记忆 market_memory.md（开盘读
               <th>市场</th>
               <th>标的池</th>
               <th>数据源</th>
-              <th>MCP 端口</th>
               <th>基准</th>
             </tr>
           </thead>
@@ -468,21 +496,18 @@ position.jsonl + 决策日志落盘 · 交易记忆 market_memory.md（开盘读
               <td><b>美股</b></td>
               <td>NASDAQ 100（102 只）</td>
               <td>quantus 本地仓库</td>
-              <td>8100-8104</td>
               <td>NDX100 等权</td>
             </tr>
             <tr>
               <td><b>A股</b></td>
-              <td>上证 50（50 只）</td>
-              <td>quantdb 后复权</td>
-              <td>8200-8204</td>
-              <td>SSE50</td>
+              <td>当日候选池（晚间研究产出，通常 20 只）</td>
+              <td>QuantDB + 通达信桥实时 + 通达信 L2 因子</td>
+              <td>同日等权</td>
             </tr>
             <tr>
               <td><b>港股</b></td>
               <td>恒指成分</td>
               <td>quantHK + 腾讯补齐</td>
-              <td>8300-8304</td>
               <td>—</td>
             </tr>
           </tbody>
@@ -499,12 +524,13 @@ position.jsonl + 决策日志落盘 · 交易记忆 market_memory.md（开盘读
         <p className="about-desc">
           <b>同池竞技</b>：同市场内所有模型使用完全相同的行情数据、工具集与提示词框架，初始资金一致——
           差异只来自模型本身的判断。当前在跑 <b>DeepSeek V4 Flash × V4 Pro × GLM 5.3 Flash</b> 零样本对决，
-          更多模型可在 <code>configs/*.json</code> 一键启用。
+          更多模型可在「设置 → 总控」的决策名册一键启用。
         </p>
         <p className="about-desc" style={{ marginTop: 8 }}>
           <b>实盘分账（A股）</b>：2026-08-31 起接入通达信桥（Windows 8550）真实券商通道。
-          每 agent 分配 <b>¥10 万虚拟额度</b>，按模型独立记账（买入分配 / 卖出释放），与模拟盘并行运行，
-          盈亏口径独立展示。
+          每 agent 分配 <b>¥10 万虚拟额度</b>，按模型独立记账（买入分配 / 卖出释放）。
+          <b>2026-10-20 起，智能体台账与盘中实况只统计通达信实盘</b>——模拟盘成绩不再展示，
+          也不再参与任何模型对比；历史模拟记录仅作归档，不进入统计口径。
         </p>
         <p className="about-desc" style={{ marginTop: 8 }}>
           <b>第二观测点</b>：2026-09 起接入迅投 QMT 只读桥，对实盘账户的资金与持仓做独立复核——
@@ -534,8 +560,9 @@ position.jsonl + 决策日志落盘 · 交易记忆 market_memory.md（开盘读
       <section id="about-10" className="panel about-sec">
         <SecHead id="10" />
         <p className="about-desc" style={{ marginBottom: 8 }}>
-          每次成交按 <b>双边万 3 费率 + 滑点</b>重算成交价与费用，累计费用与费用占比在排行榜公开。
-          手续费是超额收益的隐形杀手——我们把它摆到台面上。
+          实盘口径下，成交价取<b>券商成交回报</b>；PG 成交账本<b>不落费用字段</b>，
+          费用与费用占比一律显示「—」，不按固定费率回填估算。手续费是超额收益的
+          隐形杀手——拿不到数据就明说拿不到，不编一个数字摆上台面。
         </p>
         <table className="about-table sys">
           <thead>
@@ -550,8 +577,12 @@ position.jsonl + 决策日志落盘 · 交易记忆 market_memory.md（开盘读
               <td>日收益序列 mean / std × √252（不足 2 个交易日显示 0）</td>
             </tr>
             <tr>
+              <td><b>净值 / 收益</b></td>
+              <td>PG 账本现金 + 持仓市值（行情快照 / 桥实时价）；缺价显示「—」并标记不完整</td>
+            </tr>
+            <tr>
               <td><b>胜率 / 盈亏比</b></td>
-              <td>按持仓记录 FIFO 重建逐笔平仓，成交价与费用按价格文件重算</td>
+              <td>按 PG 账本成交 FIFO 重建回合台账（qm_agent_ledger_roundtrip），只用实际成交价</td>
             </tr>
             <tr>
               <td><b>最大回撤</b></td>
@@ -580,8 +611,8 @@ position.jsonl + 决策日志落盘 · 交易记忆 market_memory.md（开盘读
         <div className="about-desc" style={{ lineHeight: 2 }}>
           <p><b>新增智能体</b>（详见仓库 <code>docs/AGENT_GUIDE.md</code>）：</p>
           <ul style={{ paddingLeft: 20, margin: '4px 0' }}>
-            <li><b>竞技 / 回放</b>：<code>configs/*_config.json</code> 的 models 加一项并 <code>enabled: true</code>（可选自定义策略类）</li>
-            <li><b>A股实盘分账</b>：<code>configs/astock_config.json</code> 加 enabled 模型 + <code>.env</code> 模型 Key；系统自动配 ¥10 万虚拟额度，风控 / 拒单重放全继承</li>
+            <li><b>决策名册</b>：在「设置 → 总控」维护模型条目（<code>QM_DECISION_LLM_ROSTER</code>；Key 只写变量名，接口永不回传明文）</li>
+            <li><b>A股实盘分账</b>：名册新增模型后自动配 ¥10 万额度，风控 / 拒单重放全继承；是否可下单仍由 <code>ENABLE_REAL_TRADING</code> 与前端开关双重控制</li>
             <li><b>dsh 技能包</b>：<code>dsh/skills/&lt;技能名&gt;/SKILL.md</code>（frontmatter 写触发词），容器 bind mount 即生效</li>
             <li><b>回测策略</b>：Pine 策略入库后由转写 worker 自动处理；内置模板见 <code>backend/services/lab_strategies/</code></li>
           </ul>
@@ -596,8 +627,9 @@ position.jsonl + 决策日志落盘 · 交易记忆 market_memory.md（开盘读
       <section id="about-12" className="panel about-sec">
         <SecHead id="12" />
         <p className="about-desc dim" style={{ lineHeight: 1.9 }}>
-          本竞技场为研究平台。模拟路径：全部交易为历史行情回放，不涉及任何真实资金。
-          实盘路径（A股）：经通达信桥在真实券商通道成交，但资金为分账虚拟额度（每 agent ¥10 万），不投入真实资金。
+          本竞技场为研究平台。实盘路径（A股）：订单经通达信桥进入真实券商账户成交；
+          「每 agent ¥10 万」是账本内的分账额度，不对应独立资金账户。
+          智能体台账 / 盘中实况只统计通达信实盘，模拟盘不展示、不参与对比。
           历史表现不代表未来收益，本平台不构成任何投资建议。
         </p>
       </section>

@@ -6,7 +6,9 @@ import { fmtMoney, fmtNum } from '../utils/format';
 import { renderInline, renderMarkdown } from '../utils/markdown';
 import { DecItem, parseAnalysis } from '../utils/parseAnalysis';
 import { sameSymbol, stockName } from '../utils/symbols';
-import { attachFillsToRounds, LiveFill } from '../utils/liveFills';
+import { attachFillsToRounds, LiveFill, toPgFill } from '../utils/liveFills';
+import { isReviewLine } from '../utils/logKind';
+import { matchesRoundFilter, type RoundFilter } from '../utils/roundFilter';
 import './ModelChat.css';
 import { modeOf } from '../utils/modeTag';
 import { asUpdater } from '../reactCompat';
@@ -23,9 +25,7 @@ interface Round {
   date: string | null; // 交易日（提示词里的日期，回退日志日期）
 }
 
-type Filter = 'all' | 'trade' | 'review' | 'idle';
-
-const FILTERS: { id: Filter; label: string }[] = [
+const FILTERS: { id: RoundFilter; label: string }[] = [
   { id: 'all', label: '全部轮次' },
   { id: 'trade', label: '有成交' },
   { id: 'idle', label: '无成交' },
@@ -64,6 +64,7 @@ export default function ModelChat({
   currency = '$',
   names = {},
   liveFills = [],
+  liveOnly = false,
 }: {
   logs: LogLine[];
   trades: TradeRecord[];
@@ -73,9 +74,12 @@ export default function ModelChat({
   names?: Record<string, string>;
   /** 通达信桥实盘成交（秒级时间），按时间窗归属到回合 */
   liveFills?: LiveFill[];
+  /** A 股台账：只统计实盘账本。没有成交的模型（pgFills 为空）也必须压掉模拟盘
+   *  口径，否则「零成交」会被渲染成「模拟盘成交明细」整块。 */
+  liveOnly?: boolean;
 }) {
   const [open, setOpen] = useState<Set<number>>(new Set());
-  const [filter, setFilter] = useState<Filter>('all');
+  const [filter, setFilter] = useState<RoundFilter>('all');
 
   /** 成交按日期索引（交易决策 匹配） */
   const tradesByDate = useMemo(() => {
@@ -88,6 +92,31 @@ export default function ModelChat({
     }
     return map;
   }, [trades]);
+
+  /** PG 实盘成交（/trades 已按 agent 过滤）：秒级 ts 是归属回合的唯一依据。
+   *  文件模拟成交没有秒级时间，仍走「按日归属」的老口径。 */
+  const pgFills = useMemo<LiveFill[]>(
+    () =>
+      (trades ?? [])
+        .filter((t) => t.live)
+        .map(toPgFill)
+        .filter((f): f is LiveFill => f != null),
+    [trades],
+  );
+  /** 实盘成交 = PG 账本行 + 父级传入的桥回报（按 ts/方向/代码/数量去重，防双计） */
+  const allLiveFills = useMemo(() => {
+    const seen = new Set<string>();
+    const out: LiveFill[] = [];
+    for (const f of [...pgFills, ...liveFills]) {
+      const key = `${f.ts}|${f.side}|${f.code}|${f.volume}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(f);
+    }
+    return out;
+  }, [pgFills, liveFills]);
+  /** 该模型是否已切到实盘账本（是 → 不再展示/统计模拟盘成交） */
+  const isLiveLedger = liveOnly || pgFills.length > 0;
 
   /** 某交易日收盘时该 symbol 的持仓（跨写法匹配快照键） */
   const qtyAt = (date: string, symbol: string): number | null => {
@@ -106,7 +135,7 @@ export default function ModelChat({
     let pending: Omit<Round, 'seq'> | null = null;
     for (const line of logs ?? []) {
       const msgs = line.new_messages ?? [];
-      const kind: Round['kind'] = line.kind === 'review' ? 'review' : 'analysis';
+      const kind: Round['kind'] = isReviewLine(line) ? 'review' : 'analysis';
       const ts = line.timestamp ?? null;
       const usage = line.usage ?? null;
       const user = joinContent(msgs, isUser);
@@ -141,26 +170,26 @@ export default function ModelChat({
 
   /** 每回合的结构化决策（parseAnalysis 从 JSON 块提取） */
   const parsed = useMemo(() => rounds.map((r) => parseAnalysis(r.thought)), [rounds]);
-  /** 实盘成交按时间窗归属到回合（模拟盘只有日期，实盘秒级——两套口径分开算） */
-  const liveFillsByRound = useMemo(() => attachFillsToRounds(rounds, liveFills), [rounds, liveFills]);
+  /** 实盘成交按时间窗归属到回合；实盘账本下模拟盘不再计数（同一天多轮
+   *  不会被同一笔按日成交重复计入） */
+  const liveFillsByRound = useMemo(
+    () => attachFillsToRounds(rounds, allLiveFills),
+    [rounds, allLiveFills],
+  );
   const tradeCounts = useMemo(
     () =>
       rounds.map((r) => {
-        const simCount = r.date ? (tradesByDate.get(r.date) ?? []).length : 0;
         const liveCount = liveFillsByRound.bySeq.get(r.seq)?.length ?? 0;
+        if (isLiveLedger) return liveCount;
+        const simCount = r.date ? (tradesByDate.get(r.date) ?? []).length : 0;
         return simCount + liveCount;
       }),
-    [rounds, tradesByDate, liveFillsByRound],
+    [rounds, tradesByDate, liveFillsByRound, isLiveLedger],
   );
 
   const visible = rounds
     .map((r, i) => ({ r, i }))
-    .filter(({ r, i }) => {
-      if (filter === 'trade') return (tradeCounts[i] ?? 0) > 0;
-      if (filter === 'idle') return (tradeCounts[i] ?? 0) === 0;
-      if (filter === 'review') return r.kind === 'review';
-      return true;
-    })
+    .filter(({ r, i }) => matchesRoundFilter(filter, r.kind, tradeCounts[i] ?? 0))
     .reverse(); // 最新在上
 
   const toggle = (seq: number) =>
@@ -178,7 +207,8 @@ export default function ModelChat({
 
   const firstTs = rounds[0]?.ts ?? null;
   const lastTs = rounds[rounds.length - 1]?.ts ?? null;
-  const tradeRounds = tradeCounts.filter((c) => c > 0).length;
+  // 与筛选同口径：复盘轮不算「有成交轮」（模拟盘按日归属时否则会把复盘日也算上）
+  const tradeRounds = tradeCounts.filter((c, i) => c > 0 && rounds[i]?.kind !== 'review').length;
 
   return (
     <div className="mc-wrap">
@@ -186,9 +216,9 @@ export default function ModelChat({
         <span className="mc-toolbar-stat">
           本页 <b>{rounds.length}</b> 轮 · 有成交 <b>{tradeRounds}</b> 轮 · 复盘{' '}
           <b>{rounds.filter((r) => r.kind === 'review').length}</b> 轮
-          {liveFills.length > 0 && (
+          {allLiveFills.length > 0 && (
             <>
-              {' '}· 实盘成交 <b>{liveFills.length}</b> 笔
+              {' '}· 实盘成交 <b>{allLiveFills.length}</b> 笔
               {liveFillsByRound.orphan.length > 0 && (
                 <span className="mc-toolbar-note">（{liveFillsByRound.orphan.length} 笔不在本页时间窗内）</span>
               )}
@@ -219,7 +249,8 @@ export default function ModelChat({
       <div className="mc-list">
         {visible.length === 0 && <div className="empty-state">当前筛选下没有回合</div>}
         {visible.map(({ r, i }) => {
-          const dayTrades = r.date ? (tradesByDate.get(r.date) ?? []) : [];
+          // 实盘账本：模拟盘成交不再进任何一轮的展示/计数
+          const dayTrades = !isLiveLedger && r.date ? (tradesByDate.get(r.date) ?? []) : [];
           const live = liveFillsByRound.bySeq.get(r.seq) ?? [];
           const fillCount = dayTrades.length + live.length;
           const pa = parsed[i];
@@ -250,7 +281,7 @@ export default function ModelChat({
                 </span>
                 {modeOf(r.user)}
                 {r.kind === 'review' && <span className="mc-kind review">📋 复盘轮</span>}
-                <span className={`mc-status ${dayTrades.length ? '' : r.kind === 'review' ? 'review' : 'idle'}`}>{status}</span>
+                <span className={`mc-status ${fillCount ? '' : r.kind === 'review' ? 'review' : 'idle'}`}>{status}</span>
                 <span className="mc-date" title={r.ts ?? ''}>
                   {fmtDateTime(r.ts)}
                   {r.ts && <em className="mc-date-wd">{fmtWeekday(r.ts)}</em>}
@@ -314,7 +345,12 @@ export default function ModelChat({
                     {pa.decisions.length ? (
                       <div className="mc-dec-list">
                         {pa.decisions.map((d, k) => (
-                          <StructuredDecision key={`${d.code ?? d.name ?? k}-${k}`} dec={d} fills={dayTrades} names={names} />
+                          <StructuredDecision
+                            key={`${d.code ?? d.name ?? k}-${k}`}
+                            dec={d}
+                            fills={isLiveLedger ? live.map((f) => ({ symbol: f.code })) : dayTrades}
+                            names={names}
+                          />
                         ))}
                       </div>
                     ) : (
@@ -322,7 +358,7 @@ export default function ModelChat({
                     )}
                   </Section>
                   <Section
-                    title="实盘成交（通达信桥 · 秒级）"
+                    title={isLiveLedger ? '实盘成交（分账账本 · 秒级）' : '实盘成交（通达信桥 · 秒级）'}
                     hint={live.length ? `${live.length} 笔` : '本轮时间窗内无实盘回报'}
                   >
                     {live.length ? (
@@ -346,28 +382,30 @@ export default function ModelChat({
                       <div className="mc-no-trade">本轮时间窗（±90 分钟）内没有通达信桥成交回报。</div>
                     )}
                   </Section>
-                  <Section
-                    title="模拟盘成交明细（按日）"
-                    hint={dayTrades.length ? `${dayTrades.length} 笔` : '无成交'}
-                  >
-                    {dayTrades.length ? (
-                      <div className="mc-trades">
-                        {dayTrades.map((t, j) => (
-                          <DecisionCard
-                            key={`${t.date}-${t.symbol}-${j}`}
-                            trade={t}
-                            qtyAfter={qtyAt(t.date, t.symbol)}
-                            currency={currency}
-                            names={names}
-                          />
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="mc-no-trade">
-                        {r.date ? `${r.date} 未产生成交回报。` : '未产生成交回报。'}
-                      </div>
-                    )}
-                  </Section>
+                  {!isLiveLedger && (
+                    <Section
+                      title="模拟盘成交明细（按日）"
+                      hint={dayTrades.length ? `${dayTrades.length} 笔` : '无成交'}
+                    >
+                      {dayTrades.length ? (
+                        <div className="mc-trades">
+                          {dayTrades.map((t, j) => (
+                            <DecisionCard
+                              key={`${t.date}-${t.symbol}-${j}`}
+                              trade={t}
+                              qtyAfter={qtyAt(t.date, t.symbol)}
+                              currency={currency}
+                              names={names}
+                            />
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="mc-no-trade">
+                          {r.date ? `${r.date} 未产生成交回报。` : '未产生成交回报。'}
+                        </div>
+                      )}
+                    </Section>
+                  )}
                 </div>
               )}
             </div>
@@ -434,7 +472,7 @@ function MetaCell({ k, v, wide }: { k: string; v: string; wide?: boolean }) {
 
 /** 结构化决策卡：模型自己输出的 JSON 决策（action/code/pct/reason/止损止盈…），
  *  并标注该决策是否对应当日真实成交 —— 复盘看「说的和做的是否一致」。 */
-function StructuredDecision({ dec, fills, names }: { dec: DecItem; fills: TradeRecord[]; names: Record<string, string> }) {
+function StructuredDecision({ dec, fills, names }: { dec: DecItem; fills: { symbol: string }[]; names: Record<string, string> }) {
   const side = (dec.action ?? '').toLowerCase();
   const sideCls = side === 'sell' ? 'sell' : side === 'buy' ? 'buy' : 'hold';
   const matched = fills.filter((f) => dec.code && sameSymbol(f.symbol, dec.code));

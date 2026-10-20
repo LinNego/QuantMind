@@ -58,7 +58,7 @@ export function LastTradesTable({ trades, currency = '$', names }: { trades: Clo
                 <td className="faint">{fmtSpan(t.hold_days)}</td>
                 <td>{entryNotional != null ? fmtNum(entryNotional, 0) : '—'}</td>
                 <td>{fmtNum(t.notional, 0)}</td>
-                <td className="faint">{t.fee ? fmtNum(t.fee, 2) : '—'}</td>
+                <td className="faint">{t.fee != null ? fmtNum(t.fee, 2) : '—'}</td>
                 <td className={t.pnl == null ? 'dim' : t.pnl >= 0 ? 'up' : 'down'}>
                   {fmtMoneySigned(t.pnl, currency, 2)}
                 </td>
@@ -112,11 +112,19 @@ export function HoldingsTable({ data, currency = '$', names }: { data: Holdings 
             <tr key={h.symbol}>
               <td><SymCell sym={h.symbol} names={names} /></td>
               <td>{h.qty.toLocaleString('en-US')}</td>
-              <td>{fmtNum(h.price)}</td>
+              {/* 缺实时价时后端用成本价兜底估值（stale）——价格列必须留白，
+                  否则「成本价」会被读成「最新成交价」 */}
+              <td className={h.stale ? 'dim' : undefined} title={h.stale ? '缺实时价，市值按成本价兜底' : undefined}>
+                {h.stale ? '—' : fmtNum(h.price)}
+              </td>
               <td className="faint">{fmtNum(h.entry_price)}</td>
               <td>{fmtNum(h.market_value, 0)}</td>
-              <td className={h.pnl >= 0 ? 'up' : 'down'}>{fmtMoneySigned(h.pnl, currency, 0)}</td>
-              <td className={h.pnl >= 0 ? 'up' : 'down'}>{h.pnl_pct != null ? (h.pnl_pct >= 0 ? '+' : '') + fmtNum(h.pnl_pct * 100, 2) + '%' : '—'}</td>
+              <td className={h.pnl == null ? 'dim' : h.pnl >= 0 ? 'up' : 'down'}>
+                {fmtMoneySigned(h.pnl, currency, 0)}
+              </td>
+              <td className={h.pnl_pct == null ? 'dim' : h.pnl_pct >= 0 ? 'up' : 'down'}>
+                {h.pnl_pct != null ? (h.pnl_pct >= 0 ? '+' : '') + fmtNum(h.pnl_pct * 100, 2) + '%' : '—'}
+              </td>
               <td className="dim">{h.weight_pct != null ? fmtNum(h.weight_pct * 100, 1) + '%' : '—'}</td>
             </tr>
           ))}
@@ -124,6 +132,7 @@ export function HoldingsTable({ data, currency = '$', names }: { data: Holdings 
       </table>
       <div className="faint" style={{ marginTop: 6, fontSize: 11 }}>
         总权益 {currency}{data.total_equity.toLocaleString('en-US', { maximumFractionDigits: 0 })} = 现金 {currency}{data.cash.toLocaleString('en-US', { maximumFractionDigits: 0 })} + 持仓市值 {currency}{data.total_market_value.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+        {data.incomplete && ' · 含缺实时价的持仓（市值按成本价兜底，浮盈显示 —）'}
       </div>
     </div>
   );

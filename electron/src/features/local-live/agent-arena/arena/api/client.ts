@@ -65,6 +65,19 @@ export interface Summary {
   avg_trade_size: number | null;
   median_trade_size: number | null;
   median_hold_days: number | null;
+  /** ── PG 实盘口径扩展（旧文件线没有这些键；缺失显示 —） ── */
+  /** 从净值序列首点起算的区间收益（total_return 恒以 ¥10 万本金为基） */
+  period_return?: number | null;
+  series_start_equity?: number;
+  fills_count?: number;
+  buy_count?: number;
+  sell_count?: number;
+  turnover?: number;
+  first_trade_date?: string | null;
+  last_trade_date?: string | null;
+  /** 账本不记费用：'unavailable' → 费用一律显示 — */
+  fee_basis?: string;
+  full_liquidations?: number;
 }
 
 export interface EquityPoint {
@@ -79,6 +92,8 @@ export interface Performance {
   agent: string;
   points: EquityPoint[];
   summary: Summary;
+  /** 'live' = PG 分账实盘账本重建；旧文件版无此键（按模拟盘处理） */
+  scope?: 'live' | 'sim';
 }
 
 export interface PositionRecord {
@@ -100,8 +115,11 @@ export interface LogLine {
   signature?: string;
   /** 日志写入时间 ISO（后端返回，如 2026-08-31T14:00:28） */
   timestamp?: string;
-  /** 'review' = 盘后复盘轮（只读沉淀，不下单） */
+  /** 'review' = 盘后复盘轮（只读沉淀，不下单）。历史日志写入方用 mode，
+   *  新写入方用 kind；前端两者都要认（2026-10-20：只认 kind 导致复盘轮
+   *  全被当成分析轮，「盘后复盘」筛选为空）。 */
   kind?: string;
+  mode?: string;
   usage?: LogUsage | null;
   new_messages?: { role?: string; content?: string }[];
   /** 本轮的数据缺口标记（QuantMind 侧写入；当前取值 'account_unreachable'）。
@@ -118,6 +136,12 @@ export interface TradeRecord {
   cash_after: number;
   price: number | null;
   notional: number | null;
+  /** PG 实盘成交独有：秒级成交时刻（北京 ISO） */
+  ts?: string;
+  /** 成交价缺失时为 true（后端回填约价并显式标注） */
+  approx_price?: boolean;
+  /** PG 分账实盘行（通达信桥）= true */
+  live?: boolean;
 }
 
 export interface OverviewRow {
@@ -169,8 +193,12 @@ export const fetchPerformance = (agent: string, market: MarketId) =>
 export const fetchPositions = (agent: string, market: MarketId) =>
   unwrap<PositionRecord[]>(api.get(`/agents/${encodeURIComponent(agent)}/positions`, { params: { market } }));
 
-export const fetchTrades = (agent: string, market: MarketId) =>
-  unwrap<TradeRecord[]>(api.get(`/agents/${encodeURIComponent(agent)}/trades`, { params: { market } }));
+export const fetchTrades = (agent: string, market: MarketId, limit = 0) =>
+  unwrap<TradeRecord[]>(
+    api.get(`/agents/${encodeURIComponent(agent)}/trades`, {
+      params: limit > 0 ? { market, limit } : { market },
+    }),
+  );
 
 /** 分析日志（每行 = 一个分析回合）。limit>0 只取最近 N 条：
  *  全量日志累积 1MB+，对话 tab 每 30s 全量拉取是页面卡顿主因（2026-09-08）。 */
@@ -206,8 +234,9 @@ export interface LivePosition {
   available_volume: number;
   last_price: number;
   position_value: number;
-  pnl_pct: number;
-  pnl: number;
+  /** 缺现价 / 成本为 0 时后端给 null（不是 0 浮盈）；渲染必须留白为「—」 */
+  pnl_pct: number | null;
+  pnl: number | null;
   buy_time: string; // "2026-08-31T11:13"
 }
 
@@ -261,8 +290,8 @@ interface FutuAccountRaw {
 
 /** 纯函数：富途原始账户 → 面板 LiveAccount（export 供 vitest；单卡与双卡共用）。
  *  边界口径与 reshapeQmtAccount 对齐，两处富途侧约定不能想当然：
- *  - price=0 是「拿不到价」→ 不给盈亏段（0 值盈利会伪造「平盘」）；
- *  - cost<0 真实存在（摊薄成本法）→ 绝对盈亏仍有效，百分比无意义（(P-C)/C 在 C<0 时符号颠倒）→ pnl_pct 留 0。 */
+ *  - price=0 是「拿不到价」→ pnl/pnl_pct 一律 null（渲染「—」；0 值盈利会伪造「平盘」）；
+ *  - cost<0 真实存在（摊薄成本法）→ 绝对盈亏仍有效，百分比无意义（(P-C)/C 在 C<0 时符号颠倒）→ pnl_pct = null。 */
 export const reshapeFutuAccount = (
   raw: FutuAccountRaw | undefined,
   env: string,
@@ -286,8 +315,8 @@ export const reshapeFutuAccount = (
         available_volume: Number(p.available_volume) || 0,
         last_price: last,
         position_value: Number(p.market_value) || (hasPrice ? last * vol : cost * vol),
-        pnl_pct: hasPct ? +(((last - cost) / cost) * 100).toFixed(2) : 0,
-        pnl: hasPnl ? +((last - cost) * vol).toFixed(2) : 0,
+        pnl_pct: hasPct ? +(((last - cost) / cost) * 100).toFixed(2) : null,
+        pnl: hasPnl ? +((last - cost) * vol).toFixed(2) : null,
         buy_time: '',
       };
     });
@@ -345,9 +374,9 @@ interface QmtAccountRaw {
 
 /** 纯函数：桥原始返回 → 面板数据（export 供 vitest）。
  *  两处桥侧约定，不能想当然：
- *  - last_price=0 是「拿不到价」的约定（见 qmt_bridge._account_query）→ 盈亏留 0；
+ *  - last_price=0 是「拿不到价」的约定（见 qmt_bridge._account_query）→ pnl/pnl_pct = null；
  *  - cost_price<0 是真实存在的（摊薄成本法，分红累计超过原成本）→ 绝对盈亏仍有效，
- *    百分比无意义（(P-C)/C 在 C<0 时符号颠倒）→ pnl_pct 留 0；cost_price=0 则是
+ *    百分比无意义（(P-C)/C 在 C<0 时符号颠倒）→ pnl_pct = null；cost_price=0 则是
  *    字段缺失，两个都不算——0 值盈利会伪造「平盘」。 */
 export const reshapeQmtAccount = (raw: QmtAccountRaw): QmtAccount => {
   const a = raw.asset ?? { asset: 0, cash: 0, market_value: 0, frozen_cash: 0 };
@@ -368,8 +397,8 @@ export const reshapeQmtAccount = (raw: QmtAccountRaw): QmtAccount => {
         available_volume: Number(p.available_volume) || 0,
         last_price: last,
         position_value: Number(p.market_value) || (hasPrice ? last * vol : cost * vol),
-        pnl_pct: hasPct ? +(((last - cost) / cost) * 100).toFixed(2) : 0,
-        pnl: hasPnl ? +((last - cost) * vol).toFixed(2) : 0,
+        pnl_pct: hasPct ? +(((last - cost) / cost) * 100).toFixed(2) : null,
+        pnl: hasPnl ? +((last - cost) * vol).toFixed(2) : null,
         buy_time: '',
       };
     });
@@ -550,7 +579,15 @@ export interface LedgerPosition {
   name: string;
   volume: number;
   cost_price: number;
+  /** 兼容字段：有实时价时是市值，缺价时回落成本（勿用它算浮盈） */
   position_value: number;
+  /** 实时价（缺价 → null；不许拿成本价冒充） */
+  price?: number | null;
+  /** 实时市值（缺价 → null） */
+  market_value?: number | null;
+  /** 浮盈（缺价 → null，不是 0） */
+  pnl?: number | null;
+  pnl_pct?: number | null;
   buy_ts: string;
 }
 
@@ -558,6 +595,13 @@ export interface AgentLedger {
   quota: number;
   used: number;
   remaining: number;
+  /** 账本现金（含卖出回款；旧文件版无此键） */
+  cash?: number;
+  market_value?: number;
+  /** cash + 市值；任一持仓缺价 → null（UI 显示 —） */
+  equity?: number | null;
+  /** 至少一只持仓缺价，equity/market_value 不完整 */
+  incomplete?: boolean;
   positions: LedgerPosition[];
 }
 
@@ -651,12 +695,17 @@ export interface ClosedTradeDetail {
   entry_price: number;
   exit_price: number;
   notional: number;
-  fee: number;
+  /** 费用：账本不记 → null，UI 显示 —（绝不填 0） */
+  fee: number | null;
   /** 缺成本价时为 null（不可计算盈亏） */
   pnl: number | null;
   hold_days: number | null;
-  /** true = 通达信桥实盘成交（非模拟盘） */
+  /** 卖出原因（止损 / 止盈 / 调仓…；账本无记录 → undefined） */
+  exit_reason?: string | null;
+  /** true = 通达信桥实盘成交（分账账本口径） */
   live?: boolean;
+  /** true = 部分卖出（未清仓），不是完整回合 */
+  partial?: boolean;
 }
 
 /** FIFO 重建已平仓逐笔，最新在前（最多 limit 笔） */
@@ -707,10 +756,13 @@ export interface HoldingRow {
   entry_price: number;
   price: number;
   market_value: number;
-  pnl: number;
+  /** 缺实时价 → null（后端以成本价兜底估值并标 stale；不是 0 浮盈） */
+  pnl: number | null;
   pnl_pct: number | null;
   change_pct: number | null;
   weight_pct: number | null;
+  /** 现价缺位、以成本价兜底 → true */
+  stale?: boolean;
 }
 
 export interface Holdings {
@@ -718,6 +770,8 @@ export interface Holdings {
   cash: number;
   total_market_value: number;
   total_equity: number;
+  /** 有持仓缺实时价（total_market_value 含成本兜底） */
+  incomplete?: boolean;
 }
 
 export const fetchHoldings = (agent: string, market: MarketId) =>

@@ -172,17 +172,25 @@ export default function LiveDetails({
       {/* ③ 阵容（实时取自 overview） */}
       <h4 className="ld-h">③ 智能体阵容（{roster.length} 个）</h4>
       {roster.length === 0 && <p className="ld-empty">该市场暂无启用中的智能体。</p>}
-      {roster.map((r) => (
-        <p className="ld-agent" key={r.name}>
-          <b className="ld-agent-name">{r.name}</b>
-          {r.summary?.total_return != null && (
-            <span className={`ld-agent-ret ${r.summary.total_return >= 0 ? 'up' : 'down'}`}>
-              {fmtPct(r.summary.total_return)}
-            </span>
-          )}
-          <span className="ld-agent-role">{AGENT_ROLE[r.name] ?? FALLBACK_ROLE}</span>
-        </p>
-      ))}
+      {roster.map((r) => {
+        // A 股 PG 分账的 total_return 以 ¥10 万额度为基，但迁移起点可能低于额度
+        // （期初持仓未入账），拿它当业绩会把迁移缺口记成亏损。阵容展示区间收益，
+        // 与模型详情「区间收益率」同一口径。
+        const ret = market === 'cn'
+          ? r.summary?.period_return ?? null
+          : r.summary?.total_return ?? null;
+        return (
+          <p className="ld-agent" key={r.name}>
+            <b className="ld-agent-name">{r.name}</b>
+            {ret != null && (
+              <span className={`ld-agent-ret ${ret >= 0 ? 'up' : 'down'}`}>
+                {fmtPct(ret)}
+              </span>
+            )}
+            <span className="ld-agent-role">{AGENT_ROLE[r.name] ?? FALLBACK_ROLE}</span>
+          </p>
+        );
+      })}
 
       {/* ④ 风控闸门 */}
       <h4 className="ld-h">④ 风控闸门（系统侧强制，模型不可绕过）</h4>
@@ -221,7 +229,7 @@ export default function LiveDetails({
         <li>
           <b>净值口径</b>：
           {market === 'cn'
-            ? '实盘线按桥实时价计算的分账净值，分钟级采样；模拟盘仅作对照展示。'
+            ? '实盘线按桥实时价计算的分账净值，分钟级采样；A 股台账只统计实盘账本，不再展示模拟盘回放。'
             : '按当日回放价逐笔重估持仓（净值 = 现金 + Σ 持仓市值），每个持仓记录一个采样点；当日无价时沿用最近已知价。'}
         </li>
       </ul>

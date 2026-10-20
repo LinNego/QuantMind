@@ -1,4 +1,4 @@
-import type { LiveTradeLog } from '../api/client';
+import type { LiveTradeLog, TradeRecord } from '../api/client';
 
 /** 实盘（通达信桥）成交归一化 + 归属到决策回合。
  *  模拟盘成交只精确到日；桥的成交回报精确到秒（`2026-09-08T09:37:42`），
@@ -35,6 +35,33 @@ export function toLiveFill(log: LiveTradeLog | null | undefined): LiveFill | nul
     costPrice: Number.isFinite(costRaw) && costRaw > 0 ? costRaw : null,
     orderId: log.fill?.order_id ?? log.result?.order_id ?? null,
     mode: log.mode ?? '',
+  };
+}
+
+/** PG 分账账本成交（`/agents/{name}/trades` 的 `live: true` 行）→ LiveFill。
+ *
+ *  2026-10-20 起 A 股台账只认 PG 账本：`ts` 是北京秒级成交时刻，归属回合
+ *  与桥回报同一套规则。缺 `ts` 的历史行回落到当日 15:00（仅用于按日归属，
+ *  不伪装成秒级回报——展示层看 `ts` 是否带时间部分即可）。 */
+export function toPgFill(record: TradeRecord | null | undefined): LiveFill | null {
+  if (!record) return null;
+  const sideRaw = String(record.action ?? '').toLowerCase();
+  const side: LiveFill['side'] | null =
+    sideRaw === 'buy' ? 'buy' : sideRaw === 'sell' ? 'sell' : null;
+  const volume = Math.abs(Number(record.amount) || 0);
+  if (!side || volume <= 0) return null;
+  const ts = record.ts ?? (record.date ? `${record.date}T15:00:00+08:00` : '');
+  if (!ts) return null;
+  const price = Number(record.price);
+  return {
+    ts,
+    side,
+    code: record.symbol,
+    volume,
+    price: Number.isFinite(price) && price > 0 ? price : null,
+    costPrice: null,
+    orderId: null,
+    mode: 'pg_fill',
   };
 }
 

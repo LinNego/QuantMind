@@ -1,17 +1,12 @@
 import { useMemo, useState } from 'react';
-import dayjs from 'dayjs';
 import {
   BenchPoint,
-  Holdings,
   MarketId,
   fetchBenchmark,
   fetchHoldings,
-  fetchLiveEquity,
-  fetchLiveTrades,
   fetchLogs,
   fetchPerformance,
   fetchPositions,
-  fetchRealAccount,
   fetchStockNames,
   fetchTradeDetail,
   fetchTrades,
@@ -22,9 +17,8 @@ import EquityChart, { toBenchLine, toChartLine } from '../components/EquityChart
 import { logoOf, modelColor, shortName } from '../components/ModelCard';
 import { HoldingsTable, LastTradesTable, LiveFillsTable, PositionHistory, TradesTable } from '../components/Tables';
 import ModelChat from '../components/ModelChat';
-import { LiveAdjust, LiveFill, toLiveAdjust, toLiveFill } from '../utils/liveFills';
+import { LiveFill, toPgFill } from '../utils/liveFills';
 import { fmtAgo, fmtDateTime, fmtSpan } from '../utils/datetime';
-import { seriesStats, dailyCloses } from '../utils/equity';
 import { fmtMoney, fmtNum, fmtPct, pnlClass } from '../utils/format';
 import './ModelDetail.css';
 
@@ -72,12 +66,16 @@ function MetricRow({
   return b / a - 1;
 }
 
-/** 指标分组的口径标记：实盘模型下，收益/行为/成本三组仍来自模拟盘回放，不能混着看。 */
+/** 指标分组的口径标记：明确这组数字来自哪个账本，避免实盘/模拟混看。 */
 function ScopeChip({ children }: { children: React.ReactNode }) {
   return <span className="mdp-scope">{children}</span>;
 }
 
-/** 模型详情页：战报头 + KPI 带 + 指标矩阵（收益风险/交易行为/成本规模/数据时效）+ 明细四表。 */
+/** 模型详情页：战报头 + KPI 带 + 指标矩阵（收益风险/交易行为/成本规模/数据时效）+ 明细四表。
+ *
+ *  A 股（market=cn）从 2026-10-20 起只展示 PG 分账实盘账本（`qm_agent_ledger_*`）：
+ *  performance/holdings/positions/trades/trade-detail 五个端点全部走同一份账本，
+ *  模拟盘回放不再混入任何统计。港股/美股仍走原有文件数据。 */
 export interface ModelDetailProps {
   market?: MarketId;
   agent?: string;
@@ -94,7 +92,9 @@ export default function ModelDetail({ market = 'cn', agent = '', onBack }: Model
   const perf = usePolling(() => fetchPerformance(name, m), [name, m], 30000);
   const holdings = usePolling(() => fetchHoldings(name, m), [name, m], 30000);
   const positions = usePolling(() => fetchPositions(name, m), [name, m], 30000);
-  const trades = usePolling(() => fetchTrades(name, m), [name, m], 30000);
+  // CN 台账全量成交（PG 账本行数有限，放大到 2000 保证「全部轮次」的成交归属
+  // 不会被 200 条默认上限截断；远端上限 5000）
+  const trades = usePolling(() => fetchTrades(name, m, m === 'cn' ? 2000 : 0), [name, m], 30000);
   // 懒加载：FIFO 平仓明细与决策日志数据量大，只在对应 tab 激活时才拉（首屏提速）
   const tradeDetail = usePolling(
     () => (tab === 'trades' ? fetchTradeDetail(name, m, 25) : Promise.resolve(null)),
@@ -102,137 +102,105 @@ export default function ModelDetail({ market = 'cn', agent = '', onBack }: Model
     30000,
   );
   const logs = usePolling(
-    // 只取最近 80 个回合：全量日志可累积到 1MB+（2026-09-08 卡顿治理）
-    () => (tab === 'logs' ? fetchLogs(name, m, 80) : Promise.resolve(null)),
+    // CN 台账取全量回合（limit=0）：历史轮次就是用户要看的账，截断会让「全部轮次」
+    // 缺最早的几十轮。实测 flash 全量 338 轮 2.87MB，与原 300 轮仅差 61KB，
+    // 因为早期回合文本短——放宽到全量几乎零成本。港美仍用 300 控体积。
+    () => (tab === 'logs' ? fetchLogs(name, m, m === 'cn' ? 0 : 300) : Promise.resolve(null)),
     [name, m, tab],
     30000,
   );
-  // 页头「最近决策时刻」用最小查询（1 行），与日志 tab 的 80 行懒加载无关
+  // 页头「最近决策时刻」用最小查询（1 行），与日志 tab 的全量懒加载无关
   const latestLog = usePolling(() => fetchLogs(name, m, 1), [name, m], 60000);
-  // 通达信桥实盘成交回报（仅 A 股）：秒级时间，复盘对时用
-  const liveTrades = usePolling(() => (m === 'cn' ? fetchLiveTrades() : Promise.resolve([])), [m], 60000);
-  const myLiveFills = useMemo<LiveFill[]>(
-    () =>
-      (liveTrades.data ?? [])
-        .filter((t) => (t.agent ?? null) === name)
-        .map(toLiveFill)
-        .filter((f): f is LiveFill => f != null)
-        .sort((a, b) => (a.ts < b.ts ? 1 : -1)),
-    [liveTrades.data, name],
+  // A 股实盘分账不对比指数：跳过基准请求（也避免 404 噪音）
+  const bench = usePolling(
+    () => (m === 'cn' ? Promise.resolve([] as BenchPoint[]) : fetchBenchmark(m)),
+    [m],
+    300000,
   );
-  /** 人工对账行（fill_adjust）：09-08 误卖归还这类台账校正，独立成一类 */
-  const myLiveAdjusts = useMemo<LiveAdjust[]>(
-    () =>
-      (liveTrades.data ?? [])
-        .filter((t) => (t.agent ?? null) === name)
-        .map(toLiveAdjust)
-        .filter((a): a is LiveAdjust => a != null)
-        .sort((a, b) => (a.ts < b.ts ? 1 : -1)),
-    [liveTrades.data, name],
-  );
-  const bench = usePolling(() => fetchBenchmark(m), [m], 300000);
   // 股票中文名表（上证50/恒指/纳指 + quantdb 全市场），10 分钟缓存
   const stockNames = usePolling(() => fetchStockNames(m), [m], 600000);
   const names = stockNames.data ?? {};
-  // 通达信桥实盘（A股）：净值分账线 + 实盘账户持仓 —— 用户口径"有 TDX 数据，模拟盘不计入"
-  const liveEquity = usePolling(() => fetchLiveEquity(), [], 20000);
-  const realAccount = usePolling(() => fetchRealAccount(), [], 20000);
 
-  // 该模型是否有 TDX 实盘分账序列（≥2 采样点才算有效）
-  const livePts = m === 'cn' ? (liveEquity.data?.agents?.[name] ?? null) : null;
-  const isLive = !!livePts && livePts.length >= 2;
-  /** 实盘分账序列统计：有实盘时页头 KPI 一律走实盘口径，模拟盘只做对照 */
-  const liveStats = useMemo(() => (livePts ? seriesStats(livePts) : null), [livePts]);
-  // 该模型是否有 TDX 实盘持仓（账户连通且非空）
-  const realAcc = m === 'cn' ? realAccount.data : null;
-  const hasReal = !!realAcc && (realAcc.positions ?? []).length > 0;
+  /** A 股 = PG 分账实盘账本（后端 scope=live）；港美股 = 文件模拟盘。 */
+  const isLive = m === 'cn';
+
+  const s = perf.data?.summary;
+  const points = perf.data?.points ?? [];
+  const firstDate = points[0]?.date?.slice(0, 10) ?? '';
+  const lastDate = points[points.length - 1]?.date?.slice(0, 10) ?? '';
+
+  /** 实盘成交（秒级 ts）：图表标记 + 成交回报表共用同一份账本行。 */
+  const liveFills = useMemo<LiveFill[]>(
+    () =>
+      isLive
+        ? (trades.data ?? [])
+            .map(toPgFill)
+            .filter((f): f is LiveFill => f != null)
+            .sort((a, b) => (a.ts < b.ts ? 1 : -1))
+        : [],
+    [trades.data, isLive],
+  );
+
+  const chartLine = useMemo(() => {
+    if (!perf.data) return null;
+    const color = MODEL_COLOR[name] ?? '#5a5a5a';
+    const line = toChartLine(
+      perf.data.agent,
+      isLive ? `${shortName(name)} · 实盘` : perf.data.agent,
+      color,
+      perf.data.points,
+    );
+    if (!isLive) return line;
+    return {
+      ...line,
+      // 实盘分账 ¥10 万名义本金：hover 金额换算与分账额度同口径
+      notional: 100000,
+      fills: liveFills.map((f) => ({ t: new Date(f.ts).getTime(), side: f.side })),
+    };
+  }, [perf.data, isLive, name, liveFills]);
 
   const benchLine = useMemo(
     () =>
       !isLive && bench.data && bench.data.length
-        ? toBenchLine(m === 'us' ? 'NDX100' : m === 'cn' ? 'SSE50' : '', BENCH_COLOR, bench.data)
+        ? toBenchLine(m === 'us' ? 'NDX100' : '', BENCH_COLOR, bench.data)
         : null,
     [bench.data, m, isLive],
   );
 
-  const chartLine = useMemo(() => {
-    // A股实盘优先：模型有 TDX 分账序列 → 实盘净值（¥10 万名义基准），模拟盘回放不计入
-    if (livePts && livePts.length >= 2) {
-      return {
-        id: `live-${name}`,
-        label: name,
-        color: MODEL_COLOR[name] ?? '#5a5a5a',
-        points: livePts.map((p) => ({ t: dayjs(p.ts).valueOf(), v: p.value })),
-        notional: 100000,
-        // 成交标记（▲买/▼卖）：与 Live 页同口径，点在净值线上的实际成交时刻；
-        // 对账行（◆）单独一类，画「台账几点归位」而不是成交
-        fills: [
-          ...myLiveFills.map((f) => ({ t: new Date(f.ts).getTime(), side: f.side })),
-          ...myLiveAdjusts.map((a) => ({ t: new Date(a.ts).getTime(), kind: 'adjust' as const, note: a.note })),
-        ],
-      };
-    }
-    return perf.data
-      ? toChartLine(perf.data.agent, perf.data.agent, MODEL_COLOR[name] ?? '#5a5a5a', perf.data.points)
-      : null;
-  }, [livePts, perf.data, name, myLiveFills, myLiveAdjusts]);
-
-  // A股实盘持仓（通达信桥账户）→ Holdings 结构；有实盘则模拟盘持仓/快照不计入
-  const tdxHoldings = useMemo<Holdings | null>(() => {
-    if (!realAcc || !(realAcc.positions ?? []).length) return null;
-    const total = realAcc.total_asset || 1;
-    return {
-      cash: realAcc.cash,
-      total_market_value: realAcc.market_value,
-      total_equity: realAcc.total_asset,
-      holdings: (realAcc.positions ?? []).map((p) => {
-        const qty = Number(p.volume);
-        return {
-          symbol: p.symbol,
-          qty,
-          entry_price: p.cost_price,
-          price: p.price,
-          market_value: p.market_value,
-          pnl: p.market_value - qty * p.cost_price,
-          pnl_pct: p.cost_price ? p.price / p.cost_price - 1 : null,
-          change_pct: null,
-          weight_pct: p.market_value / total,
-        };
-      }),
-    };
-  }, [realAcc]);
-
-  const s = perf.data?.summary;
-  const cumPnl = (s?.end_equity ?? 0) - (s?.start_equity ?? 0);
-  const points = perf.data?.points ?? [];
-  const firstDate = points[0]?.date?.slice(0, 10) ?? '';
-  const lastDate = points[points.length - 1]?.date?.slice(0, 10) ?? '';
-  // 页头 KPI 口径：有实盘分账 → 用实盘序列（模拟盘回放只作对照，避免拿 08-28 的旧值当"当前权益"）
-  const headEquity = liveStats ? liveStats.last : s?.end_equity;
-  const headStart = liveStats ? liveStats.first : s?.start_equity;
-  const headRecords = liveStats ? liveStats.points : s?.records ?? 0;
-  const headFrom = liveStats ? liveStats.from : firstDate;
-  const headTo = liveStats ? liveStats.to : lastDate;
-  const headCumPnl = liveStats ? liveStats.last - liveStats.first : cumPnl;
-  const headReturn = liveStats ? liveStats.ret : s?.total_return ?? null;
-  const headDrawdown = liveStats ? liveStats.maxDrawdown : s?.max_drawdown ?? null;
-  const headSharpe = liveStats ? liveStats.sharpe : s?.sharpe ?? null;
+  // ── 页头 KPI：实盘口径全部取 PG summary（与净值曲线/持仓同源） ──
+  const headEquity = s?.end_equity ?? null;
+  const headStart = isLive
+    ? s?.series_start_equity ?? s?.start_equity ?? null
+    : s?.start_equity ?? null;
+  const headRecords = s?.records ?? points.length;
+  const headCumPnl =
+    headEquity != null && headStart != null ? headEquity - headStart : null;
+  const headReturn = isLive ? s?.period_return ?? null : s?.total_return ?? null;
+  const headDrawdown = s?.max_drawdown ?? null;
+  const headSharpe = s?.sharpe ?? null;
   const benchRet = useMemo(
     () => (!isLive && firstDate && lastDate ? benchReturn(bench.data, firstDate, lastDate) : null),
     [bench.data, firstDate, lastDate, isLive],
   );
-  const excess = benchRet != null && s?.total_return != null ? s.total_return - benchRet : null;
+  const excess = !isLive && benchRet != null && s?.total_return != null ? s.total_return - benchRet : null;
 
+  // ── 成交统计：实盘取账本全量 summary（不受表格条数上限影响） ──
   const fills = useMemo(
     () => (trades.data ?? []).filter((t) => t.action === 'buy' || t.action === 'sell'),
     [trades.data],
   );
-  const buyCount = fills.filter((t) => t.action === 'buy').length;
-  const sellCount = fills.length - buyCount;
-  const turnover = fills.reduce((sum, t) => sum + Math.abs(t.notional ?? 0), 0);
-  const firstTrade = fills.length ? fills[fills.length - 1].date : '';
-  const lastTrade = fills.length ? fills[0].date : '';
+  const buyCount = isLive ? s?.buy_count ?? 0 : fills.filter((t) => t.action === 'buy').length;
+  const sellCount = isLive ? s?.sell_count ?? 0 : fills.length - fills.filter((t) => t.action === 'buy').length;
+  const tradeCount = isLive ? s?.fills_count ?? fills.length : fills.length;
+  const turnover = isLive
+    ? s?.turnover ?? 0
+    : fills.reduce((sum, t) => sum + Math.abs(t.notional ?? 0), 0);
+  const firstTrade = isLive ? s?.first_trade_date ?? '' : fills.length ? fills[fills.length - 1].date : '';
+  const lastTrade = isLive ? s?.last_trade_date ?? '' : fills.length ? fills[0].date : '';
+  const totalFee = isLive ? null : s?.total_fee ?? null;
+  const avgFee = !isLive && tradeCount > 0 ? (s?.total_fee ?? 0) / Math.max(tradeCount, 1) : null;
   const lastLog = latestLog.data?.length ? latestLog.data[latestLog.data.length - 1] : null;
+  const holdingCount = holdings.data?.holdings.length ?? 0;
 
   if (perf.error) {
     return (
@@ -271,26 +239,23 @@ export default function ModelDetail({ market = 'cn', agent = '', onBack }: Model
       {/* 战报头：当前权益当主角，其余降为 KPI 带；明细进下方矩阵 */}
       <div className="mdp-hero">
         <div className="mdp-hero-main">
-          <div className="mdp-hero-k">当前权益 {isLive ? '· 实盘（通达信桥分账）' : '· 模拟'}</div>
+          <div className="mdp-hero-k">
+            当前权益 {isLive ? '· 实盘（PG 分账账本）' : '· 模拟'}
+          </div>
           <div className="mdp-hero-v">{fmtMoney(headEquity, meta.currency)}</div>
           <div className="mdp-hero-s">
-            起始 {fmtMoney(headStart, meta.currency)} · {isLive ? '采样' : '净值记录'} {headRecords}{' '}
-            {isLive ? '点' : '条'} · 区间 {headFrom || '—'} → {headTo || '—'}
-            {isLive && liveStats && (
-              <>
-                {' '}· 日频样本 {dailyCloses(livePts ?? []).length} 天
-              </>
-            )}
+            起始 {fmtMoney(headStart, meta.currency)} · {isLive ? '净值点' : '净值记录'} {headRecords}{' '}
+            条 · 区间 {firstDate || '—'} → {lastDate || '—'}
           </div>
         </div>
         <div className="mdp-kpi">
           <div className="mdp-kpi-k">累计盈亏</div>
           <div className={`mdp-kpi-v ${pnlClass(headCumPnl)}`}>
-            {headCumPnl >= 0 ? '+' : ''}{fmtMoney(headCumPnl, meta.currency, 1)}
+            {headCumPnl == null ? '—' : `${headCumPnl >= 0 ? '+' : ''}${fmtMoney(headCumPnl, meta.currency, 1)}`}
           </div>
         </div>
         <div className="mdp-kpi">
-          <div className="mdp-kpi-k">总收益率</div>
+          <div className="mdp-kpi-k">{isLive ? '区间收益率' : '总收益率'}</div>
           <div className={`mdp-kpi-v ${pnlClass(headReturn)}`}>{fmtPct(headReturn)}</div>
         </div>
         <div className="mdp-kpi">
@@ -312,7 +277,9 @@ export default function ModelDetail({ market = 'cn', agent = '', onBack }: Model
         <section className="mdp-cell">
           <div className="mdp-cell-head">
             收益与风险
-            {isLive && <ScopeChip>模拟盘 {firstDate || '—'} → {lastDate || '—'}</ScopeChip>}
+            <ScopeChip>
+              {isLive ? `实盘 ${firstDate || '—'} → ${lastDate || '—'}` : `模拟盘 ${firstDate || '—'} → ${lastDate || '—'}`}
+            </ScopeChip>
           </div>
           <MetricRow k="胜率" v={s?.win_rate != null ? fmtPct(s.win_rate, 1, false) : '—'} sub={`已平仓 ${s?.closed_trades ?? 0} 笔`} />
           <MetricRow k="盈亏比" v={s?.profit_factor != null ? fmtNum(s.profit_factor) : '—'} sub="盈利合计 / 亏损合计" />
@@ -334,13 +301,9 @@ export default function ModelDetail({ market = 'cn', agent = '', onBack }: Model
         <section className="mdp-cell">
           <div className="mdp-cell-head">
             交易行为
-            {isLive && <ScopeChip>模拟盘 {firstDate || '—'} → {lastDate || '—'}</ScopeChip>}
+            <ScopeChip>{isLive ? '实盘成交（PG 账本）' : `模拟盘 ${firstDate || '—'} → ${lastDate || '—'}`}</ScopeChip>
           </div>
-          <MetricRow
-            k="成交笔数"
-            v={fills.length}
-            sub={`${buyCount} 买 / ${sellCount} 卖`}
-          />
+          <MetricRow k="成交笔数" v={tradeCount} sub={`${buyCount} 买 / ${sellCount} 卖`} />
           <MetricRow k="平均持仓" v={fmtSpan(s?.avg_hold_days)} sub={s?.avg_hold_days != null ? `${fmtNum(s.avg_hold_days, 2)} 天` : ''} />
           <MetricRow k="持仓中位数" v={fmtSpan(s?.median_hold_days)} />
           <MetricRow
@@ -353,40 +316,37 @@ export default function ModelDetail({ market = 'cn', agent = '', onBack }: Model
         <section className="mdp-cell">
           <div className="mdp-cell-head">
             成本与规模
-            {isLive && <ScopeChip>模拟盘 {firstDate || '—'} → {lastDate || '—'}</ScopeChip>}
+            <ScopeChip>{isLive ? '实盘 · 账本不记费用' : `模拟盘 ${firstDate || '—'} → ${lastDate || '—'}`}</ScopeChip>
           </div>
-          <MetricRow k="累计费用" v={s?.total_fee != null ? fmtMoney(s.total_fee, meta.currency, 1) : '—'} sub={s?.fee_ratio != null ? `占本金 ${fmtPct(s.fee_ratio, 3, false)}` : ''} />
+          <MetricRow
+            k="累计费用"
+            v={totalFee != null ? fmtMoney(totalFee, meta.currency, 1) : '—'}
+            sub={isLive ? '成交账本不落费用字段' : s?.fee_ratio != null ? `占本金 ${fmtPct(s.fee_ratio, 3, false)}` : ''}
+          />
           <MetricRow
             k="平均单笔费用"
-            v={fills.length ? fmtMoney((s?.total_fee ?? 0) / Math.max(fills.length, 1), meta.currency, 2) : '—'}
+            v={avgFee != null ? fmtMoney(avgFee, meta.currency, 2) : '—'}
           />
           <MetricRow k="平均单笔规模" v={s?.avg_trade_size != null ? fmtMoney(s.avg_trade_size, meta.currency, 0) : '—'} />
           <MetricRow k="中位单笔规模" v={s?.median_trade_size != null ? fmtMoney(s.median_trade_size, meta.currency, 0) : '—'} />
-          <MetricRow k="累计成交额" v={fills.length ? fmtMoney(turnover, meta.currency, 0) : '—'} sub="买入 + 卖出名义金额" />
+          <MetricRow k="累计成交额" v={tradeCount ? fmtMoney(turnover, meta.currency, 0) : '—'} sub="买入 + 卖出名义金额" />
         </section>
 
         <section className="mdp-cell">
           <div className="mdp-cell-head">数据与时效</div>
-          {isLive && liveStats ? (
-            <>
-              <MetricRow
-                k="实盘净值区间"
-                v={`${liveStats.from} → ${liveStats.to}`}
-                sub={`${liveStats.points} 个采样点 · 日频 ${dailyCloses(livePts ?? []).length} 天（通达信桥）`}
-              />
-              <MetricRow
-                k="模拟盘区间"
-                v={firstDate ? `${firstDate} → ${lastDate}` : '—'}
-                sub={`${s?.records ?? 0} 个净值点 · 仅作对照`}
-              />
-            </>
-          ) : (
-            <MetricRow k="净值区间" v={firstDate ? `${firstDate} → ${lastDate}` : '—'} sub={`${s?.records ?? 0} 个净值点`} />
-          )}
+          <MetricRow
+            k="净值区间"
+            v={firstDate ? `${firstDate} → ${lastDate}` : '—'}
+            sub={`${headRecords} 个净值点 · ${isLive ? 'PG 分账账本重建' : '文件回放'}`}
+          />
           <MetricRow
             k="最近决策"
             v={fmtDateTime(lastLog?.timestamp)}
-            sub={lastLog ? `${lastLog.kind === 'review' ? '盘后复盘' : '盘中交易轮'} · ${fmtAgo(lastLog.timestamp)}` : '暂无日志'}
+            sub={
+              lastLog
+                ? `${lastLog.kind === 'review' || lastLog.mode === 'review' ? '盘后复盘' : '盘中交易轮'} · ${fmtAgo(lastLog.timestamp)}`
+                : '暂无日志'
+            }
           />
           <MetricRow
             k="基准同期"
@@ -413,7 +373,7 @@ export default function ModelDetail({ market = 'cn', agent = '', onBack }: Model
         <div className="panel-title">
           账户净值{' '}
           {isLive ? (
-            <span className="accent" style={{ fontSize: 11 }}>通达信桥实盘 · 模拟盘不计入</span>
+            <span className="accent" style={{ fontSize: 11 }}>PG 分账实盘 · 模拟盘不计入</span>
           ) : (
             <span className="faint">
               虚线 = 基准指数{benchLine ? `（${BENCH_LABEL[m]}）` : ''} · 区间 {firstDate} → {lastDate}
@@ -426,10 +386,10 @@ export default function ModelDetail({ market = 'cn', agent = '', onBack }: Model
       <div className="panel">
         <div className="tabs">
           <button className={`tab ${tab === 'positions' ? 'active' : ''}`} onClick={() => setTab('positions')}>
-            持仓 {hasReal ? `(${(realAcc?.positions ?? []).length})` : `(${holdings.data?.holdings.length ?? 0})`}
+            持仓 ({holdingCount})
           </button>
           <button className={`tab ${tab === 'trades' ? 'active' : ''}`} onClick={() => setTab('trades')}>
-            成交 ({fills.length})
+            成交 ({tradeCount})
           </button>
           <button className={`tab ${tab === 'logs' ? 'active' : ''}`} onClick={() => setTab('logs')}>
             决策日志
@@ -438,13 +398,21 @@ export default function ModelDetail({ market = 'cn', agent = '', onBack }: Model
 
         {tab === 'positions' && (
           <>
-            {hasReal ? (
-              /* 通达信桥实盘持仓为准；模拟盘持仓不计入（"持仓历史快照"也隐藏） */
+            {isLive ? (
               <>
                 <div className="mdp-note">
-                  实盘口径：以下为通达信桥账户实时持仓，模拟盘持仓与历史快照不计入。
+                  实盘口径：当前持仓取自 PG 分账账本（现金 + 持仓），价格按 Redis 实时价 →
+                  最近收盘 → 缺失标 —（不以成本价冒充现价）。下方时间线为账本逐日收盘持仓差分。
                 </div>
-                <HoldingsTable data={tdxHoldings} currency={meta.currency} names={names} />
+                {holdings.data ? (
+                  <HoldingsTable data={holdings.data} currency={meta.currency} names={names} />
+                ) : (
+                  <div className="empty-state">{holdings.error ? `持仓加载失败：${holdings.error}` : '暂无实盘持仓'}</div>
+                )}
+                <div className="panel-title" style={{ marginTop: 18 }}>
+                  持仓变动时间线 <span className="faint">{(positions.data ?? []).length} 个快照</span>
+                </div>
+                <PositionHistory records={positions.data ?? []} names={names} />
               </>
             ) : (
               <>
@@ -464,33 +432,31 @@ export default function ModelDetail({ market = 'cn', agent = '', onBack }: Model
         {tab === 'trades' && (
           <>
             <div className="mdp-strip">
-              <span><em>成交</em>{fills.length} 笔</span>
+              <span><em>成交</em>{tradeCount} 笔</span>
               <span><em>买入</em>{buyCount} 笔</span>
               <span><em>卖出</em>{sellCount} 笔</span>
               <span><em>累计成交额</em>{fmtMoney(turnover, meta.currency, 0)}</span>
-              <span><em>累计费用</em>{fmtMoney(s?.total_fee ?? null, meta.currency, 1)}</span>
+              <span><em>累计费用</em>{fmtMoney(totalFee, meta.currency, 1)}</span>
               <span><em>已平仓</em>{s?.closed_trades ?? 0} 笔</span>
-              {m === 'cn' && (
-                <span>
-                  <em>实盘成交</em>{myLiveFills.length} 笔（通达信桥）
-                  {myLiveAdjusts.length > 0 && ` · 对账 ${myLiveAdjusts.length} 笔`}
-                </span>
-              )}
+              {isLive && <span><em>账本</em>PG 分账 · 实盘</span>}
             </div>
             <div className="panel-title">
               LAST {tradeDetail.data?.length ?? 0} TRADES <span className="faint">FIFO 平仓明细 · 收益率 = 卖出价 / 买入价 − 1（未计费用）</span>
             </div>
             <LastTradesTable trades={tradeDetail.data ?? []} currency={meta.currency} names={names} />
-            <div className="panel-title" style={{ marginTop: 18 }}>
-              原始成交记录 <span className="faint">模拟盘 · 按日期倒序 · 已剔除 no_trade 记录</span>
-            </div>
-            <TradesTable records={trades.data ?? []} currency={meta.currency} names={names} />
-            {m === 'cn' && (
+            {isLive ? (
               <>
                 <div className="panel-title" style={{ marginTop: 18 }}>
-                  实盘成交回报 <span className="faint">通达信桥 · 秒级时间 · 仅本模型</span>
+                  实盘成交流水 <span className="faint">PG 账本 · 秒级时间 · 仅本模型 · 最近 {liveFills.length} 笔</span>
                 </div>
-                <LiveFillsTable fills={myLiveFills} adjusts={myLiveAdjusts} currency={meta.currency} names={names} />
+                <LiveFillsTable fills={liveFills} currency={meta.currency} names={names} />
+              </>
+            ) : (
+              <>
+                <div className="panel-title" style={{ marginTop: 18 }}>
+                  原始成交记录 <span className="faint">模拟盘 · 按日期倒序 · 已剔除 no_trade 记录</span>
+                </div>
+                <TradesTable records={trades.data ?? []} currency={meta.currency} names={names} />
               </>
             )}
           </>
@@ -504,7 +470,8 @@ export default function ModelDetail({ market = 'cn', agent = '', onBack }: Model
             model={name}
             currency={meta.currency}
             names={names}
-            liveFills={myLiveFills}
+            liveFills={[]}
+            liveOnly={isLive}
           />
         )}
       </div>

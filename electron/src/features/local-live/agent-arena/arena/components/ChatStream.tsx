@@ -7,6 +7,7 @@ import './ModelChat.css';
 import { modeOf } from '../utils/modeTag';
 import { FillLike, renderActionTags } from '../utils/actionTags';
 import { parseAnalysis } from '../utils/parseAnalysis';
+import { isReviewLine } from '../utils/logKind';
 import { ProtoSpec, isGateAgent, protoSpecOf, protoSummary } from '../utils/newsProtocol';
 import NewsProtocolView from './NewsProtocolView';
 import {
@@ -78,7 +79,7 @@ export default function ChatStream({
       };
       for (const line of ag.lines) {
         const lineTs = line.timestamp ?? null;
-        if ((line as { kind?: string }).kind === 'review') {
+        if (isReviewLine(line)) {
           const text = (line.new_messages ?? [])
             .filter((m) => String(m.role) === 'assistant' || String(m.role) === 'ai')
             .map((m) => String(m.content ?? '')).join('\n\n');
