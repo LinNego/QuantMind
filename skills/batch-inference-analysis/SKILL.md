@@ -663,8 +663,8 @@ docker exec -w /tmp quantmind python rolling_portfolio_sim.py \
 - 基准（同池等权）：2025 37.45%、2026 -2.94%、全期 18.63%；策略超额
   +21.28 / +21.33 / +21.58pp；alpha 年化 +21.3 / +20.8 / +18.8%
   （Newey-West t 1.88 / 1.03 / 1.71）。
-- **Top50 > Top20**（6 个对照 5 胜；2026 18.4% vs 7.3%）；**T+10 > T+5**
-  （5/6 胜；换手 33.4x vs 56.9x，成本 6.6% vs 11.3%/年）。
+- **Top50 > Top20**（全期 6/6 胜、2026 5/6；2026 18.4% vs 7.3%）；**T+10 > T+5**
+  （全期 5/6 胜；换手 33.4x vs 56.9x，成本 6.6% vs 11.3%/年）。
 - 分数均值过滤 +6.0pp（2025 +11.3、2026 +0.5）；分数退出 +5.9pp
   （2025 +11.3、2026 +0.2）；两者主要是 2025 的增益，2026 不伤害。
 - **大盘过滤明确有害**：2026 只有 1.8%；**extend/min_hold 不稳健**；
@@ -675,13 +675,33 @@ docker exec -w /tmp quantmind python rolling_portfolio_sim.py \
   95% 区间 [-7.7%, +109.5%]；2026 alpha t 1.0–1.3；2026 回撤 -23.8%、下行捕获
   0.97；先模拟盘/小资金 1–3 个月，不要直接上 1000 万。
 
+### 15.3.1 前向扩展（2026-08-27 ~ 2026-10-19，32 个交易日）
+
+回填 30/30 完成后，同一脚本只改 `--end`，参数全部不动：
+
+```bash
+docker exec -w /tmp quantmind python rolling_portfolio_sim.py \
+  --mode all --start 2025-02-05 --end 2026-10-19 \
+  --design-end 2025-12-31 --memory 4GB --threads 3 \
+  --out-dir /tmp/rolling_sim_oct
+```
+
+- Top50 H10 分数：前向段 **+3.08%**（基准 **-6.15%**，超额 +9.23pp）；
+  2026 到 10/19 年化 **19.96%**、全期 **39.20%**、DD 仍 **-23.83%**；2025 不变。
+- 扩展后 DSR **0.887**，2026 alpha t_NW **1.69**、全期 **2.20**；
+  2025→2026 排序相关 **0.71**。方向（Top50 > Top20、T+10 > T+5、分数 > 时间）
+  没变；**32 天只做前向观察，不据此调 N/H/buffer/stop**。
+- 新开仓 241 笔平均仅 +0.20%，说明这段补位质量一般；净值上涨主要来自存量持仓。
+
 ### 15.4 产出
 
 `rolling_summary.csv`、`rolling_yearly.csv`、`rolling_robustness.csv`、
 `rolling_rank_stability.csv`、`model_capability.csv`、`nav_*.csv`、
 `trades_*.csv`、`supp_rolling_summary.csv`、`supp_rolling_yearly.csv`。
 本次报告：`data/reports/top20_eval_20261020/滚动实盘_20261020.md`；
-CSV：`data/reports/top20_eval_20261020/rolling_20261020/`。
+CSV：`data/reports/top20_eval_20261020/rolling_20261020/`；
+前向扩展 CSV：`data/reports/top20_eval_20261020/rolling_oct_20261020/`（67 个文件，
+含 summary/yearly/robustness/nav/trades/容量）。
 
 ### 15.5 测试
 
