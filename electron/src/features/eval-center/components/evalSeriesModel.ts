@@ -137,6 +137,10 @@ const SERIES_SLOTS: Record<string, SeriesSlot[]> = {
     slot('equity_line', undefined, '账户总资产在涨还是在跌？'),
     slot('signed_bar', 'daily_pnl', '每天赚亏多少？'),
   ],
+  live_account: [
+    slot('equity_line', undefined, '实盘账户总资产在涨还是在跌？'),
+    slot('signed_bar', 'daily_pnl', '实盘每天赚亏多少？'),
+  ],
   daily_selection: [
     slot('count_bar', undefined, '每天选出几只？'),
     slot('signed_bar', 'realized_excess', '事后看，选出来的票跑赢指数了吗？'),

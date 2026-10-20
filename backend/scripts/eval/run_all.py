@@ -1,4 +1,4 @@
-"""五卡 EOD 汇总（T-P4-05b）：因子/模型/策略/账户/每日选股 → eval_scores 落表。
+"""六卡 EOD 汇总（T-P4-05b）：因子/模型/策略/账户/实盘账户/每日选股 → eval_scores 落表。
 
 - **单卡异常隔离**：任一张卡失败只记入 ``errors``，不影响其余卡与整体退出码语义
   （返回汇总，调用方按 errors 判断）；
@@ -173,6 +173,25 @@ async def _run_account_card(
     }
 
 
+async def _run_live_account_card(save: bool, *, tenant: str) -> dict[str, Any]:
+    from backend.scripts.eval.live_account_card import score_all_live_accounts
+
+    results = await score_all_live_accounts(tenant=tenant, save=save)
+    # 台账无行属正常状态（skipped，不是 failed），只有评分失败/读取异常才是真异常
+    skipped = [r for r in results if r.get("error") and r.get("skipped")]
+    failed = [r for r in results if r.get("error") and not r.get("skipped")]
+    return {
+        "n": len(results),
+        "scored": len(
+            [r for r in results if not r.get("error") and r.get("score") is not None]
+        ),
+        "errors": [
+            f"{r.get('object_type')}:{r.get('object_id')}: {r['error']}" for r in failed
+        ],
+        "skipped": len(skipped),
+    }
+
+
 async def _run_daily_selection(
     save: bool, *, trade_date: str | None, horizon: int
 ) -> dict[str, Any]:
@@ -195,7 +214,7 @@ async def run_all(
     strategy_limit: int = 5,
     account_window: int = 30,
 ) -> dict[str, Any]:
-    """顺序跑五卡（单卡隔离）→ 汇总。返回结构含各卡计数与 errors。"""
+    """顺序跑六卡（单卡隔离）→ 汇总。返回结构含各卡计数与 errors。"""
     started = time.time()
     cards: dict[str, Any] = {}
 
@@ -214,6 +233,7 @@ async def run_all(
     await _guard(
         "account", _run_account_card(save, tenant=tenant, window_days=account_window)
     )
+    await _guard("live_account", _run_live_account_card(save, tenant=tenant))
     await _guard(
         "daily_selection",
         _run_daily_selection(save, trade_date=trade_date, horizon=horizon),
@@ -260,7 +280,7 @@ def main() -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
     )
-    parser = argparse.ArgumentParser(description="五卡 EOD 评分汇总（T-P4-05b）")
+    parser = argparse.ArgumentParser(description="六卡 EOD 评分汇总（T-P4-05b）")
     parser.add_argument(
         "--date", default=None, help="每日选股交易日 YYYY-MM-DD（缺省最新）"
     )
@@ -275,7 +295,7 @@ def main() -> int:
         print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
     else:
         print(
-            f"五卡 EOD 汇总（{summary['date']}，save={summary['save']}，"
+            f"六卡 EOD 汇总（{summary['date']}，save={summary['save']}，"
             f"落分 {summary['total_scored']}，异常 {summary['total_errors']}，"
             f"耗时 {summary['elapsed_sec']}s）"
         )

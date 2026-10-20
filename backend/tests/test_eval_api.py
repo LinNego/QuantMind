@@ -86,8 +86,27 @@ def test_object_type_validation():
     assert exc.value.status_code == 400
     assert "factor" in exc.value.detail  # 提示允许集合
     assert set(ALLOWED_OBJECT_TYPES) == {
-        "factor", "model", "strategy", "account", "daily_selection", "strategy_health",
+        "factor", "model", "strategy", "account", "live_account", "daily_selection",
+        "strategy_health",
     }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_object_types_short_labels():
+    """U6：页签短名后端直给（strategy_health → 体检），每类都有——前端不再靠正则剥后缀。"""
+    from backend.services.api.routers.eval_scores import (
+        ALLOWED_OBJECT_TYPES,
+        object_types,
+    )
+
+    resp = await object_types()
+    rows = resp["data"]
+    assert {r["object_type"] for r in rows} == set(ALLOWED_OBJECT_TYPES)
+    short = {r["object_type"]: r["short_label"] for r in rows}
+    assert short["strategy_health"] == "体检"
+    assert short["live_account"] == "实盘账户"
+    assert all(short.values())
 
 
 @pytest.mark.unit
@@ -214,6 +233,7 @@ async def test_eval_api_endpoints_real_db():
 
     tag = uuid.uuid4().hex[:8]
     model_id = f"pytest_model_{tag}"
+    model_id2 = f"pytest_model_{tag}b"
     sid = f"77{uuid.uuid4().int % 10**6:06d}"
     user = {"tenant_id": "default", "user_id": "00000001"}
 
@@ -235,6 +255,16 @@ async def test_eval_api_endpoints_real_db():
                         "dims": '{"oos_predictive": {"score": %s}}' % score,
                     },
                 )
+            # 第二个模型对象：U3 截断断言需要 ≥2 个对象
+            await session.execute(
+                text(
+                    "INSERT INTO eval_scores (object_type, object_id, snapshot_date, score, "
+                    "grade, low_confidence, red_line_failed, dimensions, inputs_version) "
+                    "VALUES ('model', :oid, :d, 50.0, 'C', FALSE, '[]'::jsonb, "
+                    "'{}'::jsonb, '{}'::jsonb)"
+                ),
+                {"oid": model_id2, "d": _date.fromisoformat("2026-09-16")},
+            )
             for day, verdict in (("2026-08-01", "E"), ("2026-09-16", "A")):
                 await session.execute(
                     text(
@@ -260,6 +290,17 @@ async def test_eval_api_endpoints_real_db():
         assert listing["meta"]["count"] == 1
         assert listing["data"][0]["score"] == 72.0
         assert listing["data"][0]["display_name"] is None  # 随机 model_id 查不到人话名 → None 由前端回退
+        assert listing["meta"]["truncated"] is False
+        assert listing["meta"]["total"] == 1  # 未截断：total=count，不多查
+
+        # 1a) U3：limit=1 截断 → truncated=True 且 total 补 COUNT（≥2 个对象），
+        #     不再把「被 cap」伪装成「只有这么多」
+        capped = await list_scores(
+            object_type="model", latest_only=True, limit=1, current_user=user
+        )
+        assert capped["meta"]["truncated"] is True
+        assert capped["meta"]["total"] >= 2
+        assert len(capped["data"]) == 1
 
         # 1b) 因子列表：display_name 来自引擎词典
         from backend.services.api.routers.eval_scores import factor_display_name
@@ -288,8 +329,8 @@ async def test_eval_api_endpoints_real_db():
 
         async with _gs() as session:
             await session.execute(
-                text("DELETE FROM eval_scores WHERE object_id IN (:m, :s)"),
-                {"m": model_id, "s": sid},
+                text("DELETE FROM eval_scores WHERE object_id IN (:m, :m2, :s)"),
+                {"m": model_id, "m2": model_id2, "s": sid},
             )
             await session.commit()
         from backend.shared.database_manager_v2 import close_database

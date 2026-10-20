@@ -128,18 +128,6 @@ export function dimensionViews(row: EvalScoreRow | null | undefined): DimensionV
   });
 }
 
-export interface RadarEntry {
-  name: string;
-  value: number;
-}
-
-/** 雷达数据（≥3 个有效维度才可画；缺省维度不进雷达，如实由明细表列出） */
-export function radarEntries(row: EvalScoreRow | null | undefined): RadarEntry[] | null {
-  const withScore = dimensionViews(row).filter((d) => d.score !== null);
-  if (withScore.length < 3) return null;
-  return withScore.map((d) => ({ name: d.label, value: Math.round((d.score as number) * 10) / 10 }));
-}
-
 export interface HistorySeries {
   dates: string[];
   scores: (number | null)[];
@@ -197,12 +185,38 @@ export function formatSignedPct(value: unknown, digits = 1): string {
   return `${num > 0 ? '+' : ''}${(num * 100).toFixed(digits)}%`;
 }
 
-/** 覆盖描述：可评维度数/总维度数 + 红线数（评分卡列表行摘要） */
-export function coverageSummary(row: EvalScoreRow | null | undefined): string {
-  const views = dimensionViews(row);
-  const scored = views.filter((d) => d.score !== null).length;
-  const red = views.filter((d) => d.redLine).length;
-  const parts = [`维度 ${scored}/${views.length}`];
-  if (red > 0) parts.push(`红线 ${red}`);
-  return parts.join(' · ');
+/**
+ * URL 深链对象参数（评估徽章 → 评估中心下钻）：`object=<类型>&object_id=<id>`。
+ * 两个都齐才认；缺一个 → null（不半跳：类型对、id 空会落到榜单第一行，比不跳更误导）。
+ */
+export interface ObjectDeepLink {
+  objectType: string;
+  objectId: string;
+}
+
+export function parseObjectDeepLink(params: {
+  get(name: string): string | null;
+}): ObjectDeepLink | null {
+  const objectType = String(params.get('object') || '').trim();
+  const objectId = String(params.get('object_id') || '').trim();
+  if (!objectType || !objectId) return null;
+  return { objectType, objectId };
+}
+
+/**
+ * 榜单客户端搜索：对象 id / 展示名 / 行内人话名（含副标题 id）包含即命中。
+ * 空查询原样返回（同一引用，便于调用方 memo）。
+ */
+export function filterEvalRows(
+  rows: EvalScoreRow[] | null | undefined,
+  query: string,
+): EvalScoreRow[] {
+  const list = rows || [];
+  const q = query.trim().toLowerCase();
+  if (!q) return list;
+  return list.filter((row) => {
+    const labels = rowLabels(row);
+    const haystack = `${row.object_id} ${row.display_name || ''} ${labels.primary} ${labels.secondary}`;
+    return haystack.toLowerCase().includes(q);
+  });
 }

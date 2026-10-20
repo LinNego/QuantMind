@@ -325,20 +325,120 @@ def _insufficient_capacity(
     )
 
 
-def consistency_dim() -> DimensionScore:
-    """一致性维：回测 ↔ 同期模拟/实盘曲线的对照，评估侧尚未接这条链路。"""
+def _insufficient_consistency(
+    note: str, detail: dict[str, Any] | None = None
+) -> DimensionScore:
     return DimensionScore(
         "consistency",
         "一致性",
         WEIGHTS["consistency"],
         None,
         False,
-        {
-            "insufficient": True,
-            "note": (
-                "回测与同期模拟盘/实盘的净值曲线对照未接入评估侧"
-                "（模拟台账在 sim_trades，与本卡数据源不同源）——无对照即缺省，"
-                "不拿回测曲线自证"
-            ),
-        },
+        {**(detail or {}), "insufficient": True, "note": note},
     )
+
+
+# 一致性维分数带：年化跟踪误差（越低越好，表按 cost_dim 同款「值升分降」写法）。
+# 0.15 一档直接对齐 LIVE_MAX_TRACKING_ERROR——超它晋级门禁也拦，同一个刀口。
+CONSISTENCY_TE_BANDS: list[tuple[float, float]] = [
+    (0.0, 100.0),
+    (0.05, 90.0),
+    (0.10, 70.0),
+    (0.15, 55.0),
+    (0.25, 30.0),
+    (0.50, 0.0),
+]
+
+
+def consistency_dim(
+    *,
+    backtest_dates: list[str] | None = None,
+    backtest_equity: list[float] | None = None,
+    ledger_rows: list[dict[str, Any]] | None = None,
+    ledger_note: str | None = None,
+) -> DimensionScore:
+    """一致性维：回测曲线 ↔ 业主模拟盘台账曲线的跟踪误差对照（2026-10-15 F2 接线）。
+
+    数据链：``qlib_backtest_runs.user_id/tenant_id`` → ``simulation_fund_snapshots``
+    台账行（取数在 ``strategy_card._load_owner_ledger``）；共同交易日日收益差
+    （**台账 − 回测**）复用 ``shadow_compare.compute_tracking_error``——与
+    SIM↔REAL 晋级跟踪误差同一实现、同一条 0.15 红线（``LIVE_MAX_TRACKING_ERROR``）。
+    样本不足一律 ``insufficient`` 并写明两侧点数与共同天数，**不拿回测曲线自证**。
+    """
+    if not backtest_dates or not backtest_equity:
+        return _insufficient_consistency("回测曲线缺失（dates/equity 为空），对照无从计算")
+    if len(backtest_dates) != len(backtest_equity):
+        return _insufficient_consistency(
+            f"回测曲线行列不等（dates {len(backtest_dates)} ≠ equity {len(backtest_equity)}）"
+        )
+    if not ledger_rows:
+        return _insufficient_consistency(
+            ledger_note
+            or "业主模拟盘台账未取到（调用方未提供台账行）——回测↔台账对照无从计算，"
+            "不拿回测曲线自证"
+        )
+    ledger_series = [
+        (str(r.get("date") or ""), _as_float(r.get("total_asset")))
+        for r in ledger_rows
+        if isinstance(r, dict)
+    ]
+    ledger_series = [(d, v) for d, v in ledger_series if d and v is not None]
+    if not ledger_series:
+        return _insufficient_consistency(
+            "台账行净值为空（total_asset 缺测不补 0），对照无从计算"
+        )
+    from backend.shared.shadow_compare import compute_tracking_error
+
+    cmp = compute_tracking_error(
+        ledger_series,
+        [
+            (d, float(v))
+            for d, v in zip(backtest_dates, backtest_equity, strict=False)
+        ],
+    )
+    detail: dict[str, Any] = {
+        "source_pair": "模拟盘台账 ↔ 回测",
+        "ledger_points": len(ledger_series),
+        "backtest_points": len(backtest_equity),
+        "common_days": cmp.get("common_days"),
+        "n_returns": cmp.get("n_returns"),
+        "window_start": cmp.get("start"),
+        "window_end": cmp.get("end"),
+    }
+    if not cmp.get("sufficient"):
+        detail["insufficient"] = True
+        note = (
+            f"台账↔回测共同交易日不足：{cmp.get('reason')}"
+            f"（台账 {len(ledger_series)} 点 vs 回测 {len(backtest_equity)} 点）"
+        )
+        if ledger_note:
+            note = f"{note}；台账取数说明：{ledger_note}"
+        detail["note"] = note
+        return DimensionScore(
+            "consistency", "一致性", WEIGHTS["consistency"], None, False, detail
+        )
+    te_ann = float(cmp.get("te_ann_bps") or 0.0) / 10000.0
+    from backend.shared.backtest_health import LIVE_MAX_TRACKING_ERROR
+
+    red = te_ann > LIVE_MAX_TRACKING_ERROR
+    detail.update(
+        {
+            "insufficient": False,
+            "mean_diff_bps": cmp.get("mean_diff_bps"),
+            "std_diff_bps": cmp.get("std_diff_bps"),
+            "te_ann_bps": cmp.get("te_ann_bps"),
+            "te_ann": round(te_ann, 6),
+            "red_line_threshold": LIVE_MAX_TRACKING_ERROR,
+            "note": (
+                f"台账↔回测年化跟踪误差 {te_ann:.2%}（{cmp.get('common_days')} 个共同交易日；"
+                "日收益差方向：台账 − 回测）。"
+                + (
+                    f"超 {LIVE_MAX_TRACKING_ERROR:.0%} 红线——实盘执行与回测承诺显著偏离"
+                    if red
+                    else "在晋级门禁同一条红线内"
+                )
+            ),
+        }
+    )
+    score = score_from_thresholds(te_ann, CONSISTENCY_TE_BANDS)
+    return DimensionScore("consistency", "一致性", WEIGHTS["consistency"], score, red, detail)

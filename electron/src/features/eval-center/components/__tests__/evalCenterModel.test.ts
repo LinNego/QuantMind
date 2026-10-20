@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import type { EvalScoreRow } from '../../types/evalCenter';
 import {
   averageScore,
-  coverageSummary,
   dimensionViews,
+  filterEvalRows,
   formatNumber,
   formatPercent,
   formatSignedPct,
@@ -11,7 +11,7 @@ import {
   gradeCounts,
   gradeMeta,
   historySeries,
-  radarEntries,
+  parseObjectDeepLink,
   rowLabels,
 } from '../evalCenterModel';
 
@@ -81,34 +81,7 @@ describe('dimensionViews 维度明细', () => {
   });
 });
 
-describe('radarEntries 雷达数据', () => {
-  it('有效维度 <3 → null（不画残缺雷达）', () => {
-    const row = makeRow({
-      dimensions: {
-        a: { label: 'A', score: 80, weight: 50 },
-        b: { label: 'B', score: null, weight: 50, detail: { insufficient: true } },
-      },
-    });
-    expect(radarEntries(row)).toBeNull();
-  });
-
-  it('≥3 个有效维度 → 值保留一位小数', () => {
-    const row = makeRow({
-      dimensions: {
-        a: { label: 'A', score: 80.123, weight: 30 },
-        b: { label: 'B', score: 60, weight: 30 },
-        c: { label: 'C', score: 0, weight: 40 },
-      },
-    });
-    const entries = radarEntries(row);
-    expect(entries).not.toBeNull();
-    expect(entries!.map((e) => e.name)).toEqual(['A', 'B', 'C']);
-    expect(entries![0].value).toBe(80.1);
-    expect(entries![2].value).toBe(0); // 0 分是有效值（不是缺省）
-  });
-});
-
-describe('historySeries / coverageSummary', () => {
+describe('historySeries 历史序列', () => {
   it('历史序列按输入顺序取日期/分数/评级', () => {
     const series = historySeries([
       makeRow({ snapshot_date: '2026-09-15', score: 60, grade: 'C' }),
@@ -119,17 +92,50 @@ describe('historySeries / coverageSummary', () => {
     expect(series.grades).toEqual(['C', 'D']);
     expect(historySeries(null).dates).toEqual([]);
   });
+});
 
-  it('覆盖率摘要：维度计数 + 红线条数', () => {
-    const row = makeRow({
-      dimensions: {
-        a: { score: 80, weight: 50, label: 'A' },
-        b: { score: null, weight: 30, label: 'B', detail: { insufficient: true } },
-        c: { score: 10, weight: 20, label: 'C', red_line_failed: true },
-      },
+describe('parseObjectDeepLink（评估徽章深链参数）', () => {
+  const params = (s: string) => new URLSearchParams(s);
+
+  it('object 与 object_id 都齐才认', () => {
+    expect(parseObjectDeepLink(params('object=model&object_id=abc'))).toEqual({
+      objectType: 'model',
+      objectId: 'abc',
     });
-    expect(coverageSummary(row)).toBe('维度 2/3 · 红线 1');
-    expect(coverageSummary(null)).toBe('维度 0/0');
+  });
+
+  it('缺一个 / 空白一律 null（不半跳：类型对、id 空会落到榜单第一行，比不跳更误导）', () => {
+    expect(parseObjectDeepLink(params('object=model'))).toBeNull();
+    expect(parseObjectDeepLink(params('object_id=abc'))).toBeNull();
+    expect(parseObjectDeepLink(params('object=%20&object_id=%20'))).toBeNull();
+    expect(parseObjectDeepLink(params(''))).toBeNull();
+  });
+});
+
+describe('filterEvalRows（榜单客户端搜索）', () => {
+  const rows: EvalScoreRow[] = [
+    makeRow({ object_id: 'mdl_nativetft_2026', display_name: 'NativeTFT 主模型' }),
+    makeRow({ object_type: 'strategy', object_id: '17', display_name: null }),
+    makeRow({ object_id: 'f13_0001', display_name: null }),
+  ];
+
+  it('空查询原样返回（同一引用，便于调用方 memo）', () => {
+    expect(filterEvalRows(rows, '  ')).toBe(rows);
+    expect(filterEvalRows(null, 'x')).toEqual([]);
+  });
+
+  it('命中 ID / 展示名（大小写不敏感）', () => {
+    expect(filterEvalRows(rows, 'NATIVETFT').map((r) => r.object_id)).toEqual(['mdl_nativetft_2026']);
+    expect(filterEvalRows(rows, 'f13').map((r) => r.object_id)).toEqual(['f13_0001']);
+  });
+
+  it('无展示名时按行内人话名（rowLabels.primary）也能搜到', () => {
+    // 策略行没有 display_name → rowLabels 兜底「策略回测 17…」
+    expect(filterEvalRows(rows, '策略回测').map((r) => r.object_id)).toEqual(['17']);
+  });
+
+  it('无命中返回空数组（调用方出「没有匹配」空态）', () => {
+    expect(filterEvalRows(rows, 'zzz_不存在')).toEqual([]);
   });
 });
 

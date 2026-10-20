@@ -35,6 +35,7 @@ ALLOWED_OBJECT_TYPES = (
     "model",
     "strategy",
     "account",
+    "live_account",
     "daily_selection",
     "strategy_health",
 )
@@ -268,14 +269,16 @@ def resolve_strategy_labels(
     return out
 
 
-def account_display_label(object_id: str, username: str | None = None) -> str | None:
-    """账户 object_id（`{user}:{market}` 口径）→ 可读名。"""
+def account_display_label(
+    object_id: str, username: str | None = None, *, account_kind: str = "模拟"
+) -> str | None:
+    """账户 object_id（`{user}:{market}` 口径）→ 可读名（`account_kind`：模拟/实盘）。"""
     raw = str(object_id or "").strip()
     if not raw:
         return None
     user_part, _, market_part = raw.partition(":")
     market = _MARKET_LABELS.get(market_part.upper(), market_part.upper())
-    base = f"{market} 模拟账户" if market else "模拟账户"
+    base = f"{market} {account_kind}账户" if market else f"{account_kind}账户"
     who = str(username or "").strip() or (f"用户 {user_part}" if user_part else "")
     return f"{base}（{who}）" if who else base
 
@@ -360,7 +363,9 @@ async def _resolve_display_names(
             ).fetchall()
             names = {str(r[0]): strategy_health_display_name(r[1]) for r in rows}
             return {i: names.get(i) for i in unique}
-        if object_type == "account":
+        if object_type in ("account", "live_account"):
+            # 实盘账户卡 object_id 与模拟账户同形（`{user}:{market}`），取数共用；
+            # 只有展示词的「模拟/实盘」不同
             heads = {i: i.partition(":")[0] for i in unique}
             int_ids = [int(h) for h in heads.values() if h.isdigit()]
             unames: dict[str, str] = {}
@@ -375,7 +380,11 @@ async def _resolve_display_names(
                     )
                 ).fetchall()
                 unames = {str(r[0]): str(r[1]) for r in rows if r[1]}
-            return {i: account_display_label(i, unames.get(heads[i])) for i in unique}
+            kind = "实盘" if object_type == "live_account" else "模拟"
+            return {
+                i: account_display_label(i, unames.get(heads[i]), account_kind=kind)
+                for i in unique
+            }
     except Exception:  # noqa: BLE001
         logger.warning("评估展示名解析失败（object_type=%s）", object_type, exc_info=True)
         return {}
@@ -425,11 +434,33 @@ async def list_scores(
 
     async with get_session(read_only=True) as session:
         rows = (await session.execute(_text(sql), params)).mappings().all()
+        # U3：被 limit 截断时才补一次 COUNT 说明真实总量（未截断 total=count，一眼即知）
+        truncated = len(rows) >= limit
+        total: int | None = len(rows)
+        if truncated:
+            count_sql = (
+                f"SELECT COUNT(DISTINCT object_id) FROM eval_scores WHERE {where}"
+                if latest_only
+                else f"SELECT COUNT(*) FROM eval_scores WHERE {where}"
+            )
+            count_params = {k: v for k, v in params.items() if k != "n"}
+            total = int(
+                (await session.execute(_text(count_sql), count_params)).scalar() or 0
+            )
         data = [_row_to_score(r) for r in rows]
         names = await _resolve_display_names(session, ot, [d["object_id"] for d in data])
     for item in data:
         item["display_name"] = names.get(item["object_id"])
-    return {"success": True, "data": data, "meta": {"count": len(data), "object_type": ot}}
+    return {
+        "success": True,
+        "data": data,
+        "meta": {
+            "count": len(data),
+            "object_type": ot,
+            "total": total,
+            "truncated": truncated,
+        },
+    }
 
 
 @router.get("/scores/history")
@@ -733,11 +764,25 @@ async def object_types() -> dict[str, Any]:
         "model": "模型评分卡",
         "strategy": "策略评分卡",
         "account": "账户评分卡",
+        "live_account": "实盘账户评分卡",
         "daily_selection": "每日选股",
         "strategy_health": "体检留档",
     }
+    # U6：页签短名后端直给——label 全称怎么改都不再牵连前端页签
+    short_labels = {
+        "factor": "因子",
+        "model": "模型",
+        "strategy": "策略",
+        "account": "账户",
+        "live_account": "实盘账户",
+        "daily_selection": "每日选股",
+        "strategy_health": "体检",
+    }
     return {
         "success": True,
-        "data": [{"object_type": ot, "label": labels[ot]} for ot in ALLOWED_OBJECT_TYPES],
+        "data": [
+            {"object_type": ot, "label": labels[ot], "short_label": short_labels[ot]}
+            for ot in ALLOWED_OBJECT_TYPES
+        ],
         "meta": {"count": len(ALLOWED_OBJECT_TYPES)},
     }

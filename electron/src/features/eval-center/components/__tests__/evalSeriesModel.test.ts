@@ -307,6 +307,15 @@ describe('buildSeriesCharts 三类新对象的图位与序列键', () => {
     expect(charts.every((c) => c.option !== null)).toBe(true);
   });
 
+  it('实盘账户两问：净值 / 当日盈亏（同图位、问句按实盘口径）', () => {
+    const charts = buildSeriesCharts('live_account', accountPayload());
+
+    expect(charts.map((c) => c.kind)).toEqual(['equity_line', 'signed_bar']);
+    expect(charts.map((c) => c.key)).toEqual(['equity', 'daily_pnl']);
+    expect(charts[0].question).toContain('实盘');
+    expect(charts.every((c) => c.option !== null)).toBe(true);
+  });
+
   it('每日选股三问：入选数 / 事后超额 / 命中率', () => {
     const charts = buildSeriesCharts('daily_selection', dailySelectionPayload());
 

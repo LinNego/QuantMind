@@ -78,11 +78,11 @@ export function getObjectSeries(objectType: string, objectId: string): Promise<E
   return getJson(`/series?${qs.toString()}`);
 }
 
-/** 策略体检档案（最新 + 历史 + 晋级门禁预演，与执行点同源）
+/** 策略体检档案（最新 + 历史 + 晋级门禁预演 + 启动资格清单，与执行点同源）
  *
- * `mode` 决定返回的 `eligibility[mode]` 是哪一档（默认 SIMULATION，向后兼容）。
- * 想看实盘资格必须显式传 `'REAL'`——否则拿到的永远是模拟盘清单。
- * `gate` 恒为模拟盘预演，不吃 `mode`。
+ * `eligibility` 载荷**恒含两模式**（SIMULATION / REAL），SIM/REAL 切换是前端选择、
+ * 无需重发请求；`mode` 参数只决定回显的 `eligibility_mode`（默认 SIMULATION，
+ * 向后兼容）。`gate` 恒为模拟盘预演，不吃 `mode`。
  */
 export function getStrategyHealth(
   strategyId: string,

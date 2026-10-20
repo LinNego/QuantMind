@@ -1,13 +1,13 @@
-"""EOD 五卡评分 worker（T-P4-05b）——交易日 16:00 后跑一次 ``run_all``，心跳入调度注册表。
+"""EOD 六卡评分 worker（T-P4-05b）——交易日 16:00 后跑一次 ``run_all``，心跳入调度注册表。
 
 职责：
 - 每 60s 轮询：交易日且到点且当日未成功 → ``scripts/eval/run_all.py`` 的 ``run_all()``
-  顺序评 因子/模型/策略/账户/每日选股 → ``eval_scores`` 落表；
+  顺序评 因子/模型/策略/账户/实盘账户/每日选股 → ``eval_scores`` 落表；
 - 单卡异常在 ``run_all`` 内部隔离（不阻塞整轮）；整轮无异常才写当日完成标记
   （``eval:scores:done:{date}``，TTL 3 天）；有异常下一轮重试，但**累计尝试达到
   预算（默认 5 轮）后带错落标记**——持续性单点错误（重试治不好的那类）不再让
   整轮每分钟重跑整晚（2026-10-15 实锤：一个模型 pred 缺列烧了 411 轮）；
-- 五卡之后接着跑一次**回填**（``backfill_recent``）——把最近「待回填 ∧ 前向窗口
+- 六卡之后接着跑一次**回填**（``backfill_recent``）——把最近「待回填 ∧ 前向窗口
   已闭合」的每日选股快照重跑，否则这些天会永久停在 pending †；
 - 心跳写 ``scheduler_registry``（体检 C07 可见）。
 
@@ -94,12 +94,12 @@ def _settle_done_marker(
 ) -> str:
     """按本轮结果决定当日完成标记，返回 ``done`` / ``done_with_errors`` / ``retry``。
 
-    - 五卡无异常 → 直接落标记（值 ``"1"``）；
+    - 六卡无异常 → 直接落标记（值 ``"1"``）；
     - 有异常 → 计一次尝试；未到预算返回 ``retry``（下一轮照常重试，暂时性错误
       仍会被自愈）；达到预算 K 轮 → **带错落标记**（值为 JSON：attempts + errors
       摘要），由调用方 WARNING 并接告警面。
 
-    预算的意义是给「持续性单点错误」封顶（重试治不好，只是每分钟重烧全量五卡）；
+    预算的意义是给「持续性单点错误」封顶（重试治不好，只是每分钟重烧全量六卡）；
     期间任何一轮转好都会走成功分支清盘。
     """
     errors = int(summary.get("total_errors") or 0)
@@ -128,12 +128,12 @@ def _settle_done_marker(
 
 
 async def run_eval_scores_once(*, save: bool = True) -> dict:
-    """执行一次五卡评分（手动重跑与 worker 共用同一入口），随后回填近期 pending。"""
+    """执行一次六卡评分（手动重跑与 worker 共用同一入口），随后回填近期 pending。"""
     from backend.scripts.eval.run_all import run_all
 
     summary = await run_all(save=save)
     logger.info(
-        "[EvalScores] 五卡完成：落分=%s 异常=%s 耗时=%ss",
+        "[EvalScores] 六卡完成：落分=%s 异常=%s 耗时=%ss",
         summary.get("total_scored"),
         summary.get("total_errors"),
         summary.get("elapsed_sec"),
@@ -146,9 +146,9 @@ async def run_eval_scores_once(*, save: bool = True) -> dict:
 async def run_backfill_once() -> dict:
     """回填近期「待回填 ∧ 前向窗口已闭合」的每日选股快照（设计 §1.4）。
 
-    单独成函数：手动重跑只补历史时不必再跑一遍五卡。失败只记 warning，**不阻塞
+    单独成函数：手动重跑只补历史时不必再跑一遍六卡。失败只记 warning，**不阻塞
     当日完成标记**——回填自带 21 天回看窗口，明天的评分轮会把漏掉的一起补上；
-    反过来（回填失败就不写标记）会让整轮每 60s 重跑一次五卡，代价远大于收益。
+    反过来（回填失败就不写标记）会让整轮每 60s 重跑一次六卡，代价远大于收益。
     """
     days = _env_int("EVAL_BACKFILL_DAYS", 21)
     if days <= 0:
@@ -203,7 +203,7 @@ async def run_eval_scores_worker() -> None:
                 and not already
             ):
                 summary = await run_eval_scores_once(save=True)
-                # 完成标记只看**五卡**异常：回填失败不该让整轮每分钟重跑一次五卡。
+                # 完成标记只看**六卡**异常：回填失败不该让整轮每分钟重跑一次六卡。
                 # 回填自带 21 天回看窗口，明天那一轮会把它一起补上（自愈）。
                 backfill_errors = (summary.get("backfill") or {}).get("errors") or []
                 if backfill_errors:

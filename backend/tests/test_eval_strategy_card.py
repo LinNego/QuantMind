@@ -276,7 +276,7 @@ def test_strategy_dims_uses_trades_for_cost_and_reports_amount_gap_honestly():
 
 @pytest.mark.unit
 def test_strategy_dims_consistency_note_points_at_the_real_gap():
-    """一致性维保持缺省，但 note 必须指向真实缺口（不是「无模拟盘」这种不实说法）。"""
+    """一致性维缺省路径：调用方未带台账 → note 指向真实缺口（F2 接线后不再说「未接入评估侧」）。"""
     loaded = {
         "equity_curve": [1e5, 1e5, 1e5],
         "dates": ["2025-10-16", "2025-10-17", "2025-10-20"],
@@ -289,9 +289,51 @@ def test_strategy_dims_consistency_note_points_at_the_real_gap():
     )
     by_key = {d.key: d for d in dims}
 
+    assert by_key["consistency"].score is None
     note = str(by_key["consistency"].detail["note"])
-    assert "未接入评估侧" in note
+    assert "台账" in note
+    assert "未接入评估侧" not in note
     assert "无同期模拟曲线" not in note
+
+
+@pytest.mark.unit
+def test_consistency_dim_scores_on_overlapping_curves():
+    """台账↔回测共同日足够 → 真实算分：曲线同形 → 跟踪误差 0 → 满分不触红线。"""
+    from backend.scripts.eval.strategy_realized import consistency_dim
+
+    dates = [f"2026-09-{d:02d}" for d in range(1, 11)]
+    equity = [1.0 * (1.001**i) for i in range(10)]
+    ledger_rows = [
+        {"date": d, "total_asset": 100000.0 * (1.001**i)} for i, d in enumerate(dates)
+    ]
+
+    dim = consistency_dim(
+        backtest_dates=dates, backtest_equity=equity, ledger_rows=ledger_rows
+    )
+
+    assert dim.score == 100.0
+    assert dim.red_line_failed is False
+    assert dim.detail["te_ann"] == 0.0
+    assert dim.detail["common_days"] == 10
+    assert "台账" in dim.detail["note"]
+
+
+@pytest.mark.unit
+def test_consistency_dim_insufficient_when_curves_barely_overlap():
+    """共同交易日不足 → insufficient + 写明两侧点数（不硬算分）。"""
+    from backend.scripts.eval.strategy_realized import consistency_dim
+
+    dim = consistency_dim(
+        backtest_dates=["2026-01-05", "2026-01-06"],
+        backtest_equity=[1.0, 1.01],
+        ledger_rows=[{"date": "2026-09-01", "total_asset": 100000.0}],
+    )
+
+    assert dim.score is None
+    assert dim.detail["insufficient"] is True
+    note = str(dim.detail["note"])
+    assert "共同交易日不足" in note
+    assert "台账 1 点" in note
 
 
 # ── 代码口径（实盘数据暴露的坑） ──────────────────────────────────────

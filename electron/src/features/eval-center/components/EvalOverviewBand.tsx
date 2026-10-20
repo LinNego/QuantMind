@@ -13,6 +13,7 @@ import React, { useMemo } from 'react';
 import { BarChart3 } from 'lucide-react';
 import type { EvalScoreRow } from '../types/evalCenter';
 import { gradeColor, gradeMeta } from './evalCenterModel';
+import { gradeTextClass } from './evalTones';
 import { overviewStats } from './evalInsightModel';
 
 interface EvalOverviewBandProps {
@@ -57,17 +58,17 @@ export const EvalOverviewBand: React.FC<EvalOverviewBandProps> = ({ rows }) => {
         </div>
       </div>
 
-      {/* 图例：评级 × 数量 */}
+      {/* 图例：评级 × 数量（文字色走 evalTones.gradeTextClass，唯一取色出口） */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         {stats.counts.map((entry) => {
-          const meta = gradeMeta(entry.grade === '?' ? null : entry.grade);
+          const grade = entry.grade === '?' ? null : entry.grade;
           return (
             <span key={entry.grade} className="inline-flex items-center gap-1.5 text-[11px]">
               <span
                 className="h-1.5 w-1.5 rounded-full shrink-0"
-                style={{ background: gradeColor(entry.grade === '?' ? null : entry.grade) }}
+                style={{ background: gradeColor(grade) }}
               />
-              <span className={`font-bold ${meta.className.split(' ').find((t) => t.startsWith('text-'))}`}>
+              <span className={`font-bold ${gradeTextClass(grade)}`}>
                 {entry.grade === '?' ? '未评级' : entry.grade}
               </span>
               <span className="text-slate-400 tabular-nums">× {entry.count}</span>

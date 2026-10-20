@@ -97,7 +97,11 @@ export const EvalScoreBadge: React.FC<EvalScoreBadgeProps> = ({
       type="button"
       onClick={(e) => {
         e.stopPropagation();
-        navigate('/trading?tab=eval');
+        // 深链带上对象（object/object_id）：落地就选中这枚徽章对应的对象，
+        // 而不是让评估中心停在榜单第一行（那会让人以为评分被清空了）。
+        navigate(
+          `/trading?tab=eval&object=${encodeURIComponent(objectType)}&object_id=${encodeURIComponent(objectId)}`,
+        );
       }}
       title={title}
       className={`text-[10px] px-1.5 py-0.5 rounded-full border cursor-pointer hover:brightness-95 ${meta.className} ${className || ''}`}

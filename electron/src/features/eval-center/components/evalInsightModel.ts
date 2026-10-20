@@ -31,6 +31,7 @@ const DIMENSION_ORDER: Record<string, string[]> = {
   model: ['oos_predictive', 'stratification', 'robustness', 'rolling_health', 'turnover_cost'],
   strategy: ['return', 'risk', 'stability', 'cost', 'consistency', 'capacity'],
   account: ['exposure', 'attribution', 'risk_events', 'capital_efficiency'],
+  live_account: ['exposure', 'attribution', 'risk_events', 'capital_efficiency'],
   daily_selection: ['quality', 'realized', 'consistency', 'calibration', 'coverage'],
 };
 
@@ -216,6 +217,28 @@ function accountInsight(row: EvalScoreRow): Insight {
   };
 }
 
+function liveAccountInsight(row: EvalScoreRow): Insight {
+  const detail = detailOf(row, 'attribution');
+  const excess = toNumber(detail?.excess);
+  if (excess === null) {
+    return missingInsight('区间超额', detail, '归因维缺省（净值序列/Benchmark 样本不足）');
+  }
+  const accRet = toNumber(detail?.account_return);
+  const benchRet = toNumber(detail?.benchmark_return);
+  const points = toNumber(detail?.window_points);
+  const bits: string[] = [];
+  if (accRet !== null) bits.push(`账户 ${formatSignedPct(accRet)}`);
+  if (benchRet !== null) bits.push(`基准 ${formatSignedPct(benchRet)}`);
+  if (points !== null) bits.push(`${points} 个快照点`);
+  return {
+    label: '区间超额',
+    value: formatSignedPct(excess, 2),
+    tone: signTone(excess),
+    hint: bits.join(' · ') || '实盘台账净值窗口 vs 沪深300',
+    missing: false,
+  };
+}
+
 function dailySelectionInsight(row: EvalScoreRow): Insight {
   const detail = detailOf(row, 'realized');
   const horizon = toNumber(detail?.horizon);
@@ -253,6 +276,7 @@ const INSIGHT_BUILDERS: Record<string, (row: EvalScoreRow) => Insight> = {
   factor: factorInsight,
   strategy: strategyInsight,
   account: accountInsight,
+  live_account: liveAccountInsight,
   daily_selection: dailySelectionInsight,
 };
 

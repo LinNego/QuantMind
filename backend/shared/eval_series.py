@@ -38,9 +38,17 @@ DEFAULT_SERIES_DIR = "/data/eval_series"
 # 仓库根（backend/shared/eval_series.py → 仓库根；便携包 $ROOT、Docker /app）
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# object_type 进路径段：只认与 eval_scores 写入侧一致的六类
+# object_type 进路径段：只认与 eval_scores 写入侧一致的类型（新增写入类型须两侧同步）
 _ALLOWED_TYPES = frozenset(
-    {"factor", "model", "strategy", "account", "daily_selection", "strategy_health"}
+    {
+        "factor",
+        "model",
+        "strategy",
+        "account",
+        "live_account",
+        "daily_selection",
+        "strategy_health",
+    }
 )
 # 原样形态：模型带下划线、因子带点号、日期带横线、账户为数字。首字符不许是点
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")

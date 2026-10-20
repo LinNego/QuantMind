@@ -328,7 +328,7 @@ async def lifespan(app: FastAPI):
             run_shadow_compare_worker(),
             name="mirror-shadow-compare",
         )
-        # EOD 五卡评分（T-P4-05b）：交易日 16:00 后评 因子/模型/策略/账户/每日选股 → eval_scores
+        # EOD 六卡评分（T-P4-05b）：交易日 16:00 后评 因子/模型/策略/账户/实盘账户/每日选股 → eval_scores
         from backend.services.trade.services.eval_scores_service import (
             run_eval_scores_worker,
         )

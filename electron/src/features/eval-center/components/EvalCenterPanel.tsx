@@ -16,6 +16,7 @@
  */
 
 import React, { useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   AlertTriangle,
   Award,
@@ -23,7 +24,9 @@ import {
   Cpu,
   HeartPulse,
   Inbox,
+  Landmark,
   RefreshCw,
+  Search,
   Sigma,
   Target,
   Wallet,
@@ -35,6 +38,7 @@ import {
   listScores,
 } from '../services/evalCenterService';
 import type { EvalObjectType, EvalScoreRow, StrategyHealthArchive } from '../types/evalCenter';
+import { filterEvalRows, parseObjectDeepLink } from './evalCenterModel';
 import { useUiMode } from '../../shared/useUiMode';
 import { SelfHealthUpload } from './SelfHealthUpload';
 import { EvalOverviewBand } from './EvalOverviewBand';
@@ -51,43 +55,86 @@ const TYPE_ICONS: Record<string, React.ComponentType<{ className?: string }>> = 
   model: Cpu,
   strategy: Target,
   account: Wallet,
+  live_account: Landmark,
   daily_selection: CalendarCheck,
   strategy_health: HeartPulse,
 };
 
-/** 页签短名（后端 label 去掉「评分卡/留档」后缀；全称留在 title 悬停里） */
-function tabLabel(label: string): string {
-  return label.replace(/评分卡$/, '').replace(/留档$/, '') || label;
+/**
+ * 页签短名：优先用后端直给的 `short_label`（U6：后端改 label 全称不再牵连页签）；
+ * 只有老后端没带 short_label 时才回退到正则剥后缀。
+ */
+function typeShortLabel(t: EvalObjectType): string {
+  if (t.short_label) return t.short_label;
+  return t.label.replace(/评分卡$/, '').replace(/留档$/, '') || t.label;
 }
+
+/** 单次拉取的榜单项数（后端上限 500）；触到该值即提示可能还有更多 */
+const LIST_LIMIT = 200;
 
 export const EvalCenterPanel: React.FC = () => {
   const { isSimple } = useUiMode();
   const [objectTypes, setObjectTypes] = useState<EvalObjectType[]>([]);
-  const [activeType, setActiveType] = useState<string>('factor');
+  // 空串 = 未定档；类型表到达后取后端第一类（U5：默认不再硬编码 factor）
+  const [activeType, setActiveType] = useState<string>('');
   const [rows, setRows] = useState<EvalScoreRow[]>([]);
+  const [listTruncated, setListTruncated] = useState(false);
+  const [listTotal, setListTotal] = useState<number | null>(null);
   const [selectedId, setSelectedId] = useState<string>('');
   const [history, setHistory] = useState<EvalScoreRow[]>([]);
   const [archive, setArchive] = useState<StrategyHealthArchive | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [query, setQuery] = useState('');
+  /** 徽章深链待选中对象：等该类型榜单落地后再点中（榜单在途时 selectedId 无处可指） */
+  const [pendingSelect, setPendingSelect] = useState<{ type: string; id: string } | null>(null);
+
+  // 徽章深链（?object=model&object_id=…）：面板已挂载时再次点徽章也生效（searchParams 变化触发）
+  const [searchParams] = useSearchParams();
+  const deepLink = useMemo(() => parseObjectDeepLink(searchParams), [searchParams]);
+
+  const loadObjectTypes = async () => {
+    try {
+      const resp = await getEvalObjectTypes();
+      const types = resp?.data || [];
+      setObjectTypes(types);
+      setActiveType((prev) =>
+        prev && types.some((t) => t.object_type === prev) ? prev : types[0]?.object_type || prev
+      );
+    } catch (err: unknown) {
+      setError(errorText(err));
+    }
+  };
 
   useEffect(() => {
-    void (async () => {
-      try {
-        const resp = await getEvalObjectTypes();
-        const types = resp?.data || [];
-        setObjectTypes(types);
-        if (types.length > 0 && !types.some((t) => t.object_type === activeType)) {
-          setActiveType(types[0].object_type);
-        }
-      } catch (err: unknown) {
-        setError(errorText(err));
-      }
-    })();
+    void loadObjectTypes();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
+    const ot = deepLink?.objectType;
+    if (!deepLink || !ot) return;
+    // 类型表未到先等（同一对象参数会随 objectTypes 变化再触发）；未知类型不盲跳
+    if (objectTypes.length === 0 || !objectTypes.some((t) => t.object_type === ot)) return;
+    setPendingSelect({ type: ot, id: deepLink.objectId });
+    if (activeType !== ot) setActiveType(ot);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepLink, objectTypes]);
+
+  // 榜单落地后消费待选中：命中即选中；该类型已加载完（非在途）仍没有此对象 → 如实放弃
+  // （徽章显示「未生成」时点进来，榜单里本就没有它，硬停个空选中比不跳更误导）
+  useEffect(() => {
+    if (!pendingSelect || pendingSelect.type !== activeType) return;
+    if (rows.some((r) => r.object_id === pendingSelect.id)) {
+      setSelectedId(pendingSelect.id);
+      setPendingSelect(null);
+    } else if (!loading) {
+      setPendingSelect(null);
+    }
+  }, [pendingSelect, rows, activeType, loading]);
+
+  useEffect(() => {
+    if (!activeType) return; // 类型未定档不发请求（object_type='' 必 400）
     void loadRows(activeType);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeType]);
@@ -104,20 +151,27 @@ export const EvalCenterPanel: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId, activeType, rows]);
 
-  const loadRows = async (type: string) => {
+  const loadRows = async (type: string, opts?: { keepSelection?: boolean }) => {
+    const keepId = opts?.keepSelection ? selectedId : '';
     setLoading(true);
     setError('');
     setSelectedId('');
     setArchive(null);
     setHistory([]);
     try {
-      const resp = await listScores({ objectType: type, latestOnly: true, limit: 200 });
+      const resp = await listScores({ objectType: type, latestOnly: true, limit: LIST_LIMIT });
       const data = resp?.data || [];
       setRows(data);
-      if (data.length > 0) setSelectedId(data[0].object_id);
+      setListTruncated(Boolean(resp?.meta?.truncated) || data.length >= LIST_LIMIT);
+      setListTotal(typeof resp?.meta?.total === 'number' ? resp.meta.total : null);
+      // 刷新保留选中（对象还在时）；首次加载/切类型则落第一行
+      if (keepId && data.some((r) => r.object_id === keepId)) setSelectedId(keepId);
+      else if (data.length > 0) setSelectedId(data[0].object_id);
     } catch (err: unknown) {
       setError(errorText(err));
       setRows([]);
+      setListTruncated(false);
+      setListTotal(null);
     } finally {
       setLoading(false);
     }
@@ -145,13 +199,22 @@ export const EvalCenterPanel: React.FC = () => {
     }
   };
 
+  /** 刷新按钮：类型表（U5，失败后可重试）+ 榜单（保留选中）一起重取 */
+  const refresh = async () => {
+    if (objectTypes.length === 0) await loadObjectTypes();
+    if (activeType) await loadRows(activeType, { keepSelection: true });
+  };
+
+  const visibleRows = useMemo(() => filterEvalRows(rows, query), [rows, query]);
+
   const selectedRow = useMemo(
     () => rows.find((r) => r.object_id === selectedId) || null,
     [rows, selectedId]
   );
 
   const isHealth = activeType === 'strategy_health';
-  const activeLabel = objectTypes.find((t) => t.object_type === activeType)?.label || '';
+  const activeTypeMeta = objectTypes.find((t) => t.object_type === activeType);
+  const activeLabel = activeTypeMeta?.label || '';
 
   return (
     <div className="space-y-3">
@@ -162,8 +225,9 @@ export const EvalCenterPanel: React.FC = () => {
         </div>
         <button
           type="button"
-          onClick={() => void loadRows(activeType)}
+          onClick={() => void refresh()}
           disabled={loading}
+          title="重取类型表与榜单（保留当前选中对象）"
           className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
         >
           <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
@@ -187,13 +251,14 @@ export const EvalCenterPanel: React.FC = () => {
               }`}
             >
               <Icon className="w-3 h-3" />
-              {tabLabel(otype.label)}
+              {typeShortLabel(otype)}
             </button>
           );
         })}
       </div>
 
-      {error && (
+      {/* 榜单已有数据时的局部错误（如下钻详情失败）：顶部横幅提示；整榜失败走下方错误态块 */}
+      {error && rows.length > 0 && (
         <div className="flex items-start gap-2 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
           <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
           {error}
@@ -201,14 +266,25 @@ export const EvalCenterPanel: React.FC = () => {
       )}
 
       {loading ? (
-        <div className="flex h-48 flex-col items-center justify-center gap-3">
-          <RefreshCw className="w-6 h-6 animate-spin text-blue-500" />
-          <span className="text-xs text-slate-400">正在读取评分卡…</span>
+        // 骨架屏与榜单卡片同形（三态视觉统一：加载=骨架、空=图标文案、错误=独立块）
+        <div className="space-y-2" aria-label="正在读取评分卡">
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} className="h-[76px] animate-pulse rounded-2xl border border-slate-200/60 bg-slate-100/70" />
+          ))}
+          <div className="pt-1 text-center text-xs text-slate-400">正在读取评分卡…</div>
+        </div>
+      ) : error && rows.length === 0 ? (
+        // 读取失败≠没有记录：低分说「暂无」等于把网络/权限问题说成业务结论
+        <div className="flex flex-col items-center gap-2 rounded-2xl border border-amber-200 bg-amber-50/60 p-10 text-sm text-amber-800">
+          <AlertTriangle className="w-8 h-8 text-amber-400" />
+          评分卡读取失败，暂无法显示榜单
+          <span className="text-xs text-amber-700/80">{error} · 可点右上角「刷新」重试</span>
         </div>
       ) : rows.length === 0 ? (
         isHealth ? (
           <div className="space-y-4">
-            <div className="rounded-2xl border border-slate-200/80 bg-slate-50 p-6 text-center text-sm text-slate-500">
+            <div className="flex flex-col items-center gap-2 rounded-2xl border border-slate-200/80 bg-slate-50 p-6 text-center text-sm text-slate-500">
+              <HeartPulse className="w-8 h-8 text-slate-300" />
               暂无体检留档（回测完成后自动生成；月度复检每月留档）——下方可直接自助体检：
             </div>
             <SelfHealthUpload />
@@ -224,8 +300,37 @@ export const EvalCenterPanel: React.FC = () => {
           {!isHealth && <EvalOverviewBand rows={rows} />}
 
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
-            <div className="lg:col-span-2 space-y-2 max-h-[720px] overflow-y-auto pr-1">
-              <EvalRankList rows={rows} selectedId={selectedId} onSelect={setSelectedId} />
+            <div className="lg:col-span-2 flex flex-col gap-2 max-h-[720px]">
+              {/* 客户端搜索：对象名/ID 包含即命中（榜单一次最多 200 条，直接过滤） */}
+              <div className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-2.5 py-1.5">
+                <Search className="w-3.5 h-3.5 shrink-0 text-slate-400" />
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="搜索对象名 / ID…"
+                  className="w-full bg-transparent text-xs outline-none placeholder:text-slate-300"
+                />
+                {query && (
+                  <span className="shrink-0 text-[10px] tabular-nums text-slate-400">
+                    {visibleRows.length} / {rows.length}
+                  </span>
+                )}
+              </div>
+              <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+                {visibleRows.length === 0 ? (
+                  <div className="rounded-2xl border border-slate-200/80 bg-slate-50 p-6 text-center text-xs text-slate-400">
+                    没有匹配「{query}」的对象
+                  </div>
+                ) : (
+                  <EvalRankList rows={visibleRows} selectedId={selectedId} onSelect={setSelectedId} />
+                )}
+              </div>
+              {listTruncated && (
+                <div className="shrink-0 rounded-xl border border-slate-200/80 bg-slate-50 px-3 py-1.5 text-[10px] leading-relaxed text-slate-400">
+                  共{listTotal !== null ? ` ${listTotal} ` : ''}个对象，本次展示前 {LIST_LIMIT} 个
+                  {listTotal === null ? '（可能还有更多）' : ''}——用上方搜索或切换类型缩小范围
+                </div>
+              )}
             </div>
 
             <div className="lg:col-span-3">
@@ -244,7 +349,7 @@ export const EvalCenterPanel: React.FC = () => {
                 <EvalDetail
                   row={selectedRow}
                   objectType={activeType}
-                  typeLabel={tabLabel(activeLabel)}
+                  typeLabel={activeTypeMeta ? typeShortLabel(activeTypeMeta) : activeLabel}
                   history={history}
                   isSimple={isSimple}
                 />

@@ -63,6 +63,27 @@ describe('dimensionCoverage 维度覆盖格', () => {
     expect(cov.cells[3].note).toBe('PFS 未落库，本期不可评');
   });
 
+  it('实盘账户按账户卡同序（暴露/归因/风控事件/资金效率），不抄 jsonb 字母序', () => {
+    const row = makeRow({
+      object_type: 'live_account',
+      dimensions: {
+        risk_events: { label: '风控事件', score: 80, weight: 25 },
+        capital_efficiency: { label: '资金效率', score: 70, weight: 25 },
+        attribution: { label: '归因', score: 60, weight: 20 },
+        exposure: { label: '风险暴露', score: 90, weight: 30 },
+      },
+    });
+
+    const cov = dimensionCoverage(row);
+
+    expect(cov.cells.map((c) => c.key)).toEqual([
+      'exposure',
+      'attribution',
+      'risk_events',
+      'capital_efficiency',
+    ]);
+  });
+
   it('未知类型按权重降序（同权重按 key）排，缺省格仍带 note', () => {
     const row = makeRow({
       object_type: 'mystery_card',
@@ -214,6 +235,55 @@ describe('insightFor 关键实测量（缺证据必带原因，不许留白）',
 
     expect(insight.label).toBe('资金利用率');
     expect(insight.value).toBe('72.4%');
+  });
+
+  it('实盘账户 → 区间超额（账户/基准原样带出，不重算）', () => {
+    const row = makeRow({
+      object_type: 'live_account',
+      dimensions: {
+        attribution: {
+          label: '归因',
+          score: 62,
+          weight: 20,
+          detail: {
+            account_return: 0.021,
+            benchmark_return: 0.0086,
+            excess: 0.0124,
+            window_points: 23,
+          },
+        },
+      },
+    });
+
+    const insight = insightFor(row)!;
+
+    expect(insight.label).toBe('区间超额');
+    expect(insight.value).toBe('+1.24%');
+    expect(insight.tone).toBe('pos');
+    expect(insight.hint).toContain('基准');
+    expect(insight.hint).toContain('23 个快照点');
+    expect(insight.missing).toBe(false);
+  });
+
+  it('实盘账户归因缺省 → 有位置有原因（不消失、不留白）', () => {
+    const note = '净值/Benchmark 样本不足（账户 1 点，基准 0 点）';
+    const row = makeRow({
+      object_type: 'live_account',
+      dimensions: {
+        attribution: {
+          label: '归因',
+          score: null,
+          weight: 20,
+          detail: { insufficient: true, note },
+        },
+      },
+    });
+
+    const insight = insightFor(row)!;
+
+    expect(insight.missing).toBe(true);
+    expect(insight.value).toBe('缺省');
+    expect(insight.hint).toBe(note);
   });
 
   it('每日选股待回填 → 独立 pending 态，原因原样带出', () => {

@@ -26,7 +26,11 @@ export interface EvalScoreRow {
 export interface EvalListResponse {
   success: boolean;
   data: EvalScoreRow[];
-  meta: { count: number; object_type: string };
+  /**
+   * count = 本次返回条数。`truncated` 为真时 `total` 是该类型的真实对象总数
+   * （后端只在触到 limit 时补算；老后端缺这两键 → 按「可能还有更多」提示）。
+   */
+  meta: { count: number; object_type: string; total?: number | null; truncated?: boolean };
 }
 
 export interface EvalHistoryResponse {
@@ -38,6 +42,8 @@ export interface EvalHistoryResponse {
 export interface EvalObjectType {
   object_type: string;
   label: string;
+  /** 页签短名（后端直给；老后端缺省时前端回退剥后缀） */
+  short_label?: string;
 }
 
 /** 长序列侧车的一个点（各序列的键不同：date/label/bucket/horizon/pair/name） */

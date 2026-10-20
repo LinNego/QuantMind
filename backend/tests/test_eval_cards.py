@@ -8,7 +8,7 @@
 - 账户卡：集中度红线、资金效率阶梯、风控事件罚分、基准回看日期回归（YYYYMMDD 减法的历史 bug）、
   双 ID 键形守卫（00000001 ≢ 1 台账）；
 - run_all：单卡异常隔离 + 汇总计数；worker：时间解析/开关；
-- 真库 E2E：因子卡/账户卡/五卡全链路（数据不可用则 skip，不假过）。
+- 真库 E2E：因子卡/账户卡/六卡全链路（数据不可用则 skip，不假过）。
 """
 
 from __future__ import annotations
@@ -418,6 +418,7 @@ async def test_run_all_isolates_card_failures(monkeypatch):
     monkeypatch.setattr(run_all_mod, "_run_model_card", ok)
     monkeypatch.setattr(run_all_mod, "_run_strategy_card", ok)
     monkeypatch.setattr(run_all_mod, "_run_account_card", ok)
+    monkeypatch.setattr(run_all_mod, "_run_live_account_card", ok)
     monkeypatch.setattr(run_all_mod, "_run_daily_selection", ok)
 
     summary = await run_all_mod.run_all(save=False)
@@ -426,11 +427,12 @@ async def test_run_all_isolates_card_failures(monkeypatch):
         "model",
         "strategy",
         "account",
+        "live_account",
         "daily_selection",
     }
     assert summary["cards"]["factor"]["scored"] == 0
     assert any("factor 卡异常" in e for e in summary["errors"])
-    assert summary["total_scored"] == 4  # 其余四卡不受影响
+    assert summary["total_scored"] == 5  # 其余五卡不受影响
 
 
 @pytest.mark.unit
@@ -705,7 +707,7 @@ async def test_account_card_real_scan():
 
 @pytest.mark.asyncio
 async def test_run_all_e2e_no_save():
-    """五卡全链路（不落表）：所有卡都产出计数，真分数 >0；环境缺数据即 skip。"""
+    """六卡全链路（不落表）：所有卡都产出计数，真分数 >0；环境缺数据即 skip。"""
     try:
         from sqlalchemy import text
 
@@ -728,6 +730,7 @@ async def test_run_all_e2e_no_save():
         "model",
         "strategy",
         "account",
+        "live_account",
         "daily_selection",
     }
     if summary["total_scored"] == 0:

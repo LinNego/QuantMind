@@ -84,11 +84,15 @@ def account_series_payload(
     market: str = "CN",
     scalars: dict[str, Any] | None = None,
     max_points: int = MAX_SERIES_POINTS,
+    source_label: str = "模拟盘",
 ) -> dict[str, Any]:
-    """模拟盘快照行 → ``{series, scalars, notes}``。
+    """账户快照行 → ``{series, scalars, notes}``。
 
     ``rows`` 为按日期升序的 ``[{date, total_asset, today_pnl}]``（``today_pnl``
     可缺）——本函数只摊平，不重算净值和盈亏。
+
+    ``source_label`` 只进 notes 文案（模拟盘/实盘台账共用本函数；缺省值保持
+    既有模拟盘文案逐字不变）。
     """
     rows = [r for r in (rows or []) if isinstance(r, dict)]
     is_cn = str(market or "").upper() == "CN"
@@ -106,10 +110,10 @@ def account_series_payload(
     else:
         parts = []
         if not equity:
-            parts.append("净值序列为空（模拟盘快照表里没有该账户的行）")
+            parts.append(f"净值序列为空（{source_label}快照表里没有该账户的行）")
         elif sample_days < MIN_TREND_POINTS:
             parts.append(
-                f"模拟盘净值快照仅 {sample_days} 个交易日"
+                f"{source_label}净值快照仅 {sample_days} 个交易日"
                 f"（{equity[0]['date']} → {equity[-1]['date']}）"
                 "——点数少，只能当抽样看，别读成趋势"
             )

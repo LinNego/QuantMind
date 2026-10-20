@@ -192,7 +192,7 @@ def test_score_model_returns_unscorable_card_when_pred_lacks_label(tmp_path: Pat
     """pred.parquet 在盘但缺标签列 → 不可评卡（unscorable），不是 error。
 
     2026-10-15 实锤：stacking 集成模型导出漏 label 列，该错误被当可重试异常，
-    让 EOD 五卡轮每 ~70s 重跑整晚（411 轮）。持续性数据缺陷必须如实缺省。
+    让 EOD 六卡轮每 ~70s 重跑整晚（411 轮）。持续性数据缺陷必须如实缺省。
     """
     # Arrange：metadata 齐 + pred 只有三列（真实缺陷形态：无 label/label_return）
     root = tmp_path / "mdl_bad_pred"

@@ -229,8 +229,9 @@ def strategy_dims(
     bench_ann: float | None,
     amount_stats: dict[str, Any] | None,
     round_trip_cost: float | None,
+    ledger: dict[str, Any] | None = None,
 ) -> tuple[list[DimensionScore], dict[str, Any]]:
-    """已加载的回测产物 → 六维（不读库；基准年化与成交额由调用方取好传入）。"""
+    """已加载的回测产物 → 六维（不读库；基准年化、成交额、业主台账由调用方取好传入）。"""
     equity = [float(v) for v in loaded["equity_curve"]]
     returns = curve_to_returns(equity)
     ann = annualized_return(returns)
@@ -245,7 +246,12 @@ def strategy_dims(
         cost_dim(
             stats, gross_pnl=gross_pnl, ann_return=ann, round_trip_cost=round_trip_cost
         ),
-        consistency_dim(),
+        consistency_dim(
+            backtest_dates=loaded.get("dates"),
+            backtest_equity=equity,
+            ledger_rows=(ledger or {}).get("rows"),
+            ledger_note=(ledger or {}).get("note"),
+        ),
         capacity_dim(
             stats,
             median_amount_wan=amount.get("median_amount_wan"),
@@ -489,6 +495,45 @@ async def load_backtest_curve(
     }
 
 
+async def _load_owner_ledger(backtest_id: str | None) -> dict[str, Any]:
+    """一致性维输入：回测业主的模拟盘台账行（F2 接线，2026-10-15）。
+
+    业主映射直接取 ``qlib_backtest_runs.user_id/tenant_id``（与取结果文件同一张
+    表，不旁路猜业主）；qlib 回测为 A 股口径 → 快照按 CN 取行。回看窗口 90 天
+    （与账户卡同款）；覆盖不到的天数在共同日对齐里自然缺省，不补不造。
+    返回 ``{rows, note}``——任何取不到的形态都带 note 说明，绝不静默空集。
+    """
+    if not backtest_id:
+        return {"rows": [], "note": "无 backtest_id（按文件路径评分），业主无从映射"}
+    from sqlalchemy import text as _text
+
+    from backend.shared.database_manager_v2 import get_session
+
+    async with get_session(read_only=True) as session:
+        row = (
+            await session.execute(
+                _text(
+                    "SELECT user_id, tenant_id FROM qlib_backtest_runs "
+                    "WHERE backtest_id = :b LIMIT 1"
+                ),
+                {"b": str(backtest_id)},
+            )
+        ).fetchone()
+    if not row or not str(row[0] or "").strip():
+        return {"rows": [], "note": f"qlib_backtest_runs 无 {backtest_id} 的业主行"}
+    tenant = str(row[1] or "default")
+    user = str(row[0])
+    from backend.scripts.eval.account_card import load_fund_snapshot_rows
+
+    rows = await load_fund_snapshot_rows(tenant, user, market="CN", days=90)
+    if not rows:
+        return {
+            "rows": [],
+            "note": f"业主 {user} 的模拟盘快照表 90 天窗口内无行（账户未运行或无快照）",
+        }
+    return {"rows": rows, "note": None}
+
+
 async def candidate_backtest_ids(*, limit: int = 20) -> list[str]:
     """近期 completed 且登记了结果文件路径的回测 ID（新→旧；文件仍在由 scored 时兜底）。"""
     from sqlalchemy import text as _text
@@ -622,11 +667,13 @@ async def score_strategy(
     amount_stats = _median_amount_wan(
         symbols, loaded.get("start", ""), loaded.get("end", "")
     )
+    ledger = await _load_owner_ledger(backtest_id)
     dims, evidence = strategy_dims(
         loaded,
         bench_ann=bench_ann,
         amount_stats=amount_stats,
         round_trip_cost=round_trip_cost,
+        ledger=ledger,
     )
     combined = combine_dimension_scores(dims)
     object_id = backtest_id or loaded.get("path") or str(file_path)
