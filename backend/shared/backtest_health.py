@@ -121,6 +121,27 @@ def evaluate_equity_curve(
     return report
 
 
+def live_sim_days_blocked_note(sim_trading_days: int) -> str:
+    """REAL 晋级：模拟交易日不足的拒绝措辞（**唯一出处**）。
+
+    展示面逐项清单直接引用本函数，而不是从 ``promotion_gate`` 的短路 note 里
+    「刮」理由——它按门槛总表顺序（体检→天数→误差）返回**首个**未过门，前序门
+    未过时后一项会张冠李戴（2026-10-15 回归）。
+    """
+    return (
+        f"模拟盘运行 {sim_trading_days} 交易日 < 门槛 {LIVE_SIM_MIN_TRADING_DAYS} 日"
+        "（晋级门槛），请继续模拟验证。"
+    )
+
+
+def live_tracking_error_blocked_note(tracking_error: float) -> str:
+    """REAL 晋级：跟踪误差超限的拒绝措辞（唯一出处；理由归属同 ``live_sim_days_blocked_note``）。"""
+    return (
+        f"模拟↔真单跟踪误差 {tracking_error:.2%} > 门槛 {LIVE_MAX_TRACKING_ERROR:.0%}"
+        "（晋级门槛），请先排查执行偏差。"
+    )
+
+
 def promotion_gate(
     health: dict[str, Any] | None,
     *,
@@ -164,15 +185,9 @@ def promotion_gate(
         return True, note
     # REAL
     if sim_trading_days is not None and sim_trading_days < LIVE_SIM_MIN_TRADING_DAYS:
-        return False, (
-            f"模拟盘运行 {sim_trading_days} 交易日 < 门槛 {LIVE_SIM_MIN_TRADING_DAYS} 日"
-            "（晋级门槛），请继续模拟验证。"
-        )
+        return False, live_sim_days_blocked_note(sim_trading_days)
     if tracking_error is not None and tracking_error > LIVE_MAX_TRACKING_ERROR:
-        return False, (
-            f"模拟↔真单跟踪误差 {tracking_error:.2%} > 门槛 {LIVE_MAX_TRACKING_ERROR:.0%}"
-            "（晋级门槛），请先排查执行偏差。"
-        )
+        return False, live_tracking_error_blocked_note(tracking_error)
     return True, f"体检结论 {verdict}；模拟证据达标"
 
 

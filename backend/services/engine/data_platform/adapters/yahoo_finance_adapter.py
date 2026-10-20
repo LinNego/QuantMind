@@ -252,8 +252,15 @@ class YahooFinanceAdapter(OfflineDataSourceAdapter):
         elif field == "sector":
             try:
                 info = t.info
-                if not info:
-                    raise DataUnavailable(f"yfinance no info for {ticker}")
+                # 降级防护（2026-10-15）：crumb 失效时 info 是非空但缺业务键的
+                # 降级 dict，旧判据 `if not info` 拦不住 → 静默写空 sector。
+                # 按「信号键」判定：sector 与 industry 全缺才拒（个别标的本就无分类）
+                if not info or not any(
+                    info.get(k) for k in ("sector", "industry")
+                ):
+                    raise DataUnavailable(
+                        f"yfinance sector info degraded/empty for {ticker}"
+                    )
                 df = pd.DataFrame([{
                     "symbol": symbol.upper(),
                     "sector": info.get("sector", ""),
@@ -269,8 +276,14 @@ class YahooFinanceAdapter(OfflineDataSourceAdapter):
         elif field == "f10":
             try:
                 info = t.info
-                if not info:
-                    raise DataUnavailable(f"yfinance no info for {ticker}")
+                # 同上：按信号键判定（市值/长名/52 周高三个键全缺 = 降级 dict）
+                if not info or not any(
+                    info.get(k) is not None
+                    for k in ("marketCap", "longName", "fiftyTwoWeekHigh")
+                ):
+                    raise DataUnavailable(
+                        f"yfinance f10 info degraded/empty for {ticker}"
+                    )
                 df = pd.DataFrame([{
                     "symbol": symbol.upper(),
                     "name": info.get("longName", ""),
@@ -521,8 +534,14 @@ class YahooFinanceAdapter(OfflineDataSourceAdapter):
         elif field == "valuation":
             try:
                 data = t.info
-                if not data:
-                    raise DataUnavailable(f"yfinance no info for {ticker}")
+                # 同 f10：估值四信号键全缺 = 降级 dict，拒绝写入（宁缺勿空）
+                if not data or not any(
+                    data.get(k) is not None
+                    for k in ("marketCap", "trailingPE", "priceToBook", "enterpriseValue")
+                ):
+                    raise DataUnavailable(
+                        f"yfinance valuation info degraded/empty for {ticker}"
+                    )
                 df = pd.DataFrame([{
                     "symbol": symbol.upper(),
                     "market_cap": data.get("marketCap"),

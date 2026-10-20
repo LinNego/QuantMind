@@ -137,6 +137,44 @@ def test_disabled_not_seen_as_builtin(monkeypatch):
     assert rqc.using_builtin_free_feed() is False
 
 
+# ── 2026-10-14：口令回落必须跟随 host（自建库不得拿到公网服口令）─────────────
+
+
+def test_self_hosted_password_does_not_fall_back_to_free_feed(monkeypatch):
+    """host 指向自建 Redis 且口令未配 → 口令必须是**空**，不是公网服的口令。
+
+    旧实现无条件 ``_read(..., FREE_FEED_PASSWORD)``：免密自建库会忽略多余 AUTH
+    照样连上（**能跑，所以长期没被发现**），而一旦自建库真设了 requirepass，
+    就是必然的认证失败。2026-10-14 实测把行情收到本机（免密）时暴露。
+    """
+    _clear(monkeypatch)
+    monkeypatch.setenv("REMOTE_QUOTE_REDIS_HOST", "redis")
+    monkeypatch.setenv("REMOTE_QUOTE_REDIS_PASSWORD", "")
+
+    host, _port, password, _db = rqc.resolve_remote_quote_redis()
+
+    assert host == "redis"
+    assert password is None, f"自建库不该拿到公网服口令：{password!r}"
+
+
+def test_explicit_password_still_wins_on_self_hosted(monkeypatch):
+    """显式配了口令就必须用它（只有「未配」才回落空）。"""
+    _clear(monkeypatch)
+    monkeypatch.setenv("REMOTE_QUOTE_REDIS_HOST", "redis")
+    monkeypatch.setenv("REMOTE_QUOTE_REDIS_PASSWORD", "s3cret")
+
+    assert rqc.resolve_remote_quote_redis() == ("redis", rqc.FREE_FEED_PORT, "s3cret", rqc.FREE_FEED_DB)
+
+
+def test_builtin_host_keeps_free_feed_password(monkeypatch):
+    """回落内置免费服时，口令仍用内置值——**不回归**。"""
+    _clear(monkeypatch)
+    host, _port, password, _db = rqc.resolve_remote_quote_redis()
+
+    assert host == rqc.FREE_FEED_HOST
+    assert password == rqc.FREE_FEED_PASSWORD
+
+
 _EXECUTOR = (
     Path(__file__).resolve().parents[1]
     / "services"

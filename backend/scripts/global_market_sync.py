@@ -291,6 +291,55 @@ def _write_snapshot_file(root: Path, symbol: str, df: pd.DataFrame) -> Path:
     return target
 
 
+# 各快照字段的「信号列」：这些列全空 = 上游退回空载荷，绝不能覆盖旧文件。
+# 2026-10-15 事故：crumb 失效窗口的降级载荷把 sector 写成空串、f10 写成全 NULL，
+# 逐文件直接覆写 → 516 个 sector 文件全废。此表是写入侧的最后一道闸。
+_SNAPSHOT_SIGNAL_COLS: dict[str, tuple[str, ...]] = {
+    "sector": ("sector", "industry"),
+    "f10": ("market_cap", "pe_ratio", "pb_ratio", "dividend_yield"),
+    "recommendations": ("strongBuy", "buy", "hold", "sell", "strongSell"),
+    "upgrades_downgrades": ("Firm", "ToGrade", "FromGrade", "Action"),
+    "earnings_estimate": ("avg", "numberOfAnalysts", "growth"),
+    "revenue_estimate": ("avg", "numberOfAnalysts", "growth"),
+    "growth_estimates": ("stockTrend", "indexTrend"),
+    "analyst_price_targets": ("current", "mean", "median", "high", "low"),
+    "major_holders": ("Value",),
+    "mutual_fund_holders": ("Holder", "Shares", "pctHeld"),
+    "calendar": ("Earnings Date", "Ex-Dividend Date", "Dividend Date"),
+    "insider_transactions": ("Insider", "Shares", "Value"),
+}
+
+
+def _is_degraded_snapshot(field: str, df: pd.DataFrame) -> bool:
+    """判定快照载荷是否整体退化（应跳过写入而不是覆盖旧数据）。
+
+    判据：
+    - 命中信号列且**全部信号列全空/空串/空数组** → 退化
+    - 未登记信号列的字段：除 symbol/source 外**所有值列全空** → 退化
+    """
+
+    def _has_value(s: pd.Series) -> bool:
+        if not s.notna().any():
+            return False
+        txt = s.dropna().astype(str).str.strip()
+        return bool(((txt != "") & (txt != "[]") & (txt.str.lower() != "nan")).any())
+
+    if df is None or df.empty:
+        return True
+    signal_cols = _SNAPSHOT_SIGNAL_COLS.get(field)
+    if signal_cols:
+        cols = [c for c in signal_cols if c in df.columns]
+        if not cols:
+            return False  # 列集与预期不同（上游改名），交给下游与回归暴露
+        return not any(_has_value(df[c]) for c in cols)
+    value_cols = [
+        c for c in df.columns if c not in ("symbol", "source", "published_at")
+    ]
+    if not value_cols:
+        return True
+    return not any(_has_value(df[c]) for c in value_cols)
+
+
 def _normalise_valuation(symbol: str, data: dict) -> pd.DataFrame | None:
     """yahoo info → QuantDB 估值 schema。
 
@@ -322,9 +371,16 @@ def _normalise_valuation(symbol: str, data: dict) -> pd.DataFrame | None:
             "release_id": "yahoo",
             "published_at": datetime.now().isoformat(timespec="seconds"),
         }
-        if row["total_mv"] is None and row["pe_ttm"] is None and row["pb"] is None:
-            # 三个核心字段全空 = 上游 schema 又对不上了，不能静默写空分区
-            log.warning("估值标准化 %s: 核心字段全空，疑似字段名漂移", symbol)
+        if (
+            row["total_mv"] is None
+            and row["pe_ttm"] is None
+            and row["pb"] is None
+            and row["ps_ttm"] is None
+        ):
+            # 四个核心字段全空 = 上游降级或字段名漂移，拒绝写入该行
+            # （2026-10-15：降级窗口曾把全天分区写成 360 行全 NULL）
+            log.debug("估值标准化 %s: 核心字段全空，跳过", symbol)
+            return None
         return pd.DataFrame([row])
     except Exception as exc:  # noqa: BLE001
         log.warning("估值标准化失败 %s: %s", symbol, exc)
@@ -499,6 +555,7 @@ def sync_snapshot(
     # 估值是分区格式，走 _write_partition
     if field == "valuation":
         frames = []
+        degraded = 0
 
         def _fetch_val(symbol: str):
             try:
@@ -516,20 +573,30 @@ def sync_snapshot(
                 df = future.result()
                 if df is not None and not df.empty:
                     frames.append(df)
+                else:
+                    degraded += 1
         if not frames:
-            return {"field": field, "written": 0, "errors": len(symbols)}
+            log.warning("估值同步：全部标的退化/失败，不写分区（防静默写空）")
+            return {
+                "field": field,
+                "written": 0,
+                "errors": len(symbols),
+                "dir": rel_dir,
+            }
         all_df = pd.concat(frames, ignore_index=True)
         max_date = all_df["time"].max().strftime("%Y%m%d")
         _write_partition(root, max_date, all_df)
         return {
             "field": field,
             "written": len(all_df),
+            "degraded": degraded,
             "partition": max_date,
             "dir": rel_dir,
         }
 
     written = 0
     errors = 0
+    degraded = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(_fetch_snapshot_one, adapter, field, s): s for s in symbols
@@ -538,6 +605,12 @@ def sync_snapshot(
             symbol = futures[future]
             df = future.result()
             if df is not None and not df.empty:
+                # 写入侧退化闸：降级载荷跳过写入，保住旧文件（2026-10-15 事故）
+                if _is_degraded_snapshot(field, df):
+                    degraded += 1
+                    if degraded <= 3:
+                        log.warning("快照退化跳过 %s %s（不覆盖旧文件）", field, symbol)
+                    continue
                 try:
                     _write_snapshot_file(root, symbol, df)
                     written += 1
@@ -547,13 +620,17 @@ def sync_snapshot(
             else:
                 errors += 1
 
-    return {
+    result = {
         "field": field,
         "symbols": len(symbols),
         "written": written,
         "errors": errors,
         "dir": rel_dir,
     }
+    if degraded:
+        result["degraded"] = degraded
+        log.warning("[%s] 快照退化跳过 %d 只（旧文件保留）", field, degraded)
+    return result
 
 
 def _business_days(end: date, n: int) -> list[date]:

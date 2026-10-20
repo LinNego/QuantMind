@@ -111,7 +111,15 @@ def resolve_remote_quote_redis() -> tuple[str, int, str | None, int] | None:
         db = int(_read("REMOTE_QUOTE_REDIS_DB", str(FREE_FEED_DB)) or FREE_FEED_DB)
     except (TypeError, ValueError):
         db = FREE_FEED_DB
-    password = _read("REMOTE_QUOTE_REDIS_PASSWORD", FREE_FEED_PASSWORD) or None
+    # 口令**只在回落内置免费服时**才用内置值。旧实现无条件回落
+    # （``_read(..., FREE_FEED_PASSWORD)``）——私有部署指向自建 Redis 时，
+    # 这会把公网免费服的口令当成自建库的口令塞给客户端：
+    # 免密库会忽略多余 AUTH 照样连上（**能跑，所以长期没被发现**），
+    # 而一旦自建库真设了 requirepass，就是必然的认证失败。
+    password = _read("REMOTE_QUOTE_REDIS_PASSWORD", "")
+    if not password and host == FREE_FEED_HOST:
+        password = FREE_FEED_PASSWORD
+    password = password or None
     _warn_once_if_builtin_default(host)
     return host, port, password, db
 

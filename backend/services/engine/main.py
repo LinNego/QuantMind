@@ -43,7 +43,9 @@ async def _mining_queue_sweeper(launcher) -> None:
 
 # 兼容 qlib_app 内部裸导入路径（from qlib_app.*）
 if "qlib_app" not in sys.modules:
-    sys.modules["qlib_app"] = importlib.import_module("backend.services.engine.qlib_app")
+    sys.modules["qlib_app"] = importlib.import_module(
+        "backend.services.engine.qlib_app"
+    )
 
 
 @asynccontextmanager
@@ -72,19 +74,26 @@ async def lifespan(app: FastAPI):
         from backend.services.engine.qlib_app.services.optimization_persistence import (
             OptimizationPersistence,
         )
+
         await BacktestPersistence().ensure_tables()
         await OptimizationPersistence().ensure_tables()
-        logger.info("✅ Backtest/Optimization tables ensured (qlib init deferred to first use)")
+        logger.info(
+            "✅ Backtest/Optimization tables ensured (qlib init deferred to first use)"
+        )
     except Exception as e:
         logger.error(f"❌ Table ensure failed: {e} (non-fatal)")
 
     try:
-        from backend.services.engine.qlib_app.services.rd_agent_persistence import RDAgentFactorPersistence
+        from backend.services.engine.qlib_app.services.rd_agent_persistence import (
+            RDAgentFactorPersistence,
+        )
 
         await RDAgentFactorPersistence().ensure_tables()
         # 跨市场回测台账扩展（T-FB-06）：kind/params_json 列、七态词表、序列表。
         # 依赖上一步的基表，次序不可颠倒。
-        from backend.services.engine.factor_backtest import store as factor_backtest_store
+        from backend.services.engine.factor_backtest import (
+            store as factor_backtest_store,
+        )
 
         await factor_backtest_store.ensure_tables()
     except Exception as e:
@@ -94,7 +103,9 @@ async def lifespan(app: FastAPI):
     try:
         # 批量回测重启可重入（T-FB-09）：中断批次重新入队，孤儿 running 行收口。
         # 数据面是台账行，恢复失败只告警（状态轮询还有兜底入口）。
-        from backend.services.engine.factor_backtest import batch as factor_backtest_batch
+        from backend.services.engine.factor_backtest import (
+            batch as factor_backtest_batch,
+        )
 
         resumed = await factor_backtest_batch.resume_interrupted()
         if resumed:
@@ -196,16 +207,21 @@ async def lifespan(app: FastAPI):
         app.state.startup_healthy = False
         logger.error(f"❌ Model registry table ensure failed: {e}")
 
-    set_service_health("quantmind-engine", bool(getattr(app.state, "startup_healthy", True)))
+    set_service_health(
+        "quantmind-engine", bool(getattr(app.state, "startup_healthy", True))
+    )
 
     # 启动 VectorizedMatcher（受 ENABLE_VECTORIZED_MATCHER 环境变量控制）
     vm_task: asyncio.Task | None = None
     try:
         from backend.services.trade.services.vectorized_matcher import VectorizedMatcher
+
         _vm = VectorizedMatcher()
         vm_task = asyncio.create_task(_vm.start(), name="vectorized_matcher")
         app.state.vectorized_matcher = _vm
-        logger.info("✅ VectorizedMatcher task created (active if ENABLE_VECTORIZED_MATCHER=true)")
+        logger.info(
+            "✅ VectorizedMatcher task created (active if ENABLE_VECTORIZED_MATCHER=true)"
+        )
     except Exception as e:
         logger.warning(f"⚠️ VectorizedMatcher startup skipped: {e}")
 
@@ -214,16 +230,22 @@ async def lifespan(app: FastAPI):
         from backend.services.engine.inference.realtime_service import default_service
 
         default_service().start()
-        logger.info("✅ RealtimeInference service loop created (active if qm:realtime:infer:config.enabled=true)")
+        logger.info(
+            "✅ RealtimeInference service loop created (active if qm:realtime:infer:config.enabled=true)"
+        )
     except Exception as e:
         logger.warning(f"⚠️ RealtimeInference startup skipped: {e}")
 
     # 启动日内市场状态服务（P6 T-P6-13；Redis 配置门控，默认关）
     try:
-        from backend.services.engine.realtime_regime import default_service as regime_service
+        from backend.services.engine.realtime_regime import (
+            default_service as regime_service,
+        )
 
         regime_service().start()
-        logger.info("✅ RealtimeRegime service loop created (active if qm:realtime:regime:config.enabled=true)")
+        logger.info(
+            "✅ RealtimeRegime service loop created (active if qm:realtime:regime:config.enabled=true)"
+        )
     except Exception as e:
         logger.warning(f"⚠️ RealtimeRegime startup skipped: {e}")
 
@@ -232,27 +254,43 @@ async def lifespan(app: FastAPI):
         from backend.shared.anomaly_contract import ensure_anomaly_types
 
         await asyncio.to_thread(ensure_anomaly_types)
-        from backend.services.engine.anomaly_engine import default_service as anomaly_service
+        from backend.services.engine.anomaly_engine import (
+            default_service as anomaly_service,
+        )
 
         anomaly_service().start()
-        logger.info("✅ AnomalyEngine service loop created (active if qm:engine:anomaly:config.enabled=true)")
+        logger.info(
+            "✅ AnomalyEngine service loop created (active if qm:engine:anomaly:config.enabled=true)"
+        )
     except Exception as e:
         logger.warning(f"⚠️ AnomalyEngine startup skipped: {e}")
 
     # 启动新闻情报服务（P6 T-P6-12；Redis 配置门控默认关）
     try:
-        from backend.services.engine.news_intel_engine import default_service as news_intel_service
+        from backend.services.engine.news_intel_engine import (
+            default_service as news_intel_service,
+        )
 
         news_intel_service().start()
-        logger.info("✅ NewsIntel service loop created (active if qm:engine:news_intel:config.enabled=true)")
+        logger.info(
+            "✅ NewsIntel service loop created (active if qm:engine:news_intel:config.enabled=true)"
+        )
     except Exception as e:
         logger.warning(f"⚠️ NewsIntel startup skipped: {e}")
 
     # 启动预热向量解析/字段检索（2026-05-03：暂时关闭强制预热以加快启动速度）
-    warmup_enabled = os.getenv("AI_STRATEGY_WARMUP", "false").strip().lower() not in ("0", "false", "no", "off")
+    warmup_enabled = os.getenv("AI_STRATEGY_WARMUP", "false").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
     if warmup_enabled:
         try:
-            from backend.services.engine.ai_strategy.services.startup_health import run_startup_health_checks
+            from backend.services.engine.ai_strategy.services.startup_health import (
+                run_startup_health_checks,
+            )
+
             await run_startup_health_checks()
             logger.info("✅ AI Strategy Warmup completed successfully")
         except Exception as e:
@@ -296,7 +334,9 @@ async def lifespan(app: FastAPI):
             level="info" if ok else "error",
             source="quantmind-engine",
             title="推理引擎服务启动完成" if ok else "推理引擎服务启动异常",
-            message="QuantMind Engine 启动完成" if ok else "Engine 启动存在初始化失败，请检查日志",
+            message="QuantMind Engine 启动完成"
+            if ok
+            else "Engine 启动存在初始化失败，请检查日志",
         )
     except Exception:  # noqa: BLE001 - 事件记录非关键路径
         pass
@@ -414,6 +454,11 @@ PROTECTED_PREFIXES: tuple[str, ...] = (
     # 2026-10-07 实测匿名 `GET /api/v1/factor-research/scan?dataset=private`
     # 经网关返回 200（对照 `/api/v1/qlib/health` 正确地 401）。
     "/api/v1/factor-research/",
+    # 因子报告：与 factor-research 同族（同一批私有因子的 IC/分层/多空序列），
+    # 2026-10-07 那次漏项的同款一致性缺口——报告链路同样经网关暴露
+    # （engine_proxy 白名单含 `/api/v1/factor-report/{p:path}`），一并纳入；
+    # 见 test_factor_research_auth_gate.py（两前缀都被承重断言锁死）。
+    "/api/v1/factor-report/",
 )
 
 
@@ -457,7 +502,9 @@ async def auth_middleware(request: Request, call_next):
         if not is_internal_call and not user_id:
             return JSONResponse(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                content={"detail": "Authentication required (Invalid internal secret or missing user context)"},
+                content={
+                    "detail": "Authentication required (Invalid internal secret or missing user context)"
+                },
             )
         # 需要用户上下文的受保护路由列表（唯一出处见模块级 PROTECTED_PREFIXES）
         if not user_id and any(path.startswith(p) for p in PROTECTED_PREFIXES):
@@ -481,7 +528,11 @@ async def auth_middleware(request: Request, call_next):
         except Exception:  # noqa: BLE001 - 规范化失败不阻断（保持旧行为）
             pass
         # 注入到 request.state
-        request.state.user = {"user_id": user_id, "tenant_id": tenant_id, "sub": user_id}
+        request.state.user = {
+            "user_id": user_id,
+            "tenant_id": tenant_id,
+            "sub": user_id,
+        }
 
     response = await call_next(request)
     return response
@@ -499,17 +550,27 @@ app.add_middleware(
 #    动态路由会先于 /strategies/templates 等静态路由匹配，导致 templates 接口
 #    被同步数据库查询阻塞、引发事件循环死锁）
 try:
-    from backend.services.engine.qlib_app.api.user_strategies import router as strategies_router
+    from backend.services.engine.qlib_app.api.user_strategies import (
+        router as strategies_router,
+    )
 
-    app.include_router(strategies_router, prefix="/api/v1/strategies", tags=["Strategies"])
+    app.include_router(
+        strategies_router, prefix="/api/v1/strategies", tags=["Strategies"]
+    )
 except ImportError as e:
     logger.error(f"❌ Failed to load Strategies router: {e}")
 
 # 1. AI 策略生成
 try:
-    from backend.services.engine.ai_strategy.api.routes.strategy_backtest_loop import router as strategy_loop_router
-    from backend.services.engine.ai_strategy.api.v1.routes import router as ai_strat_router
-    from backend.services.engine.ai_strategy.api.v1.wizard import router as wizard_router
+    from backend.services.engine.ai_strategy.api.routes.strategy_backtest_loop import (
+        router as strategy_loop_router,
+    )
+    from backend.services.engine.ai_strategy.api.v1.routes import (
+        router as ai_strat_router,
+    )
+    from backend.services.engine.ai_strategy.api.v1.wizard import (
+        router as wizard_router,
+    )
 
     app.include_router(ai_strat_router, prefix="/api/v1", tags=["AI Strategy"])
     app.include_router(wizard_router, prefix="/api/v1", tags=["Strategy Wizard"])
@@ -522,7 +583,9 @@ except ImportError as e:
 try:
     from backend.services.engine.routers.inference import router as inference_router
 
-    app.include_router(inference_router, prefix="/api/v1/inference", tags=["AI Inference"])
+    app.include_router(
+        inference_router, prefix="/api/v1/inference", tags=["AI Inference"]
+    )
 except ImportError as e:
     logger.error(f"❌ Failed to load AI Inference router: {e}")
 
@@ -536,7 +599,9 @@ except ImportError as e:
 
 # 3.1 实盘E2E最小契约接口
 try:
-    from backend.services.engine.routers.realtime_contract import router as realtime_contract_router
+    from backend.services.engine.routers.realtime_contract import (
+        router as realtime_contract_router,
+    )
 
     app.include_router(realtime_contract_router, prefix="/api/v1")
 except ImportError as e:
@@ -580,7 +645,9 @@ except ImportError as e:
 
 # 5.1 管理员策略模板管理
 try:
-    from backend.services.engine.qlib_app.api.admin_templates import router as admin_templates_router
+    from backend.services.engine.qlib_app.api.admin_templates import (
+        router as admin_templates_router,
+    )
 
     app.include_router(
         admin_templates_router,
@@ -594,7 +661,9 @@ except ImportError as e:
 # 6. 股票查询与智能选股
 try:
     from backend.services.engine.stock_query_app.routes import router as stock_router
-    from backend.services.engine.stock_query_app.smart_screener_api import router as smart_screener_router
+    from backend.services.engine.stock_query_app.smart_screener_api import (
+        router as smart_screener_router,
+    )
 
     app.include_router(stock_router)
     app.include_router(smart_screener_router)
@@ -606,13 +675,25 @@ except ImportError as e:
 try:
     from backend.services.engine.routers.ai_ide.chat import router as ai_chat_router
     from backend.services.engine.routers.ai_ide.config import router as ai_config_router
-    from backend.services.engine.routers.ai_ide.executor import router as ai_executor_router
-    from backend.services.engine.routers.ai_ide.workspace import router as ai_workspace_router
+    from backend.services.engine.routers.ai_ide.executor import (
+        router as ai_executor_router,
+    )
+    from backend.services.engine.routers.ai_ide.workspace import (
+        router as ai_workspace_router,
+    )
 
-    app.include_router(ai_chat_router, prefix="/api/v1/ai-ide/ai", tags=["Cloud IDE-AI"])
-    app.include_router(ai_config_router, prefix="/api/v1/ai-ide/config", tags=["Cloud IDE-Config"])
-    app.include_router(ai_executor_router, prefix="/api/v1/ai-ide/execute", tags=["Cloud IDE-Executor"])
-    app.include_router(ai_workspace_router, prefix="/api/v1/ai-ide/files", tags=["Cloud IDE-Workspace"])
+    app.include_router(
+        ai_chat_router, prefix="/api/v1/ai-ide/ai", tags=["Cloud IDE-AI"]
+    )
+    app.include_router(
+        ai_config_router, prefix="/api/v1/ai-ide/config", tags=["Cloud IDE-Config"]
+    )
+    app.include_router(
+        ai_executor_router, prefix="/api/v1/ai-ide/execute", tags=["Cloud IDE-Executor"]
+    )
+    app.include_router(
+        ai_workspace_router, prefix="/api/v1/ai-ide/files", tags=["Cloud IDE-Workspace"]
+    )
     logger.info("✅ Cloud AI-IDE routers loaded")
 except ImportError as e:
     logger.error(f"❌ Failed to load Cloud AI-IDE routers: {e}")
@@ -647,7 +728,9 @@ except ImportError as e:
     logger.error(f"❌ Failed to load AlphaAgent docs routers: {e}")
 
 try:
-    from backend.services.engine.routers.trading_agents import router as trading_agents_router
+    from backend.services.engine.routers.trading_agents import (
+        router as trading_agents_router,
+    )
 
     app.include_router(trading_agents_router)
     logger.info("✅ TradingAgents routers loaded")
@@ -655,7 +738,9 @@ except ImportError as e:
     logger.error(f"❌ Failed to load TradingAgents routers: {e}")
 
 try:
-    from backend.services.engine.routers.quantbot_router import router as quantbot_router
+    from backend.services.engine.routers.quantbot_router import (
+        router as quantbot_router,
+    )
 
     app.include_router(quantbot_router)
     logger.info("✅ QuantBot router loaded")
@@ -663,9 +748,13 @@ except ImportError as e:
     logger.error(f"❌ Failed to load QuantBot router: {e}")
 
 try:
-    from backend.services.engine.strategy_lab.routers import router as strategy_lab_router
+    from backend.services.engine.strategy_lab.routers import (
+        router as strategy_lab_router,
+    )
 
-    app.include_router(strategy_lab_router, prefix="/api/v1/ai-ide", tags=["Strategy Lab"])
+    app.include_router(
+        strategy_lab_router, prefix="/api/v1/ai-ide", tags=["Strategy Lab"]
+    )
     logger.info("✅ Strategy Lab router loaded")
 except ImportError as e:
     logger.error(f"❌ Failed to load Strategy Lab router: {e}")
@@ -681,7 +770,9 @@ except ImportError as e:
 
 try:
     # 因子研究（factor-lib-demo 改造版）：排行榜/单因子/对比/合成
-    from backend.services.engine.factor_research.router import router as factor_research_router
+    from backend.services.engine.factor_research.router import (
+        router as factor_research_router,
+    )
 
     app.include_router(factor_research_router)
     logger.info("✅ Factor Research router loaded")
@@ -690,7 +781,9 @@ except ImportError as e:
 
 try:
     # 跨市场回测中心（T-FB）：矩阵/单因子/台账/曲线
-    from backend.services.engine.factor_backtest.router import router as factor_backtest_router
+    from backend.services.engine.factor_backtest.router import (
+        router as factor_backtest_router,
+    )
 
     app.include_router(factor_backtest_router)
     logger.info("✅ Factor Backtest router loaded")

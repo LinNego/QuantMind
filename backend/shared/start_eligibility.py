@@ -20,6 +20,8 @@ from typing import Any
 from backend.shared.backtest_health import (
     LIVE_MAX_TRACKING_ERROR,
     LIVE_SIM_MIN_TRADING_DAYS,
+    live_sim_days_blocked_note,
+    live_tracking_error_blocked_note,
     promotion_gate,
 )
 from backend.shared.strategy_lifecycle import can_start, normalize_status
@@ -97,9 +99,7 @@ def _health_item(
     )
 
 
-def _sim_days_item(
-    health: dict[str, Any] | None, sim_trading_days: int | None
-) -> dict[str, Any]:
+def _sim_days_item(sim_trading_days: int | None) -> dict[str, Any]:
     if sim_trading_days is None:
         return _build_item(
             key="sim_days",
@@ -107,25 +107,19 @@ def _sim_days_item(
             value=f"{_NO_RECORD}（只提示不拦）",
         )
     ok = sim_trading_days >= LIVE_SIM_MIN_TRADING_DAYS
-    # 仅当体检已过时调用，失败原因才**只可能**是天数——不会与体检项混淆
-    _, note = promotion_gate(
-        health, mode="REAL", sim_trading_days=sim_trading_days, tracking_error=None
-    )
+    # 理由直接取本项专属措辞（唯一出处 backtest_health）——不再借道 promotion_gate：
+    # 它按门槛总表顺序短路返回，前序门未过时会把别人的结论当成本项理由（2026-10-15 回归）
+    reason = "" if ok else live_sim_days_blocked_note(sim_trading_days)
     return _build_item(
         key="sim_days",
         passed=ok,
         value=f"{sim_trading_days} / {LIVE_SIM_MIN_TRADING_DAYS} 交易日",
-        reason=note,
+        reason=reason,
         next_step=f"继续模拟运行，累计满 {LIVE_SIM_MIN_TRADING_DAYS} 个交易日后再进实盘",
     )
 
 
-def _tracking_error_item(
-    health: dict[str, Any] | None,
-    *,
-    sim_trading_days: int | None,
-    tracking_error: float | None,
-) -> dict[str, Any]:
+def _tracking_error_item(tracking_error: float | None) -> dict[str, Any]:
     if tracking_error is None:
         return _build_item(
             key="tracking_error",
@@ -133,18 +127,12 @@ def _tracking_error_item(
             value=f"{_NO_RECORD}（只提示不拦）",
         )
     ok = tracking_error <= LIVE_MAX_TRACKING_ERROR
-    # 体检与天数都已过时调用，失败原因才**只可能**是跟踪误差
-    _, note = promotion_gate(
-        health,
-        mode="REAL",
-        sim_trading_days=sim_trading_days,
-        tracking_error=tracking_error,
-    )
+    reason = "" if ok else live_tracking_error_blocked_note(tracking_error)
     return _build_item(
         key="tracking_error",
         passed=ok,
         value=f"{tracking_error:.2%} / ≤ {LIVE_MAX_TRACKING_ERROR:.0%}",
-        reason=note,
+        reason=reason,
         next_step="排查模拟与真单的执行偏差（成交价/滑点/费率），把跟踪误差压入门槛内",
     )
 
@@ -190,14 +178,8 @@ def build_start_eligibility(
     items.append(_health_item(health, mode=mode_key, gate_on=health_gate_enabled))
 
     if mode_key == "REAL" and health_gate_enabled:
-        items.append(_sim_days_item(health, sim_trading_days))
-        items.append(
-            _tracking_error_item(
-                health,
-                sim_trading_days=sim_trading_days,
-                tracking_error=tracking_error,
-            )
-        )
+        items.append(_sim_days_item(sim_trading_days))
+        items.append(_tracking_error_item(tracking_error))
 
     allowed = all(item["passed"] for item in items)
     next_step = ""

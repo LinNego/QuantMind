@@ -173,6 +173,61 @@ def test_real_without_sim_state_history_only_hints() -> None:
     assert items["tracking_error"]["passed"] is True
 
 
+# ── 理由归属：每项 reason 必须描述**本项**失败（回归 2026-10-15） ──────
+# 旧实现把 sim_days / tracking_error 的理由从 `promotion_gate` 的 note「刮」来，
+# 而 promotion_gate 按门槛总表顺序（体检→天数→跟踪误差）短路返回 —— 前序门未过时，
+# 后一项的 reason 会张冠李戴（天数项引用体检结论等）。以下三条把每种串味路径钉死。
+
+
+@pytest.mark.unit
+def test_sim_days_reason_names_days_when_health_also_fails() -> None:
+    """体检 L + 天数不足同时未过：天数项理由必须是天数事实，不是体检结论。"""
+    result = build_start_eligibility(
+        status=STATUS_SIM,
+        health=_L_HEALTH,
+        mode="REAL",
+        sim_trading_days=LIVE_SIM_MIN_TRADING_DAYS - 1,
+    )
+    items = _items(result)
+    assert items["health"]["passed"] is False
+    assert items["sim_days"]["passed"] is False
+    assert "模拟盘运行" in items["sim_days"]["reason"]
+    assert "不得晋级" not in items["sim_days"]["reason"]  # 那是体检项的说辞
+    assert "不得晋级" in items["health"]["reason"]
+
+
+@pytest.mark.unit
+def test_sim_days_reason_names_days_when_health_missing() -> None:
+    """无体检留档 + 天数不足：天数项理由不得变成「尚未完成回测体检」。"""
+    result = build_start_eligibility(
+        status=STATUS_SIM,
+        health=None,
+        mode="REAL",
+        sim_trading_days=1,
+    )
+    items = _items(result)
+    assert items["sim_days"]["passed"] is False
+    assert "模拟盘运行" in items["sim_days"]["reason"]
+    assert "体检" not in items["sim_days"]["reason"]
+
+
+@pytest.mark.unit
+def test_tracking_error_reason_names_error_when_days_also_short() -> None:
+    """天数不足 + 误差超限同时未过：误差项理由必须是误差事实，不是天数。"""
+    result = build_start_eligibility(
+        status=STATUS_SIM,
+        health=_A_HEALTH,
+        mode="REAL",
+        sim_trading_days=1,
+        tracking_error=LIVE_MAX_TRACKING_ERROR + 0.01,
+    )
+    items = _items(result)
+    assert items["sim_days"]["passed"] is False
+    assert items["tracking_error"]["passed"] is False
+    assert "跟踪误差" in items["tracking_error"]["reason"]
+    assert "模拟盘运行" not in items["tracking_error"]["reason"]
+
+
 # ── 模板 / 非用户策略 ────────────────────────────────────────────────
 
 
