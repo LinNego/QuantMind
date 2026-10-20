@@ -101,4 +101,49 @@ class AgentLedgerRead:
         return round(self.quota_total - self.quota_used, 2)
 
 
-__all__ = ["AccountRead", "AgentLedgerRead"]
+def _positive_float(value: object) -> float | None:
+    """账本数值 → 正数 float（空/脏/布尔/非有限 → None，与 ``as_float`` 同口径）。"""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return out if out > 0 and out not in (float("inf"), float("-inf")) else None
+
+
+def entry_prices_from_ledger(ledger: Any) -> dict[str, float]:
+    """账本成本价 → ``{后缀码: cost_price}``（``maybe_write_watch`` 的回填源）。
+
+    **只认分账账本**：桥账户的成本是共享账户的混合口径，不是本 agent 的建仓价。
+    成本缺失/≤0 的持仓跳过（执行器会退回柜台成本，不会拿到一个假成本）。
+    """
+    out: dict[str, float] = {}
+    for code, pos in (getattr(ledger, "positions", None) or {}).items():
+        if not isinstance(pos, Mapping):
+            continue
+        cost = _positive_float(pos.get("cost_price"))
+        if cost is not None:
+            out[str(code)] = cost
+    return out
+
+
+def held_symbols_from_ledger(ledger: Any) -> set[str]:
+    """分账账本里**当前持有**的标的（``maybe_write_watch`` 的持仓校验源）。
+
+    与 :func:`entry_prices_from_ledger` 分开：成本缺失的持仓仍然算「持有」——
+    它该有保护位（执行器会退回柜台成本），只是回填不了 ``entry_price``。
+    """
+    return {
+        str(code)
+        for code, pos in (getattr(ledger, "positions", None) or {}).items()
+        if isinstance(pos, Mapping) and str(code or "").strip()
+    }
+
+
+__all__ = [
+    "AccountRead",
+    "AgentLedgerRead",
+    "entry_prices_from_ledger",
+    "held_symbols_from_ledger",
+]

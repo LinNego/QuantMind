@@ -526,15 +526,55 @@ class TestStateMachine:
         assert len(h.dispatched) == 1
         assert h.state()["rules"]["600036.SH"]["entry_price"] == 95.0
 
-    def test_missing_entry_notifies_and_skips(self) -> None:
+    def test_no_position_skips_silently_and_stays_armed(self) -> None:
+        """无持仓 ≠ 缺成本价：**不推告警**，规则保持 armed（建仓后自动恢复）。
+
+        688543.SH 实录：LLM 把「回踩 47.60 再买入」写成了 watch，落成卖出规则后
+        执行器每天推一条「缺少成本价」——标的根本没持仓，成本价无从谈起。这类
+        告警只会教人忽略告警。
+        """
+        h = Harness(
+            cfg=_cfg([_rule(entry_price=None)]),
+            ticks={"600036.SH": {"lastPrice": 90.0}},
+            positions=[],
+        )
+        summary = h.cycle()
+        assert summary["evaluated"] == 1 and summary["triggered"] == 0
+        assert h.dispatched == []
+        assert not any("缺少成本价" in n["title"] for n in h.notices)
+        st = h.state()["rules"]["600036.SH"]
+        assert st["status"] == ex.ST_ARMED
+        assert st["skip_reason"] == "no_position"
+
+    def test_position_without_cost_still_notifies(self) -> None:
+        """有持仓但柜台没给成本价 = 真数据问题，告警要保留（每日一次）。"""
+        h = Harness(
+            cfg=_cfg([_rule(entry_price=None)]),
+            ticks={"600036.SH": {"lastPrice": 90.0}},
+            positions=[_position(cost=0.0)],
+        )
+        h.cycle()
+        h.cycle()
+        assert h.dispatched == []
+        alerts = [n for n in h.notices if "缺少成本价" in n["title"]]
+        assert len(alerts) == 1
+        assert "柜台有该标的持仓" in alerts[0]["content"]
+
+    def test_no_position_skip_reason_clears_after_position_appears(self) -> None:
+        """先无持仓（留诊断）→ 建仓后按柜台成本恢复评估，诊断键清掉。"""
         h = Harness(
             cfg=_cfg([_rule(entry_price=None)]),
             ticks={"600036.SH": {"lastPrice": 90.0}},
             positions=[],
         )
         h.cycle()
-        assert h.dispatched == []
-        assert any("缺少成本价" in n["title"] for n in h.notices)
+        h.client.positions = [_position(cost=95.0)]
+        h.cycle()
+        st = h.state()["rules"]["600036.SH"]
+        assert "skip_reason" not in st
+        assert st["entry_price"] == 95.0
+        # 95×0.95=90.25，现价 90 ≤ 90.25 → 触发
+        assert len(h.dispatched) == 1
 
 
 # --------------------------------------------------------------------------

@@ -63,6 +63,10 @@ REJECT_NO_CODE = "决策缺 code"
 REJECT_NO_LEVEL = "既无 stop_loss 也无 take_profit：没有价位的条件位没有意义"
 REJECT_PCT_ZERO = "决策明说 pct≤0（不表达卖出量）→ 不挂条件位"
 REJECT_DUPLICATE = "与本轮已挂规则同标的同价位同比例（去重）"
+REJECT_NOT_HELD = (
+    "标的当前无持仓：watch 只给现有持仓挂保护位（触发即减仓/止盈），不会建仓；"
+    "计划买入的标的请在 buy 决策里给出 stop_loss 与买入条件，建仓后下一轮再挂 watch"
+)
 
 #: 价位归一小数位（去重签名用；与隔壁 `_lvl` 同口径）
 _LEVEL_DIGITS = 3
@@ -182,15 +186,35 @@ def watch_signature(rule: WatchRule) -> tuple[str, float | None, float | None, f
     )
 
 
-def plan_watch(decisions: Iterable[Decision], *, agent: str = "") -> WatchPlan:
+def plan_watch(
+    decisions: Iterable[Decision],
+    *,
+    agent: str = "",
+    held_symbols: Iterable[str] | None = None,
+) -> WatchPlan:
     """本轮决策里的 ``watch`` → 待挂规则（其余动作原样忽略）。
 
     每条 watch 决策**必落**到 ``rules`` 或 ``rejected`` 之一（不丢行）：
     「没挂上」和「没这条决策」在事后排查里是两件事，前者要有人看见理由。
+
+    ``held_symbols``：本 agent **当前持有的标的**（任意口径，内部归一为后缀式）。
+    给出时，未持仓标的的 watch 一律拒绝（:data:`REJECT_NOT_HELD`）——执行器把
+    watch 落成**卖出规则**（跌破减仓/涨到止盈），未持仓时它没有可保护的对象；
+    LLM 常把「回踩某价再买入」写成 watch，落了库也永远不会成交，只会让执行器
+    每天告警「缺成本价」。``None`` = 不校验（迁移预演 / 老调用点，行为不变）。
     """
     rules: list[WatchRule] = []
     rejected: list[Rejection] = []
     seen: set[tuple[str, float | None, float | None, float]] = set()
+    held = (
+        None
+        if held_symbols is None
+        else {
+            executor.normalize_symbol(str(symbol))
+            for symbol in held_symbols
+            if str(symbol or "").strip()
+        }
+    )
 
     for i, d in enumerate(decisions or []):
         if not d.is_watch:
@@ -211,6 +235,9 @@ def plan_watch(decisions: Iterable[Decision], *, agent: str = "") -> WatchPlan:
         # 先归一标的、再造规则、**最后校验**：被校验的那份就是被交出去的那份
         # （校验一份、使用另一份是这类映射层最典型的自欺）。
         symbol = executor.normalize_symbol(code)
+        if held is not None and symbol not in held:
+            rejected.append(Rejection(i, code, REJECT_NOT_HELD))
+            continue
         rule = _rule_dict(d, symbol, reduce_pct)
         reason = executor.rule_reject_reason(rule)
         if reason:
@@ -248,6 +275,7 @@ __all__ = [
     "REJECT_DUPLICATE",
     "REJECT_NO_CODE",
     "REJECT_NO_LEVEL",
+    "REJECT_NOT_HELD",
     "REJECT_PCT_ZERO",
     "Rejection",
     "WatchPlan",

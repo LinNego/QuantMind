@@ -40,6 +40,7 @@ from backend.shared.decision.watch_map import (
     REJECT_DUPLICATE,
     REJECT_NO_CODE,
     REJECT_NO_LEVEL,
+    REJECT_NOT_HELD,
     REJECT_PCT_ZERO,
     WatchPlan,
     plan_watch,
@@ -89,6 +90,54 @@ class TestEligibility:
     def test_either_level_alone_is_enough(self, field: str) -> None:
         plan = plan_watch(_rows(_watch(**{field: 100.0})))
         assert len(plan.rules) == 1
+
+
+class TestHeldSymbolsGate:
+    """``held_symbols``：watch 只保护现有持仓（688543.SH 实录）。
+
+    LLM 把「回踩 47.60 不破再买入」写成 watch；watch 落库后是**卖出规则**，
+    无持仓时永远不会成交，执行器只会每天推「缺少成本价」。
+    """
+
+    def test_non_held_watch_is_rejected_with_reason(self) -> None:
+        plan = plan_watch(
+            _rows(_watch("688543.SH", stop_loss=47.6, pct=0.1)),
+            held_symbols={"600036.SH"},
+        )
+        assert plan.rules == ()
+        assert plan.rejected[0].reason == REJECT_NOT_HELD
+
+    def test_held_watch_is_armed(self) -> None:
+        plan = plan_watch(
+            _rows(_watch("688543.SH", stop_loss=47.6, pct=0.1)),
+            held_symbols={"688543.SH"},
+        )
+        assert len(plan.rules) == 1
+        assert plan.rejected == ()
+
+    @pytest.mark.parametrize("held", ["SH688543", "688543.SH", "sh688543"])
+    def test_held_symbols_are_normalised_before_comparison(self, held: str) -> None:
+        plan = plan_watch(
+            _rows(_watch("688543.SH", stop_loss=47.6)),
+            held_symbols={held},
+        )
+        assert len(plan.rules) == 1
+
+    def test_none_disables_the_gate(self) -> None:
+        """``held_symbols=None`` = 老调用点/迁移预演：行为与加闸前逐字一致。"""
+        plan = plan_watch(_rows(_watch("688543.SH", stop_loss=47.6)))
+        assert len(plan.rules) == 1
+
+    def test_empty_holdings_rejects_everything(self) -> None:
+        plan = plan_watch(
+            _rows(
+                _watch("688543.SH", stop_loss=47.6),
+                _watch("601100.SH", stop_loss=50.0),
+            ),
+            held_symbols=set(),
+        )
+        assert plan.rules == ()
+        assert {r.reason for r in plan.rejected} == {REJECT_NOT_HELD}
 
 
 class TestReducePctThreeStates:

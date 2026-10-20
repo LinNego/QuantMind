@@ -159,7 +159,6 @@ from backend.services.trade.services.decision_round_blocks import (
     load_round_snapshots,
 )
 from backend.services.trade.services.decision_round_io import (
-    entry_prices_from_ledger,
     maybe_write_watch,
     record_round_dialogue,
     record_round_position,
@@ -618,7 +617,9 @@ async def _run_once_inner(
                     decisions=decisions,
                     agent=agent,
                     notes=notes,
-                    entry_prices=entry_prices_from_ledger(ledger),
+                    # 分账账本：成本回填 + watch 只保护本 agent 现有持仓（执行器把它
+                    # 落成卖出规则，未持仓标的挂了也不会成交，只会每天告警缺成本价）
+                    ledger=ledger,
                 )
             # 「取不到」与「真的是空」必须分开（同 ``summary`` 那条纪律）：没有
             # ``outcomes`` 属性时合并结果只剩守护段，审计行会显示「这一轮什么也没发生」

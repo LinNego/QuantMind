@@ -715,22 +715,6 @@ def record_round_position(
         notes.append("arena 持仓落盘未完成（持仓/净值文件面本轮无新行，详见日志）")
 
 
-def entry_prices_from_ledger(ledger: Any) -> dict[str, float]:
-    """账本成本价 → ``{后缀码: cost_price}``（``maybe_write_watch`` 的回填源）。
-
-    **只认分账账本**：桥账户的成本是共享账户的混合口径，不是本 agent 的建仓价。
-    成本缺失/≤0 的持仓跳过（执行器会退回柜台成本，不会拿到一个假成本）。
-    """
-    out: dict[str, float] = {}
-    for code, pos in (getattr(ledger, "positions", None) or {}).items():
-        if not isinstance(pos, Mapping):
-            continue
-        cost = as_float(pos.get("cost_price"))
-        if cost is not None and cost > 0:
-            out[str(code)] = cost
-    return out
-
-
 def maybe_write_watch(
     *,
     deps: RoundDeps,
@@ -738,7 +722,7 @@ def maybe_write_watch(
     decisions: Sequence[Any],
     agent: str,
     notes: list[str],
-    entry_prices: Mapping[str, float] | None = None,
+    ledger: Any = None,
 ) -> Any:
     """守护规则（``watch`` → 规则表，整组替换）。
 
@@ -752,19 +736,35 @@ def maybe_write_watch(
       也得先有一条明确的规则。这一条是本仓**有意**比隔壁保守的地方（隔壁整组替换
       不问空集）。
 
-    ``entry_prices``：``{后缀码: 本 agent 分账成本价}``。模型给的 watch 规则通常
-    只有绝对止损/止盈价、不带建仓成本；写规则时把账本成本一并落进 ``entry_price``，
-    执行器就不必每轮依赖柜台持仓成本——柜台读不到的瞬时窗口会让**已挂的规则整体
-    跳过**（2026-10-19 601000.SH 实测：成本 4.54 明明记在账本里，规则却是
-    ``entry_price=None``）。规则已显式带成本时不覆盖。
+    ``ledger``：本 agent 的分账账本 —— 成本价回填 ``entry_price``（已显式带成本
+    不覆盖；2026-10-19 601000.SH），同时是持仓闸门：账本里没有的标的拒绝 ``watch``
+    （watch 落库是卖出规则，未持仓没有可保护的对象；2026-10-20 688543.SH）。
+    ``None`` = 不校验（老调用点）。
     """
     if slot.schema != SCHEMA_INTRADAY:
         return None
-    from backend.shared.decision.watch_map import plan_watch
+    from backend.services.trade.services.decision_round_ledger import (
+        entry_prices_from_ledger,
+        held_symbols_from_ledger,
+    )
+    from backend.shared.decision.watch_map import REJECT_NOT_HELD, plan_watch
 
-    watch_plan = plan_watch(decisions, agent=agent)
+    held = None if ledger is None else held_symbols_from_ledger(ledger)
+    watch_plan = plan_watch(decisions, agent=agent, held_symbols=held)
+    entry_prices = entry_prices_from_ledger(ledger)
+    not_held = sum(1 for r in watch_plan.rejected if r.reason == REJECT_NOT_HELD)
+    if not_held:
+        notes.append(
+            f"守护规则拒绝 {not_held} 条未持仓标的：watch 只保护现有持仓，不建仓"
+        )
     if not getattr(watch_plan, "rules", ()):
-        notes.append("本轮无 watch 决策：守护规则表**整组保留**（不写空集）")
+        if getattr(watch_plan, "rejected", ()):
+            notes.append(
+                f"本轮 {len(watch_plan.rejected)} 条 watch 全部未挂上："
+                "守护规则表**整组保留**（不写空集）"
+            )
+        else:
+            notes.append("本轮无 watch 决策：守护规则表**整组保留**（不写空集）")
         return None
     if entry_prices:
         filled = 0

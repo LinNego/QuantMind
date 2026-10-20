@@ -1684,12 +1684,40 @@ async def test_watch_rule_without_ledger_cost_leaves_entry_price_empty():
     assert not any("回填分账成本价" in n for n in notes)
 
 
+@pytest.mark.asyncio
+async def test_watch_on_non_held_symbol_is_rejected_and_table_kept():
+    """688543.SH 实录：模型把「回踩 47.60 再首建」写成了 watch。
+
+    watch 落库后是**卖出规则**（跌破减仓/涨到止盈），无持仓时永远不会成交，
+    执行器只会每天推一条「缺少成本价」。分账账本里没有的标的必须拒绝并留痕；
+    全拒时**不写空集**（整组替换会摘掉该 agent 的全部既有守护）。
+    """
+    h = make_harness(
+        decision_text=decisions_json(
+            {
+                "action": "watch",
+                "code": "688543.SH",
+                "pct": 0.1,
+                "stop_loss": 47.6,
+                "reason": "回踩 47.60 不破再小仓首建",
+            }
+        )
+    )
+    result = await run_once(SLOT_1000, deps=h.deps, now=TEN_05)
+    assert result.status == R.STATUS_OK
+    assert result.watch_armed == 0
+    assert h.log["watch"] == []  # 全拒 → 一次写都没有（不写空集）
+    notes = h.log["ledger"][0][0].context_meta["notes"]
+    assert any("拒绝 1 条未持仓标的" in n for n in notes)
+    assert any("整组保留" in n for n in notes)
+
+
 @pytest.mark.unit
 def test_entry_price_backfill_keeps_explicit_value_and_rounds(monkeypatch):
     """回填只补空缺：规则已带成本价时不动它；补进去的值归一到三位小数。"""
     from backend.shared.decision import watch_map
 
-    def fake_plan(decisions, *, agent=""):  # noqa: ARG001
+    def fake_plan(decisions, *, agent="", held_symbols=None):  # noqa: ARG001
         return watch_map.WatchPlan(
             rules=(
                 watch_map.WatchRule(
@@ -1712,7 +1740,14 @@ def test_entry_price_backfill_keeps_explicit_value_and_rounds(monkeypatch):
         decisions=[],
         agent="fake-model",
         notes=notes,
-        entry_prices={"600036.SH": 36.5, "601000.SH": 4.5412},
+        ledger=AgentLedgerRead(
+            ok=True,
+            known=True,
+            positions={
+                "600036.SH": {"cost_price": 36.5},
+                "601000.SH": {"cost_price": 4.5412},
+            },
+        ),
     )
 
     rules = h.log["watch"][0]["plan"].rules

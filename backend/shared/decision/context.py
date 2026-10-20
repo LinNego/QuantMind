@@ -558,11 +558,13 @@ def _intraday_rule_lines(ctx: RebalanceContext) -> list[str]:
         "2. T+1：可卖量 0 的持仓不能卖。ST/*ST/退市整理股与黑名单标的**不可买入**"
         "（闸门硬拦）。买卖/换仓依据 = 信号分数 + 大盘盘面 + 板块主线 + 新闻分子"
         "综合判断，HOLD/BUY 侧标签一律不作为依据。",
-        "3. watch = 挂**条件位**：stop_loss=跌破此价自动减仓 pct 比例、take_profit="
-        "涨到此价自动止盈 pct（至少给一个，由分钟级价格哨兵盯，不用等下一个整点）。"
-        "move_stop 可选：价格**上触**该价后把 stop_loss 上移到该价（只用于浮盈锁利，"
-        "必须高于当前 stop_loss，填低了会被忽略；下破触发请用 stop_loss，别用 move_stop）。",
-        "4. 「③推理论证」里写了具体价位的持仓，**必须**同步落成 watch 决策"
+        "3. watch = 给**现有持仓**挂**条件位**：stop_loss=跌破此价自动减仓 pct 比例、"
+        "take_profit=涨到此价自动止盈 pct（至少给一个，由分钟级价格哨兵盯，不用等"
+        "下一个整点）。move_stop 可选：价格**上触**该价后把 stop_loss 上移到该价"
+        "（只用于浮盈锁利，必须高于当前 stop_loss，填低了会被忽略；下破触发请用 "
+        "stop_loss，别用 move_stop）。watch 只会减仓/止盈、**不会建仓**——"
+        "未持仓的标的不要用 watch，想等回踩再买请在 buy 决策里写清买入条件与 stop_loss。",
+        "4. 「③推理论证」里写了具体价位的**持仓**，**必须**同步落成 watch 决策"
         "（带 code 与 reason 写明触发价与动作）——只写在文字里等于没设防。",
     ]
     if any(h.held_days is not None for h in _display_holdings(ctx)):

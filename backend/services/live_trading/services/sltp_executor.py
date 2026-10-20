@@ -1176,20 +1176,43 @@ async def run_sltp_cycle(
 
         # entry_price：规则显式 → 状态缓存 → 柜台持仓成本价
         entry = _to_float(rule.get("entry_price")) or _to_float(st.get("entry_price"))
-        if not entry and positions is None:
-            positions = await _fetch_positions(deps)
-            entry = _position_entry_price(_find_position(positions, symbol))
         if not entry or entry <= 0:
-            if not st.get("entry_missing_notified"):
-                st["entry_missing_notified"] = True
-                await deps.notify(
-                    user_id,
-                    f"{symbol} 止损规则缺少成本价",
-                    "规则未配置 entry_price 且柜台无持仓成本，无法计算触发线；已跳过。",
-                    "warning",
-                    tenant_id=tenant_id,
-                )
-            continue
+            if positions is None:
+                positions = await _fetch_positions(deps)
+            position = _find_position(positions, symbol)
+            if position is None:
+                # 无持仓：这条规则没有可保护的对象，成本价无从谈起。常见两种来源：
+                # auto 规则是卖出后的残留；LLM 规则是把「回踩某价再买入」写成了
+                # watch（watch 是卖出规则，不建仓）。**不推告警**——每天一条
+                # 「缺少成本价」只会教人忽略告警；状态保持 armed，建仓后下一轮
+                # 自动按柜台成本恢复评估。
+                st["skip_reason"] = "no_position"
+                if not st.get("no_position_logged"):
+                    st["no_position_logged"] = True
+                    logger.info(
+                        "[SltpExec] %s 规则已武装但当前无持仓，跳过评估"
+                        "（该规则是卖出保护，不建仓；建仓后自动恢复）",
+                        symbol,
+                    )
+                continue
+            entry = _position_entry_price(position)
+            if not entry or entry <= 0:
+                # 有持仓但柜台没给成本价 = 真数据问题（清仓后残余行/桥字段缺失），
+                # 需要人看一眼；与「无持仓」分开，保留这条告警。
+                if not st.get("entry_missing_notified"):
+                    st["entry_missing_notified"] = True
+                    await deps.notify(
+                        user_id,
+                        f"{symbol} 止损规则缺少成本价",
+                        "柜台有该标的持仓但未返回成本价（open_price/avg_price/"
+                        "cost_price 均为空），无法计算触发线；已跳过。"
+                        "请检查持仓成本或为该规则显式配置 entry_price。",
+                        "warning",
+                        tenant_id=tenant_id,
+                    )
+                continue
+        if st.get("skip_reason") == "no_position":
+            st.pop("skip_reason", None)  # 建仓后恢复：清掉上一轮的「无持仓」诊断
         st["entry_price"] = entry
 
         # 高水位的凭据校验必须**在本轮抬高之前**：晚一步，本轮的上涨会先把
