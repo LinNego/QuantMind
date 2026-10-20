@@ -142,6 +142,22 @@ def _label(result: RoundResult) -> str:
     return f"{slot}{who}"
 
 
+def _llm_failure_advice(note: str) -> str:
+    """LLM 失败告警的**处置方向**：超时与额度/配置是两条完全不同的排查线。
+
+    2026-10-20 用户实感「经常出现这个问题，有额度的啊」：旧文案把所有 ``api_failed``
+    都指向「查配置与额度」，而实际是 GLM 生成 8k tokens 超过 120s 的读超时。
+    超时 → 供应商排队/生成过慢（可调大名册 ``timeout``）；其余才查 key/余额/端点。
+    """
+    low = str(note or "").lower()
+    if "timeout" in low or "timed out" in low:
+        return (
+            "供应商响应超时（排队/生成过慢，与账户余额无关）；补跑槽会自动重试，"
+            "仍频繁则调大名册里该模型的 timeout。"
+        )
+    return "补跑槽会自动重试；若全天如此，先查模型配置与额度。"
+
+
 def round_alert(result: RoundResult) -> RoundAlert | None:
     """这一轮有没有要推给人的事；没有就 ``None``。
 
@@ -159,7 +175,7 @@ def round_alert(result: RoundResult) -> RoundAlert | None:
             kind=ALERT_LLM_FAILED,
             level="error",
             title=f"决策轮 {label} 模型未出决策",
-            content=f"{note}。\n补跑槽会自动重试；若全天如此，先查模型配置与额度。",
+            content=f"{note}。\n{_llm_failure_advice(note)}",
         )
 
     if result.status == STATUS_ERROR:
@@ -530,6 +546,63 @@ _STATUS_WORD = {
     STATUS_ABORTED: "中止（未发单）",
 }
 
+# 2026-10-20 卡片化（用户原话「qq 的通知 排版不好」）：旧版把整段「方向」策略
+# 叙述塞进池行的括号（``方向=大盘偏弱（…），缩量…``），手机上先滚三行才见计数；
+# 两条 agent 摘要之间也没有边界。改按 ``qq_briefing`` 的卡片口径排版。
+#: 摘要卡片的分隔线（纯文本；QQ 拒 markdown，靠 ━ 划边界）。
+_SUMMARY_RULE = "━" * 14
+#: 方向原文是一整段策略叙述，摘要面只留首句判断（一屏内要看到计数与要点）。
+_DIRECTION_MAX_CHARS = 40
+#: 截断点至少要有这么长的首句，否则硬切到上限（避免砍成「弱」这种残句）。
+_DIRECTION_MIN_CLAUSE_CHARS = 12
+#: 状态 → 一眼判读的图标；未知状态退 ``•``。
+_STATUS_ICON = {
+    STATUS_OK: "✅",
+    STATUS_LLM_FAILED: "⚠️",
+    STATUS_ERROR: "❌",
+    STATUS_ABORTED: "⛔",
+}
+
+
+def _short_direction(text: str) -> str:
+    """方向压成一句：折叠空白；超限时在**第一个够长的顶层分句**处截断。
+
+    截断点只认括号外的 ``，；。``——括号内的顿号是列举（如
+    ``大盘偏弱（上证5日-1.7%、平量、低位）``），在那里切会砍出残句。
+    """
+    flat = " ".join(str(text or "").split())
+    if len(flat) <= _DIRECTION_MAX_CHARS:
+        return flat
+    head = flat[:_DIRECTION_MAX_CHARS]
+    cut = -1
+    depth = 0
+    for idx, ch in enumerate(head):
+        if ch == "（":
+            depth += 1
+        elif ch == "）":
+            depth = max(0, depth - 1)
+        elif depth == 0 and ch in "，；。;":
+            if idx + 1 >= _DIRECTION_MIN_CLAUSE_CHARS:
+                cut = idx
+                break
+    if cut >= 0:
+        head = head[:cut]
+    return head.rstrip("，；。、,; ") + "…"
+
+
+def _split_highlight(text: str) -> tuple[str, str]:
+    """把要点行尾的 ``（理由）`` 拆出来：正文一行、理由折到 ``↳`` 续行。
+
+    手机上一行长理由会挤成两三行且括号悬空；折行后每条要点都是「做了什么 /
+    为什么」两段。没有全角括号（或括号未收尾）就原样返回。
+    """
+    head, sep, tail = text.partition("（")
+    if sep and tail.endswith("）"):
+        reason = tail[:-1].strip()
+        if reason:
+            return head.rstrip(), reason
+    return text, ""
+
 
 def round_summary(result: RoundResult) -> str | None:
     """一轮干完活之后的**值班摘要**正文（纯函数）；``skipped`` 没有摘要。
@@ -540,11 +613,12 @@ def round_summary(result: RoundResult) -> str | None:
 
     2026-10-15 增：``meta["highlights"]``（``decision_round_notes.round_highlights``
     提炼的执行要点）逐条渲染成 ``▸`` 行——摘要要报「做了什么」而非只有计数；
-    没有/取不到就不渲染（不编占位）。唤醒轮首行带 ``⏰唤醒``。
+    没有/取不到就不渲染（不编占位）。唤醒轮状态行带 ``⏰唤醒``。
     """
     if result.status == STATUS_SKIPPED:
         return None
     word = _STATUS_WORD.get(result.status, result.status)
+    icon = _STATUS_ICON.get(result.status, "•")
     meta = result.meta if isinstance(result.meta, Mapping) else {}
     pool = meta.get("pool")
     pool = dict(pool) if isinstance(pool, Mapping) else {}
@@ -555,33 +629,43 @@ def round_summary(result: RoundResult) -> str | None:
             bits.append(f"展示 {int(pool.get('shown') or 0)}")
         if "dropped" in pool:
             bits.append(f"滤除 {int(pool.get('dropped') or 0)}")
-        direction = str(pool.get("direction") or "").strip()
-        if direction:
-            bits.append(f"方向={direction}")
         if bits:
-            seg += "（" + "，".join(bits) + "）"
+            seg += " · " + " · ".join(bits)
     else:
         seg = "池 —（未记录）"
-    wake_tag = " ｜ ⏰唤醒" if _is_wake(result) else ""
+    failed = int(result.failed or 0)
+    counts = (
+        f"决策 {int(result.decisions or 0)} · 腿 {int(result.legs or 0)} · "
+        f"提交 {int(result.submitted or 0)}"
+    )
+    if failed:  # 「失败 0」不占手机一行——只有真失败才出现
+        counts += f"（失败 {failed}）"
+    wake_tag = " · ⏰唤醒" if _is_wake(result) else ""
     lines = [
-        f"轮次 {result.round_id} ｜ 状态：{word}{wake_tag}",
+        _SUMMARY_RULE,
+        f"{icon} {word}{wake_tag} · 轮次 {result.round_id}",
         seg,
-        (
-            f"决策 {int(result.decisions or 0)} ｜ 腿 {int(result.legs or 0)} ｜ "
-            f"提交 {int(result.submitted or 0)}（失败 {int(result.failed or 0)}）"
-        ),
     ]
+    direction = _short_direction(str(pool.get("direction") or ""))
+    if direction:
+        lines.append(f"方向：{direction}")
+    lines.append(counts)
     if int(result.watch_armed or 0) > 0:
         lines.append(f"守护规则 {int(result.watch_armed)} 条")
     highlights = meta.get("highlights")
     if isinstance(highlights, (list, tuple)):
         for row in highlights:
             text = " ".join(str(row).split())
-            if text:
-                lines.append(f"▸ {text}")
+            if not text:
+                continue
+            head, reason = _split_highlight(text)
+            lines.append(f"▸ {head}")
+            if reason:
+                lines.append(f"　　↳ {reason}")
     note = str(result.note or "").strip()
     if note:
         lines.append(f"说明：{note}")
+    lines.append(_SUMMARY_RULE)
     return "\n".join(lines)
 
 
@@ -630,7 +714,7 @@ async def summarize_round(result: RoundResult, *, alerted: bool) -> bool:
     if alerted or not summary_due(result):
         return False
     try:
-        sent = await _send_summary_qq(f"决策轮摘要 · {label}", body)
+        sent = await _send_summary_qq(f"📊 决策轮摘要 · {label}", body)
     except Exception as exc:  # noqa: BLE001 通知层的毛病不许带走跑完的一轮
         logger.warning("[DecisionRound] 摘要推送异常 %s: %s", label, exc)
         return False

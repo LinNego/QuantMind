@@ -666,6 +666,11 @@ async def test_real_db_sell_clamps_and_writes_a_roundtrip_row():
             await session.commit()
         assert out.applied == 100, "只记实际持有的"
         assert "500" in out.note and "100" in out.note
+        # 卖出回执口径随 outcome 带回（成本/持有天数/是否清仓）——成交 QQ 的
+        # 「盈亏多少、持有几天」就是这三个值，不在通知层重算第二份算术。
+        assert out.cost_price == pytest.approx(30.0)
+        assert out.holding_days is not None and 3.0 <= out.holding_days < 3.1
+        assert out.closed is True
 
         from backend.shared.agent_ledger_contract import ROUNDTRIP_TABLE
 

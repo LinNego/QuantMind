@@ -131,6 +131,24 @@ def test_llm_failure_is_reported_under_its_own_kind() -> None:
     assert alert.kind == A.ALERT_LLM_FAILED
     assert alert.level == "error"
     assert "401 欠费" in alert.content
+    assert "额度" in alert.content  # 非超时失败仍按配置/额度方向排查
+
+
+def test_timeout_failure_advice_points_at_the_provider_not_quota() -> None:
+    """ReadTimeout ≠ 额度问题（2026-10-20 用户实感「有额度的啊」）：处置方向要说对。
+
+    超时的处置是「供应商排队/生成过慢」，可调大该模型 timeout；把人引去查余额
+    只会让真正的原因（120s 不够 GLM 生成 8k tokens）永远没人看。
+    """
+    alert = A.round_alert(
+        _result(
+            status=STATUS_LLM_FAILED,
+            note="LLM 未给出决策（api_failed）：ReadTimeout: The read operation timed out",
+        )
+    )
+    assert alert is not None
+    assert "超时" in alert.content
+    assert "额度" not in alert.content
 
 
 def test_execution_error_status_is_reported() -> None:
@@ -671,10 +689,59 @@ def test_summary_carries_the_pool_rows_and_legs() -> None:
     )
     assert body is not None
     assert "池 30 行" in body  # pool.rows
-    assert "展示 12" in body and "滤除 18" in body and "方向=看多" in body
+    assert "展示 12" in body and "滤除 18" in body and "方向：看多" in body
     assert "决策 5" in body and "腿 2" in body and "提交 2" in body
     assert "守护规则 1 条" in body
     assert "rnd-20260924-0935" in body and "提交完成" in body
+
+
+# ── 卡片排版（2026-10-20）：用户原话「qq 的通知 排版不好」 ────────────────
+# 旧版把「方向」整段策略叙述塞进池行的括号里（`方向=大盘偏弱（…），缩量…`），
+# 手机上要滚三四行才看到计数；两条 agent 摘要之间也没有边界，视觉上糊成一条。
+# 新版按 ``qq_briefing`` 卡片口径：━ 分隔线包住正文、方向独占一行且只留首句、
+# 计数用 ``·`` 轻分隔、▸ 要点把长理由折到第二行（↳）。
+_SUMMARY_RULE = "━" * 14
+
+
+def test_summary_is_framed_as_a_card() -> None:
+    """首尾各有分隔线，状态行带图标与轮次；两条摘要之间有可见边界。"""
+    body = A.round_summary(
+        _result(decisions=3, legs=1, submitted=1, note="提交完成", meta=_pool_meta())
+    )
+    assert body is not None
+    lines = body.splitlines()
+    assert lines[0] == _SUMMARY_RULE and lines[-1] == _SUMMARY_RULE
+    assert "✅ 跑完" in lines[1] and "rnd-20260924-0935" in lines[1]
+
+
+def test_a_long_direction_keeps_only_the_leading_clause() -> None:
+    """方向原文是整段策略叙述：摘要面只留首句判断，其余折成省略号。"""
+    direction = (
+        "大盘偏弱（上证5日-1.7%、平量、低位），缩量普跌下生存基调：减弱势仓、"
+        "留现金、禁止逆势买入；监管制度利好（四项举措、18只主动ETF）中期偏多"
+    )
+    body = A.round_summary(
+        _result(legs=1, submitted=1, meta=_pool_meta(direction=direction))
+    )
+    assert body is not None
+    assert "方向：大盘偏弱（上证5日-1.7%、平量、低位）…" in body
+    assert "缩量普跌下生存基调" not in body  # 余下叙述不上卡
+
+
+def test_short_direction_is_rendered_verbatim() -> None:
+    """短方向不截断、不加省略号（防截断逻辑把正常值也改坏）。"""
+    body = A.round_summary(
+        _result(legs=1, submitted=1, meta=_pool_meta(direction="看多"))
+    )
+    assert body is not None and "方向：看多" in body and "看多…" not in body
+
+
+def test_zero_failure_count_is_not_rendered() -> None:
+    """失败 0 不占一行字：只在真失败时出现（手机屏幕每一行都值钱）。"""
+    quiet = A.round_summary(_result(legs=1, submitted=1, failed=0, meta=_pool_meta()))
+    noisy = A.round_summary(_result(legs=1, submitted=1, failed=1, meta=_pool_meta()))
+    assert quiet is not None and "失败 0" not in quiet
+    assert noisy is not None and "失败 1" in noisy
 
 
 def test_a_skipped_round_has_no_summary() -> None:
@@ -884,8 +951,11 @@ def test_summary_renders_the_decision_highlights() -> None:
         )
     )
     assert body is not None
-    assert "▸ 买入 中国石油(SH601857) 800股 @12.33（60 日新高放量）" in body
-    assert "▸ 卖出 中国核电(SH601985) 500股 @9.18（跌破 20 日线）" in body
+    # 要点主体一行，长理由折到 ↳ 续行（手机上括号里的理由不会再挤成第二三行）
+    assert "▸ 买入 中国石油(SH601857) 800股 @12.33" in body
+    assert "↳ 60 日新高放量" in body
+    assert "▸ 卖出 中国核电(SH601985) 500股 @9.18" in body
+    assert "↳ 跌破 20 日线" in body
     assert body.index("决策 2") < body.index("▸") < body.index("说明：")
 
 
@@ -906,6 +976,7 @@ def test_highlight_lines_are_flattened_to_one_line() -> None:
     )
     assert body is not None
     assert "▸ 买入 中国石油(SH601857) 800股 @12.33" in body
+    assert "↳" not in body  # 没有理由就没有续行（不编空段）
 
 
 def test_a_wake_round_carries_the_clock_mark() -> None:
@@ -950,7 +1021,8 @@ async def test_a_wake_round_push_carries_the_clock_and_the_highlights(
     assert pushed is True and len(sent) == 1
     title, content = sent[0]
     assert "⏰" in title and "12:55" in title
-    assert "▸ 买入 中国石油(SH601857) 800股 @12.33（放量突破）" in content
+    assert "▸ 买入 中国石油(SH601857) 800股 @12.33" in content
+    assert "↳ 放量突破" in content
 
 
 # ── 停滞：worker 活着，但整天一轮都没跑成 ──────────────────────────────

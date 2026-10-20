@@ -73,6 +73,76 @@ def test_sell_side_keeps_execution_wording(monkeypatch):
     assert "卖出" in calls[0][0]
 
 
+# ── 卖出回执带盈亏与持有天数（2026-10-20 用户要求）─────────────────────
+# 用户原话：「这个通知要告知盈利多少。持有几天。卖出时候。」数据来自分账账本
+# 回合行（成本/买入时刻/是否清仓由 record_sell 在成交同一事务里算出）——取不到
+# 成本就不渲染盈亏段，绝不按 0 成本编一个假 P&L。
+def test_sell_fill_shows_realized_pnl_holding_days_and_liquidation(
+    monkeypatch,
+):
+    calls = _capture(monkeypatch)
+    tps._notify_fill_qq(
+        _fill(
+            side="sell",
+            filled_volume=400,
+            filled_price=4.8,
+            cost_price=4.2,
+            holding_days=3.0,
+            closed=True,
+        )
+    )
+    title, content = calls[0]
+    assert "卖出" in title and "400股" in title.replace(" ", "")
+    assert "盈亏 +¥240（+14.29%）" in content
+    assert "持有 3 天" in content
+    assert "清仓" in content and "减仓" not in content
+
+
+def test_a_loss_is_shown_with_a_minus_sign(monkeypatch):
+    calls = _capture(monkeypatch)
+    tps._notify_fill_qq(
+        _fill(
+            side="sell",
+            filled_volume=400,
+            filled_price=4.8,
+            cost_price=5.0,
+            holding_days=1.5,
+            closed=False,
+        )
+    )
+    _, content = calls[0]
+    assert "盈亏 -¥80（-4.00%）" in content
+    assert "持有 1.5 天" in content
+    assert "减仓" in content and "清仓" not in content
+
+
+def test_buy_fill_never_renders_a_pnl_block(monkeypatch):
+    """买入没有已实现盈亏；就算上游误塞了成本字段也不许渲染。"""
+    calls = _capture(monkeypatch)
+    tps._notify_fill_qq(_fill(cost_price=4.2, holding_days=3.0, closed=True))
+    _, content = calls[0]
+    assert "盈亏" not in content and "持有" not in content
+
+
+def test_sell_without_cost_basis_omits_the_pnl_block(monkeypatch):
+    """账本没这一笔（人工单/无 agent 归属）→ 只报成交事实，绝不编盈亏。"""
+    calls = _capture(monkeypatch)
+    tps._notify_fill_qq(_fill(side="sell", cost_price=0, holding_days=2.0))
+    _, content = calls[0]
+    assert "盈亏" not in content and "持有" not in content
+
+
+def test_roundtrip_fields_map_the_ledger_outcome():
+    """分账 outcome → 回执字段：只搬成本口径；无成本一律空（不臆造）。"""
+    from backend.shared.agent_ledger_store import ApplyOutcome
+
+    assert tps._sell_roundtrip_fields(
+        ApplyOutcome(applied=100, cost_price=4.2, holding_days=3.0, closed=False)
+    ) == {"cost_price": 4.2, "holding_days": 3.0, "closed": False}
+    assert tps._sell_roundtrip_fields(ApplyOutcome(applied=100)) == {}
+    assert tps._sell_roundtrip_fields(None) == {}
+
+
 def test_falls_back_to_symbol_when_name_mapper_down(monkeypatch):
     # 名称解析失败 → 标题退化为符号，仍然要推（告警面不该被旁路组件拖死）
     calls = _capture(monkeypatch, name=None)

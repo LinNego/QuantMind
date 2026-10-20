@@ -10,6 +10,7 @@ TdxPushService - QuantMind ↔ 通达信 双向推送服务
 
 import asyncio
 import logging
+import math
 import os
 import uuid
 from typing import Any, NamedTuple, Optional
@@ -76,6 +77,59 @@ def _fill_transitioned(
     return str(prior_status or "").lower() != "filled"
 
 
+def _sell_roundtrip_fields(outcome: Any) -> dict[str, Any]:
+    """``ApplyOutcome`` → 回执里带得走的成本口径（无成本/买入 → 空 dict）。
+
+    只搬**账本已经算好**的三个值，不在这里重算：盈亏与持有天数的口径只有
+    ``record_sell``/``_roundtrip_row`` 一处（成交回执不该长出第二份算术）。
+    """
+    try:
+        cost = float(getattr(outcome, "cost_price", None) or 0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    if cost <= 0:
+        return {}
+    fields: dict[str, Any] = {"cost_price": cost}
+    days = getattr(outcome, "holding_days", None)
+    if days is not None:
+        fields["holding_days"] = float(days)
+    closed = getattr(outcome, "closed", None)
+    if closed is not None:
+        fields["closed"] = bool(closed)
+    return fields
+
+
+def _sell_pnl_segment(fill: dict, volume: int, price: float) -> str:
+    """卖出回执的**已实现盈亏 + 持有天数**一段（2026-10-20 用户要求）。
+
+    数据来自分账回合行（``agent_ledger_store._roundtrip_of`` 随成交同事务落库，
+    经 ``ApplyOutcome`` 带回）：成本取持仓成本价，持有天数取「买入时刻 → 成交时刻」，
+    ``closed`` 区分清仓与减仓。**没有成本（人工单/无 agent 归属）就返回空串**——
+    宁可少一段，也不按 0 成本编一个假 P&L（同「宁缺数字不端 0 元假账」纪律）。
+    """
+    try:
+        cost = float(fill.get("cost_price") or 0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    if cost <= 0 or volume <= 0 or price <= 0:
+        return ""
+    pnl = (price - cost) * volume
+    pnl_pct = (price / cost - 1.0) * 100.0
+    sign = "+" if pnl >= 0 else "-"
+    seg = f"盈亏 {sign}¥{abs(pnl):,.0f}（{pnl_pct:+.2f}%）"
+    try:
+        days = float(fill.get("holding_days"))
+    except (TypeError, ValueError):
+        days = None
+    if days is not None and math.isfinite(days):
+        seg += f" · 持有 {days:g} 天"
+    if fill.get("closed") is True:
+        seg += " · 清仓"
+    elif fill.get("closed") is False:
+        seg += " · 减仓"
+    return seg
+
+
 def _notify_fill_qq(fill: dict) -> None:
     """真单成交 → QQ 回执（执行面用词保留「买入/卖出」；失败只降级绝不反噬）。
 
@@ -117,6 +171,10 @@ def _notify_fill_qq(fill: dict) -> None:
         exchange_id = str(fill.get("exchange_order_id") or "").strip()
         if exchange_id:
             body += f" · 委托 {exchange_id}"
+        if is_sell:
+            pnl_seg = _sell_pnl_segment(fill, volume, price)
+            if pnl_seg:
+                body += "\n" + pnl_seg
         notify_async(title, body)
     except Exception:  # noqa: BLE001 通知失败不许反噬成交落库
         logger.warning("[TdxPush] 成交 QQ 回执降级跳过", exc_info=True)
@@ -864,6 +922,9 @@ class TdxPushService:
             fee = estimate_order_fee(filled_value, side)
             filled_at = submitted_at if order_status == OrderStatus.FILLED else None
 
+            # 本轮分账回合行带来的卖出成本口径（成交回执要报盈亏/持有天数/清仓）；
+            # 无 agent 归属或买入单保持空，回执就不渲染这一段。
+            pnl_fields: dict[str, Any] = {}
             prior = existing.get(exchange_id)
             prior_status = (
                 getattr(prior.status, "value", prior.status) if prior else None
@@ -1057,7 +1118,7 @@ class TdxPushService:
                             # 分账（乙2）：无 agent 的单静默跳过（返回 None）；
                             # 失败**不 catch**（纪律 3：与成交行同事务，写不进去
                             # 就整轮重投——宁可晚记，不可「成交在、账本无」）。
-                            await post_fill_for_order(
+                            outcome = await post_fill_for_order(
                                 db,
                                 order=_LedgerOrderRef(
                                     order_id=str(order_pk),
@@ -1082,6 +1143,8 @@ class TdxPushService:
                                 ),
                                 trade_date=executed_at,
                             )
+                            if order_side == OrderSide.SELL and outcome:
+                                pnl_fields = _sell_roundtrip_fields(outcome)
 
             if became_filled:
                 fills.append(
@@ -1091,6 +1154,7 @@ class TdxPushService:
                         "filled_volume": filled_volume,
                         "filled_price": filled_price,
                         "exchange_order_id": exchange_id,
+                        **pnl_fields,
                     }
                 )
         if skipped_no_key or skipped_no_price:

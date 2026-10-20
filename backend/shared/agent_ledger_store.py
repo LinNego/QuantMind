@@ -106,6 +106,11 @@ class ApplyOutcome:
     * ``note``：非空即代表本次记账与入参不一致（坏 tick、超卖、卖非持仓、方向不认识、
       或是重复投递）。**必须进日志**，不是可选项。
     * ``virtual_cash``：记账后该 agent 的虚拟现金（重复投递时 = 当前值）。
+
+    卖出（真记上时）额外带回合行的成本口径 ``cost_price`` / ``holding_days`` /
+    ``closed``：成交回执（``tdx_push_service._notify_fill_qq``）用它们渲染
+    「盈亏多少、持有几天、清仓还是减仓」。买入与未记上的卖出保持 ``None``——
+    ``None`` 的语义是「不知道」，调用方**不得**回落到 0 编一个假 P&L。
     """
 
     applied: float = 0.0
@@ -113,6 +118,9 @@ class ApplyOutcome:
     note: str = ""
     approx_price: bool = False
     virtual_cash: float | None = None
+    cost_price: float | None = None
+    holding_days: float | None = None
+    closed: bool | None = None
 
 
 # ── 纯映射（无 DB）──────────────────────────────────────────────────
@@ -431,6 +439,9 @@ async def apply_fill(
         note=note,
         approx_price=approx,
         virtual_cash=new_cash,
+        cost_price=_finite(rt.get("cost_price")) if rt else None,
+        holding_days=_finite(rt.get("holding_days")) if rt else None,
+        closed=(bool(rt.get("closed")) if rt is not None else None),
     )
 
 
