@@ -258,6 +258,14 @@ def main() -> None:
     ap.add_argument("--only", default="", help="只算这些因子名（逗号分隔）")
     ap.add_argument("--bank-size", type=int, default=BANK_SIZE)
     ap.add_argument("--start-dt", default=START_DT)
+    ap.add_argument(
+        "--start-year", type=int, default=0,
+        help="只装载该自然年及以后的 K 线（尾窗增量；0=全历史）",
+    )
+    ap.add_argument(
+        "--max-days", type=int, default=0,
+        help="只保留末 N 个交易日求值（尾窗增量；0=不截断）",
+    )
     ap.add_argument("--max-symbols", type=int, default=None, help="试点用：只取前 N 只票")
     ap.add_argument("--out-root", default="", help="覆盖产出目录（试点用）")
     ap.add_argument("--dry-run", action="store_true", help="只求值不落盘（试点用）")
@@ -268,7 +276,11 @@ def main() -> None:
     out_root = Path(args.out_root) if args.out_root else OUT_ROOT
     partial_root = PARTIAL_ROOT if not args.out_root else out_root.parent / "_partial_pilot"
 
-    W = alf.load_kline(max_symbols=args.max_symbols)
+    W = alf.load_kline(
+        start_year=args.start_year or None, max_symbols=args.max_symbols
+    )
+    if args.max_days:
+        W = {k: v.iloc[-args.max_days:] for k, v in W.items()}
     days, syms = W["close"].index, list(W["close"].columns)
     log.info("网格 %d 交易日 × %d 标的（%s ~ %s）",
              len(days), len(syms), days[0].date(), days[-1].date())

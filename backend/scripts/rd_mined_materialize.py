@@ -811,7 +811,9 @@ def _resolve_h5(h5_path: str | None) -> Path:
     return cache
 
 
-def _generate_shared_h5(cache_path: Path) -> None:
+def _generate_shared_h5(
+    cache_path: Path, *, start_date: date | None = None
+) -> None:
     from backend.services.engine.rd_agent.rd_loop_wrapper import RDLoopWrapper
 
     wrapper = RDLoopWrapper(market=DEFAULT_MARKET)
@@ -819,9 +821,59 @@ def _generate_shared_h5(cache_path: Path) -> None:
     # 若传缓存自身会「先删目标再链接」把缓存毁掉。
     with tempfile.TemporaryDirectory(prefix="rd_mined_h5_") as tmp:
         wrapper._generate_h5_from_parquet(  # noqa: SLF001 - 复用既有生成器
-            str(_quantdb_dir()), str(Path(tmp) / "daily_pv.h5"), debug=False
+            str(_quantdb_dir()),
+            str(Path(tmp) / "daily_pv.h5"),
+            debug=False,
+            start_date=start_date,
         )
+    if not cache_path.is_file():
+        raise RuntimeError(f"共享 h5 生成后目标缓存不存在：{cache_path}")
     logger.info("daily_pv.h5 已生成/复用：%s", cache_path)
+
+
+#: 尾窗数据面前置月数：最大回看 240 个交易日（≈12 个月）+ 缓冲。
+_TAIL_LOOKBACK_MONTHS = 18
+
+
+def _tail_h5_start(since: date) -> date:
+    """尾窗数据面起点：锚到 ``since`` 前 18 个月的月初（月内稳定，缓存可复用）。"""
+    anchor = pd.Timestamp(since) - pd.DateOffset(months=_TAIL_LOOKBACK_MONTHS)
+    return date(anchor.year, anchor.month, 1)
+
+
+def _resolve_tail_h5(since: date) -> Path:
+    """刷新模式数据面：只覆盖 ``since`` 之后所需尾窗的共享缓存。
+
+    因子代码最大回看 240 个交易日且无 expanding/cumsum，固定起点尾窗即可
+    正确算出新日期值；避免每晚重生成 8GB 全历史缓存。缓存名与生成器同一
+    命名函数（窗口 + 数据集选择），mtime 新鲜时直接复用。
+    """
+    from backend.services.engine.rd_agent.rd_loop_wrapper import (
+        _H5_DEFAULT_END,
+        _h5_cache_name,
+        datasets_from_env,
+    )
+
+    start = _tail_h5_start(since)
+    datasets = datasets_from_env()
+    cache = (
+        _quantdb_dir()
+        / ".h5_cache"
+        / _h5_cache_name(False, start, _H5_DEFAULT_END, datasets)
+    )
+    if cache.is_file() and not _h5_is_valid(cache):
+        logger.warning("尾窗 h5 缓存非有效 HDF5，删除重生成：%s", cache)
+        cache.unlink(missing_ok=True)
+    if not cache.is_file():
+        logger.info("生成尾窗数据面 %s ~ 最新（缓存 %s）", start, cache)
+        _generate_shared_h5(cache, start_date=start)
+    if not _h5_is_valid(cache):
+        raise RuntimeError(f"尾窗 daily_pv.h5 非有效 HDF5：{cache}")
+    try:
+        os.chmod(cache, 0o444)
+    except OSError:  # pragma: no cover - 非 POSIX/权限受限时静默
+        pass
+    return cache
 
 
 def _resolve_minute_face(h5_path: str | None, row: Mapping[str, Any]) -> Path:
@@ -1649,12 +1701,130 @@ async def materialize_overview(*, market: str = DEFAULT_MARKET) -> dict[str, Any
     }
 
 
+def _select_refresh_targets(
+    rows: list[Mapping[str, Any]],
+    manifest: Mapping[str, Any],
+    *,
+    factor_ids: set[str] | None = None,
+) -> tuple[list[tuple[dict[str, Any], str]], dict[str, int]]:
+    """刷新模式候选：只取清单里 ``materialized`` 的日频因子及其落库列名。
+
+    刷新只补新交易日值，不重跑门禁/值级查重、不改清单状态；分钟因子
+    的数据面是任务级分钟 face，不在日频共享 h5 尾窗范围内，跳过并计数。
+    """
+    targets: list[tuple[dict[str, Any], str]] = []
+    skipped = {"not_materialized": 0, "no_column": 0, "minute": 0}
+    for row in rows:
+        factor_id = str(row.get("factor_id") or "")
+        if factor_ids is not None and factor_id not in factor_ids:
+            continue
+        entry = manifest.get(factor_id) or {}
+        if str(entry.get("status") or "") != "materialized":
+            skipped["not_materialized"] += 1
+            continue
+        column = str(entry.get("column") or "")
+        if not column:
+            skipped["no_column"] += 1
+            continue
+        if _row_native_freq(row) != FREQ_DAY:
+            skipped["minute"] += 1
+            continue
+        targets.append((dict(row), column))
+    return targets, skipped
+
+
+async def _run_refresh(args: argparse.Namespace) -> int:
+    """尾窗刷新：已物化因子的新交易日值（不做门禁/查重/清单变更）。"""
+    lib_root = _lib_root()
+    since = datetime.strptime(str(args.refresh_since), "%Y%m%d").date()
+    until = (
+        datetime.strptime(str(args.refresh_end), "%Y%m%d").date()
+        if args.refresh_end
+        else date.today()
+    )
+    if since > until:
+        logger.error("刷新窗口非法：%s > %s", since, until)
+        return 2
+    manifest = _load_manifest(lib_root)
+    rows = await _query_candidates(market=args.market)
+    factor_ids = set(args.factor_ids) if args.factor_ids else None
+    targets, skipped = _select_refresh_targets(
+        rows, manifest, factor_ids=factor_ids
+    )
+    logger.info(
+        "刷新 %s ~ %s：候选 %d，跳过 %s", since, until, len(targets), skipped
+    )
+    if not targets:
+        return 0
+    if args.dry_run:
+        for row, column in targets[:30]:
+            logger.info(
+                "  [dry-run] %s → %s",
+                str(row.get("factor_id") or "")[:8],
+                column,
+            )
+        if len(targets) > 30:
+            logger.info("  ... 其余 %d 条", len(targets) - 30)
+        return 0
+
+    face = _resolve_tail_h5(since)
+    logger.info("尾窗数据面 = %s", face)
+    stats = {"factors": len(targets), "written": 0, "empty": 0, "errors": 0}
+    dirty_library = False
+    for idx, (row, column) in enumerate(targets, 1):
+        factor_id = str(row.get("factor_id") or "")
+        try:
+            values = _compute_factor_values(
+                row, face, timeout=_exec_timeout(row, args.timeout)
+            )
+            if values.empty:
+                raise RuntimeError("因子值为全空")
+            day_index = values.index.get_level_values(0)
+            tail = values[
+                (day_index >= since.isoformat()) & (day_index <= until.isoformat())
+            ]
+            if tail.empty:
+                stats["empty"] += 1
+                logger.warning("[%d/%d] %s 尾窗无值", idx, len(targets), column)
+                continue
+            dirty_library = True
+            written = _write_factor(tail, column)
+            stats["written"] += 1
+            logger.info(
+                "[%d/%d] %s → %d 个非空值（%s ~ %s）",
+                idx,
+                len(targets),
+                column,
+                written,
+                tail.index.get_level_values(0).min(),
+                tail.index.get_level_values(0).max(),
+            )
+        except Exception as exc:  # noqa: BLE001 - 单因子失败继续，汇总非零退出
+            stats["errors"] += 1
+            logger.exception("[%d/%d] %s 刷新失败：%s", idx, len(targets), factor_id[:8], exc)
+    if dirty_library:
+        report = _align_partition_schemas(lib_root)
+        logger.info("分区 schema 对齐：%s", report)
+    if args.register:
+        try:
+            await _register_library(lib_root, force=args.force_register)
+        except Exception as exc:  # noqa: BLE001 - 注册失败不影响已写数据
+            logger.exception("目录注册失败：%s", exc)
+            stats["errors"] += 1
+    logger.info("刷新汇总：%s", stats)
+    return 0 if stats["errors"] == 0 else 1
+
+
 async def _run(args: argparse.Namespace) -> int:
     lib_root = _lib_root()
     lock = _acquire_run_lock()
     if lock is None:
         logger.warning("另一个物化进程正在运行，本次跳过（避免并发写同一座库）")
         return 0
+    # 用 getattr：单元测试以最小 Namespace 直接调 _run，缺属性不能变成
+    # AttributeError（ argparse 主路径恒有该属性，行为不变）
+    if getattr(args, "refresh_since", None):
+        return await _run_refresh(args)
     if args.gates_only:
         return await _run_gates_only(args)
     if args.align_only:
@@ -2112,6 +2282,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--align-only", action="store_true", help="只做分区 schema 对齐后退出"
     )
     parser.add_argument(
+        "--refresh-since",
+        default="",
+        help=(
+            "尾窗刷新模式起点（YYYYMMDD）：只补已物化因子的新交易日值，"
+            "不跑门禁/查重、不改清单"
+        ),
+    )
+    parser.add_argument(
+        "--refresh-end",
+        default="",
+        help="尾窗刷新终点（YYYYMMDD，默认今天）",
+    )
+    parser.add_argument(
         "--gates-only",
         action="store_true",
         help=(
@@ -2131,6 +2314,23 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                 parser.error(
                     f"{flag} 与 --gates-only 不兼容（复评按清单范围，不做物化/注册）"
                 )
+    if args.refresh_since:
+        for flag, value in (
+            ("--task-id", args.task_id),
+            ("--align-only", args.align_only),
+            ("--gates-only", args.gates_only),
+            ("--force", args.force),
+            ("--no-corr-gate", args.no_corr_gate),
+            ("--limit", args.limit),
+        ):
+            if value:
+                parser.error(f"{flag} 与 --refresh-since 不兼容（刷新只补新日期值）")
+        try:
+            datetime.strptime(args.refresh_since, "%Y%m%d")
+            if args.refresh_end:
+                datetime.strptime(args.refresh_end, "%Y%m%d")
+        except ValueError:
+            parser.error("--refresh-since/--refresh-end 需为 YYYYMMDD")
     args.factor_ids = [
         s.strip() for s in str(args.factor_ids or "").split(",") if s.strip()
     ]
