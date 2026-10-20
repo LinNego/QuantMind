@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 
 from backend.shared.decision.context import PoolQuote
 from backend.shared.decision_context_source import day_change_pct
+from backend.shared.stock_utils import StockCodeUtil
 
 #: regime 快照「新鲜」窗口（分钟）：引擎 60 秒刷新，超过 5 分钟没动 = 服务停摆或
 #: 非交易时段（盘前轮拿到的多是昨收后那一版）——如实标旧，不静默当实时。
@@ -533,14 +534,204 @@ def build_minute_block(
     return "\n".join([header] + lines)
 
 
-def build_l2_block() -> str:
-    """丁2【L2 微观结构】门控块：QM 无盘中逐笔 L2 源——如实不可得，永不静默。"""
-    return (
-        "【L2 微观结构】本轮不可得——QM 未接入盘中逐笔 L2 源（内外盘/大单/主力"
-        "资金等逐笔指标缺位；日频 L2 因子在 QuantDB，不构成盘中口径）。盘口类"
-        "异动的替代口径是五档失衡（见【实时盘口】，那是代理、不是 L2）。"
-        "不要凭空推断逐笔资金流向。"
+#: L2 快照新鲜窗（秒）：与 ``tdx_l2_capture_task._REALTIME_MAX_AGE_SEC`` 同口径
+#: （900s）。采集每轮把快照写 PG；超过 15 分钟没更新 = 断流/非交易时段——陈旧
+#: 微观结构当当前盘口用比没有更危险。
+L2_SNAPSHOT_STALE_SEC = 900.0
+
+#: 采集侧时段因子（分钟数 = 开盘后偏移，与 ``tdx_l2_capture_task.ZONE_BOUNDARIES``
+#: 同源）。只有**已进入**的时段有真值：未进入时 baseline=0 → ratio 恒 1.0（实现
+#: 事实），渲染层必须滤掉，否则等于喂一个假「满量」。
+_L2_ZONES = (("T3", 600), ("T4", 630), ("T5", 660), ("T6", 780))
+
+#: 未接线门控文本（**字节冻结**：旧替身/历史提示词逐字节不变）。
+_L2_UNWIRED_TEXT = (
+    "【L2 微观结构】本轮不可得——QM 未接入盘中逐笔 L2 源（内外盘/大单/主力"
+    "资金等逐笔指标缺位；日频 L2 因子在 QuantDB，不构成盘中口径）。盘口类"
+    "异动的替代口径是五档失衡（见【实时盘口】，那是代理、不是 L2）。"
+    "不要凭空推断逐笔资金流向。"
+)
+
+
+def _l2_key(code: object) -> str:
+    """股票代码 → PG L2 快照的键口径（前缀码 ``SH600036``）。"""
+    return StockCodeUtil.to_prefix(str(code or ""))
+
+
+def _l2_age_s(row: Mapping[str, Any], now: datetime) -> float | None:
+    """快照 ``ts`` → 距 ``now`` 秒数；naive 时间戳不猜时区 → ``None``。"""
+    ts = row.get("ts")
+    if not isinstance(ts, datetime) or ts.tzinfo is None or now.tzinfo is None:
+        return None
+    return max(0.0, (now - ts).total_seconds())
+
+
+def _l2_age_text(age: float | None) -> str:
+    if age is None:
+        return ""
+    return f"快照 {age:.0f}s 前" if age < 90 else f"快照 {age / 60:.0f} 分钟前"
+
+
+def _l2_started_zones(row: Mapping[str, Any], now: datetime | None) -> set[str]:
+    """已进入的采集时段（用**快照时刻**判定，不用轮次时刻）。"""
+    moment = row.get("ts")
+    if not isinstance(moment, datetime):
+        moment = now
+    if not isinstance(moment, datetime):
+        return set()
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(_CST)
+    minute = moment.hour * 60 + moment.minute
+    return {zone for zone, start in _L2_ZONES if minute >= start}
+
+
+def _l2_half(value: float | None) -> str:
+    return "—" if value is None else f"{value:.2f}"
+
+
+def _l2_factor_tokens(row: Mapping[str, Any], zones: set[str]) -> list[str]:
+    """因子 → 一行文本；**缺失一律跳过**（绝不把没算出来的因子写成 0）。"""
+    factors = row.get("factors")
+    factors = factors if isinstance(factors, Mapping) else {}
+
+    def value(key: str) -> float | None:
+        return _f(factors.get(key))
+
+    tokens: list[str] = []
+    imbalance = value("micro_zone_distribution")
+    if imbalance is not None:
+        tokens.append(f"L2五档失衡 {imbalance:+.2f}")
+    vpin_vol = value("micro_vpin_vol_ratio")
+    vpin_amt = value("micro_vpin_amount_ratio")
+    if vpin_vol is not None or vpin_amt is not None:
+        tokens.append(f"VPIN量/额 {_l2_half(vpin_vol)}/{_l2_half(vpin_amt)}")
+    divergence = value("vol_price_divergence")
+    if divergence is not None:
+        tokens.append(f"量价背离 {divergence:+.2f}")
+    decay = value("micro_impact_decay_half_life")
+    if decay is not None:
+        tokens.append(f"冲击衰减 {decay:.2f}")
+    liquidity = value("micro_liquidity_daily_pattern")
+    if liquidity is not None:
+        tokens.append(f"流动性日型 {liquidity:.2f}")
+    recent_vol = value("micro_zone_rv_ratio_close")
+    if recent_vol is not None:
+        tokens.append(f"近端波动 {recent_vol:.2f}")
+    gap = value("micro_open_gap")
+    if gap is not None:
+        tokens.append(f"开盘跳空 {gap * 100:+.2f}%")
+    zone_parts = [
+        f"{zone} {ratio:.2f}"
+        for zone, _start in _L2_ZONES
+        if zone in zones
+        for ratio in (value(f"micro_zone_vol_ratio_{zone}"),)
+        if ratio is not None
+    ]
+    if zone_parts:
+        tokens.append("时段量比 " + "/".join(zone_parts))
+    b_order = _f(row.get("b_order"))
+    b_cancel = _f(row.get("b_cancel"))
+    s_order = _f(row.get("s_order"))
+    s_cancel = _f(row.get("s_cancel"))
+    if (
+        b_order
+        and b_order > 0
+        and b_cancel is not None
+        and s_order
+        and s_order > 0
+        and s_cancel is not None
+    ):
+        tokens.append(f"委撤 买 {b_cancel / b_order:.1%}/卖 {s_cancel / s_order:.1%}")
+    cjbs = _f(row.get("cjbs"))
+    if cjbs and cjbs > 0:
+        tokens.append(f"成交 {cjbs:,.0f} 笔")
+    buy_avp = _f(row.get("buy_avp"))
+    sell_avp = _f(row.get("sell_avp"))
+    if buy_avp and buy_avp > 0 and sell_avp and sell_avp > 0:
+        tokens.append(f"买均 {buy_avp:.2f}/卖均 {sell_avp:.2f}")
+    tic_num = _f(row.get("l2_tic_num"))
+    order_num = _f(row.get("l2_order_num"))
+    if tic_num and tic_num > 0 and order_num and order_num > 0:
+        tokens.append(f"L2逐笔 {tic_num:,.0f}/委托 {order_num:,.0f}")
+    return tokens
+
+
+def build_l2_block(
+    rows: Mapping[str, Mapping[str, Any]] | None = None,
+    holdings: Sequence[Any] = (),
+    pool: Sequence[Any] = (),
+    now: datetime | None = None,
+) -> str:
+    """丁2【L2 微观结构】：通达信付费 L2 逐股快照 → 决策提示词。
+
+    ``rows=None`` = 未接线（旧替身）→ :data:`_L2_UNWIRED_TEXT`（历史字节冻结）。
+    接线后 ``rows`` 是 ``feeds.l2_snapshots`` 的返回（**前缀码**键）；持仓优先、
+    池票次之，同码只出一行。只渲染 :data:`L2_SNAPSHOT_STALE_SEC` 内的快照，
+    陈旧/缺失逐项计数——**读不到与没有是两件事**。分是 13 因子 ICIR 加权
+    **原始分**（未做截面标准化，跨股不可比），口径句随块走。
+    """
+    if rows is None:
+        return _L2_UNWIRED_TEXT
+    held = {_l2_key(h.code) for h in holdings}
+    entries: list[tuple[str, Any]] = [("持仓", h) for h in holdings]
+    entries.extend(("池", q) for q in pool if _l2_key(q.code) not in held)
+    if not entries:
+        return ""
+    moment = now or datetime.now(_CST)
+    lines: list[str] = []
+    missing = stale = 0
+    for role, item in entries:
+        row = rows.get(_l2_key(item.code))
+        if not isinstance(row, Mapping):
+            missing += 1
+            continue
+        age = _l2_age_s(row, moment)
+        if age is not None and age > L2_SNAPSHOT_STALE_SEC:
+            stale += 1
+            continue
+        head = f"- [{role}] {item.name}({item.code})"
+        price = _f(row.get("now_price"))
+        pre_close = _f(row.get("pre_close"))
+        if price is not None and price > 0:
+            change = (
+                (price - pre_close) / pre_close * 100.0
+                if pre_close is not None and pre_close > 0
+                else None
+            )
+            head += f" 现价 {price:.2f}（{_pct2(change)}）"
+        score = _f(row.get("signal_score"))
+        if score is not None:
+            head += f" · 分 {score:.1f}（原始）"
+        age_text = _l2_age_text(age)
+        if age_text:
+            head += f" · {age_text}"
+        lines.append(head)
+        detail = _l2_factor_tokens(row, _l2_started_zones(row, moment))
+        if detail:
+            lines.append("  " + " · ".join(detail))
+    if not lines:
+        if stale:
+            return (
+                "【L2 微观结构】本轮不可得——今日快照全部超过 15 分钟未更新"
+                "（L2 采集断流或非交易时段）；陈旧微观结构不能当当前盘口依据，"
+                "不要凭空推断逐笔资金流向。"
+            )
+        return (
+            "【L2 微观结构】本轮不可得——通达信 L2 采集未产出今日快照"
+            f"（{missing} 只标的（持仓/池）均无数据：采集任务未运行/桥未连通/"
+            "非交易时段）。不要凭空推断逐笔资金流向。"
+        )
+    header = (
+        "【L2 微观结构】（通达信付费 L2，逐股约 1–3 分钟轮询；分=13 因子 "
+        "ICIR 加权原始分 0–100，未做截面标准化、跨股不可比；"
+        "快照超 15 分钟按缺位处理；缺失因子不渲染）"
     )
+    out = [header, *lines]
+    if missing:
+        out.append(f"- （另有 {missing} 只标的（持仓/池）本轮无 L2 快照）")
+    if stale:
+        out.append(f"- （另有 {stale} 只快照超 15 分钟未更新，未渲染）")
+    return "\n".join(out)
 
 
 def parse_brief_ts(brief: Mapping[str, Any] | None) -> float | None:

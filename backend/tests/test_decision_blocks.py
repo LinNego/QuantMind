@@ -608,11 +608,140 @@ class TestBuildIndicesBlock:
         assert INDEX_CODES == ("000300.SH", "000001.SH", "399001.SZ", "399006.SZ")
 
 
+L2_NOW = datetime(2026, 10, 14, 10, 14, tzinfo=CST)
+
+
+def _holding(code: str = "600036.SH", name: str = "招商银行") -> HoldingRow:
+    return HoldingRow(
+        code=code,
+        name=name,
+        volume=1000,
+        cost=9.0,
+        price=9.45,
+        pnl_pct=5.0,
+        day_chg=None,
+        avail=1000,
+    )
+
+
+def _pool(code: str, name: str = "测试票") -> PoolQuote:
+    return PoolQuote(code=code, name=name, price=9.45, age_min=0.5)
+
+
+def _l2_row(**over) -> dict:
+    """真实 ``tdx_l2_snapshot`` 行形状（symbol=前缀码；factors 已解析成 dict）。"""
+    row = {
+        "symbol": "SH600036",
+        "ts": L2_NOW - timedelta(seconds=38),
+        "signal_score": 52.3,
+        "factors": {
+            "micro_zone_distribution": 0.14,
+            "micro_vpin_vol_ratio": 0.21,
+            "micro_vpin_amount_ratio": 0.18,
+            "vol_price_divergence": 0.32,
+            "micro_impact_decay_half_life": 0.27,
+            "micro_liquidity_daily_pattern": 4.45,
+            "micro_zone_rv_ratio_close": 0.62,
+            "micro_zone_vol_ratio_T3": 0.33,
+            # 采集侧未进入的时段恒 1.0——必须被时段门滤掉
+            "micro_zone_vol_ratio_T4": 1.0,
+            "micro_open_gap": -0.012,
+        },
+        "now_price": 9.45,
+        "pre_close": 9.51,
+        "cjbs": 13604,
+        "b_order": 100.0,
+        "b_cancel": 15.0,
+        "s_order": 100.0,
+        "s_cancel": 8.0,
+    }
+    row.update(over)
+    return row
+
+
 class TestBuildL2Block:
-    def test_always_honest_unavailable(self):
+    """丁2【L2 微观结构】：未接线 → 历史门控字节；接线 → 通达信付费 L2 逐股快照。
+
+    口径（2026-10-20 用户要求「付费通达信的数据为啥不用」）：采集侧
+    ``tdx_l2_capture_task`` 每轮把 13 因子的 ICIR 加权**原始分**（未截面标准化）
+    与快照写进 ``tdx_l2_snapshot``；本块只渲染 **15 分钟内的今日快照**，陈旧行
+    按缺位处理并计数——陈旧微观结构当当前盘口用比没有更危险。
+    """
+
+    def test_unwired_keeps_the_legacy_gate_bytes(self):
         text = build_l2_block()
         assert "【L2 微观结构】本轮不可得" in text
         assert "五档失衡" in text and "代理" in text
+        assert "通达信" not in text
+
+    def test_wired_but_empty_is_a_different_unavailable_reason(self):
+        # 「采集没产出」与「QM 没接源」是两件事：接线后不许再谎报未接入。
+        text = build_l2_block({}, [_holding()], (), L2_NOW)
+        assert "【L2 微观结构】本轮不可得" in text
+        assert "通达信 L2" in text and "未接入盘中逐笔" not in text
+        assert "1 只标的" in text
+
+    def test_fresh_snapshot_renders_price_score_and_microstructure(self):
+        text = build_l2_block({"SH600036": _l2_row()}, [_holding()], (), L2_NOW)
+        assert "【L2 微观结构】（通达信付费 L2" in text
+        # 原始分口径必须跟着走：跨股不可比，不能让人读成截面分位。
+        assert "未做截面标准化" in text and "跨股不可比" in text
+        assert "- [持仓] 招商银行(600036.SH) 现价 9.45（-0.63%）" in text
+        assert "分 52.3（原始）" in text
+        assert "快照 38s 前" in text
+        assert "L2五档失衡 +0.14" in text
+        assert "VPIN量/额 0.21/0.18" in text
+        assert "量价背离 +0.32" in text
+        assert "冲击衰减 0.27" in text
+        assert "流动性日型 4.45" in text
+        assert "近端波动 0.62" in text
+        assert "开盘跳空 -1.20%" in text
+        assert "委撤 买 15.0%/卖 8.0%" in text
+        assert "成交 13,604 笔" in text
+
+    def test_pool_rows_are_labelled_and_holdings_win_the_same_code(self):
+        text = build_l2_block(
+            {"SH600036": _l2_row(), "SZ000001": _l2_row(symbol="SZ000001")},
+            [_holding()],
+            [_pool("600036.SH"), _pool("000001.SZ", name="平安银行")],
+            L2_NOW,
+        )
+        assert text.count("招商银行(600036.SH)") == 1
+        assert "- [持仓] 招商银行(600036.SH)" in text
+        assert "- [池] 平安银行(000001.SZ)" in text
+
+    def test_future_zone_ratio_is_not_rendered(self):
+        # 采集侧对**尚未进入**的时段 baseline=0 → ratio 恒 1.0（假值）；
+        # 10:14 只应出 T3，T4/T5/T6 一律不渲染。
+        text = build_l2_block({"SH600036": _l2_row()}, [_holding()], (), L2_NOW)
+        assert "时段量比 T3 0.33" in text
+        for zone in ("T4", "T5", "T6"):
+            assert f"时段量比 {zone}" not in text
+
+    def test_stale_snapshot_is_counted_not_rendered(self):
+        stale = _l2_row(ts=L2_NOW - timedelta(seconds=1200))
+        text = build_l2_block({"SH600036": stale}, [_holding()], (), L2_NOW)
+        assert "本轮不可得" in text
+        assert "超过 15 分钟" in text
+        assert "现价" not in text  # 陈旧价不许冒充当前盘口
+
+    def test_missing_factors_are_skipped_never_rendered_as_zero(self):
+        row = _l2_row(factors={"micro_zone_distribution": None}, signal_score=None)
+        text = build_l2_block({"SH600036": row}, [_holding()], (), L2_NOW)
+        assert "L2五档失衡" not in text
+        assert " · 分 " not in text  # 分缺失 → 整段不出，绝不写 0
+        assert "VPIN" not in text
+
+    def test_partial_coverage_counts_the_gaps(self):
+        stale = _l2_row(symbol="SZ000001", ts=L2_NOW - timedelta(seconds=1000))
+        text = build_l2_block(
+            {"SH600036": _l2_row(), "SZ000001": stale},
+            [_holding()],
+            [_pool("000001.SZ", name="平安银行"), _pool("601000.SH", name="唐山港")],
+            L2_NOW,
+        )
+        assert "另有 1 只标的（持仓/池）本轮无 L2 快照" in text
+        assert "另有 1 只快照超 15 分钟未更新" in text
 
 
 def _tier(**kw):

@@ -219,6 +219,122 @@ async def test_load_decision_rows_reraises_so_the_assembly_layer_can_degrade(
         await F.load_decision_rows(DAY, "10000001")
 
 
+# ── 通达信 L2 快照面（丁2：付费 L2 因子进决策提示词）─────────────────
+# 口径：读**主库**（采集任务写 PG 后下一轮就要看见）；symbol 是前缀码、
+# trade_date 是 YYYYMMDD；factors 可能是 JSONB(已解析 dict) 或驱动给的 JSON 串，
+# 两种都要能吃。读失败上抛，由装配层降级留痕。
+class _L2Result:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return self._rows
+
+
+class _L2Session:
+    def __init__(self, rows, seen):
+        self._rows = rows
+        self._seen = seen
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, stmt, params):
+        self._seen["sql"] = str(stmt)
+        self._seen["params"] = dict(params)
+        return _L2Result(self._rows)
+
+
+def _patch_l2_session(monkeypatch, rows, seen, *, boom=False):
+    from backend.shared import database_manager_v2 as db
+
+    def fake_get_session(*, read_only=True):
+        seen["read_only"] = read_only
+        if boom:
+            raise RuntimeError("主库连接炸了")
+        return _L2Session(rows, seen)
+
+    monkeypatch.setattr(db, "get_session", fake_get_session)
+
+
+@pytest.mark.asyncio
+async def test_l2_snapshots_read_primary_and_parse_factors(monkeypatch):
+    seen: dict = {}
+    rows = [
+        {
+            "symbol": "SH600036",
+            "ts": "T0",
+            "signal_score": 52.3,
+            "factors": '{"micro_vpin_vol_ratio": 0.21}',
+            "cjbs": 13604,
+        }
+    ]
+    _patch_l2_session(monkeypatch, rows, seen)
+
+    out = await F.l2_snapshots(["600036.SH", "600036.SH", ""], DAY)
+
+    # 读主库：采集刚写的快照必须当轮可见（从库滞后会把 L2 块整段降级）
+    assert seen["read_only"] is False
+    assert seen["params"]["day"] == "20260924"
+    assert seen["params"]["codes"] == ["SH600036"]  # 后缀→前缀、去重、空码剔除
+    assert "DISTINCT ON (symbol)" in seen["sql"]
+    assert out == {
+        "SH600036": {
+            "symbol": "SH600036",
+            "ts": "T0",
+            "signal_score": 52.3,
+            "factors": {"micro_vpin_vol_ratio": 0.21},
+            "cjbs": 13604,
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_l2_snapshots_accepts_an_already_parsed_factor_mapping(monkeypatch):
+    seen: dict = {}
+    _patch_l2_session(
+        monkeypatch,
+        [{"symbol": "SH600036", "factors": {"vol_price_divergence": 0.3}}],
+        seen,
+    )
+    out = await F.l2_snapshots(["600036.SH"], DAY)
+    assert out["SH600036"]["factors"] == {"vol_price_divergence": 0.3}
+
+
+@pytest.mark.asyncio
+async def test_l2_snapshots_bad_factors_degrade_to_empty_mapping(monkeypatch):
+    seen: dict = {}
+    _patch_l2_session(monkeypatch, [{"symbol": "SH600036", "factors": "{坏JSON"}], seen)
+    out = await F.l2_snapshots(["600036.SH"], DAY)
+    # 因子坏了只丢因子，快照行本身（分/价/委撤）仍可渲染。
+    assert out["SH600036"]["factors"] == {}
+
+
+@pytest.mark.asyncio
+async def test_l2_snapshots_without_codes_never_touches_the_db(monkeypatch):
+    def boom(*, read_only=True):
+        raise AssertionError("空码表不应开库")
+
+    from backend.shared import database_manager_v2 as db
+
+    monkeypatch.setattr(db, "get_session", boom)
+    assert await F.l2_snapshots([], DAY) == {}
+    assert await F.l2_snapshots(["", "???"], DAY) == {}
+
+
+@pytest.mark.asyncio
+async def test_l2_snapshots_reraises_so_the_assembly_layer_can_degrade(monkeypatch):
+    _patch_l2_session(monkeypatch, [], {}, boom=True)
+    with pytest.raises(RuntimeError, match="主库连接炸了"):
+        await F.l2_snapshots(["600036.SH"], DAY)
+
+
 # ── 唤醒上下文（read_wake_ctx：无记录/读失败 → ""，绝不抛）───────────
 class FakeCtxClient:
     def __init__(self, value=None, *, boom=False):

@@ -482,6 +482,7 @@ def make_harness(**over) -> Harness:
         load_news_files=over.pop("load_news_files", None),
         load_risk_files=over.pop("load_risk_files", None),
         read_series_summary=over.pop("read_series_summary", None),
+        load_l2_snapshot=over.pop("load_l2_snapshot", None),
         load_decision_rows=over.pop("load_decision_rows", None),
         read_wake_ctx=over.pop("read_wake_ctx", None),
         # 镜像闸门/回注（P0 审计修）：默认 None = 未接线（两块整段不渲染）。
@@ -2363,6 +2364,76 @@ async def test_round_renders_batch2_blocks_when_wired():
 
 
 @pytest.mark.asyncio
+async def test_round_feeds_paid_tdx_l2_snapshots_into_the_prompt():
+    """丁2 接线：通达信付费 L2 的 13 因子快照进**买卖决策**提示词（2026-10-20 用户
+    要求「付费通达信的数据为啥不用」）。取数按持仓+池一次读，代码后缀进、快照按
+    前缀存——渲染时两处都有标记。"""
+    calls: dict = {}
+
+    async def load_l2(codes, trade_date):
+        calls["codes"] = list(codes)
+        calls["day"] = trade_date
+        ts = NOW - timedelta(seconds=41)
+        return {
+            "SH600036": {
+                "symbol": "SH600036",
+                "ts": ts,
+                "signal_score": 61.2,
+                "factors": {
+                    "micro_zone_distribution": 0.31,
+                    "micro_vpin_vol_ratio": 0.22,
+                    "vol_price_divergence": -0.18,
+                },
+                "now_price": 40.0,
+                "pre_close": 39.5,
+                "cjbs": 8200,
+                "b_order": 100.0,
+                "b_cancel": 25.0,
+                "s_order": 100.0,
+                "s_cancel": 10.0,
+            }
+        }
+
+    cheap = PoolRow(
+        code="601988.SH",
+        name="中国银行",
+        industry="银行",
+        score=1.0,
+        fusion=0.6,
+        rank=3,
+    )
+    h = make_harness(
+        pool=pool_doc(BANK_ROW, PRICEY_ROW, cheap),
+        snaps={
+            **SNAPS,
+            **INDEX_SNAPS,
+            "601988.SH": {"Now": 4.2, "PreClose": 4.15, "timestamp": NOW.timestamp()},
+        },
+        read_series_summary=lambda codes: dict(SERIES_FIXTURE),
+        load_l2_snapshot=load_l2,
+    )
+    await run_once(SLOT_0935, deps=h.deps, now=NOW)
+    prompt = h.log["llm"][0]["prompt"]
+
+    assert "【L2 微观结构】（通达信付费 L2" in prompt
+    assert "未接入盘中逐笔" not in prompt
+    assert "- [持仓] 招商银行(600036.SH) 现价 40.00（+1.27%）" in prompt
+    assert "分 61.2（原始）" in prompt
+    assert "快照 41s 前" in prompt
+    assert "L2五档失衡 +0.31" in prompt
+    assert "VPIN量/额 0.22/—" in prompt  # 额侧因子缺 → 显式缺位，不补 0
+    assert "量价背离 -0.18" in prompt
+    assert "委撤 买 25.0%/卖 10.0%" in prompt
+    # 池票也在询价清单里（没有自己的快照 → 计数，不编）
+    assert "另有" in prompt and "本轮无 L2 快照" in prompt
+    # 后缀码进、交易日按本轮 now 取（跨日不会拿昨天的快照）
+    assert "600036.SH" in calls["codes"]
+    assert calls["day"] == DAY
+    # 健康路径不产生降级告警
+    assert "通达信 L2 快照" not in prompt.split("【L2 微观结构】")[0]
+
+
+@pytest.mark.asyncio
 async def test_round_unwired_batch2_keeps_legacy_prompt_bytes():
     """未接线（旧替身/历史行为）：丁1–丁9 与风险两槽整段不渲染——
     升级不动存量提示词（字节冻结纪律的第二批延续）。"""
@@ -2481,9 +2552,13 @@ async def test_round_batch2_degrades_loudly_and_never_fakes_first_round():
     async def rows_boom(trade_date, user):
         raise RuntimeError("台账库连接炸了")
 
+    async def l2_boom(codes, trade_date):
+        raise RuntimeError("L2 快照表连不上")
+
     native = FakeNative()
     h = make_harness(
         read_series_summary=series_boom,
+        load_l2_snapshot=l2_boom,
         load_news_files=lambda: (None, None),
         load_decision_rows=rows_boom,
         load_risk_files=boom,
@@ -2497,6 +2572,8 @@ async def test_round_batch2_degrades_loudly_and_never_fakes_first_round():
     assert prompt.index("【数据新鲜度警告】") < prompt.index("【你名下的现有持仓】")
     assert "指数快照未取全（0/4）" in prompt
     assert "行情序列 market:series 本轮无成员" in prompt
+    assert "通达信 L2 快照读取失败（RuntimeError）" in prompt
+    assert "【L2 微观结构】本轮不可得" in prompt
     assert "新闻简报文件缺失" in prompt
     assert "决策台账读取失败（RuntimeError）" in prompt
     assert "事件风险清单未产出" in prompt

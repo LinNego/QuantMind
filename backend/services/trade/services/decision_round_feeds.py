@@ -9,6 +9,7 @@
 - :func:`read_risk_files` → 风险两槽（``risk_block.json`` / ``industry_risk.json``
   / ``fundamental_flags.json``，cron 在产、键是**裸 6 位码**）
 - :func:`series_summaries` → 丁1/丁3 动量窗原料（``market:series`` 远端 ZSET）
+- :func:`l2_snapshots` → 丁2 通达信付费 L2 因子快照（PG ``tdx_l2_snapshot`` 当日最新行）
 - :func:`load_decision_rows` → 丁6 互看 / 丁9 上一轮（审计台账当日行）
 - :func:`read_wake_ctx` → 丙1 唤醒说明文本（写侧在 ``tick.wake_tick``）
 
@@ -33,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Mapping, Sequence
 from datetime import date
@@ -221,6 +223,88 @@ def series_summaries(
         summary = _summarize(list(rows or []))
         if summary is not None:
             out[code] = summary
+    return out
+
+
+# ── 通达信 L2 快照（丁2）────────────────────────────────────────────
+#: A 股前缀码（``SH600036``）：PG 的唯一口径，脏码在开库前剔掉。
+_A_SHARE_PREFIX_RE = re.compile(r"^(SH|SZ|BJ)\d{6}$")
+
+
+def _l2_codes(codes: Sequence[str]) -> list[str]:
+    """后缀/前缀/裸码 → 前缀码（去重、保序、剔脏）；空表 = 不开库。"""
+    from backend.shared.stock_utils import StockCodeUtil
+
+    out: list[str] = []
+    for raw in codes:
+        code = StockCodeUtil.to_prefix(str(raw or ""))
+        if code and _A_SHARE_PREFIX_RE.match(code) and code not in out:
+            out.append(code)
+    return out
+
+
+def _json_object(raw: Any) -> dict[str, Any]:
+    """JSONB → dict；驱动已解析（asyncpg 实测返回 dict）或给 JSON 串都能吃。
+
+    坏内容 → ``{}``（该行的分/价/委撤仍可渲染，因子整段缺位由渲染层显式跳过）。
+    """
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        logger.warning("[DecisionRound] L2 factors 不是合法 JSON（长度 %s）", len(raw))
+        return {}
+    return dict(doc) if isinstance(doc, Mapping) else {}
+
+
+async def l2_snapshots(
+    codes: Sequence[str], trade_date: date | str
+) -> Mapping[str, Mapping[str, Any]]:
+    """通达信 L2 因子快照（丁2）：``{前缀码: 当日最新一行}``。
+
+    **读主库**（``read_only=False``）：采集任务每轮把快照写 PG，下一轮决策就要看见；
+    从库滞后会把整块 L2 降级成「本轮不可得」。读失败**上抛**，由装配层收成
+    「不可得」并进丁8 留痕——静默空表会被读成「今天没有 L2 数据」。
+
+    ``symbol`` 在前缀码域、``trade_date`` 是 ``YYYYMMDD``；``DISTINCT ON``
+    保证一码一行（同一轮多周期采集也只取最新）。``factors`` 统一解析成 dict，
+    未知列原样保留（渲染层按需取用，缺失一律跳过、绝不补 0）。
+    """
+    wanted = _l2_codes(codes)
+    if not wanted:
+        return {}
+    day = (
+        trade_date.strftime("%Y%m%d")
+        if isinstance(trade_date, date)
+        else str(trade_date).replace("-", "")[:8]
+    )
+    from sqlalchemy import text
+
+    from backend.shared.database_manager_v2 import get_session
+
+    async with get_session(read_only=False) as session:
+        result = await session.execute(
+            text(
+                "SELECT DISTINCT ON (symbol) symbol, ts, signal_score, factors, "
+                "cjbs, b_order, b_cancel, s_order, s_cancel, buy_avp, sell_avp, "
+                "l2_tic_num, l2_order_num, now_price, pre_close "
+                "FROM tdx_l2_snapshot "
+                "WHERE trade_date = :day AND symbol = ANY(:codes) "
+                "ORDER BY symbol, ts DESC"
+            ),
+            {"day": day, "codes": wanted},
+        )
+        rows = result.mappings().all()
+    out: dict[str, Mapping[str, Any]] = {}
+    for raw in rows:
+        row = dict(raw)
+        row["factors"] = _json_object(row.get("factors"))
+        symbol = str(row.get("symbol") or "")
+        if symbol:
+            out[symbol] = row
     return out
 
 

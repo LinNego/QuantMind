@@ -335,6 +335,12 @@ class ExclusionRead:
     note: str = ""
 
 
+#: (tenant, user) → (分数字典, 元信息)；见 ``shared.signal_scores.load_score_snapshot``。
+ScoreRead = Callable[[str, str], Awaitable[tuple[Any, dict[str, Any]]]]
+#: (codes, 交易日) → {前缀码: 当日最新 L2 快照}；见 ``feeds.l2_snapshots``。
+L2SnapshotRead = Callable[[Sequence[str], date], Awaitable[Mapping[str, Any]]]
+
+
 @dataclass(frozen=True, slots=True)
 class RoundDeps:
     """一轮编排的全部外界（frozen；测试逐项换替身，生产见 :func:`default_round_deps`）。"""
@@ -388,16 +394,10 @@ class RoundDeps:
     #: () → 盘中 regime 快照（db0 ``qm:regime:intraday``；服务未开/读失败 → ``None``）。
     #: **缺失不拦轮**：提示词按「本轮不可得」降级（``build_market_state_block``）。``None`` = 未接线。
     load_regime: Callable[[], Mapping[str, Any] | None] | None = None
-    #: (tenant, user) → (score_map, meta)（与 ``shared.signal_scores.
-    #: load_score_snapshot`` 同一实现——取数失败已在那边吞成 ``ok=False``+
-    #: 原因）。异常同样按不可得降级，不拦轮。``None`` = 未接线。
-    load_scores: (
-        Callable[
-            [str, str],
-            Awaitable[tuple[dict[str, dict[str, Any]], dict[str, Any]]],
-        ]
-        | None
-    ) = None
+    #: (tenant, user) → (score_map, meta)；取数失败那边已吞成 ``ok=False``+原因，异常同样按不可得降级、不拦轮。``None`` = 未接线。
+    load_scores: ScoreRead | None = None
+    #: (codes, 交易日) → {前缀码: 当日最新 L2 快照}（丁2）；None = 未接线（历史字节）。
+    load_l2_snapshot: L2SnapshotRead | None = None
     #: () → (news_brief|None, watch|None)；丁4 新闻取数面。None = 未接线。
     load_news_files: Callable[[], tuple[Mapping[str, Any] | None, ...]] | None = None
     #: () → (risk|None, industry|None, fund|None)；风险两槽取数面（见 feeds）。

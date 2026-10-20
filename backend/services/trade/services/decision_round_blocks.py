@@ -14,7 +14,8 @@
 2. **未接线 = 历史字节**：``deps`` 上对应闭包为 ``None``（旧替身）→ 对应块整段
    空串，提示词与升级前逐字节一致（上游金样不破）。第二批以
    ``deps.read_series_summary`` 为**总接线标记**（生产 io 同批全量注入，见
-   :func:`enrich_quotes_with_blocks`）——没它整批不渲染。
+   :func:`enrich_quotes_with_blocks`）——没它整批不渲染。丁2 L2 是**自有接线**
+   （``deps.load_l2_snapshot``）：数据源独立（通达信 PG 快照），可单独开关。
 
 ``RoundBlocks`` 是装配结果的信封：编排层把 ``build_context`` 的历史参数原样
 转发给 :func:`build_round_context`，其余各块由 ``replace`` 注入——
@@ -331,7 +332,7 @@ async def enrich_quotes_with_blocks(
         if alert:
             alerts.append(alert)
 
-    # 丁1 盘口 / 丁3 分钟 / 丁2 L2 门控（微观结构面，同属总接线标记）
+    # 丁1 盘口 / 丁3 分钟（微观结构面，同属总接线标记）
     orderbook_block = minute_block = l2_block = ""
     if enabled:
         series: Mapping[str, Any] = {}
@@ -348,9 +349,31 @@ async def enrich_quotes_with_blocks(
             holdings, snapped, series, now, pool=scored_seq
         )
         minute_block = build_minute_block(holdings, series, now)
-        l2_block = build_l2_block()
         if holdings and not series:
             alerts.append("行情序列 market:series 本轮无成员：盘口涨速/分钟特征缺位")
+
+    # 丁2 通达信付费 L2（自有接线：采集任务写 PG，这里读当日最新行）。
+    # 与盘口/分钟不同源：总接线标记为 None 时仍可单独接线；未接线 → 历史门控字节。
+    if deps.load_l2_snapshot is not None and (held_codes or pool_codes):
+        l2_codes = list(dict.fromkeys(held_codes + pool_codes))
+        l2_rows: Mapping[str, Any] = {}
+        l2_note = ""
+        try:
+            l2_rows = await deps.load_l2_snapshot(l2_codes, now.date()) or {}
+        except Exception as exc:  # noqa: BLE001 L2 读不到按不可得降级（不拦轮）
+            logger.warning("[DecisionRound] %s L2 快照读取异常: %s", round_id, exc)
+            l2_note = (
+                f"通达信 L2 快照读取失败（{type(exc).__name__}）：L2 微观结构块降级"
+            )
+        else:
+            if not l2_rows:
+                l2_note = "通达信 L2 快照本轮无数据：L2 微观结构块降级"
+        if l2_note:
+            alerts.append(l2_note)
+        l2_block = build_l2_block(l2_rows, holdings, scored_seq, now)
+    elif enabled:
+        # 第二批总接线但 L2 未单独接线：历史门控字节（旧替身/存量部署不改提示词）。
+        l2_block = build_l2_block()
 
     # 丁4 新闻（自有接线）
     news_block = ""

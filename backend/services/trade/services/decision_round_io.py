@@ -410,8 +410,7 @@ def default_round_deps() -> RoundDeps:
     def _read_mirror_ctx() -> Mapping[str, Any]:
         """镜像提示词面（2026-10-15 审计 P0-B/P0-C）：闸门约束 + 当日跳过明细。
 
-        与下单侧同一实现（``prompt_mirror_context``），读的是交易库（``get_redis``
-        = db2，与 ``record_skip`` 写侧同库）；读取失败在那边已兜成 ``skips=None``。
+        与下单侧同一实现（``prompt_mirror_context``），读交易库（``get_redis``=db2，与 ``record_skip`` 写侧同库）；读取失败那边已兜成 ``skips=None``。
         """
         from backend.services.live_trading.services import real_mirror_service
 
@@ -476,6 +475,7 @@ def default_round_deps() -> RoundDeps:
         load_news_files=feeds.read_news_files,
         load_risk_files=feeds.read_risk_files,
         read_series_summary=feeds.series_summaries,
+        load_l2_snapshot=feeds.l2_snapshots,
         load_decision_rows=feeds.load_decision_rows,
         read_wake_ctx=_read_wake_ctx,
         # 镜像闸门/回注（P0 审计修）：非镜像部署下 active=False → 两块整段空串
