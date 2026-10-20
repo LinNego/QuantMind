@@ -82,9 +82,27 @@ def normalize_model_bucket(model_id: str | None) -> str:
     return slug[:48] if slug else "inference_script"
 
 
+#: 批量行桶名前缀（写侧契约；实时行走因子目录版本，不带此前缀）
+BUCKET_PREFIX = "script_v1_"
+
+
 def resolve_feature_version(model_id: str | None) -> str:
     """模型 id → ``engine_signal_scores.feature_version`` 桶名。"""
-    return f"script_v1_{normalize_model_bucket(model_id)}"
+    return f"{BUCKET_PREFIX}{normalize_model_bucket(model_id)}"
+
+
+def realtime_feature_version(metadata: Mapping[str, Any] | None) -> str:
+    """模型元数据 → 实时行 ``feature_version``（**读写两侧唯一实现**）。
+
+    实时推理落库不写批量桶 ``script_v1_<模型桶>``，而写模型的因子目录版本
+    （``realtime_service`` 原内联口径）：``factor_catalog_version`` 优先，
+    其次 ``feature_version``，都缺省为 ``"default"``。空串按缺省处理（写侧
+    用 ``or`` 链，空串同样落到下一级）。
+    """
+    meta = metadata if isinstance(metadata, Mapping) else {}
+    return str(
+        meta.get("factor_catalog_version") or meta.get("feature_version") or "default"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -287,6 +305,84 @@ async def resolve_effective_bucket(
         "reason": "",
         "owner_user": owner,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 实时行桶解析（enforce/shadow 要把生效模型自己的实时行算进来）
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: 模型元数据 → 实时桶的进程内缓存 TTL。元数据变更不频繁，而哨兵每 60s、
+#: 决策轮每轮都会取一次快照；不缓存等于每次读分都多一次 DB 查询。
+_REALTIME_BUCKET_TTL_SECONDS = 300.0
+_realtime_bucket_cache: dict[tuple[str, str], tuple[float, str | None]] = {}
+
+
+def reset_realtime_bucket_cache() -> None:
+    """清实时桶缓存（测试用；模型元数据更新后最多 5min 自然生效）。"""
+    _realtime_bucket_cache.clear()
+
+
+async def resolve_realtime_bucket(
+    tenant_id: str,
+    model_id: str | None,
+    *,
+    session_factory: Any = None,
+) -> str | None:
+    """生效模型 → 实时行 ``feature_version``；查不到/读失败 → ``None``。
+
+    只按批量桶 ``feature_version = script_v1_<桶>`` 过滤会把同模型的盘中实时行
+    整片漏掉（实时行写的是因子目录版本）。读路径据此把过滤条件扩成
+    「批量桶 OR（实时桶 AND model_version = 生效模型）」——**必须带
+    model_version**：多个模型可能共享同一份因子目录，只按目录过滤会把别的
+    模型的实时分混进来（正是桶隔离要消灭的混读）。
+
+    返回 ``None`` 时调用方只读批量桶，不猜目录；读库异常不缓存（避免瞬时故障
+    被固化 5 分钟），模型不存在则缓存 None。
+    """
+    tenant = str(tenant_id or "default").strip() or "default"
+    mid = str(model_id or "").strip()
+    if not mid:
+        return None
+    key = (tenant, mid)
+    now = time.monotonic()
+    cached = _realtime_bucket_cache.get(key)
+    if cached is not None and now - cached[0] < _REALTIME_BUCKET_TTL_SECONDS:
+        return cached[1]
+    try:
+        if session_factory is None:
+            from backend.shared.database_manager_v2 import get_session
+
+            session_factory = get_session
+        from sqlalchemy import text
+
+        async with session_factory(read_only=True) as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT metadata_json FROM qm_user_models "
+                        "WHERE tenant_id = :tid AND model_id = :mid "
+                        "ORDER BY updated_at DESC NULLS LAST LIMIT 1"
+                    ),
+                    {"tid": tenant, "mid": mid},
+                )
+            ).first()
+    except Exception as exc:  # noqa: BLE001 - 实时桶解析失败按「没有」降级
+        _warn_once(
+            f"rtbucket:{tenant}:{mid}",
+            f"实时桶解析失败 tenant={tenant} model={mid}: {exc}；只读批量桶",
+        )
+        return None
+    result: str | None = None
+    if row is not None:
+        metadata = row[0]
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except ValueError:
+                metadata = {}
+        result = realtime_feature_version(metadata)
+    _realtime_bucket_cache[key] = (now, result)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

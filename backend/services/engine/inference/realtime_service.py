@@ -32,6 +32,7 @@ from collections.abc import Callable
 import numpy as np
 
 from backend.shared.load_governor import LoadGovernor
+from backend.shared.signal_buckets import realtime_feature_version
 
 from backend.services.engine.inference.realtime_core import (
     compute_cycle,
@@ -499,7 +500,7 @@ class RealtimeInferenceService:
             "trade_date": today,
             "model_id": model_id,
             "model_version": model_version,
-            "feature_version": str(meta.get("factor_catalog_version") or meta.get("feature_version") or "default"),
+            "feature_version": realtime_feature_version(meta),
             "feature_dim": len(cols),
             "expected_symbols": len(hot),
             "ready_symbols": result.ready,

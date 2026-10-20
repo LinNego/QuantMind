@@ -247,13 +247,22 @@ class TestScoreScan:
         return {"SH600036": {"stockName": "招商银行", "sources": ["real"]}}
 
     @staticmethod
-    def _scores(value: float, *, as_of: str = "2026-09-20", freq: str = "daily"):
+    def _scores(
+        value: float,
+        *,
+        as_of: str = "2026-09-20",
+        freq: str = "daily",
+        model_id: str = "mdl_test",
+    ):
         return {
             "SH600036": {
                 "value": value,
                 "side": "BUY" if value > 0 else "SELL",
                 "freq": freq,
                 "asOf": as_of,
+                "model_id": model_id,
+                "model_bucket": f"script_v1_{model_id}",
+                "bucket": f"script_v1_{model_id}",
             }
         }
 
@@ -341,6 +350,119 @@ class TestScoreScan:
         assert alerts == []  # 停摆 19 天：那跌是上周的事，不报成今天
         stored = redis.hashes[f"{BASELINE_KEY_PREFIX}default:10000001"]
         assert json.loads(stored["SH600036"])["v"] == -0.3  # 但基线要跟上
+
+    @pytest.mark.asyncio
+    async def test_model_switch_reanchors_without_alert(self):
+        # 2026-10-20 事故：同日多个模型批次按完成顺序落库，哨兵把「换模型」的
+        # 分数差当成下跌，7 只持仓同时报「下穿 0」。换模型只重锚，不报警。
+        redis = FakeRedis()
+        sentinel = self._sentinel(
+            [
+                self._scores(0.12, model_id="mdl_a"),
+                self._scores(-0.03, model_id="mdl_b"),
+            ],
+            redis,
+        )
+        user = {"tenant_id": "default", "user_id": "10000001"}
+
+        await sentinel._scan_scores(redis, user, self._watch(), {}, 1e9)
+        alerts = await sentinel._scan_scores(redis, user, self._watch(), {}, 1e9 + 60)
+
+        assert alerts == []
+        record = json.loads(
+            redis.hashes[f"{BASELINE_KEY_PREFIX}default:10000001"]["SH600036"]
+        )
+        assert record["v"] == -0.03
+        assert record["m"] == "script_v1_mdl_b"
+        # 换模型后当日基准必须跟着换，否则后续骤降会拿旧模型的锚算
+        assert record["a"] == -0.03
+
+    @pytest.mark.asyncio
+    async def test_same_model_daily_to_realtime_still_alerts(self):
+        # 同一个模型从批次行切到实时行是**正常**的盘中更新，不能当换模型吞掉
+        redis = FakeRedis()
+        sentinel = self._sentinel(
+            [
+                self._scores(0.12, freq="daily"),
+                self._scores(-0.03, freq="realtime"),
+            ],
+            redis,
+        )
+        user = {"tenant_id": "default", "user_id": "10000001"}
+
+        await sentinel._scan_scores(redis, user, self._watch(), {}, 1e9)
+        alerts = await sentinel._scan_scores(redis, user, self._watch(), {}, 1e9 + 60)
+
+        assert len(alerts) == 1
+        assert alerts[0]["kind"] == KIND_SCORE_CROSS_ZERO
+        assert alerts[0]["detail"]["freq"] == "realtime"
+        assert alerts[0]["detail"]["model_id"] == "mdl_test"
+
+    @pytest.mark.asyncio
+    async def test_legacy_baseline_without_model_reanchors_silently(self):
+        # 上线前写入的基线没有 m 字段：来源不明 → 拒绝跨未知来源比较，
+        # 只重锚一次（宁可漏一条，也不拿两个模型的差报警）。
+        redis = FakeRedis()
+        redis.hset(
+            f"{BASELINE_KEY_PREFIX}default:10000001",
+            mapping={
+                "SH600036": json.dumps(
+                    {"v": 0.5, "d": "2026-09-20", "a": 0.5, "ad": "2001-09-09"}
+                )
+            },
+        )
+        sentinel = self._sentinel([self._scores(-0.3, model_id="mdl_new")], redis)
+        user = {"tenant_id": "default", "user_id": "10000001"}
+
+        alerts = await sentinel._scan_scores(redis, user, self._watch(), {}, 1e9)
+
+        assert alerts == []
+        record = json.loads(
+            redis.hashes[f"{BASELINE_KEY_PREFIX}default:10000001"]["SH600036"]
+        )
+        assert record["m"] == "script_v1_mdl_new"
+        assert record["v"] == -0.3
+        assert record["a"] == -0.3
+
+    @pytest.mark.asyncio
+    async def test_model_switch_resets_day_anchor(self):
+        # 换模型后仍拿旧模型的当日锚算「回落线」会凭空报骤降。
+        redis = FakeRedis()
+        sentinel = self._sentinel(
+            [
+                self._scores(0.8, model_id="mdl_a"),
+                self._scores(0.5, model_id="mdl_b"),
+                self._scores(0.25, model_id="mdl_b"),
+            ],
+            redis,
+        )
+        user = {"tenant_id": "default", "user_id": "10000001"}
+        cfg = {"score_drop_threshold": 0.35}
+
+        await sentinel._scan_scores(redis, user, self._watch(), cfg, 1e9)
+        assert await sentinel._scan_scores(redis, user, self._watch(), cfg, 1e9 + 60) == []
+        alerts = await sentinel._scan_scores(
+            redis, user, self._watch(), cfg, 1e9 + 120
+        )
+
+        # 单步 0.25、以换模型后的锚 0.5 计也只回落 0.25 → 不报；
+        # 若沿用旧模型锚 0.8，回落 0.55 会误报骤降。
+        assert alerts == []
+
+    @pytest.mark.asyncio
+    async def test_alert_detail_carries_model_provenance(self):
+        redis = FakeRedis()
+        sentinel = self._sentinel([self._scores(0.2), self._scores(-0.1)], redis)
+        user = {"tenant_id": "default", "user_id": "10000001"}
+
+        await sentinel._scan_scores(redis, user, self._watch(), {}, 1e9)
+        alerts = await sentinel._scan_scores(redis, user, self._watch(), {}, 1e9 + 60)
+
+        assert len(alerts) == 1
+        detail = alerts[0]["detail"]
+        assert detail["model_id"] == "mdl_test"
+        assert detail["model_bucket"] == "script_v1_mdl_test"
+        assert detail["bucket"] == "script_v1_mdl_test"
 
     @pytest.mark.asyncio
     async def test_unmonitored_symbols_are_not_stored(self):
@@ -506,7 +628,14 @@ class TestScoreScan:
         redis = FakeRedis()
         redis.hashes[f"{BASELINE_KEY_PREFIX}default:10000001"] = {
             "SH600036": json.dumps(
-                {"v": 0.4, "d": "2026-09-19", "a": 0.4, "ad": "2001-09-08"}
+                {
+                    "v": 0.4,
+                    "d": "2026-09-19",
+                    "a": 0.4,
+                    "ad": "2001-09-08",
+                    # 同模型续日：模型身份未变，prev 类规则必须照常触发
+                    "m": "script_v1_mdl_test",
+                }
             )
         }
         sentinel = self._sentinel([self._scores(-0.1)], redis)

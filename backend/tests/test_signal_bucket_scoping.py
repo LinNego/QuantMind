@@ -23,10 +23,13 @@ from backend.shared.signal_buckets import (
     SCOPING_REDIS_KEY,
     get_scoping_mode,
     normalize_model_bucket,
+    realtime_feature_version,
     record_shadow_evidence,
+    reset_realtime_bucket_cache,
     reset_scoping_mode_cache,
     resolve_effective_bucket,
     resolve_feature_version,
+    resolve_realtime_bucket,
     shadow_diff,
 )
 
@@ -106,6 +109,33 @@ class TestNormalizeModelBucket:
             resolve_feature_version("mdl_cust_train_20260916000342_b701110b_7ed2e231")
             == "script_v1_mdl_cust_train_20260916000342_b701110b_7ed2e231"
         )
+
+
+@pytest.mark.unit
+class TestRealtimeFeatureVersion:
+    """实时行 feature_version 口径与写侧 ``realtime_service`` 必须同源。
+
+    实时行不写 ``script_v1_<桶>``，而是写模型的 ``factor_catalog_version``
+    （缺省退 ``feature_version``，再缺省 ``"default"``）。读侧 enforce 要把
+    这些行算进生效模型，必须按同一顺序解析，否则盘中分会整片消失。
+    """
+
+    def test_prefers_factor_catalog_version(self):
+        assert (
+            realtime_feature_version(
+                {"factor_catalog_version": "qdb-cat-x", "feature_version": "v1"}
+            )
+            == "qdb-cat-x"
+        )
+
+    def test_falls_back_to_feature_version(self):
+        assert realtime_feature_version({"feature_version": "v1"}) == "v1"
+
+    def test_empty_metadata_uses_default_bucket(self):
+        assert realtime_feature_version({}) == "default"
+        assert realtime_feature_version(None) == "default"
+        # 与写侧逐字同口径：只做 `or` 链，不做 strip/归一
+        assert realtime_feature_version({"factor_catalog_version": "  "}) == "  "
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +331,74 @@ async def _seed_default_models(tenant: str, owners: list[tuple[str, str]]) -> No
             )
 
 
+async def _seed_model_with_meta(
+    tenant: str,
+    user_id: str,
+    model_id: str,
+    metadata: dict,
+    *,
+    is_default: bool = True,
+) -> None:
+    from sqlalchemy import text
+
+    from backend.shared.database_manager_v2 import get_session
+
+    async with get_session() as session:
+        await session.execute(
+            text(
+                "INSERT INTO qm_user_models (tenant_id, user_id, model_id, status, "
+                "metadata_json, is_default, activated_at) "
+                "VALUES (:t, :u, :m, 'ready', CAST(:meta AS JSONB), :dflt, NOW())"
+            ),
+            {
+                "t": tenant,
+                "u": user_id,
+                "m": model_id,
+                "meta": json.dumps(metadata),
+                "dflt": is_default,
+            },
+        )
+
+
+async def _seed_realtime_score(
+    tenant: str,
+    *,
+    model_id: str,
+    symbol: str,
+    score: float,
+    created_at,
+    signal_ts,
+    feature_version: str | None = None,
+) -> None:
+    """实时行：feature_version=因子目录、model_version=模型 id、source=realtime。"""
+    from sqlalchemy import text
+
+    from backend.shared.database_manager_v2 import get_session
+
+    async with get_session() as session:
+        await session.execute(
+            text(
+                "INSERT INTO engine_signal_scores "
+                "(run_id, tenant_id, user_id, trade_date, symbol, fusion_score, "
+                " model_version, feature_version, market, source, universe_tag, "
+                " created_at, signal_ts) "
+                "VALUES (:run, :t, 'u1', :td, :sym, :score, :mv, :fv, 'CN', "
+                "        'realtime', 'CN', :ts, :sts)"
+            ),
+            {
+                "run": f"rt-{model_id}-{uuid.uuid4().hex[:8]}",
+                "t": tenant,
+                "td": D1,
+                "sym": symbol,
+                "score": score,
+                "mv": model_id,
+                "fv": feature_version or f"qdb-cat-{model_id}",
+                "ts": created_at,
+                "sts": signal_ts,
+            },
+        )
+
+
 async def _seed_scores(tenant: str, rows: list[dict]) -> None:
     from sqlalchemy import text
 
@@ -458,7 +556,7 @@ async def test_watchlist_enforce_unresolvable_never_mixes(monkeypatch):
     tenant = f"{TAG_PREFIX}unres-{uuid.uuid4().hex[:8]}"
     await _cleanup_tenants([tenant])
     try:
-        ids = await _seed_two_bucket_tenant(tenant)
+        await _seed_two_bucket_tenant(tenant)
 
         async def _unresolved(**_kw):
             return {
@@ -589,5 +687,109 @@ async def test_scanner_loader_bucket_scoping_real_db(monkeypatch):
             "600005.SH",
         }
     finally:
+        await _cleanup_tenants([tenant])
+        await _close_db()
+
+
+# ---------------------------------------------------------------------------
+# 真库：enforce 必须把「生效模型自己的实时行」算进来
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resolve_realtime_bucket_reads_model_metadata():
+    await _require_db()
+    tenant = f"{TAG_PREFIX}rtmeta-{uuid.uuid4().hex[:8]}"
+    model = f"mdl_rtmeta_{uuid.uuid4().hex[:8]}"
+    await _cleanup_tenants([tenant])
+    try:
+        await _seed_model_with_meta(
+            tenant,
+            "u1",
+            model,
+            {"market": "CN", "factor_catalog_version": "qdb-cat-meta"},
+        )
+        reset_realtime_bucket_cache()
+        assert await resolve_realtime_bucket(tenant, model) == "qdb-cat-meta"
+        # 模型不存在 → None（不猜、不拿别的模型的目录）
+        assert await resolve_realtime_bucket(tenant, "mdl_missing") is None
+    finally:
+        reset_realtime_bucket_cache()
+        await _cleanup_tenants([tenant])
+        await _close_db()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_enforce_includes_realtime_rows_of_effective_model_only(monkeypatch):
+    """enforce 只读生效模型：批量桶 + 该模型的实时行；同目录的别的模型不能混入。"""
+    await _require_db()
+    import backend.shared.signal_scores as ss
+
+    tag = uuid.uuid4().hex[:8]
+    tenant = f"{TAG_PREFIX}rt-{tag}"
+    model_prod = f"mdl_rtprod_{tag}"
+    model_other = f"mdl_rtother_{tag}"
+    catalog = f"qdb-cat-shared-{tag}"
+    await _cleanup_tenants([tenant])
+    try:
+        await _seed_model_with_meta(
+            tenant,
+            "u1",
+            model_prod,
+            {"market": "CN", "factor_catalog_version": catalog},
+        )
+        # 同一租户同一市场只能有一个默认模型；另一模型只用于验证
+        # 「同目录但不同 model_version 不混入」，不参与生效模型解析。
+        await _seed_model_with_meta(
+            tenant,
+            "u1",
+            model_other,
+            {"market": "CN", "factor_catalog_version": catalog},
+            is_default=False,
+        )
+        await _seed_scores(
+            tenant,
+            [
+                {"user": "u1", "model_id": model_prod, "symbol": "600001", "score": 0.5, "trade_date": D1, "created_at": TS_PROD},
+                {"user": "u1", "model_id": model_prod, "symbol": "600002", "score": 0.4, "trade_date": D1, "created_at": TS_PROD},
+            ],
+        )
+        # 生效模型自己的实时行：同一天后更新 → 覆盖批量分
+        await _seed_realtime_score(
+            tenant,
+            model_id=model_prod,
+            symbol="600002.SH",
+            score=-0.2,
+            created_at=TS_PROD,
+            signal_ts=TS_CAND,
+            feature_version=catalog,
+        )
+        # 同因子目录的另一个模型：feature_version 相同，但 model_version 不同
+        await _seed_realtime_score(
+            tenant,
+            model_id=model_other,
+            symbol="600003.SH",
+            score=-0.9,
+            created_at=TS_CAND,
+            signal_ts=TS_CAND,
+            feature_version=catalog,
+        )
+
+        monkeypatch.setattr(ss, "get_scoping_mode", lambda **kw: "enforce")
+        reset_realtime_bucket_cache()
+        score_map, meta = await ss.load_score_snapshot(tenant)
+
+        assert set(score_map) == {"SH600001", "SH600002"}
+        assert score_map["SH600001"]["value"] == 0.5
+        assert score_map["SH600002"]["value"] == -0.2  # 实时行胜出
+        assert score_map["SH600002"]["freq"] == "realtime"
+        assert score_map["SH600002"]["model_id"] == model_prod
+        assert meta["bucket"] == resolve_feature_version(model_prod)
+        assert meta["realtime_bucket"] == catalog
+        assert meta["realtime_rows"] == 1
+    finally:
+        reset_realtime_bucket_cache()
         await _cleanup_tenants([tenant])
         await _close_db()

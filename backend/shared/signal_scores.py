@@ -10,9 +10,12 @@
    ``trade_date``（计数把后缀身份折叠到裸 6 位——实时行 ``600036.SH`` 与批量行
    ``600036`` 是同一只，同股只算一次；T4-1 审计 M2）；当日覆盖不足（推理刚跑到
    一半/降级日）时回退到最近一天，并把回退事实交给调用方（``meta.fallback=True``）。
-2. 该日每标的取**最新一条**（``DISTINCT ON <裸码归一键> ORDER BY <同键>, created_at
-   DESC, id DESC``）：同一天同一只股会有多行——日频批次行 / 盘中实时行
-   （``source='realtime'``）/ 不同 run 的重复打分，且 **symbol 有三种写法**
+2. 该日每标的取**最后写入的一条**（``DISTINCT ON <裸码归一键> ORDER BY <同键>,
+   COALESCE(signal_ts, created_at) DESC, id DESC``）：``created_at`` 是首次插入
+   时间（实时 upsert 故意不覆盖），``signal_ts`` 才是最后写入时间——只看
+   ``created_at`` 会让盘中实时行被之后跑完的批次行整天压住。同一天同一只股会有
+   多行——日频批次行 / 盘中实时行（``source='realtime'``）/ 不同 run 的重复打分，
+   且 **symbol 有三种写法**
    （裸 ``600036`` / 后缀 ``600036.SH`` / 前缀 ``SH600036``）。按**字面** symbol
    去重只能合并同形态的行：裸码留多行，Python 侧「后写覆盖」实际是按字面序挑
    一条（前缀形排序恒在后 → 恒胜），与 ``created_at`` 最新无关。故去重键必须先
@@ -43,10 +46,12 @@ from sqlalchemy import text
 
 from backend.shared.logging_config import get_logger
 from backend.shared.signal_buckets import (
+    BUCKET_PREFIX,
     get_scoping_mode,
     record_shadow_evidence,
     resolve_effective_bucket,
     resolve_feature_version,
+    resolve_realtime_bucket,
     shadow_diff,
 )
 from backend.shared.stock_utils import StockCodeUtil
@@ -101,10 +106,12 @@ SQL_LATEST_ANY_DATE_TMPL = (
 
 SQL_SCORES_BY_DATE_TMPL = (
     "SELECT DISTINCT ON ({sym_key}) symbol, fusion_score, signal_side, source, "
-    "trade_date, rank_pct "
+    "trade_date, rank_pct, feature_version, model_version "
     "FROM engine_signal_scores "
     f"WHERE tenant_id = :tid AND trade_date = :d AND {A_SHARE_MARKET_SQL} {{bucket}}"
-    "ORDER BY {sym_key}, created_at DESC, id DESC"
+    # 「最后写入」而非「首次插入」：实时 upsert 只更新 signal_ts（created_at
+    # 故意冻结在首插），只看 created_at 会让盘中实时行被之后跑完的批次行压住。
+    "ORDER BY {sym_key}, COALESCE(signal_ts, created_at) DESC, id DESC"
 )
 
 #: 桶过滤子句（enforce/shadow 按桶取数用；前导 AND + 尾随空格由这里携带）
@@ -154,18 +161,42 @@ def normalize_position_symbol(raw: Any) -> str | None:
     return normalize_a_share_symbol(str(raw or "").split("::", 1)[0].strip())
 
 
+def _row_model_refs(
+    feature_version: Any, model_version: Any
+) -> tuple[str | None, str | None, str | None]:
+    """行 → ``(model_id, model_bucket, raw_bucket)``（模型身份唯一口径）。
+
+    哨兵要跨批次/实时比较分数，必须先判断「是不是同一款模型」：
+
+    - 批量行 ``feature_version=script_v1_<模型桶>`` → 身份就是该桶；
+    - 实时行 ``feature_version=因子目录``、``model_version=<模型 id>`` → 身份按
+      写侧同一折叠规则算 ``script_v1_<桶>``，与同模型批量行**逐字相等**。长
+      模型 id 被截断时两侧仍一致（不拿完整 id 比，避免假「换模型」）；
+    - 来源不明 → 身份退化为原始 ``feature_version``；全空 → ``None``。
+    """
+    fv = str(feature_version or "").strip()
+    mv = str(model_version or "").strip()
+    if fv.startswith(BUCKET_PREFIX):
+        slug = fv[len(BUCKET_PREFIX) :]
+        return (slug or None), fv, fv
+    if mv and mv != "inference_script":
+        return mv, resolve_feature_version(mv), fv or None
+    return None, (fv or None), (fv or None)
+
+
 def build_score_map(
     rows: list[Any], trade_date: str
 ) -> tuple[dict[str, dict[str, Any]], int]:
-    """DB 行 → ``{prefix: {value, side, freq, asOf, rank_pct}}``；返回 (map, realtime_count)。
+    """DB 行 → ``{prefix: {value, side, freq, asOf, rank_pct, ...}}``。
 
-    行序 = ``DISTINCT ON`` 的结果序（每 symbol 仅一行，已是该标的最近一条）。
-    分数为 NULL 的行仍进 map：NaN 分数与「没有分数」不同，前端要能区分。
+    返回 ``(map, realtime_count)``。行序 = ``DISTINCT ON`` 的结果序（每 symbol
+    仅一行，已是该标的最后写入的一条）。分数为 NULL 的行仍进 map：NaN 分数与
+    「没有分数」不同，前端要能区分。
 
-    ``rank_pct``（0–1 截面分位，0..1，``compute_rank_pct``/percent_rank 口径）为
-    **additive 契约列**：老行未回填时是 NULL → 键在、值为 None（「没分位」与
-    「分位是 0」不是一回事——0 是「这批里垫底」，None 是「不知道」）。行长度守卫
-    与 ``asOf`` 同式：只有 4/5 列的老调用方传进来也不能炸。
+    ``rank_pct``（0–1 截面分位，``compute_rank_pct`` 口径）与
+    ``bucket``/``model_id``/``model_bucket``（模型来源）均为 **additive 契约列**：
+    老行/老调用方缺列时键仍在、值为 None（「不知道」不是「没有」）。行长度守卫
+    与 ``asOf`` 同式：只有 4/5/6 列的老行传进来也不能炸。
     """
     score_map: dict[str, dict[str, Any]] = {}
     realtime_rows = 0
@@ -176,29 +207,67 @@ def build_score_map(
         freq = score_freq_of(r[3])
         if freq == "realtime":
             realtime_rows += 1
+        model_id, model_bucket, raw_bucket = _row_model_refs(
+            r[6] if len(r) > 6 else None,
+            r[7] if len(r) > 7 else None,
+        )
         score_map[sym] = {
             "value": float(r[1]) if r[1] is not None else None,
             "side": r[2],
             "freq": freq,
             "asOf": str(r[4])[:10] if len(r) > 4 and r[4] is not None else trade_date,
             "rank_pct": (float(r[5]) if len(r) > 5 and r[5] is not None else None),
+            "bucket": raw_bucket,
+            "model_id": model_id,
+            "model_bucket": model_bucket,
         }
     return score_map, realtime_rows
 
 
+def _bucket_filter(
+    bucket: str | None,
+    realtime_bucket: str | None = None,
+    model_id: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """桶隔离过滤子句 + 绑定参数（三条查询共用，保证口径一致）。
+
+    只按批量桶过滤会漏掉同模型的盘中实时行（实时行 ``feature_version`` 是
+    因子目录版本）。带上 ``realtime_bucket`` 时扩成「批量桶 OR（实时桶 AND
+    model_version = 生效模型）」——**必须限定 model_version**：多个模型可能
+    共享同一因子目录，只按目录过滤就是另一种混读。
+    """
+    if not bucket:
+        return "", {}
+    model = str(model_id or "").strip()
+    if realtime_bucket and model and realtime_bucket != bucket:
+        return (
+            "AND (feature_version = :bucket OR "
+            "(feature_version = :rt_bucket AND model_version = :model_id)) ",
+            {"bucket": bucket, "rt_bucket": realtime_bucket, "model_id": model},
+        )
+    return _BUCKET_SQL, {"bucket": bucket}
+
+
 async def _fetch_snapshot(
-    session: Any, tenant_id: str, bucket: str | None
+    session: Any,
+    tenant_id: str,
+    bucket: str | None,
+    *,
+    realtime_bucket: str | None = None,
+    model_id: str | None = None,
 ) -> tuple[Any, list[Any], bool]:
     """一次口径取数 → ``(信号日 d0, rows, 覆盖不足回退标志)``。
 
-    ``bucket=None`` 渲染的 SQL 与旧常量逐字节相同；非空则三条查询都带
-    ``feature_version = :bucket``（覆盖充分日/回退日也按桶算——否则回退日会
-    落到别的桶的日期上）。
+    ``bucket=None`` 渲染的 SQL 与旧常量逐字节相同；非空则三条查询都带桶过滤
+    （覆盖充分日/回退日也按桶算——否则回退日会落到别的桶的日期上），实时行
+    按 :func:`_bucket_filter` 的规则并入。
     """
-    clause = _BUCKET_SQL if bucket else ""
-    params: dict[str, Any] = {"tid": tenant_id, "min_cov": MIN_SIGNAL_COVERAGE}
-    if bucket:
-        params["bucket"] = bucket
+    clause, bucket_params = _bucket_filter(bucket, realtime_bucket, model_id)
+    params: dict[str, Any] = {
+        "tid": tenant_id,
+        "min_cov": MIN_SIGNAL_COVERAGE,
+        **bucket_params,
+    }
     d0 = (
         await session.execute(
             text(
@@ -222,7 +291,7 @@ async def _fetch_snapshot(
             text(
                 SQL_SCORES_BY_DATE_TMPL.format(bucket=clause, sym_key=SYMBOL_FOLD_KEY)
             ),
-            {"tid": tenant_id, "d": d0, **({"bucket": bucket} if bucket else {})},
+            {"tid": tenant_id, "d": d0, **bucket_params},
         )
     ).fetchall()
     return d0, list(rows), fallback
@@ -241,13 +310,16 @@ async def load_score_snapshot(
 
     ``meta`` 带 ``signal_date``（实际取到的信号日）、``fallback``（覆盖不足回退到
     最近日）、``realtime_rows``（其中盘中实时行条数）、``ok``/``reason``，以及
-    P2-0 桶隔离面 ``scoping``/``bucket``/``model_id``/``model_source``。
-    取数失败不抛：返回空 map + ``ok=False``，调用方按「没取到 ≠ 分数是 0」处理。
+    P2-0 桶隔离面 ``scoping``/``bucket``/``realtime_bucket``/``model_id``/
+    ``model_source``。取数失败不抛：返回空 map + ``ok=False``，调用方按「没取到
+    ≠ 分数是 0」处理。
 
     桶隔离（``scoping`` 模式见 ``signal_buckets``）：``model_id`` 显式传入时
     直接按该模型桶取；否则按生效模型解析（``user_id`` 缺省时用租户 is_default
-    持有者）。``enforce`` 下解析失败 → 空结果 + ``ok=False`` + 原因（混读比
-    没数据更危险）；``shadow`` 下照旧口径出数 + 影子比对留痕。
+    持有者）。生效桶除了批量行 ``script_v1_<桶>``，还并入**该模型自己的实时
+    行**（``feature_version=因子目录`` 且 ``model_version=生效模型``）——否则
+    盘中分会在 enforce 下整片消失。``enforce`` 下解析失败 → 空结果 + ``ok=False``
+    + 原因（混读比没数据更危险）；``shadow`` 下照旧口径出数 + 影子比对留痕。
     """
     from backend.shared.database_manager_v2 import get_session
 
@@ -260,6 +332,7 @@ async def load_score_snapshot(
         "reason": None,
         "scoping": mode,
         "bucket": None,
+        "realtime_bucket": None,
         "model_id": None,
         "model_source": None,
     }
@@ -279,6 +352,10 @@ async def load_score_snapshot(
             meta["model_id"] = eff.get("model_id")
             meta["model_source"] = eff.get("model_source")
         meta["bucket"] = bucket
+        if bucket and meta.get("model_id"):
+            meta["realtime_bucket"] = await resolve_realtime_bucket(
+                tenant_id, meta["model_id"]
+            )
         if not bucket and mode == "enforce":
             meta["reason"] = (
                 f"信号桶隔离：生效模型桶无法解析（{eff.get('reason')}）；"
@@ -290,11 +367,24 @@ async def load_score_snapshot(
     try:
         async with get_session(read_only=True) as session:
             read_bucket = bucket if mode == "enforce" else None
-            d0, rows, fallback = await _fetch_snapshot(session, tenant_id, read_bucket)
+            rt_bucket = meta.get("realtime_bucket") if read_bucket else None
+            d0, rows, fallback = await _fetch_snapshot(
+                session,
+                tenant_id,
+                read_bucket,
+                realtime_bucket=rt_bucket,
+                model_id=meta.get("model_id"),
+            )
             meta["fallback"] = fallback
             if mode == "shadow":
                 if bucket:
-                    d0_b, rows_b, _ = await _fetch_snapshot(session, tenant_id, bucket)
+                    d0_b, rows_b, _ = await _fetch_snapshot(
+                        session,
+                        tenant_id,
+                        bucket,
+                        realtime_bucket=meta.get("realtime_bucket"),
+                        model_id=meta.get("model_id"),
+                    )
                     old_map, _ = build_score_map(
                         rows, str(d0)[:10] if d0 is not None else ""
                     )

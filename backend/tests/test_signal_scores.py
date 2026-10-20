@@ -7,6 +7,11 @@
 
 from __future__ import annotations
 
+import uuid
+from datetime import date, datetime, timezone
+
+import pytest
+
 from backend.shared.signal_scores import (
     A_SHARE_MARKET_SQL,
     MIN_SIGNAL_COVERAGE,
@@ -18,6 +23,7 @@ from backend.shared.signal_scores import (
     normalize_a_share_symbol,
     score_freq_of,
 )
+from backend.shared.signal_buckets import resolve_feature_version
 
 
 class TestNormalizeAShareSymbol:
@@ -57,6 +63,10 @@ class TestBuildScoreMap:
                 "freq": "daily",
                 "asOf": "2026-09-19",
                 "rank_pct": 0.882,
+                # 6 列老行没有模型来源列：键在、值 None（「不知道」不是「没有」）
+                "bucket": None,
+                "model_id": None,
+                "model_bucket": None,
             }
         }
         assert realtime_rows == 0
@@ -125,6 +135,199 @@ class TestBuildScoreMap:
         assert score_map["SH600036"]["side"] == "SELL"
         assert realtime_rows == 1
 
+    def test_model_identity_unifies_batch_and_realtime_for_same_model(self):
+        # 同一款模型的批量行 feature_version=script_v1_<桶>，实时行
+        # feature_version=因子目录、model_version=<模型 id>。哨兵要跨盘中/日频
+        # 比较分数，两行的**模型身份必须相等**，否则每次批次↔实时切换都会
+        # 被当成换模型而静默重锚（永远不报警）。
+        rows = [
+            (
+                "600036",
+                0.2,
+                "BUY",
+                "batch",
+                "2026-10-20",
+                0.9,
+                "script_v1_mdl_x",
+                "inference_script",
+            ),
+            (
+                "000001",
+                0.3,
+                "BUY",
+                "realtime",
+                "2026-10-20",
+                0.8,
+                "qdb-catalog-v1",
+                "mdl_x",
+            ),
+        ]
+        score_map, _ = build_score_map(rows, "2026-10-20")
+
+        assert score_map["SH600036"]["model_bucket"] == "script_v1_mdl_x"
+        assert score_map["SZ000001"]["model_bucket"] == "script_v1_mdl_x"
+        # 诊断列保留原始值：批量行桶名 / 实时行因子目录
+        assert score_map["SH600036"]["bucket"] == "script_v1_mdl_x"
+        assert score_map["SZ000001"]["bucket"] == "qdb-catalog-v1"
+        assert score_map["SH600036"]["model_id"] == "mdl_x"
+        assert score_map["SZ000001"]["model_id"] == "mdl_x"
+
+    def test_model_identity_matches_even_when_bucket_is_truncated(self):
+        # 写侧桶名截断 48 字符。实时行按同一折叠规则现算桶名，长 id 也不会
+        # 与批量行身份分叉（拿完整 id 比会假切换）。
+        long_id = "mdl_" + "x" * 80
+        bucket = resolve_feature_version(long_id)
+        rows = [
+            (
+                "600036",
+                0.2,
+                "BUY",
+                "batch",
+                "2026-10-20",
+                None,
+                bucket,
+                "inference_script",
+            ),
+            ("000001", 0.3, "BUY", "realtime", "2026-10-20", None, "cat-x", long_id),
+        ]
+        score_map, _ = build_score_map(rows, "2026-10-20")
+
+        assert score_map["SH600036"]["model_bucket"] == bucket
+        assert score_map["SZ000001"]["model_bucket"] == bucket
+
+    def test_unknown_provenance_keeps_keys_but_no_identity(self):
+        # 老调用方（6 列）没有来源列：键必须在（调用方按键取值），值为 None
+        # 表示「不知道」——哨兵据此拒绝跨未知来源比较。
+        score_map, _ = build_score_map(
+            [("600036", 0.31, "BUY", "batch", "2026-09-19", 0.882)], "2026-09-19"
+        )
+
+        assert score_map["SH600036"]["bucket"] is None
+        assert score_map["SH600036"]["model_id"] is None
+        assert score_map["SH600036"]["model_bucket"] is None
+
+
+class TestSnapshotFreshness:
+    """实时行「最后写入」应赢过之后落库的批量行。
+
+    历史坑：``created_at`` 是首次插入时间，实时 upsert 只更新 ``signal_ts``
+    （``realtime_contract`` 故意不覆盖 ``created_at``）。只看 ``created_at``
+    时，盘中实时行会被**之后**跑完的批次行整天压住——用户看到的仍是日频分，
+    且不同批次按完成顺序互相覆盖。
+    """
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_realtime_row_with_newer_signal_ts_wins(self, monkeypatch):
+        await _require_db()
+        import backend.shared.signal_scores as ss
+
+        tenant = f"t-fresh-{uuid.uuid4().hex[:8]}"
+        await _cleanup_tenant(tenant)
+        try:
+            monkeypatch.setattr(ss, "get_scoping_mode", lambda **kw: "off")
+            await _seed_score(
+                tenant,
+                symbol="600036",
+                score=0.9,
+                source="batch",
+                feature_version="script_v1_mdl_batch",
+                model_version="inference_script",
+                created_at=datetime(2099, 1, 6, 10, 0, tzinfo=timezone.utc),
+                signal_ts=datetime(2099, 1, 6, 10, 0, tzinfo=timezone.utc),
+            )
+            # 实时行先插入、后更新：created_at 更早，signal_ts 更新
+            await _seed_score(
+                tenant,
+                symbol="600036.SH",
+                score=-0.5,
+                source="realtime",
+                feature_version="qdb-catalog-v1",
+                model_version="mdl_live",
+                created_at=datetime(2099, 1, 6, 9, 0, tzinfo=timezone.utc),
+                signal_ts=datetime(2099, 1, 6, 11, 0, tzinfo=timezone.utc),
+            )
+
+            score_map, meta = await ss.load_score_snapshot(tenant)
+
+            assert meta["ok"] is True
+            assert score_map["SH600036"]["value"] == -0.5
+            assert score_map["SH600036"]["freq"] == "realtime"
+            assert score_map["SH600036"]["model_id"] == "mdl_live"
+        finally:
+            await _cleanup_tenant(tenant)
+            await _close_db()
+
+
+async def _require_db():
+    from sqlalchemy import text
+
+    from backend.shared.database_manager_v2 import get_session
+
+    try:
+        async with get_session(read_only=True) as probe:
+            await probe.execute(text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"DB 不可用: {exc}")
+
+
+async def _close_db():
+    from backend.shared.database_manager_v2 import close_database
+
+    await close_database()
+
+
+async def _cleanup_tenant(tenant: str):
+    from sqlalchemy import text
+
+    from backend.shared.database_manager_v2 import get_session
+
+    async with get_session() as session:
+        await session.execute(
+            text("DELETE FROM engine_signal_scores WHERE tenant_id = :t"),
+            {"t": tenant},
+        )
+
+
+async def _seed_score(
+    tenant: str,
+    *,
+    symbol: str,
+    score: float,
+    source: str,
+    feature_version: str,
+    model_version: str,
+    created_at: datetime,
+    signal_ts: datetime,
+):
+    from sqlalchemy import text
+
+    from backend.shared.database_manager_v2 import get_session
+
+    async with get_session() as session:
+        await session.execute(
+            text(
+                "INSERT INTO engine_signal_scores "
+                "(run_id, tenant_id, user_id, trade_date, symbol, fusion_score, "
+                " model_version, feature_version, market, source, universe_tag, "
+                " created_at, signal_ts) "
+                "VALUES (:run, :t, 'u1', :td, :sym, :score, :mv, :fv, 'CN', :src, "
+                "        'CN', :ts, :sts)"
+            ),
+            {
+                "run": f"run_fresh_{uuid.uuid4().hex[:10]}",
+                "t": tenant,
+                "td": date(2099, 1, 6),
+                "sym": symbol,
+                "score": score,
+                "mv": model_version,
+                "fv": feature_version,
+                "src": source,
+                "ts": created_at,
+                "sts": signal_ts,
+            },
+        )
+
 
 class TestScoreFreqOf:
     """分频标注的唯一判定：只有 ``source='realtime'`` 才敢说「实时」。
@@ -172,7 +375,11 @@ class TestSqlConstants:
         # 数字形之后，Python 侧「后写覆盖」会等价于「前缀形恒胜」，与 created_at 无关。
         assert SYMBOL_FOLD_KEY in SQL_SCORES_BY_DATE
         assert "DISTINCT ON (symbol)" not in SQL_SCORES_BY_DATE
-        assert "created_at DESC" in SQL_SCORES_BY_DATE
+        # 取「最后写入」而不是「首次写入」：实时 upsert 只更新 signal_ts
+        # （created_at 冻结在首插），只看 created_at 会让后跑的批次整天压住实时行。
+        assert "COALESCE(signal_ts, created_at) DESC" in SQL_SCORES_BY_DATE
+        assert "feature_version" in SQL_SCORES_BY_DATE
+        assert "model_version" in SQL_SCORES_BY_DATE
 
     def test_scores_query_carries_rank_pct(self):
         # rank_pct 是决策轮行情行内「信号分」的唯一原料（折算研究评分刻度）；

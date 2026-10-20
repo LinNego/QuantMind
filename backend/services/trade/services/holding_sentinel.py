@@ -504,16 +504,31 @@ class HoldingSentinel:
                 if isinstance(parsed, Mapping):
                     prev = parsed
 
-            # 当日基准（骤降判定用）：当天第一眼看到的分数，跨日或老格式记录重设。
-            # 重设只让「越过回落线」本轮失效——prev 类规则（下穿 0 / 单步骤降）
-            # 照跑，否则停机一夜后的第一个早晨会静默吞掉隔夜下穿 0。
+            # 模型身份（批量桶 / 实时行归一后的桶）：换模型 = 分数不可比。
+            # 2026-10-20 事故：同日多个模型批次按完成顺序落库，哨兵把「换模型」
+            # 的分数差当成下跌，7 只持仓同时报「下穿 0」。老基线没有 m 字段、
+            # 来源不明时同样拒绝比较——宁可漏一条，也不拿两个模型的差报警。
+            now_model = str(
+                entry.get("model_bucket") or entry.get("model_id") or ""
+            ).strip()
+            prev_model = str((prev.get("m") if prev else "") or "").strip()
+            model_comparable = (
+                bool(prev_model) and bool(now_model) and prev_model == now_model
+            )
+            model_changed = prev is not None and not model_comparable
+
+            # 当日基准（骤降判定用）：当天第一眼看到的分数，跨日/换模型或老格式
+            # 记录重设。重设只让「越过回落线」本轮失效——prev 类规则（下穿 0 /
+            # 单步骤降）照跑，否则停机一夜后的第一个早晨会静默吞掉隔夜下穿 0。
+            # 换模型时连 prev 类规则也不能跑：两套分数不同刻度，且旧锚必须清掉
+            # （否则后续同模型回落会拿旧模型的锚算，凭空报骤降）。
             anchor = prev.get("a") if prev else None
             try:
                 anchor_f = float(anchor) if anchor is not None else None
             except (TypeError, ValueError):
                 anchor_f = None
             anchor_day = str((prev.get("ad") if prev else "") or "")
-            if anchor_f is None or anchor_day != scan_day:
+            if model_changed or anchor_f is None or anchor_day != scan_day:
                 anchor_f = None
                 next_anchor, next_anchor_day = now_score, scan_day
             else:
@@ -525,11 +540,22 @@ class HoldingSentinel:
                     "d": entry.get("asOf") or current_as_of,
                     "a": next_anchor,
                     "ad": next_anchor_day,
+                    "m": now_model or None,
                 },
                 ensure_ascii=False,
             )
             if prev is None:
                 continue  # 首次见到：只播种，不报警
+            if model_changed:
+                logger.info(
+                    "[holding_sentinel] 模型切换/来源不明，重锚不报警 user=%s "
+                    "sym=%s prev=%s now=%s",
+                    user_id,
+                    sym,
+                    prev_model or "?",
+                    now_model or "?",
+                )
+                continue
             if not baseline_is_comparable(prev.get("d"), entry.get("asOf")):
                 continue  # 基线过期（哨兵停摆/换期）：重新播种，不把陈年下跌当今天
             verdict = evaluate_score_transition(
@@ -567,6 +593,10 @@ class HoldingSentinel:
                         "score_as_of": entry.get("asOf"),
                         "baseline_as_of": prev.get("d"),
                         "day_anchor": anchor_f,
+                        # 分数出处（同模型才比较；换模型在上方已重锚跳过）
+                        "model_id": entry.get("model_id"),
+                        "model_bucket": entry.get("model_bucket"),
+                        "bucket": entry.get("bucket"),
                         "sources": watch.get("sources") or [],
                     },
                     score_prev=prev.get("v"),

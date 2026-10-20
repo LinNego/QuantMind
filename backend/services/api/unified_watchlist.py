@@ -277,8 +277,9 @@ async def load_signal_scores(
     - ``candidates``：最近覆盖充分日（``COUNT(DISTINCT symbol) >= MIN_SIGNAL_COVERAGE``，
       与候选列表同口径）``signal_side='BUY'`` 且 ``fusion_score > 0``，按分数降序**全量**
       （截断统一由 ``merge_sources`` 在输出端做，cap 只在一处生效）。
-    - ``score_map``：该日**全部**标的的最新一条分数（同 symbol 多 run 时按
-      ``created_at`` 取最新——混着取会让分数不确定），供持仓/自选行显示分数；
+    - ``score_map``：该日**全部**标的的最后写入一条分数（同 symbol 多 run 时按
+      ``COALESCE(signal_ts, created_at)`` 取最新——实时 upsert 冻结 ``created_at``，
+      混着取会让分数不确定），供持仓/自选行显示分数；
       ``source='realtime'`` 的行即盘中实时分（热集推理落库）。
     - ``user_id`` 透传给快照取数（P2-0 桶隔离的生效模型解析用）。
     """
