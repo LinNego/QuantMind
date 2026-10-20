@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 自有因子库每日尾窗物化（宿主 cron，JST 04:10 = 北京 03:10）
+# 自有因子库每日尾窗物化（JST 23:00 起跑 = 北京 22:00；cron 尚未安装）
 #
 # 为什么有这个脚本：factor_defs / cand_factors / factor1300 / gap_mined / l1_batch1 /
 # rd_mined 的公式**不在数据平台的同步链路里**——QuantDB 夜间同步只负责行情与下载类
@@ -17,14 +17,16 @@
 #   3) 可用内存 < MIN_MEM_GB 有界等待，仍不足则跳过并推 QQ（这是每日唯一档期，
 #      静默跳过 = 次日推理缺特征，不能沉默）。
 #
-# 时刻怎么定的：quantdb 当日分区 ~01:55 JST 落盘 → alpha 02:30~03:50 →
-# 本脚本 04:10 起跑（留 20 分钟余量）→ 快车道 ~<1.5h；长预热因子（复利窗口
-# 如 TSRANK(REF(c,504),504)=1008 日、f1300 最长 1220 日）走第二遍 --only，
-# 额外 ~1~1.5h，整轮通常 06:30–07:10 收工。墙钟上限 3.5h（07:40 JST 兜底），
-# 仍早于 08:50 盘前检查与 09:00 CST 盘前推理。
-# 注意：长窗遍可能与 05:30/06:30/07:30 的 alpha 补池重试链重叠（重试在起跑后
-# 才拿锁，本脚本的等待闸门管不到）；内存闸门按起跑时点判断，重试链并发时由
-# 各自的内存上限与 swap 告警兜底。
+# 时刻怎么定的（2026-10-20 用户拍板）：JST 23:00（北京 22:00）起跑，用户口径
+# 是 QuantDB 数据一般在 22:00 前更新。注意本机 A 股同步调度存于 Redis
+# quantmind:sync_schedule:A（当前 00:55 容器 CST = 01:55 JST），23:00 起跑时
+# 目标日 = 当时最新日K（通常为前一交易日）；当晚新落盘的一日由次晚补。
+# 首跑实测（2026-10-20 00:18 起，旧版代码）：快档 1h49m（rd_mined 独占 56m）；
+# 长预热因子（复利窗口如 TSRANK(REF(c,504),504)=1008 日、f1300 最长 1220 日）
+# 走第二遍 --only，额外 ~1~1.5h → 整轮预计 01:30–02:30 JST 收工。墙钟上限
+# 3.5h（次日 02:30 兜底），早于 08:50 盘前检查与 09:00 CST 盘前推理。
+# 注意：02:30 的 alpha 刷新档期可能与长窗遍重叠；本机 alpha 自身 30GB 内存闸
+# 会先等后跳，长窗遍起跑前也有 alpha_busy/内存双闸，各自告警兜底。
 #
 # 告警：失败/部分完成/内存跳过 → QQ（scripts/push_notify.py）；成功只记日志。
 # 状态：<quantdb>/6_ml_datasets/_materialize_status.json（保留最近 30 轮）。
@@ -34,7 +36,7 @@
 #     bash scripts/factor_materialize_daily.sh --dry-run    # 只打印计划
 #     MIN_MEM_GB=30 ALPHA_WAIT_SECONDS=0 ...               # 覆盖默认闸门
 #
-# cron（JST=北京+1h）：10 4 * * 2-6
+# 起跑：JST 23:00（cron 尚未安装；建议行 `0 23 * * 1-5`，待用户明确批准）
 set -uo pipefail
 
 QM_ROOT="${QM_ROOT:-/home/zbox/projects/quantmind}"
@@ -57,7 +59,7 @@ MEM_WAIT_SECONDS="${MEM_WAIT_SECONDS:-1800}"
 MEM_WAIT_SLEEP=120
 ALPHA_WAIT_SECONDS="${ALPHA_WAIT_SECONDS:-3600}"
 ALPHA_WAIT_SLEEP=60
-#: 整轮墙钟上限（默认 3.5h：04:10 起跑最晚 07:40 JST 收工，早于 09:00 JST 盘前推理）
+#: 整轮墙钟上限（默认 3.5h：23:00 起跑最晚次日 02:30 JST 收工，早于盘前推理）
 TIMEOUT_SECONDS="${MATERIALIZE_TIMEOUT_SECONDS:-12600}"
 
 DRY_RUN=0
