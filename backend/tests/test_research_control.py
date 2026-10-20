@@ -43,6 +43,7 @@ _ENV_KEYS = (
     "QM_RESEARCH_LLM_MAX_TOKENS",
     "QM_RESEARCH_LLM_TEMPERATURE",
     "QM_RESEARCH_LLM_REASONING_EFFORT",
+    "QM_QUANTDB_DATA_DIR",
     "GLM_API_BASE",
     "GLM_API_KEY",
     "OPENAI_API_BASE",
@@ -284,6 +285,18 @@ class TestConfig:
 
 
 class TestStore:
+    def test_data_base_follows_quantdb_mount(self, tmp_path, monkeypatch):
+        # Arrange：容器里 QM_QUANTDB_DATA_DIR=/data/quantdb，数据根是它的父目录
+        quantdb = tmp_path / "quantdb"
+        quantdb.mkdir()
+        monkeypatch.setenv("QM_QUANTDB_DATA_DIR", str(quantdb))
+
+        # Act
+        base = rc_store.data_base()
+
+        # Assert
+        assert base == tmp_path
+
     def test_write_report_updates_meta_and_state(self):
         content = "# 收盘复盘\n\n今日指数上涨。\n"
 
@@ -342,9 +355,42 @@ class TestStore:
         rc_store.upsert_brief(_TARGET, _DAY, "news", "x" * 3000)
 
         meta = json.loads(rc_store.brief_meta_path(_TARGET).read_text(encoding="utf-8"))
-        assert (
-            len(meta["sections"]["news"]["content"]) == rc_store.SECTION_CONTENT_LIMIT
+        content = meta["sections"]["news"]["content"]
+        assert content.startswith("x" * 100)
+        assert content.endswith("…（全文见当日报告文件）")
+        assert len(content) < rc_store.SECTION_CONTENT_LIMIT + 40
+
+    def test_brief_surfaces_conclusion_not_first_paragraph(self):
+        # Arrange：新闻档第一段是市场综述，真正的次日方向在第七节
+        report = (
+            "## 1. 市场与资金\n\n"
+            "利率锚切换导致午后回落。\n\n"
+            "## 7. 明日方向（新闻定稿版）\n\n"
+            "- 方向：中性偏弱震荡\n- 板块：人形机器人\n"
         )
+
+        # Act
+        rc_store.upsert_brief(_TARGET, _DAY, "news", report)
+
+        # Assert：brief 顶部「当前结论」取结论段，而不是第一段
+        meta = json.loads(rc_store.brief_meta_path(_TARGET).read_text(encoding="utf-8"))
+        assert meta["sections"]["news"]["summary"].startswith("- 方向：中性偏弱震荡")
+        md = rc_store.read_brief(_TARGET)
+        assert "## 当前结论（新闻复盘）\n\n- 方向：中性偏弱震荡" in md
+
+    def test_excerpt_cuts_at_line_boundary(self):
+        text = "第一行\n" * 800  # 4800 字符，远超声明的 2400
+
+        out = rc_store._excerpt(text, 2400)
+
+        assert out.endswith("…（全文见当日报告文件）")
+        assert "第一行\n\n…" in out
+
+    def test_excerpt_drops_trailing_heading_without_body(self):
+        # 截断点恰好落在「标题 + 空行」之后：留下空标题比不截断更糟
+        out = rc_store._excerpt("a\n## 标题\n" + "b" * 3000, 9)
+
+        assert out == "a\n\n…（全文见当日报告文件）"
 
     def test_extract_section_stops_at_same_level_heading(self):
         text = "## 经验与教训\n- 教训一\n### 细项\n- 子项\n## 明日方向\n偏强"
@@ -426,6 +472,8 @@ class TestPrompts:
         assert "数据缺口" in text
         assert "总资产" in text
         assert "绝不编造" in text
+        # 持仓条数必须与明细一致（实测出过「明细 6 只、正文写仅两只」）
+        assert "照抄事实包明细" in text
 
 
 # ── 编排 ─────────────────────────────────────────────────────────────

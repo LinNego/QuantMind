@@ -41,6 +41,8 @@ SECTION_TITLES: dict[str, str] = {
 SECTION_CONTENT_LIMIT = 2400
 #: brief 最终结论上限
 FINAL_CONTENT_LIMIT = 4000
+#: 各档报告里「结论段」的标题关键字（行文各档不同，命中任一即可）
+CONCLUSION_NAMES = ("明日方向", "明日结论", "明日执行计划")
 
 
 def repo_root() -> Path:
@@ -48,11 +50,18 @@ def repo_root() -> Path:
 
 
 def _data_base() -> Path:
-    """数据根：仓库 ``data/`` 优先（宿主与容器都挂载），否则容器 ``/data``。
+    """数据根：容器用挂载 ``/data``，宿主用仓库 ``data/``（符号链接到真实盘）。
 
-    判据是**父目录**是否存在，不是子目录——``research_control`` 首次运行时
-    还没建出来，按子目录判会把宿主进程误导到不存在的 ``/data``。
+    **不能**按 ``repo_root()/data`` 是否存在来判容器：镜像里自带一个陈旧的
+    ``/app/data``（只有 ``backtest_2026``），按它解析会让容器内的 API / 交易进程
+    读到与 cron（写 ``/data``）完全不同的目录——面板永远「五档未运行」、
+    决策轮永远读不到 brief，且全链无报错。
     """
+    quantdb_dir = os.getenv("QM_QUANTDB_DATA_DIR")
+    if quantdb_dir:
+        return Path(quantdb_dir).parent
+    if Path("/.dockerenv").exists() and Path("/data").is_dir():
+        return Path("/data")
     repo_data = repo_root() / "data"
     return repo_data if repo_data.is_dir() else Path("/data")
 
@@ -250,6 +259,35 @@ def extract_section(content: str, names: tuple[str, ...]) -> str:
     return "\n".join(out).strip()
 
 
+def _excerpt(content: str, limit: int) -> str:
+    """按行边界截断并标注「全文在报告文件」，不把半句话/空标题留在 brief 里。"""
+    text = (content or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    nl = cut.rfind("\n")
+    if nl > limit // 2:
+        cut = cut[:nl]
+    lines = cut.splitlines()
+    while lines and (
+        not lines[-1].strip() or re.match(r"^\s{0,3}#{1,6}\s+", lines[-1])
+    ):
+        lines.pop()
+    return "\n".join(lines).rstrip() + "\n\n…（全文见当日报告文件）"
+
+
+def conclusion_of(content: str, limit: int = 1200) -> str:
+    """取报告结论段（明日方向/结论）；没有才退回首段摘要。
+
+    摘要取「第一段正文」会把「当前结论」抬成市场综述——新闻档的第一段是利率/汇率，
+    真正的次日方向在第七节。结论段优先，才配得上 brief 顶部那行「当前结论」。
+    """
+    section = extract_section(content, CONCLUSION_NAMES)
+    if section:
+        return _excerpt(section, limit)
+    return summary_of(content, limit=min(limit, 240))
+
+
 # ── brief ────────────────────────────────────────────────────────────
 
 
@@ -276,8 +314,8 @@ def upsert_brief(
         "slot": slot,
         "title": SECTION_TITLES.get(slot, slot),
         "ts": datetime.now(CN_TZ).isoformat(),
-        "summary": summary_of(content),
-        "content": (content or "")[:SECTION_CONTENT_LIMIT],
+        "summary": conclusion_of(content),
+        "content": _excerpt(content, SECTION_CONTENT_LIMIT),
         "machine": machine or {},
     }
     meta["sections"] = sections
@@ -286,7 +324,7 @@ def upsert_brief(
     if slot == "night":
         meta["final"] = {
             "ts": datetime.now(CN_TZ).isoformat(),
-            "content": (content or "")[:FINAL_CONTENT_LIMIT],
+            "content": _excerpt(content, FINAL_CONTENT_LIMIT),
             "machine": machine or {},
         }
     _write_json(brief_meta_path(target), meta)
