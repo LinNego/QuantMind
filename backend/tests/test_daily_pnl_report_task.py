@@ -29,6 +29,7 @@ def _row(
     mv: float = 0.0,
     positions: int = 0,
     last: str = "15:00",
+    payload=None,
 ):
     return SimpleNamespace(
         account_id=key,
@@ -39,6 +40,7 @@ def _row(
         cash=cash,
         market_value=mv,
         position_count=positions,
+        payload_json=payload,
     )
 
 
@@ -162,6 +164,136 @@ class TestBuildReport:
         _, content = task.build_report([channel], date(2026, 10, 8))
 
         assert "当日 +¥0.00（+0.00%）" in content
+
+
+# ── 当日成交 / 清仓明细 ───────────────────────────────────────────────
+
+
+class TestActivityBlocks:
+    def _activity(self, **over):
+        base = {
+            "buys": [
+                {
+                    "symbol": "601000.SH",
+                    "code": "SH601000",
+                    "name": "唐山港",
+                    "quantity": 300,
+                    "avg_price": 4.54,
+                    "fills": 2,
+                }
+            ],
+            "sells": [
+                {
+                    "symbol": "601857.SH",
+                    "code": "SH601857",
+                    "name": "中国石油",
+                    "quantity": 200,
+                    "avg_price": 12.70,
+                    "fills": 1,
+                }
+            ],
+            "closed": [
+                {
+                    "symbol": "601857.SH",
+                    "code": "SH601857",
+                    "name": "中国石油",
+                    "quantity": 200,
+                    "realized_pnl": 1547.8,
+                    "pnl_pct": 156.0,
+                    "cost_known": True,
+                }
+            ],
+            "closed_pnl_total": 1547.8,
+            "closed_cost_unknown": 0,
+        }
+        base.update(over)
+        return base
+
+    def _content(self, activity):
+        channel = {**TestBuildReport()._tdx(), "activity": activity}
+        _, content = task.build_report([channel], date(2026, 10, 8))
+        return content
+
+    def test_renders_buys_sells_and_closed_pnl(self):
+        content = self._content(self._activity())
+
+        assert "**今日成交**" in content
+        assert "买入 1 只 2 笔 ｜ 唐山港(SH601000) 300股@4.54" in content
+        assert "卖出 1 只 1 笔 ｜ 中国石油(SH601857) 200股@12.70" in content
+        assert "**今日清仓**" in content
+        assert "中国石油(SH601857) 200股 +¥1,547.80（+156.00%）" in content
+        assert "合计 +¥1,547.80（按成本，未扣费）" in content
+
+    def test_no_activity_renders_no_detail_section(self):
+        content = self._content(None)
+
+        assert "今日成交" not in content
+        assert "今日清仓" not in content
+
+    def test_zero_side_still_shows_a_dash(self):
+        """全清仓日没有买入：保留「买入 —」，一眼看出当天只有卖。"""
+        content = self._content(self._activity(buys=[]))
+
+        assert "买入 —" in content
+
+    def test_unknown_cost_is_not_rendered_as_zero(self):
+        closed = {
+            "symbol": "688543.SH",
+            "code": "SH688543",
+            "name": "国科军工",
+            "quantity": 100,
+            "realized_pnl": None,
+            "pnl_pct": None,
+            "cost_known": False,
+        }
+        activity = self._activity(
+            closed=[closed],
+            closed_pnl_total=None,
+            closed_cost_unknown=1,
+        )
+
+        content = self._content(activity)
+
+        assert "国科军工(SH688543) 100股 · 成本未知" in content
+        assert "合计 —（成本未知，未计盈亏）" in content
+        assert "¥0.00" not in content.split("**今日清仓**")[1]
+
+    def test_mixed_known_and_unknown_totals_flag_the_gap(self):
+        unknown = {
+            "symbol": "688543.SH",
+            "code": "SH688543",
+            "name": "",
+            "quantity": 100,
+            "realized_pnl": None,
+            "pnl_pct": None,
+            "cost_known": False,
+        }
+        activity = self._activity(
+            closed=self._activity()["closed"] + [unknown],
+            closed_cost_unknown=1,
+        )
+
+        content = self._content(activity)
+
+        assert "SH688543 100股 · 成本未知" in content
+        assert "另 1 只成本未知" in content
+
+    def test_long_lists_are_capped_with_remainder(self):
+        buys = [
+            {
+                "symbol": f"60000{i}.SH",
+                "code": f"SH60000{i}",
+                "name": "",
+                "quantity": 100,
+                "avg_price": 1.0,
+                "fills": 1,
+            }
+            for i in range(11)
+        ]
+
+        content = self._content(self._activity(buys=buys))
+
+        assert "…另 1 只" in content
 
 
 # ── 镜像段（P2-2）：跳过/失败台账进日报 ──────────────────────────────
@@ -337,6 +469,35 @@ class TestCollectDayChannels:
         assert channels[0]["day_pnl"] is None
         assert channels[0]["day_pnl_pct"] is None
 
+    @pytest.mark.asyncio
+    async def test_zero_volume_template_rows_are_not_positions(self):
+        """清仓后桥回 9 条 0 股模板行：持仓数按 payload 里真有股数的行数。
+
+        2026-10-20 实况：全清后账户页/日报显示「持仓 9 只 ｜ 市值 ¥0.00」。
+        """
+        payload = {
+            "positions": [
+                {"symbol": "601857.SH", "volume": 0},
+                {"symbol": "601000.SH", "volume": 0},
+                {"symbol": "601985.SH", "volume": 100},
+            ]
+        }
+        db = _FakeSession(
+            [_row("2026-10-08", 918_397.51, 917_955.65, positions=3, payload=payload)]
+        )
+
+        channels = await task.collect_day_channels(db, date(2026, 10, 8))
+
+        assert channels[0]["position_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_payload_falls_back_to_stored_count(self):
+        db = _FakeSession([_row("2026-10-08", 918_397.51, 917_955.65, positions=4)])
+
+        channels = await task.collect_day_channels(db, date(2026, 10, 8))
+
+        assert channels[0]["position_count"] == 4
+
 
 # ── 发送状态机：真实推送 / 失败 / 无数据 ──────────────────────────────
 
@@ -346,7 +507,11 @@ class TestRunDailyReport:
         async def fake_collect(db, day):
             return channels
 
+        async def fake_activity(db, day, channel_list):
+            return {}
+
         monkeypatch.setattr(task, "collect_day_channels", fake_collect)
+        monkeypatch.setattr(task, "collect_day_activity", fake_activity)
 
     def _patch_fanout(self, monkeypatch, *, delivered=1, audience=1, exc=None):
         """隔离通知面登记（审计 H11）：记录调用，不碰真库。"""
@@ -403,6 +568,84 @@ class TestRunDailyReport:
         assert sent["title"] == "收盘收益 · 2026-10-08"
         assert "¥918,397.51" in sent["content"]
         assert "trade:daily-pnl-report:20261008" in redis.client.store
+
+    @pytest.mark.asyncio
+    async def test_report_carries_day_activity(self, monkeypatch):
+        """当日成交/清仓明细进 QQ 文案（用户要的「今天买了什么、清仓赚没赚」）。"""
+        sent: dict = {}
+        self._patch_channels(monkeypatch, [_channel_tdx()])
+        self._patch_fanout(monkeypatch)
+
+        async def fake_activity(db, day, channels):
+            return {
+                "tdx": {
+                    "buys": [],
+                    "sells": [
+                        {
+                            "symbol": "601857.SH",
+                            "code": "SH601857",
+                            "name": "中国石油",
+                            "quantity": 200,
+                            "avg_price": 12.70,
+                            "fills": 1,
+                        }
+                    ],
+                    "closed": [
+                        {
+                            "symbol": "601857.SH",
+                            "code": "SH601857",
+                            "name": "中国石油",
+                            "quantity": 200,
+                            "realized_pnl": 1547.8,
+                            "pnl_pct": 156.0,
+                            "cost_known": True,
+                        }
+                    ],
+                    "closed_pnl_total": 1547.8,
+                    "closed_cost_unknown": 0,
+                }
+            }
+
+        monkeypatch.setattr(task, "collect_day_activity", fake_activity)
+        import backend.shared.qq_notify as qq
+
+        monkeypatch.setattr(
+            qq, "notify", lambda title, content: sent.update(content=content) or True
+        )
+
+        result = await task.run_daily_pnl_report(
+            _fake_redis(), today=date(2026, 10, 8), db=object()
+        )
+
+        assert result["sent"] is True
+        assert "**今日成交**" in sent["content"]
+        assert "中国石油(SH601857) 200股@12.70" in sent["content"]
+        assert "合计 +¥1,547.80" in sent["content"]
+
+    @pytest.mark.asyncio
+    async def test_activity_read_failure_never_breaks_the_report(self, monkeypatch):
+        """明细读挂（快照表缺失/桥断档）→ 报表照发，只是少了明细段。"""
+        sent: dict = {}
+        self._patch_channels(monkeypatch, [_channel_tdx()])
+        self._patch_fanout(monkeypatch)
+
+        async def boom(db, day, channels):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(task, "collect_day_activity", boom)
+        import backend.shared.qq_notify as qq
+
+        monkeypatch.setattr(
+            qq, "notify", lambda title, content: sent.update(content=content) or True
+        )
+
+        result = await task.run_daily_pnl_report(
+            _fake_redis(), today=date(2026, 10, 8), db=object()
+        )
+
+        assert result["sent"] is True
+        assert "¥918,397.51" in sent["content"]
+        assert "今日成交" not in sent["content"]
 
     @pytest.mark.asyncio
     async def test_notify_failure_is_not_success(self, monkeypatch):
@@ -477,7 +720,11 @@ class TestNotificationRegistration:
         async def fake_collect(db, day):
             return channels
 
+        async def fake_activity(db, day, channel_list):
+            return {}
+
         monkeypatch.setattr(task, "collect_day_channels", fake_collect)
+        monkeypatch.setattr(task, "collect_day_activity", fake_activity)
         import backend.shared.qq_notify as qq
 
         monkeypatch.setattr(qq, "notify", lambda *a, **k: notify_result)

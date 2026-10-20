@@ -14,6 +14,10 @@
 user 别名，与实盘账户页/风控档位同一口径，禁另起一套）。当日盈亏金额 =
 总资产 − 日初权益；百分比走 ``resolve_daily_pnl_pct`` 与卡片逐位同源。
 
+当日有真单成交时，通道块后附 **今日成交**（买入/卖出按标的汇总）与
+**今日清仓**（当日卖空的标的按摊薄成本结转的已实现盈亏）——数据源与口径见
+``daily_pnl_activity``。明细读失败只丢这两段，报表本体照发。
+
 当日有真单镜像事件时（P2-2），附一段**镜像台账**（``mirror:skipped`` /
 ``mirror:failed`` 两本账的当日计数，按原因聚合 Top-N）——镜像跳过/失败此前只在
 双轨对账里可见，而那份报告只在**有未解释缺口**时才推 QQ；一切都被解释的「安静日」
@@ -47,6 +51,8 @@ from datetime import date, datetime
 
 from backend.services.live_trading.services.trading_session import TZ
 from backend.shared import qq_notify
+
+from .daily_pnl_activity import collect_day_activity
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +159,83 @@ def _mirror_block(mirror: dict) -> str:
     return "\n".join(lines)
 
 
+#: 「今日成交」每侧最多列出的标的数（QQ 单条上限 1600 字）。
+_TRADE_SYMBOLS_MAX = 10
+#: 「今日清仓」最多逐行列出的标的数，其余折成「另 N 只」。
+_CLOSED_LINES_MAX = 10
+
+
+def _symbol_label(item: dict) -> str:
+    """``名称(SH601857)``；名称缺失退回代码，绝不显示成空串。"""
+    code = str(item.get("code") or "").strip()
+    name = str(item.get("name") or "").strip()
+    return f"{name}({code})" if name and code else (name or code)
+
+
+def _fmt_quantity(value: float) -> str:
+    return f"{int(round(float(value or 0.0))):,}"
+
+
+def _trade_side_line(label: str, items: list[dict]) -> str:
+    """一侧成交压成一行：``卖出 9 只 19 笔 ｜ 名称(代码) 200股@12.70、…``。"""
+    if not items:
+        return f"{label} —"
+    fills = sum(int(item.get("fills") or 0) for item in items)
+    parts = [
+        f"{_symbol_label(item)} {_fmt_quantity(item.get('quantity'))}股@"
+        f"{float(item.get('avg_price') or 0.0):.2f}"
+        for item in items[:_TRADE_SYMBOLS_MAX]
+    ]
+    line = f"{label} {len(items)} 只 {fills} 笔 ｜ " + "、".join(parts)
+    if len(items) > _TRADE_SYMBOLS_MAX:
+        line += f" …另 {len(items) - _TRADE_SYMBOLS_MAX} 只"
+    return line
+
+
+def _closed_line(item: dict) -> str:
+    label = _symbol_label(item)
+    quantity = _fmt_quantity(item.get("quantity"))
+    pnl = item.get("realized_pnl")
+    if pnl is None:
+        # 缺成本 ≠ 打平：不许显示成 +¥0.00
+        return f"{label} {quantity}股 · 成本未知"
+    pct = item.get("pnl_pct")
+    pct_text = f"（{_fmt_signed_pct(pct)}）" if pct is not None else ""
+    return f"{label} {quantity}股 {_fmt_signed_money(pnl)}{pct_text}"
+
+
+def _activity_blocks(activity: dict | None) -> list[str]:
+    """当日成交 / 清仓明细段；无成交返回空列表（不出空段）。"""
+    if not activity:
+        return []
+    lines: list[str] = []
+    buys = activity.get("buys") or []
+    sells = activity.get("sells") or []
+    if buys or sells:
+        lines.extend(
+            [
+                "**今日成交**",
+                _trade_side_line("买入", buys),
+                _trade_side_line("卖出", sells),
+            ]
+        )
+    closed = activity.get("closed") or []
+    if closed:
+        lines.append("**今日清仓**")
+        lines.extend(_closed_line(item) for item in closed[:_CLOSED_LINES_MAX])
+        if len(closed) > _CLOSED_LINES_MAX:
+            lines.append(f"…另 {len(closed) - _CLOSED_LINES_MAX} 只")
+        total = activity.get("closed_pnl_total")
+        unknown = int(activity.get("closed_cost_unknown") or 0)
+        if total is None:
+            lines.append("合计 —（成本未知，未计盈亏）")
+        else:
+            note = "（按成本，未扣费"
+            note += f"；另 {unknown} 只成本未知" if unknown else ""
+            lines.append(f"合计 {_fmt_signed_money(total)}{note}）")
+    return ["\n".join(lines)]
+
+
 def build_report(
     channels: list[dict], day: date, mirror: dict | None = None
 ) -> tuple[str, str] | None:
@@ -185,6 +268,7 @@ def build_report(
                 ]
             )
         )
+        blocks.extend(_activity_blocks(c.get("activity")))
     if len(channels) >= 2:
         total = sum(float(c["total_asset"]) for c in channels)
         pnls = [c.get("day_pnl") for c in channels]
@@ -208,6 +292,28 @@ def build_report(
 
 
 # ---------- 数据收集 ----------
+
+
+def _position_count(row) -> int:
+    """持仓数以快照 payload 里**真有股数**的行为准，payload 缺失回落落库列。
+
+    桥清仓后仍会回 0 股模板行，``position_count`` 列因此写成 9 只、市值 ¥0.00
+    （2026-10-20 实况）。payload 在就数 payload——报表不跟着模板行说谎。
+    """
+    payload = getattr(row, "payload_json", None)
+    positions = payload.get("positions") if isinstance(payload, dict) else None
+    if not isinstance(positions, list):
+        return int(getattr(row, "position_count", 0) or 0)
+    count = 0
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        try:
+            if float(item.get("volume") or 0) > 0:
+                count += 1
+        except (TypeError, ValueError):
+            continue
+    return count
 
 
 async def collect_day_channels(db, day: date) -> list[dict]:
@@ -249,7 +355,7 @@ async def collect_day_channels(db, day: date) -> list[dict]:
                 "total_asset": total,
                 "cash": float(row.cash or 0.0),
                 "market_value": float(row.market_value or 0.0),
-                "position_count": int(row.position_count or 0),
+                "position_count": _position_count(row),
                 "day_pnl": round(total - base, 2) if base > 0 else None,
                 "day_pnl_pct": resolve_daily_pnl_pct(
                     total_asset=total, day_open_equity=base
@@ -383,6 +489,17 @@ async def _register_delivery(
     return True
 
 
+async def _safe_collect_activity(db, day: date, channels: list[dict]) -> dict:
+    """当日成交/清仓明细：读失败只丢明细段，**不拖垮报表本体**。"""
+    if not channels:
+        return {}
+    try:
+        return await collect_day_activity(db, day, channels)
+    except Exception as exc:  # noqa: BLE001 - 明细是旁注，报表本体照发
+        logger.warning("[DailyPnlReport] 当日成交/清仓读取失败（报表照发）: %s", exc)
+        return {}
+
+
 async def run_daily_pnl_report(redis, *, today: date | None = None, db=None) -> dict:
     """生成并推送当日收盘收益报表。
 
@@ -397,11 +514,15 @@ async def run_daily_pnl_report(redis, *, today: date | None = None, db=None) -> 
 
             async with get_session(read_only=True) as session:
                 channels = await collect_day_channels(session, day)
+                activity = await _safe_collect_activity(session, day, channels)
         else:
             channels = await collect_day_channels(db, day)
+            activity = await _safe_collect_activity(db, day, channels)
     except Exception as exc:  # noqa: BLE001 - 读失败按"没有数据"重试，不算发送
         logger.error("[DailyPnlReport] 台账读取失败: %s", exc, exc_info=True)
         return {"date": date_str, "sent": False, "error": f"ledger_read_failed: {exc}"}
+
+    channels = [{**c, "activity": activity.get(c["key"])} for c in channels]
 
     # 镜像台账（P2-2）：读失败只是缺一段增量信息，**不拖垮报表**（与台账读的
     # fail-closed 相反——那份是报表本体，这份是旁注）。

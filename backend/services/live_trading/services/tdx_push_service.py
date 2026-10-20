@@ -283,6 +283,42 @@ def _batch_quantdb_last_close(symbols: list[str]) -> dict[str, float]:
     return result
 
 
+def normalize_bridge_positions(
+    positions_raw: list[dict[str, Any]] | None,
+    price_map: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """桥 ``/api/v1/account/query`` 的持仓 → 落库持仓（**0 股模板行丢弃**）。
+
+    桥在清仓后仍会把该代码留成 ``total_volume=0`` 的模板行（2026-10-20 实测：
+    9 只全清后仍回 9 条 0 股行）。0 股不是持仓——计入 ``position_count`` /
+    写进 ``payload_json`` 会把「持仓 9 只 / 市值 ¥0.00」带进日终账本，收盘
+    收益报表原样展示。价格缺失时用 QuantDB 最近收盘价补（与模拟撮合同源）。
+    """
+    positions: list[dict[str, Any]] = []
+    for p in positions_raw or []:
+        symbol = str(p.get("stock_code") or "").strip()
+        if not symbol:
+            continue
+        volume = int(p.get("total_volume") or 0)
+        if volume <= 0:
+            continue
+        price = float(p.get("current_price") or p.get("price") or 0)
+        if price <= 0:
+            price = float((price_map or {}).get(symbol) or 0.0)
+        positions.append(
+            {
+                "symbol": symbol,
+                "name": str(p.get("stock_name") or "").strip(),
+                "volume": volume,
+                "available_volume": int(p.get("available_volume") or 0),
+                "cost_price": float(p.get("cost_price") or 0),
+                "price": price,
+                "market_value": round(volume * price, 2),
+            }
+        )
+    return positions
+
+
 class TdxPushService:
     def __init__(self, bridge_url: str = "", bridge_token: str = ""):
         self.bridge_url = str(bridge_url or TDX_BRIDGE_URL).rstrip("/")
@@ -575,26 +611,8 @@ class TdxPushService:
             _batch_quantdb_last_close,
             [str(p.get("stock_code") or "").strip() for p in positions_raw],
         )
-        positions = []
-        for p in positions_raw:
-            symbol = str(p.get("stock_code") or "").strip()
-            if not symbol:
-                continue
-            volume = int(p.get("total_volume") or 0)
-            price = float(p.get("current_price") or p.get("price") or 0)
-            if price <= 0:
-                price = price_map.get(symbol, 0.0)
-            positions.append(
-                {
-                    "symbol": symbol,
-                    "name": str(p.get("stock_name") or "").strip(),
-                    "volume": volume,
-                    "available_volume": int(p.get("available_volume") or 0),
-                    "cost_price": float(p.get("cost_price") or 0),
-                    "price": price,
-                    "market_value": round(volume * price, 2),
-                }
-            )
+        # 0 股模板行不是持仓（桥清仓后仍返回）——丢弃，见 normalize_bridge_positions
+        positions = normalize_bridge_positions(positions_raw, price_map)
         total_asset = float(asset.get("asset") or 0)
         cash = float(asset.get("cash") or 0)
         # 桥的 market_value 可能为 0，按持仓市值累加
