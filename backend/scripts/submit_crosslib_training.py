@@ -31,6 +31,9 @@ config.yaml>` 钉扎逐库目录版本——版本不一致即拒绝提交，保
     # GPU TFT（NativeTFT，dl_params 走内置配方；训练容器自动探测 GPU，无卡回落 CPU）
     QM_PASSWORD=... python3 backend/scripts/submit_crosslib_training.py \\
         --model-type nativetft --pin-versions-from data/training_jobs/<base_run>/config.yaml
+    # 无 admin 口令时走内部调用（secret 取 env INTERNAL_CALL_SECRET，fail-closed）
+    INTERNAL_CALL_SECRET=... python3 backend/scripts/submit_crosslib_training.py \\
+        --internal-call --internal-user-id 10000001
 """
 
 from __future__ import annotations
@@ -180,12 +183,26 @@ async def _login(client, password: str) -> str:
     return str(tok)
 
 
-async def _fetch_catalog(client, token: str, lib: str) -> dict[str, Any]:
+def _build_internal_headers(user_id: str, tenant_id: str) -> dict[str, str]:
+    """内部调用身份头：secret 只从 env 读，缺失即拒绝（fail-closed）。"""
+    secret = os.getenv("INTERNAL_CALL_SECRET", "").strip()
+    if not secret:
+        _fail("内部调用需 env INTERNAL_CALL_SECRET（fail-closed，不落默认值）")
+    if not user_id:
+        _fail("内部调用需 --internal-user-id（模型产物按用户目录落盘）")
+    return {
+        "X-Internal-Call": secret,
+        "X-User-Id": user_id,
+        "X-Tenant-Id": tenant_id or "default",
+    }
+
+
+async def _fetch_catalog(client, headers: dict[str, str], lib: str) -> dict[str, Any]:
     """返回 {version_id, columns: key -> source_column（仅 enabled 项）}；不 ready 即退出。"""
     r = await client.get(
         "/models/feature-catalog",
         params={"market": _MARKET, "factor_source": lib},
-        headers={"Authorization": f"Bearer {token}"},
+        headers=headers,
     )
     if r.status_code != 200:
         _fail(f"拉取目录失败 {lib}: {r.status_code} {str(r.text)[:200]}")
@@ -468,6 +485,17 @@ async def main() -> None:
     ap.add_argument("--selection-json", type=Path, default=_DEFAULT_SELECTION)
     ap.add_argument("--api-base", default="http://localhost:8000/api/v1")
     ap.add_argument("--password", default=os.getenv("QM_PASSWORD", ""))
+    ap.add_argument(
+        "--internal-call",
+        action="store_true",
+        help="走内部调用身份头（X-Internal-Call），免 admin 口令",
+    )
+    ap.add_argument(
+        "--internal-user-id",
+        default="",
+        help="内部调用时代表哪个用户（模型产物落该用户目录，如 10000001）",
+    )
+    ap.add_argument("--internal-tenant-id", default="default")
     ap.add_argument("--dry-run", action="store_true", help="只校验 + 打印载荷，不提交")
     ap.add_argument(
         "--wait-config", type=float, default=180.0, help="config.yaml 等待秒数"
@@ -525,17 +553,23 @@ async def main() -> None:
         f"{tp['split']['train_start']}..{tp['split']['test_end']}"
     )
 
-    if not args.password:
-        _fail("未提供 admin 口令（env QM_PASSWORD 或 --password）")
-
     import httpx
     import yaml
 
     async with httpx.AsyncClient(base_url=args.api_base, timeout=120) as client:
-        token = await _login(client, args.password)
+        if args.internal_call:
+            auth_headers = _build_internal_headers(
+                args.internal_user_id, args.internal_tenant_id
+            )
+            print("[submit] 认证方式：内部调用身份头（X-Internal-Call）")
+        else:
+            if not args.password:
+                _fail("未提供 admin 口令（env QM_PASSWORD 或 --password）")
+            token = await _login(client, args.password)
+            auth_headers = {"Authorization": f"Bearer {token}"}
         catalogs: dict[str, dict[str, Any]] = {}
         for lib in sel["libraries"]:
-            catalogs[lib] = await _fetch_catalog(client, token, lib)
+            catalogs[lib] = await _fetch_catalog(client, auth_headers, lib)
             print(
                 f"  · {lib:22s} {catalogs[lib]['version_id']}  enabled={len(catalogs[lib]['columns'])}"
             )
@@ -584,7 +618,7 @@ async def main() -> None:
         r = await client.post(
             "/models/run-training",
             json=payload,
-            headers={"Authorization": f"Bearer {token}"},
+            headers=auth_headers,
         )
         if r.status_code not in (200, 201, 202):
             _fail(f"提交失败 {r.status_code}: {str(r.text)[:600]}")
