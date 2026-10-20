@@ -38,6 +38,12 @@ DEFAULT_HOT_SET_KEY = config.DEFAULT_HOT_SET_KEY
 DEFAULT_CAP = 1000
 DEFAULT_SILENCE_S = 120.0
 
+# 配额/鉴权类失败（Token Insufficient）的退避：静默重订每 60s 一次会把配额
+# 持续烧穿（2026-10-17~20 实测 8 分片累计 44,560 次重订，Token 始终不足）。
+# 退避从 5min 起指数翻倍、封顶 1h；收到真实数据帧即清零。
+AUTH_BACKOFF_INITIAL_S = 300.0
+AUTH_BACKOFF_MAX_S = 3600.0
+
 _BID_ASK_FIELDS = tuple(
     [f"bid{i}" for i in range(1, 6)]
     + [f"bid_vol{i}" for i in range(1, 6)]
@@ -250,6 +256,8 @@ class SubscriptionEngine:
         silence_s: float = DEFAULT_SILENCE_S,
         sync_interval_s: float = 15.0,
         resubscribe_min_gap_s: float = 60.0,
+        auth_backoff_initial_s: float = AUTH_BACKOFF_INITIAL_S,
+        auth_backoff_max_s: float = AUTH_BACKOFF_MAX_S,
         shard_id: int = 0,
         shard_count: int = 1,
         max_queue_records: int = DEFAULT_QUEUE_MAX_RECORDS,
@@ -269,6 +277,10 @@ class SubscriptionEngine:
         self.silence_s = float(silence_s)
         self.sync_interval_s = float(sync_interval_s)
         self.resubscribe_min_gap_s = float(resubscribe_min_gap_s)
+        self.auth_backoff_initial_s = max(1.0, float(auth_backoff_initial_s))
+        self.auth_backoff_max_s = max(
+            self.auth_backoff_initial_s, float(auth_backoff_max_s)
+        )
         self.shard_count = max(1, int(shard_count))
         self.shard_id = int(shard_id) % self.shard_count
         self.max_record_age_s = (
@@ -282,6 +294,10 @@ class SubscriptionEngine:
         self._current: set[str] = set()  # 原生码（后缀式）
         self.last_frame_ts: float | None = None
         self._last_resubscribe_ts = 0.0
+        # 配额/鉴权退避（Token Insufficient）：期间绝不重订阅，避免把配额烧穿
+        self._auth_backoff_until = 0.0
+        self._auth_backoff_s = 0.0
+        self._auth_backoff_reason: str | None = None
         self._stop = asyncio.Event()
         self.counters: dict[str, Any] = {
             "frames": 0,
@@ -300,8 +316,58 @@ class SubscriptionEngine:
             # 队列背压（2026-10-14 事故新增；深度见 snapshot().queue_depth）
             "enqueue_stale_dropped": 0,  # 陈旧重放帧入队前丢（与归档同口径闸门）
             "queue_dropped": 0,  # 队列满逐出最旧（保新弃旧）
+            "auth_backoff_entries": 0,  # 进入配额/鉴权退避次数
+            "auth_backoff_skipped": 0,  # 退避期间被拦下的热集同步/重订次数
             "last_error": None,
         }
+
+    # ── 配额/鉴权退避 ────────────────────────────────────────────────
+
+    def _in_auth_backoff(self, now: float | None = None) -> bool:
+        return (now if now is not None else time.time()) < self._auth_backoff_until
+
+    def auth_backoff_remaining_s(self, now: float | None = None) -> float:
+        return max(
+            0.0, self._auth_backoff_until - (now if now is not None else time.time())
+        )
+
+    def _enter_auth_backoff(self, reason: str) -> None:
+        """Token Insufficient → 指数退避；已在退避中不重复翻倍。"""
+        now = time.time()
+        if now < self._auth_backoff_until:
+            return
+        next_s = (
+            min(self._auth_backoff_s * 2, self.auth_backoff_max_s)
+            if self._auth_backoff_s > 0
+            else self.auth_backoff_initial_s
+        )
+        self._auth_backoff_s = next_s
+        self._auth_backoff_until = now + next_s
+        self._auth_backoff_reason = str(reason or "")[:200]
+        self.counters["auth_backoff_entries"] += 1
+        self.counters["last_error"] = f"auth backoff: {reason}"
+        logger.warning(
+            "订阅配额/鉴权失败，退避 %.0fs（期间不重订阅）: %s", next_s, reason
+        )
+
+    def _reset_auth_backoff(self) -> None:
+        if self._auth_backoff_s > 0:
+            logger.info(
+                "订阅收到真实数据帧，重置配额退避（原 %.0fs）", self._auth_backoff_s
+            )
+        self._auth_backoff_until = 0.0
+        self._auth_backoff_s = 0.0
+        self._auth_backoff_reason = None
+
+    def _should_force_resubscribe(self, now: float) -> bool:
+        """静默强制重订判定（配额退避期间一律不重订）。"""
+        if self._in_auth_backoff(now):
+            return False
+        return bool(
+            self._current
+            and is_silent(self.last_frame_ts, now, self.silence_s)
+            and now - self._last_resubscribe_ts >= self.resubscribe_min_gap_s
+        )
 
     # 回调（SDK 线程）——只做解析入队，绝不阻塞原生线程
     def on_push(self, raw: str) -> int:
@@ -317,12 +383,18 @@ class SubscriptionEngine:
             codes[kind] = int(codes.get(kind, 0)) + 1
             self.counters["last_error"] = f"push parse: {exc}"
             self.counters["last_parse_error_preview"] = str(raw)[:160]
+            # 推送通道同样会回 ErrorId=-2: Token Insufficient（2026-10-17 起实测）。
+            # 这是配额/鉴权失败而非损坏帧：继续按 60s 静默重订只会持续烧配额。
+            code, msg = protocol.map_sdk_error(exc)
+            if code == "rate_limited":
+                self._enter_auth_backoff(msg)
             return 1
         self.counters["frames"] += 1
         self.counters["last_frame_preview"] = str(raw)[:120]
         self.counters["last_frame_records"] = len(records)
         if records:
             self.counters["frames_data"] = self.counters.get("frames_data", 0) + 1
+            self._reset_auth_backoff()
         else:
             # 元帧（ColDes 全列、Content 空行——订阅 ACK/心跳型），无数据内容
             self.counters["frames_meta"] = self.counters.get("frames_meta", 0) + 1
@@ -523,7 +595,10 @@ class SubscriptionEngine:
             code, msg = protocol.map_sdk_error(exc)
             self.counters["last_error"] = f"resubscribe: {msg}"
             if code == "rate_limited":
-                self._gate.note_rate_limited()
+                if self._gate is not None:
+                    self._gate.note_rate_limited()
+                # 订阅调用本身报配额不足 → 立刻退避，别等下一条静默周期再试
+                self._enter_auth_backoff(msg)
             return False
         self._current = set(symbols)
         self._last_resubscribe_ts = time.time()
@@ -550,6 +625,16 @@ class SubscriptionEngine:
 
     def sync_hot_set_once(self) -> dict[str, Any]:
         """一次热集差分同步（供 run 循环与手动触发复用；含本片分片过滤）。"""
+        remaining = self.auth_backoff_remaining_s()
+        if remaining > 0:
+            # 配额/鉴权退避期间连热集都不读：热集随时在变，读了也只会触发重订
+            self.counters["auth_backoff_skipped"] += 1
+            return {
+                "changed": False,
+                "reason": "auth_backoff",
+                "retry_in_s": round(remaining, 1),
+                "current": len(self._current),
+            }
         full = self._read_hot_set()
         if full is None:
             return {"changed": False, "reason": "hot_set_unreadable"}
@@ -595,13 +680,9 @@ class SubscriptionEngine:
             try:
                 drained = await asyncio.to_thread(self._drain_backlog)
                 await asyncio.to_thread(self.sync_hot_set_once)
-                # 静默断流 → 强制重订阅（带最小间隔防抖动）
+                # 静默断流 → 强制重订阅（带最小间隔防抖动；配额退避期间不重订）
                 now = time.time()
-                if (
-                    self._current
-                    and is_silent(self.last_frame_ts, now, self.silence_s)
-                    and now - self._last_resubscribe_ts >= self.resubscribe_min_gap_s
-                ):
+                if self._should_force_resubscribe(now):
                     logger.warning(
                         "订阅静默 %.0fs，强制重订阅 %d 只",
                         now - (self.last_frame_ts or now),
@@ -634,6 +715,12 @@ class SubscriptionEngine:
                 round(now - self.last_frame_ts, 1) if self.last_frame_ts else None
             ),
             "silent": is_silent(self.last_frame_ts, now, self.silence_s),
+            "auth_backoff": {
+                "active": self._in_auth_backoff(now),
+                "duration_s": round(self._auth_backoff_s, 1),
+                "retry_in_s": round(self.auth_backoff_remaining_s(now), 1),
+                "reason": self._auth_backoff_reason,
+            },
             "queue_depth": len(self._queue),
             "queue_max": self._queue_maxlen,
             "counters": dict(self.counters),

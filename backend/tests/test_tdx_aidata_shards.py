@@ -656,3 +656,52 @@ async def test_save_config_resets_cluster_singleton_only_for_construction_update
     req2 = router_mod.TdxAiDataConfigRequest(token="tok-x")
     await router_mod.save_tdx_aidata_config(req2, current_user={"is_admin": True})
     assert "token" in calls and "reset" not in calls
+
+
+# ── 8. worker 重启必须杀掉不退的进程（2026-10-20 孤儿 worker 实测）──────
+#
+# 背景：SIGTERM 可被原生 SDK 线程卡住；restart() 旧实现只发一次 SIGTERM 就返回，
+# 2026-10-14/15 的 4 个 worker 一直活到 10-20（socket 已被新进程替换，成为无主
+# 订阅并继续消耗 token）。restart 必须在宽限后升级 SIGKILL。
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dies_on_term", [True, False])
+async def test_restart_escalates_to_sigkill_when_worker_ignores_term(
+    monkeypatch, dies_on_term
+):
+    from backend.shared.tdx_aidata import client as client_mod
+
+    c = client_mod.TdxAiDataClient(socket_path="/tmp/qm-test-restart.sock")
+
+    async def _status(*_a, **_k):
+        return {"pid": 4242}
+
+    async def _close():
+        return None
+
+    c.status = _status
+    c._close_conn = _close
+    calls: list[int] = []
+    alive = {"v": True}
+
+    def _fake_kill(pid: int, sig: int):
+        calls.append(sig)
+        if sig == signal.SIGTERM and dies_on_term:
+            alive["v"] = False
+        if sig == signal.SIGKILL:
+            alive["v"] = False
+        if sig == 0 and not alive["v"]:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(client_mod.os, "kill", _fake_kill)
+    monkeypatch.setattr(client_mod, "TERM_GRACE_S", 0.25)
+    monkeypatch.setattr(client_mod, "TERM_POLL_S", 0.05)
+
+    assert await c.restart() is True
+
+    assert signal.SIGTERM in calls
+    if dies_on_term:
+        assert signal.SIGKILL not in calls  # 已退出：不补刀
+    else:
+        assert signal.SIGKILL in calls  # 卡死：宽限后强杀

@@ -185,6 +185,11 @@ def test_push_error_kind_classifier():
     )
     # 有 ErrorId 无 RetFlag（如 ErrorId=11 连接失败）
     assert protocol.push_error_kind("推送错误 ErrorId=11: None") == "server_errorid_11"
+    # Token 配额失败是负数 ErrorId——必须能归类（2026-10-20 实测 ErrorId=-2）
+    assert (
+        protocol.push_error_kind("推送错误 ErrorId=-2: Token Insufficient")
+        == "server_errorid_-2"
+    )
     # 本地解析失败两类
     assert protocol.push_error_kind("推送非 JSON: Expecting value") == "non_json"
     assert protocol.push_error_kind("推送类型不支持: bytes") == "unsupported_type"
@@ -364,3 +369,97 @@ def test_drain_backlog_catches_up_across_batches():
     assert len(engine._queue) == 0
     assert engine.counters["written"] == 1200
     assert len(written_keys) == 1200  # 全部经 hset 落库
+
+
+# ── 7. 配额/鉴权退避（2026-10-20：Token Insufficient 重订风暴）──────────
+#
+# 事故链条：2026-10-17 起订阅推送回 ErrorId=-2: Token Insufficient，旧实现只当
+# 普通解析错误计数；静默 120s 后每 60s 强制重订一次，8 分片 × 3 天累计 44,560
+# 次重订，配额始终不足。修复：识别 rate_limited → 指数退避（5min→1h），退避期间
+# 不读热集、不重订；收到真实数据帧即清零。
+
+
+@pytest.mark.unit
+def test_token_insufficient_enters_auth_backoff_and_blocks_resubscribe(monkeypatch):
+    from types import SimpleNamespace
+
+    from backend.shared.tdx_aidata import collector
+
+    clock = {"t": 1_000_000.0}
+    # 只替换 collector 模块的 time 引用（不碰全局 time 模块）
+    monkeypatch.setattr(collector, "time", SimpleNamespace(time=lambda: clock["t"]))
+    engine = _make_engine(hot_set_reader=lambda: {"600036.SH"})
+    engine._current = {"600036.SH"}
+
+    engine.on_push('{"ErrorId": -2, "Error": "Token Insufficient"}')
+
+    snap = engine.snapshot()
+    assert snap["auth_backoff"]["active"] is True
+    assert snap["auth_backoff"]["duration_s"] == 300.0
+    assert snap["auth_backoff"]["retry_in_s"] == 300.0
+    assert engine.counters["auth_backoff_entries"] == 1
+
+    # 退避期间热集同步直接跳过（不读热集、不重订）
+    out = engine.sync_hot_set_once()
+    assert out["reason"] == "auth_backoff"
+    assert out["retry_in_s"] == 300.0
+    assert engine.counters["auth_backoff_skipped"] == 1
+
+    # 静默强制重订同样被拦下（时钟越过最小间隔也不重订）
+    engine.last_frame_ts = clock["t"] - 200  # 已静默 200s > silence_s
+    assert engine._should_force_resubscribe(clock["t"] + 120) is False
+
+    # 退避到期后恢复同步
+    clock["t"] += 301
+    assert engine._should_force_resubscribe(clock["t"]) is True
+    out = engine.sync_hot_set_once()
+    assert out.get("reason") != "auth_backoff"
+
+
+@pytest.mark.unit
+def test_auth_backoff_doubles_to_cap_and_resets_on_data_frame(monkeypatch):
+    from types import SimpleNamespace
+
+    from backend.shared.tdx_aidata import collector
+
+    clock = {"t": 2_000_000.0}
+    monkeypatch.setattr(collector, "time", SimpleNamespace(time=lambda: clock["t"]))
+    engine = _make_engine()
+
+    err = '{"ErrorId": -2, "Error": "Token Insufficient"}'
+    durations = []
+    for _ in range(6):
+        engine.on_push(err)
+        durations.append(engine.snapshot()["auth_backoff"]["duration_s"])
+        clock["t"] += engine.auth_backoff_remaining_s() + 1
+
+    # 300 → 600 → 1200 → 2400 → 3600（封顶）→ 3600
+    assert durations == [300.0, 600.0, 1200.0, 2400.0, 3600.0, 3600.0]
+
+    # 真实数据帧到达 → 退避清零，下一轮重新从 300 起
+    engine.on_push(_frame_json([{"code": "600036.SH", "price": "40.92"}]))
+    snap = engine.snapshot()
+    assert snap["auth_backoff"]["active"] is False
+    assert snap["auth_backoff"]["duration_s"] == 0.0
+
+    engine.on_push(err)
+    assert engine.snapshot()["auth_backoff"]["duration_s"] == 300.0
+
+
+@pytest.mark.unit
+def test_resubscribe_rate_limited_enters_backoff_without_budget_gate(monkeypatch):
+    """订阅调用本身报 Token Insufficient → 立即退避；budget_gate=None 不得炸。"""
+    from types import SimpleNamespace
+
+    from backend.shared.tdx_aidata import collector
+
+    monkeypatch.setattr(collector, "time", SimpleNamespace(time=lambda: 3_000_000.0))
+
+    def _raise(codes, cb):
+        raise RuntimeError("Code=13 Insufficient token")
+
+    engine = _make_engine(sdk_subscribe=_raise, budget_gate=None)
+
+    assert engine.resubscribe({"600036.SH"}) is False
+    assert engine.counters["auth_backoff_entries"] == 1
+    assert engine.snapshot()["auth_backoff"]["active"] is True

@@ -93,6 +93,8 @@ l2_status: dict[str, Any] = {
 
 # 上次成功解析出的候选池；engine 拉分失败时兜底沿用, 不让采集周期空转
 _last_watchlist: list[str] = []
+# 上次清理历史实时键的日期（启动/跨日各清一次，避免每周期扫全键）
+_last_sweep_day: str | None = None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -468,8 +470,9 @@ async def _tdx_call(method: str, params: dict) -> dict | None:
 async def fetch_l2_data(symbol_suffix: str, with_more: bool = False) -> tuple[dict | None, dict]:
     """拉取单只股票 L2 扩展日线（+ 可选 more_info）+ 快照。返回 (exday_data, snapshot)。
 
-    more_info 仅 L2TicNum/L2OrderNum 等诊断字段，因子计算不依赖 →
-    每 8 只取一次，省下 1 次桥调用（60/min 限流与行情推送共享）。
+    more_info 仅 L2TicNum/L2OrderNum 等诊断字段，因子计算不依赖。调用侧对
+    决策池/持仓**每轮必取**（决策轮只读这些票），其余每 8 只抽样一次，省下
+    1 次桥调用（600/min 限流与行情推送共享）。
     """
     exday = await _tdx_call("get_exday_data", {"stock_code": symbol_suffix, "count": 1})
     row = None
@@ -515,6 +518,11 @@ def _decision_pool_codes(day: str) -> list[str]:
         if code and code not in codes:
             codes.append(code)
     return codes
+
+
+def _needs_more_info(prefix: str, priority: set[str], processed: int) -> bool:
+    """more_info 取样判定：优先集合（决策池/持仓）每轮必取，其余每 8 只抽样。"""
+    return prefix in priority or processed % 8 == 0
 
 
 def _resolve_watchlist(
@@ -610,9 +618,38 @@ def _redis_set_json(key: str, value: dict, ttl: int | None = None) -> None:
     trade_redis.set(key, value, ttl)
 
 
+def sweep_stale_realtime_keys(today: str | None = None) -> int:
+    """清理历史遗留的实时因子键（``ts`` 早于今日或无法解析）。
+
+    2026-10-20 实测 119 个键中 21 个是 09-23~10-16 的陈料且 ``ttl=-1``
+    （写侧 TTL 机制上线前写入）。读侧 900s 窗口已把它们挡在池外，但键本身
+    一直留着；任务启动与跨日时清掉。**只删非今日键**——当天的键即使 TTL
+    缺失也不动（可能仍在正常周期内）。
+    """
+    client = trade_redis.client
+    if client is None:
+        return 0
+    day = today or datetime.now().strftime("%Y-%m-%d")
+    deleted = 0
+    try:
+        for key in client.scan_iter(match="tdx:l2:realtime:*"):
+            payload = trade_redis.get(key)
+            ts = str(payload.get("ts") or "") if isinstance(payload, dict) else ""
+            if ts[:10] >= day:
+                continue
+            trade_redis.delete(key)
+            deleted += 1
+    except Exception as exc:  # noqa: BLE001 - 清理失败不阻断采集
+        logger.warning("[TdxL2] 清理历史实时因子键失败(忽略): %s", exc)
+        return deleted
+    if deleted:
+        logger.info("[TdxL2] 清理历史实时因子键 %d 个（ts 早于 %s）", deleted, day)
+    return deleted
+
+
 async def run_tdx_l2_capture_task(interval_sec: int = 0) -> None:
     """L2 因子采集主循环：候选池+持仓轮询 → 13 因子 → PG + Redis。"""
-    global _last_watchlist  # 跨周期保留候选池；否则赋值语句使其被当局部变量，空池时 UnboundLocalError
+    global _last_watchlist, _last_sweep_day  # 跨周期保留；赋值语句否则使其被当局部变量
     from backend.services.live_trading.services.tdx_rolling_trade_service import (
         TdxRollingTradeService,
     )
@@ -621,6 +658,8 @@ async def run_tdx_l2_capture_task(interval_sec: int = 0) -> None:
     svc = TdxRollingTradeService()
     base_interval = float(interval_sec or _env_int("TDX_L2_INTERVAL_SEC", DEFAULT_INTERVAL_SEC))
     states: dict[str, L2SeriesState] = {}
+    _last_sweep_day = datetime.now().strftime("%Y-%m-%d")
+    sweep_stale_realtime_keys(_last_sweep_day)  # 启动清一次历史陈键（只删非今日）
     l2_status["running"] = True
     l2_status["started_at"] = datetime.now().isoformat(timespec="seconds")
     logger.info("[TdxL2] L2 因子采集任务启动, base_interval=%.0fs", base_interval)
@@ -628,6 +667,10 @@ async def run_tdx_l2_capture_task(interval_sec: int = 0) -> None:
     while True:
         cycle_start = time.monotonic()
         try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            if _last_sweep_day != today:  # 跨日：清掉昨日及更早的实时键
+                _last_sweep_day = today
+                sweep_stale_realtime_keys(today)
             await ensure_l2_tables()  # 幂等；失败时循环内重试，不让任务整体退出
             if trade_redis.client is not None:
                 cfg = trade_redis.get(_CONFIG_KEY) or {}
@@ -692,6 +735,9 @@ async def run_tdx_l2_capture_task(interval_sec: int = 0) -> None:
                 if code and code not in pos_codes:
                     pos_codes.append(code)
             pos_set = set(pos_codes)
+            # more_info 优先集合：决策池 + 持仓（决策轮实际消费的票），
+            # 其余按每 8 只抽样——旧实现纯按计数抽样，池/持仓可能整轮抽不到。
+            more_priority = pos_set | set(decision_pool)
             cycle_order = pos_codes + [s for s in watchlist if s not in pos_set]
             for prefix in cycle_order:
                 if calls >= _CALLS_PER_CYCLE or l2_status.get("rate_limited"):
@@ -700,7 +746,7 @@ async def run_tdx_l2_capture_task(interval_sec: int = 0) -> None:
                 # 避免 429 时全速重试打爆桥窗口）；全量 ~6min 刷新一遍
                 await asyncio.sleep(120.0 / _CALLS_PER_MIN)
                 suffix = StockCodeUtil.to_suffix(prefix) or prefix
-                with_more = processed % 8 == 0
+                with_more = _needs_more_info(prefix, more_priority, processed)
                 calls += 3 if with_more else 2  # 先计费：失败也已打桥
                 try:
                     data, snap = await fetch_l2_data(suffix, with_more=with_more)

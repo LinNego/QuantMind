@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
 
+# worker 收到 SIGTERM 后可能卡在原生 SDK 线程不退（2026-10-20 实测：8 月/10 月
+# 遗留的 4 个孤儿 worker 仍在订阅并消耗 token）——宽限后升级 SIGKILL。
+TERM_GRACE_S = 2.0
+TERM_POLL_S = 0.1
+
 
 class TdxAiDataError(RuntimeError):
     """统一错误：code ∈ rate_limited/worker_down/timeout/invalid_params/sdk_unavailable/call_failed/protocol。"""
@@ -355,7 +360,22 @@ class TdxAiDataClient:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
-            await asyncio.sleep(0.5)
+            # 宽限内未退出 → SIGKILL（SIGTERM 可被原生线程卡住，孤儿会继续
+            # 订阅并烧 token）。宽限窗口同时防 PID 复用误杀：pid 来自刚查询的
+            # status，2s 内复用的概率可忽略。
+            deadline = time.monotonic() + TERM_GRACE_S
+            while time.monotonic() < deadline:
+                await asyncio.sleep(TERM_POLL_S)
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+            else:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            await asyncio.sleep(0.2)
             return True
         try:
             os.unlink(self.socket_path)

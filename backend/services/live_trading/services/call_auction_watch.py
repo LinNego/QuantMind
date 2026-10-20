@@ -458,6 +458,40 @@ def write_outputs(
 # ---------- 单档执行 ----------
 
 
+def write_failure_status(
+    *, day: str, sample: str, auction_type: int, error: str, now: datetime
+) -> dict[str, Any]:
+    """取数失败也写状态键：读侧不能继续拿上一次成功档当「当前状态」。
+
+    2026-10-20 实测：Token 配额耗竭后 09:15/09:20/09:25 三档全失败，任务按
+    重试上限放弃；状态键仍停留在 10-16 的成功档，``/call-auction/status``
+    看起来一切正常。失败必须覆盖心跳（``failed=true`` + 错误原文）。
+    """
+    status = {
+        "sample": sample,
+        "auction_type": auction_type,
+        "at": now.isoformat(),
+        "day": day,
+        "targets": None,
+        "holdings": None,
+        "candidates": None,
+        "rows_total": 0,
+        "errors": [str(error)],
+        "archive": "",
+        "failed": True,
+    }
+    try:
+        from backend.services.trade_shared.deps import get_redis
+
+        client = _redis_client(get_redis())
+        if client is None:
+            raise RuntimeError("交易 Redis 不可用")
+        client.set(STATUS_KEY, json.dumps(status, ensure_ascii=False), ex=STATUS_TTL_S)
+    except Exception as exc:  # noqa: BLE001 - 状态写入失败只告警
+        logger.warning("[CallAuction] 失败状态写入失败: %s", exc)
+    return status
+
+
 async def run_sample(now: datetime, sample: str) -> bool:
     """执行一个采样档；返回 True=本档已完成（无论数据空否），False=可重试失败。"""
     day = now.strftime("%Y%m%d")
@@ -480,6 +514,13 @@ async def run_sample(now: datetime, sample: str) -> bool:
         records = await fetch_records(symbols, auction_type)
     except Exception as exc:  # noqa: BLE001 - 交回循环按宽限重试
         logger.warning("[CallAuction] %s 取数失败（将在宽限内重试）: %s", sample, exc)
+        write_failure_status(
+            day=day,
+            sample=sample,
+            auction_type=auction_type,
+            error=f"{type(exc).__name__}: {exc}",
+            now=now,
+        )
         return False
 
     from backend.shared.stock_utils import StockCodeUtil

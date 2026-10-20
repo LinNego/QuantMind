@@ -249,7 +249,7 @@ def parse_push_payload(raw: Any) -> list[dict[str, Any]]:
 # ── 错误映射 ────────────────────────────────────────────────────────
 
 
-_PUSH_ERR_ID_RE = re.compile(r"ErrorId=(\d+)")
+_PUSH_ERR_ID_RE = re.compile(r"ErrorId=(-?\d+)")
 _PUSH_RETFLAG_RE = re.compile(r"RetFlag=(-?\d+)")
 
 
@@ -258,6 +258,7 @@ def push_error_kind(message: object) -> str:
 
     已知形态（2026-10-14 全链实测）：``ErrorId=10`` + ``RetFlag=-5397`` = 订阅服务
     对本次推送返回错误信封（载荷无 ResultSets、无数据丢失，约 1% 帧，帧流不断）；
+    ``ErrorId=-2`` = Token 配额/鉴权失败（2026-10-20 实测，负数必须能归类）；
     ``推送非 JSON`` = 载荷破损；其余归 ``other``。分类键进
     ``SubscriptionEngine.counters["parse_error_codes"]``，供排障一眼分辨「服务端
     偶发」与「本地解析坏了」。

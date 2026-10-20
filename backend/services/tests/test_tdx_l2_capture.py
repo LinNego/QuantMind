@@ -277,15 +277,15 @@ class TestBuildSignalScore:
 
 
 class TestResolveWatchlist:
-    def test_ranks_pool_then_appends_positions(self):
-        # Arrange
+    def test_ranks_positions_then_appends_score_top_n(self):
+        # Arrange: 卖出侧优先——持仓排在分数腿之前（见 _resolve_watchlist 文档）
         scores = {"SH600000": 3.0, "SH600519": 2.5, "SZ000001": 1.0}
         positions = [{"symbol": "SZ300750"}, {"symbol": "SH600519"}]
         # Act
         watch = _resolve_watchlist(scores, positions, [], pool_size=2)
         # Assert
-        assert watch[:2] == ["SH600000", "SH600519"]  # Top2
-        assert "SZ300750" in watch  # 持仓补充
+        assert watch[:2] == ["SZ300750", "SH600519"]  # 持仓优先
+        assert watch[2:] == ["SH600000"]  # 再补分数 Top2（SH600519 已去重）
         assert watch.count("SH600519") == 1  # 去重
 
     def test_respects_max_watchlist(self):
@@ -354,3 +354,51 @@ class TestRealtimeKeyLifecycle:
         assert _REALTIME_MAX_AGE_SEC > worst_case, (
             f"窗口 {_REALTIME_MAX_AGE_SEC}s 覆盖不了最坏周转 {worst_case:.0f}s —— 会静默掏空池子"
         )
+
+
+class TestMoreInfoSampling:
+    """付费 L2 字段（L2TicNum/L2OrderNum）取样：决策池/持仓必取，其余抽样。"""
+
+    def test_priority_symbols_always_sampled(self):
+        from backend.services.live_trading.services.tdx_l2_capture_task import (
+            _needs_more_info,
+        )
+
+        priority = {"SH600000", "SZ000001"}
+        # Arrange/Act: 非 8 倍数轮次
+        # Assert: 优先集合必取；普通标的只在每 8 只时抽样
+        assert _needs_more_info("SH600000", priority, 3) is True
+        assert _needs_more_info("SZ000001", priority, 7) is True
+        assert _needs_more_info("SH600519", priority, 8) is True
+        assert _needs_more_info("SH600519", priority, 9) is False
+
+
+class TestStaleRealtimeKeySweep:
+    """历史陈键清理：只删非今日/无法解析的键，当日键保留。"""
+
+    def _rc(self):
+        from backend.services.tests.test_tdx_l2_realtime import _FakeRedis
+        from backend.services.trade_shared.redis_client import RedisClient
+
+        raw = _FakeRedis()
+        rc = RedisClient()
+        rc.client = raw
+        return rc, raw
+
+    def test_deletes_old_and_unparseable_keeps_today(self):
+        from unittest.mock import patch
+
+        from backend.services.live_trading.services import tdx_l2_capture_task as cap
+
+        rc, raw = self._rc()
+        raw.set("tdx:l2:realtime:SH600000", '{"ts": "2026-10-19T10:00:00"}')
+        raw.set("tdx:l2:realtime:SH600001", '{"ts": "2026-10-20T09:31:00"}')
+        raw.set("tdx:l2:realtime:SH600002", '{"ts": ""}')
+
+        with patch.object(cap, "trade_redis", rc):
+            deleted = cap.sweep_stale_realtime_keys("2026-10-20")
+
+        assert deleted == 2
+        assert "tdx:l2:realtime:SH600001" in raw.store
+        assert "tdx:l2:realtime:SH600000" not in raw.store
+        assert "tdx:l2:realtime:SH600002" not in raw.store

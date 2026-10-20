@@ -595,3 +595,42 @@ async def test_run_sample_closing_slot_waits_for_tail(monkeypatch, tmp_path):
     assert doc["symbols"]["600036.SH"]["summary"]["last_time"] == "14:59:57"
     hset = [op for op in fake_pipe.ops if op[0] == "hset"]
     assert hset and json.loads(hset[0][3])["sample"] == "15:00:05"
+
+
+@pytest.mark.unit
+def test_write_failure_status_overwrites_stale_success_heartbeat(monkeypatch):
+    """取数失败必须覆盖状态键——否则读侧继续显示上一次成功档（2026-10-20）。"""
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    import backend.services.trade_shared.deps as deps
+
+    ops: list[tuple] = []
+    fake_client = SimpleNamespace(
+        set=lambda key, value, ex=None: ops.append((key, value, ex))
+    )
+    monkeypatch.setattr(deps, "get_redis", lambda: SimpleNamespace(client=fake_client))
+
+    from backend.services.live_trading.services.call_auction_watch import (
+        STATUS_KEY,
+        STATUS_TTL_S,
+        write_failure_status,
+    )
+
+    status = write_failure_status(
+        day="20261020",
+        sample="09:25:05",
+        auction_type=1,
+        error="TdxAiDataError: Token Insufficient",
+        now=datetime(2026, 10, 20, 9, 25, 5),
+    )
+
+    assert status["failed"] is True
+    assert status["targets"] is None
+    key, value, ex = ops[0]
+    assert key == STATUS_KEY and ex == STATUS_TTL_S
+    import json
+
+    saved = json.loads(value)
+    assert saved["failed"] is True
+    assert "Token Insufficient" in saved["errors"][0]
