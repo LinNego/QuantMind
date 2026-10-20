@@ -52,9 +52,11 @@ ALPHA_LOCK="${QM_ALPHA_LOCK:-/tmp/.qm_alpha_refresh.lock}"
 ALPHA_RETRY_LOCK="${QM_ALPHA_RETRY_LOCK:-/tmp/.qm_alpha_retry.lock}"
 #: 整轮起跑的最低可用内存。2026-10-20 实测：快档峰值 8.7GB、长窗遍
 #: （全标的 ×1234 日）峰值 10.19GB。宿主机因 CIFS slab 泄漏长期只有 ~12GB
-#: 可用，旧默认 24GB 会让本链在本机永远跳过。长窗遍另有独立内存闸
-#: （orchestrator LONG_PASS_MIN_MEM_GB，默认 11GB），不足只跳第二遍。
-MIN_MEM_GB="${MIN_MEM_GB:-11}"
+#: 可用，旧默认 24GB 会让本链在本机永远跳过。整轮闸取 10GB：只保第一遍
+#: （峰值 8.7GB）能起跑；第二遍另有独立内存闸（orchestrator
+#: LONG_PASS_MIN_MEM_GB，默认 11GB），可用不足时只跳第二遍、记 partial，
+#: 不会为了一条长窗列把整晚的第一遍也挡掉。
+MIN_MEM_GB="${MIN_MEM_GB:-10}"
 MEM_WAIT_SECONDS="${MEM_WAIT_SECONDS:-1800}"
 MEM_WAIT_SLEEP=120
 ALPHA_WAIT_SECONDS="${ALPHA_WAIT_SECONDS:-3600}"
