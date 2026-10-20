@@ -21,6 +21,8 @@
   python backend/scripts/alpha_library_factors.py --smoke            # 冒烟: 50只×400天
   python backend/scripts/alpha_library_factors.py                    # 全量（已有分区跳过）
   python backend/scripts/alpha_library_factors.py --start-year 2016  # 指定起始年
+  python backend/scripts/alpha_library_factors.py --start-date 20250601 --start-dt 20261020
+                                                                     # 尾部增量（预热窗精确到日）
   python backend/scripts/alpha_library_factors.py --max-symbols 200  # 仅前 N 只（调试）
 """
 
@@ -57,11 +59,25 @@ INSTRUMENT = f"{QUANTDB}/2_base_sector/instrument_detail/*.parquet"
 # ---------------------------------------------------------------------------
 
 
-def load_kline(start_year: int | None = None, max_symbols: int | None = None) -> dict[str, pd.DataFrame]:
-    """读 daily_forward 全历史 → 每字段一张宽表 (index=time, columns=symbol)。"""
+def load_kline(
+    start_year: int | None = None,
+    max_symbols: int | None = None,
+    start_date: str | None = None,
+) -> dict[str, pd.DataFrame]:
+    """读 daily_forward 全历史 → 每字段一张宽表 (index=time, columns=symbol)。
+
+    ``start_date``（YYYYMMDD）优先于 ``start_year``：尾部增量只需覆盖「最长因子
+    回看 250 个交易日 + 余量」的预热窗，不必从年初加载（674 日窗实测峰值 RSS
+    6.7GB，330 日窗约一半）。
+    """
     con = duckdb.connect()
     q = f"SELECT symbol, time, open, high, low, close, volume, amount FROM read_parquet('{KLINE}')"
-    if start_year:
+    if start_date:
+        sd = str(start_date).strip()
+        if len(sd) != 8 or not sd.isdigit():
+            raise ValueError(f"start_date 必须是 YYYYMMDD：{start_date!r}")
+        q += f" WHERE time >= DATE '{sd[:4]}-{sd[4:6]}-{sd[6:]}'"
+    elif start_year:
         q += f" WHERE year(time) >= {start_year}"
     df = con.execute(q).fetchdf()
     con.close()
@@ -996,6 +1012,9 @@ def write_partitions(factors: dict[str, pd.DataFrame], *, start_dt: str = "20160
             # float32 落盘：训练特征无需 float64，体积减半
             for col in names:
                 day[col] = day[col].astype(np.float32)
+            # cast **之后**再清一次 inf：|x|>3.4e38 的 float64 在 astype 时会溢出成
+            # ±inf（2026-10-20 实测 a101_084 26 格），上面的 pre-cast replace 拦不住。
+            day = day.replace([np.inf, -np.inf], np.nan)
             dt_dir = out_root / f"dt={dt_str}"
             dt_dir.mkdir(parents=True, exist_ok=True)
             target = dt_dir / "data.parquet"
@@ -1186,6 +1205,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true", help="冒烟测试（50 只 × 400 天）")
     ap.add_argument("--start-year", type=int, default=None)
+    ap.add_argument(
+        "--start-date",
+        default=None,
+        help="加载起始日 YYYYMMDD（优先于 --start-year；尾部增量预热用）",
+    )
     ap.add_argument("--max-symbols", type=int, default=None)
     ap.add_argument("--start-dt", default="20160101", help="分区写盘起始日期 YYYYMMDD")
     ap.add_argument("--rebuild", action="store_true", help="覆盖重写已有分区")
@@ -1194,7 +1218,11 @@ def main() -> None:
 
     t0 = time.time()
     if args.labels:
-        W = load_kline(start_year=args.start_year, max_symbols=args.max_symbols)
+        W = load_kline(
+            start_year=args.start_year,
+            max_symbols=args.max_symbols,
+            start_date=args.start_date,
+        )
         n = write_labels(compute_labels(W), start_dt=args.start_dt)
         log.info("labels written: %d partitions (%.0fs)", n, time.time() - t0)
         return
@@ -1204,7 +1232,11 @@ def main() -> None:
         return
 
     assert PLAN.is_file(), f"missing {PLAN}"
-    W = load_kline(start_year=args.start_year, max_symbols=args.max_symbols)
+    W = load_kline(
+        start_year=args.start_year,
+        max_symbols=args.max_symbols,
+        start_date=args.start_date,
+    )
     dates, syms = W["close"].index, list(W["close"].columns)
     ind = load_industry_map()
     log.info("industry map: %d symbols, %d industries", len(ind), ind.nunique())
