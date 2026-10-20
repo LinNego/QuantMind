@@ -44,6 +44,7 @@ from backend.services.api.market_analysis_futures.router import (
     router as market_analysis_futures_router,
 )
 from backend.services.api.routers.market_kline import router as market_kline_router
+from backend.services.api.routers.market_minute import router as market_minute_router
 from backend.services.api.routers.model_training import router as model_training_router
 from backend.services.api.routers.model_rollouts import router as model_rollouts_router
 from backend.services.api.routers.model_rolling import router as model_rolling_router
@@ -519,6 +520,7 @@ app.include_router(system_router)
 app.include_router(api_keys_router, prefix="/api/v1")
 app.include_router(asset_router, prefix="/api/v1/asset", tags=["Asset"])
 app.include_router(market_kline_router)
+app.include_router(market_minute_router)
 app.include_router(market_analysis_router)
 app.include_router(market_analysis_hk_router)
 app.include_router(market_analysis_us_router)
