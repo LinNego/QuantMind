@@ -209,6 +209,10 @@ class RebalanceContext:
     stage2_block: str = ""
     #: 丁7【风险预算档位】（当前 tiers 五键）。空串 = 未接线。
     tier_block: str = ""
+    #: 【研究总控·交易日前瞻】块（前一日夜间综合 + 当日各档复盘；IO 侧从
+    #: ``data/research_control/brief/{target}.json`` 取紧凑版）。空串 = 未接线/
+    #: 研究总控未产出——默认路径与历史金样逐字节一致。
+    research_block: str = ""
     #: 授予额度（**只认分账额度**，不是真实账户总资产）：2026-10-19 用户拍板，
     #: agent 不得看见账户总金额。真实账户三数只走内部风控/审计。
     quota_total: float = AGENT_QUOTA_TOTAL
@@ -633,6 +637,10 @@ def _context_body(ctx: RebalanceContext) -> list[str]:
     # 丁5【大盘指数】行：状态块的取数面（同一批快照）。空串 = 未接线。
     if ctx.indices_block:
         lines += [ctx.indices_block, ""]
+    # 【研究总控·交易日前瞻】：慢变量（前一日夜间综合 + 当日各档复盘），
+    # 紧跟大盘快照之后。空串 = 未接线/未产出，逐字节不出现。
+    if ctx.research_block:
+        lines += [ctx.research_block, ""]
     if ctx.extra_context:
         lines += [ctx.extra_context, ""]
     lines += _pool_lines(ctx)

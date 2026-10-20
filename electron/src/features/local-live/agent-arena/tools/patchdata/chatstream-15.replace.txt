@@ -1,0 +1,1 @@
+                {!isNews && !isResearch && pa.decisions.length > 0 && (

@@ -36,6 +36,12 @@ def lma():
     return mod
 
 
+@pytest.fixture(autouse=True)
+def _isolate_research_brief(lma, monkeypatch):
+    """提示词测试不读真实 repo 的研究总控档案（部署后同日产物会出现在 data/）。"""
+    monkeypatch.setattr(lma, "_research_block", lambda: "")
+
+
 def _pos(code: str = "601000.SH", cost: float = 4.5, volume: float = 1000) -> dict:
     return {"code": code, "name": "唐山港", "volume": volume, "cost_price": cost}
 

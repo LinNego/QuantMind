@@ -1,0 +1,2 @@
+        const isReview = r.kind === 'review';
+        const isOpen = isReview ? !open.has(i) : open.has(i);

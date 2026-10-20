@@ -1,0 +1,10 @@
+              {isNews ? (
+                <span className="mc-mode-chip news">新闻</span>
+              ) : isResearch ? (
+                <span className="mc-mode-chip research">研究总控</span>
+              ) : (
+                modeOf(r.user)
+              )}
+              {!isNews &&
+                !isResearch &&
+                renderActionTags(r.thought, {

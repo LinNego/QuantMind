@@ -1,0 +1,3 @@
+              {isNews ? <span className="mc-mode-chip news">新闻</span> : modeOf(r.user)}
+              {!isNews &&
+                renderActionTags(r.thought, {

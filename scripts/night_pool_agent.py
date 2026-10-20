@@ -22,6 +22,7 @@ cron：北京 02:30 周二~周六（JST 03:30）→ 等 quantdb 当日分区落�
 输出命名：池文件按**目标交易日** `{target}_agent_picks.json`（09:35 消费的就是当日池）；
          纪要 logs/night_pool/{session}.md/.json 按数据会话日。
 """
+
 import argparse
 import json
 import re
@@ -34,8 +35,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "prompts"))
 
-from trading_cal import (is_trading_day, next_trading_day,  # noqa: E402
-                         prev_trading_day)
+from trading_cal import (
+    is_trading_day,
+    next_trading_day,  # noqa: E402
+    prev_trading_day,
+)
 from stock_industry import load_industry_map  # noqa: E402
 from backend.shared.env_flags import normalize_env_flag  # noqa: E402
 from backend.shared.text_compact import short_clause  # noqa: E402
@@ -79,8 +83,10 @@ def check_data_fresh(session: str) -> tuple[bool, str]:
     """quantdb 最新分区是否已到会话日。未到 → (False, 原因)，调用方退出码 2。"""
     d0 = latest_dt()
     if not d0 or d0 < session:
-        return False, (f"quantdb 最新分区 {d0 or '（无）'} 落后于会话日 {session}"
-                       "——宁可不产也不产陈旧池（等 04:30 幂等补跑）")
+        return False, (
+            f"quantdb 最新分区 {d0 or '（无）'} 落后于会话日 {session}"
+            "——宁可不产也不产陈旧池（等 04:30 幂等补跑）"
+        )
     return True, ""
 
 
@@ -105,9 +111,11 @@ def _gap_note(d0: str) -> str:
     idle = _idle_days(d0)
     if idle < 2:
         return ""
-    return (f"\n⚠️ 最新收盘日为 {d0}，距今已 {idle} 个自然日（周末/长假休市），"
-            "行情数据止于该收盘日；复市首日受休市期间增量信息影响可能跳变，"
-            "判断需以下方休市窗口新闻简报为准，无法核实的信息不要臆测。")
+    return (
+        f"\n⚠️ 最新收盘日为 {d0}，距今已 {idle} 个自然日（周末/长假休市），"
+        "行情数据止于该收盘日；复市首日受休市期间增量信息影响可能跳变，"
+        "判断需以下方休市窗口新闻简报为准，无法核实的信息不要臆测。"
+    )
 
 
 def now_cn():
@@ -132,15 +140,20 @@ def _news_block(d0: str) -> str:
         latest = _json.loads((nb / "latest.json").read_text(encoding="utf-8"))
         text = str(latest.get("text") or "")
         if text:
-            lines.append(f"【新闻 agent·最新分子（{str(latest.get('ts'))[:16]}）】\n{text}")
+            lines.append(
+                f"【新闻 agent·最新分子（{str(latest.get('ts'))[:16]}）】\n{text}"
+            )
     except (OSError, _json.JSONDecodeError):
         pass
 
     # 2) 今日各轮要点（宏观/主题/持仓信号，跨轮合并去重）
     try:
         rounds = []
-        for line in (nb / "history.jsonl").read_text(encoding="utf-8",
-                                                     errors="replace").splitlines():
+        for line in (
+            (nb / "history.jsonl")
+            .read_text(encoding="utf-8", errors="replace")
+            .splitlines()
+        ):
             try:
                 b = _json.loads(line)
             except _json.JSONDecodeError:
@@ -151,12 +164,17 @@ def _news_block(d0: str) -> str:
             seg = ["【新闻 agent·今日各轮要点】"]
             for b in rounds[-6:]:
                 m = b.get("macro") or {}
-                seg.append(f"- {str(b.get('ts'))[11:16]} 宏观:{m.get('view', '—')}"
-                           f"(bias {m.get('bias', 0):+.1f})"
-                           + "；主题:" + "、".join(t.get("name", "") for t in (b.get("themes") or [])[:2]))
+                seg.append(
+                    f"- {str(b.get('ts'))[11:16]} 宏观:{m.get('view', '—')}"
+                    f"(bias {m.get('bias', 0):+.1f})"
+                    + "；主题:"
+                    + "、".join(t.get("name", "") for t in (b.get("themes") or [])[:2])
+                )
                 for h in (b.get("holdings") or [])[:3]:
-                    seg.append(f"    · {h.get('name')}({h.get('code')}) {h.get('verdict')}"
-                               f" impact{float(h.get('impact') or 0):+.0f} {h.get('event_type')}")
+                    seg.append(
+                        f"    · {h.get('name')}({h.get('code')}) {h.get('verdict')}"
+                        f" impact{float(h.get('impact') or 0):+.0f} {h.get('event_type')}"
+                    )
             lines.append("\n".join(seg))
     except OSError:
         pass
@@ -171,20 +189,43 @@ def _news_block(d0: str) -> str:
             continue
         ms = rv.get("mentions") or []
         if ms:
-            seg = [f"【{day} 新闻提及个股→当日实际走势（晚间复盘档案，验证新闻可靠性）】"]
+            seg = [
+                f"【{day} 新闻提及个股→当日实际走势（晚间复盘档案，验证新闻可靠性）】"
+            ]
             for m in ms[:10]:
                 mv = m.get("move")
-                seg.append(f"- {m.get('name')}({m.get('code')}) [{m.get('event')}] "
-                           f"当日{f'{mv:+.2f}%' if mv is not None else '无数据'}")
+                seg.append(
+                    f"- {m.get('name')}({m.get('code')}) [{m.get('event')}] "
+                    f"当日{f'{mv:+.2f}%' if mv is not None else '无数据'}"
+                )
             lines.append("\n".join(seg))
         break
 
     if not lines:
-        return ("\n【新闻 agent 产物】今日无分子（19:05 全景轮未跑或管线异常）——"
-                "本次研究不带新闻窗口信息，观点只基于初筛分数与盘面。\n")
-    return ("\n以下为『新闻 agent 管线』今日产物（门卫→宏观/板块/持仓→主编分子，"
-            "非原始新闻流；判断直接引用其结论并注明）：\n\n" + "\n\n".join(lines) + "\n\n")
+        return (
+            "\n【新闻 agent 产物】今日无分子（19:05 全景轮未跑或管线异常）——"
+            "本次研究不带新闻窗口信息，观点只基于初筛分数与盘面。\n"
+        )
+    return (
+        "\n以下为『新闻 agent 管线』今日产物（门卫→宏观/板块/持仓→主编分子，"
+        "非原始新闻流；判断直接引用其结论并注明）：\n\n" + "\n\n".join(lines) + "\n\n"
+    )
 
+
+def _research_block(target: str) -> str:
+    """研究总控最终稿（夜间综合）→ 产池提示词里的权威结论段。
+
+    研究总控 ``night`` 档 02:10 先跑、本脚本 02:30 后跑：正常情况下拿到的是同一
+    ``target`` 的最终稿（方向/资金/新闻/模型分数/板块/风险）。拿不到（当日未跑、
+    首次上线、档案被清）返回空串——由调用方在提示词里注明「无」，绝不臆造结论。
+    """
+    try:
+        from backend.shared.research_control.dossier import brief_for_prompt
+
+        return brief_for_prompt(target)
+    except Exception as exc:  # noqa: BLE001 研究总控不可用不挡产池
+        print(f"⚠️ 研究总控 brief 读取失败: {exc}")
+        return ""
 
 
 def _db():
@@ -196,8 +237,10 @@ def _db():
 def latest_dt() -> str:
     import glob
 
-    for base in (ROOT / "data/quantdb/1_kline_data/daily_backward",
-                 Path("/data/quantdb/1_kline_data/daily_backward")):
+    for base in (
+        ROOT / "data/quantdb/1_kline_data/daily_backward",
+        Path("/data/quantdb/1_kline_data/daily_backward"),
+    ):
         if base.is_dir():
             parts = sorted(glob.glob(f"{base}/dt=*"))
             return parts[-1].rsplit("dt=", 1)[-1]
@@ -208,15 +251,18 @@ def load_names_industry() -> dict:
     import glob
 
     names = {}
-    for base in (ROOT / "data/quantdb/2_base_sector/instrument_detail",
-                 Path("/data/quantdb/2_base_sector/instrument_detail")):
+    for base in (
+        ROOT / "data/quantdb/2_base_sector/instrument_detail",
+        Path("/data/quantdb/2_base_sector/instrument_detail"),
+    ):
         f = base / "instrument_detail.parquet"
         if not f.is_file():
             continue
         try:
             con = _db()
             for sym, nm in con.execute(
-                    "SELECT Symbol, Name FROM read_parquet(?)", [str(f)]).fetchall():
+                "SELECT Symbol, Name FROM read_parquet(?)", [str(f)]
+            ).fetchall():
                 if sym and nm:
                     names[str(sym)] = str(nm)
         except Exception:  # noqa: BLE001
@@ -230,8 +276,10 @@ def build_candidates(date: str, top: int = 26) -> list:
     import glob
 
     base = None
-    for b in (ROOT / "data/quantdb/1_kline_data/daily_backward",
-              Path("/data/quantdb/1_kline_data/daily_backward")):
+    for b in (
+        ROOT / "data/quantdb/1_kline_data/daily_backward",
+        Path("/data/quantdb/1_kline_data/daily_backward"),
+    ):
         if b.is_dir():
             base = b
             break
@@ -247,17 +295,21 @@ def build_candidates(date: str, top: int = 26) -> list:
         f"""SELECT a.symbol, a.close c1, a.volume v1, a.amount amt,
                    b.close c0
             FROM read_parquet('{f0}') a
-            LEFT JOIN read_parquet('{f1}') b USING (symbol)""").df()
+            LEFT JOIN read_parquet('{f1}') b USING (symbol)"""
+    ).df()
     df = df.dropna(subset=["c1", "c0", "amt"])
     df["chg1"] = (df["c1"] / df["c0"] - 1) * 100
-    df["turn_est"] = df["v1"] * df["c1"] / 10000  # 成交额估算亿元（对照 amount 更稳则用 amt）
+    df["turn_est"] = (
+        df["v1"] * df["c1"] / 10000
+    )  # 成交额估算亿元（对照 amount 更稳则用 amt）
     df = df[df["amt"] >= 20000]  # ≥2 亿元成交（万元口径）
     df = df[(df["chg1"] >= -3) & (df["chg1"] <= 8)]
     # Alpha 因子 join（alpha_library 最近 ≤7 日分区；缺失则降级为基础三项打分）
     alpha_cols = ["a158_ROC20", "a158_ROC5", "a158_STD20"]
     alpha_df = None
-    alpha_parts = sorted(glob.glob(
-        f"{ROOT / 'data/quantdb/6_ml_datasets/alpha_library'}/dt=*"))
+    alpha_parts = sorted(
+        glob.glob(f"{ROOT / 'data/quantdb/6_ml_datasets/alpha_library'}/dt=*")
+    )
     for p in reversed(alpha_parts[-8:]):
         pdt = p.rsplit("dt=", 1)[-1]
         if pdt <= d0 and glob.glob(f"{p}/*.parquet"):
@@ -265,8 +317,13 @@ def build_candidates(date: str, top: int = 26) -> list:
                 alpha_df = con.execute(
                     f"SELECT symbol, {', '.join(alpha_cols)} FROM read_parquet('{p}/*.parquet')"
                 ).df()
-                alpha_df = alpha_df.rename(columns={
-                    "a158_ROC20": "mom20", "a158_ROC5": "roc5", "a158_STD20": "std20"})
+                alpha_df = alpha_df.rename(
+                    columns={
+                        "a158_ROC20": "mom20",
+                        "a158_ROC5": "roc5",
+                        "a158_STD20": "std20",
+                    }
+                )
                 alpha_df["alpha_dt"] = pdt
                 break
             except Exception:  # noqa: BLE001
@@ -278,18 +335,22 @@ def build_candidates(date: str, top: int = 26) -> list:
     if ms_files:
         ms = con.execute(
             f"SELECT symbol, momentum_1d, momentum_3d, buy_pressure, sell_pressure "
-            f"FROM read_parquet('{ms_files[-1]}')").df()
+            f"FROM read_parquet('{ms_files[-1]}')"
+        ).df()
         df = df.merge(ms, on="symbol", how="left")
-        base = (df["chg1"].clip(-3, 8) * 0.4
-                + df["momentum_3d"].fillna(0).clip(-15, 15) * 0.35
-                + (df["buy_pressure"].fillna(0.5)
-                   - df["sell_pressure"].fillna(0.5)) * 100 * 0.25)
+        base = (
+            df["chg1"].clip(-3, 8) * 0.4
+            + df["momentum_3d"].fillna(0).clip(-15, 15) * 0.35
+            + (df["buy_pressure"].fillna(0.5) - df["sell_pressure"].fillna(0.5))
+            * 100
+            * 0.25
+        )
     else:
         base = df["chg1"] * 0.6 + df["turn_est"] / 10000 * 0.4
     if "mom20" in df.columns:
         # Alpha 因子增强（可解释三项，各项 clip 到 ±1）：
         #   mom20 20日趋势确认 +；roc5 短线过热反转保护 -；std20 低波优先 -
-        mom20 = (df["mom20"].fillna(0).clip(-20, 20) / 20)
+        mom20 = df["mom20"].fillna(0).clip(-20, 20) / 20
         rev = -(df["roc5"].fillna(0).clip(-10, 10) / 10)
         lowvol = -(df["std20"].fillna(0).clip(-5, 5) / 5)
         df["score"] = base * 0.6 + 0.15 * mom20 + 0.15 * rev + 0.1 * lowvol
@@ -303,11 +364,23 @@ def build_candidates(date: str, top: int = 26) -> list:
     out = df.sort_values("score", ascending=False).head(top)
     rows = []
     for _, r in out.iterrows():
-        row = {"code": r["symbol"], "name": str(r["name"]), "chg1": round(float(r["chg1"]), 2),
-               "amount_yi": round(float(r["amt"]) / 10000, 2), "score": round(float(r["score"]), 2)}
-        if "mom20" in r and r.get("mom20") == r.get("mom20") and r.get("mom20") is not None:
-            row["alpha"] = {k: round(float(r[k]), 2) for k in ("mom20", "roc5", "std20")
-                            if r.get(k) == r.get(k)}
+        row = {
+            "code": r["symbol"],
+            "name": str(r["name"]),
+            "chg1": round(float(r["chg1"]), 2),
+            "amount_yi": round(float(r["amt"]) / 10000, 2),
+            "score": round(float(r["score"]), 2),
+        }
+        if (
+            "mom20" in r
+            and r.get("mom20") == r.get("mom20")
+            and r.get("mom20") is not None
+        ):
+            row["alpha"] = {
+                k: round(float(r[k]), 2)
+                for k in ("mom20", "roc5", "std20")
+                if r.get(k) == r.get(k)
+            }
         rows.append(row)
     return rows, d0
 
@@ -482,7 +555,8 @@ def format_pool_card(target: str, payload: dict, picks: list) -> tuple:
     title = f"🌙 晚间股票池 · {_dash8(target)[5:]}"
     lines = [_PUSH_RULE]
     view = short_clause(
-        str(payload.get("market_view") or ""), max_chars=_CARD_DIRECTION_MAX
+        str(payload.get("market_view") or payload.get("direction") or ""),
+        max_chars=_CARD_DIRECTION_MAX,
     )
     if view:
         lines.append(f"🧭 方向：{view}")
@@ -494,8 +568,9 @@ def format_pool_card(target: str, payload: dict, picks: list) -> tuple:
         if not name:
             continue
         strength = str(item.get("strength") or "").strip()
-        reason = short_clause(str(item.get("reason") or ""), max_chars=30,
-                              min_clause_chars=8)
+        reason = short_clause(
+            str(item.get("reason") or ""), max_chars=30, min_clause_chars=8
+        )
         head = f"{name}（{strength}）" if strength else name
         sector_lines.append(f"　{head}：{reason}" if reason else f"　{head}")
     if sector_lines:
@@ -589,9 +664,7 @@ def _brain_endpoint(model: str, env: dict) -> tuple:
     return base, key
 
 
-def call_brain(
-    task: str, model: str = "", timeout_s: int = BRAIN_TIMEOUT_S
-) -> tuple:
+def call_brain(task: str, model: str = "", timeout_s: int = BRAIN_TIMEOUT_S) -> tuple:
     """直连 LLM 跑研究任务（重试 1 次；失败/截断 raise，由 run() 降级为不产池）。
 
     ``finish_reason=length``（max_tokens 截断）即 raise：本任务输出是
@@ -600,7 +673,11 @@ def call_brain(
     import requests
 
     env = _load_env()
-    model = model or str(env.get("QM_NIGHT_POOL_MODEL") or "").strip() or DEFAULT_BRAIN_MODEL
+    model = (
+        model
+        or str(env.get("QM_NIGHT_POOL_MODEL") or "").strip()
+        or DEFAULT_BRAIN_MODEL
+    )
     base, key = _brain_endpoint(model, env)
     payload = {
         "model": model,
@@ -608,7 +685,8 @@ def call_brain(
             {
                 "role": "system",
                 "content": "你是量化投研的晚间市场研究总控（A股）。"
-                "严格按任务要求以 JSON 输出，无其他文字。",
+                "先按任务要求输出 Markdown 正文，最后附一个 ```json 机读块；"
+                "除该机读块外不要输出其他代码围栏。",
             },
             {"role": "user", "content": task},
         ],
@@ -660,7 +738,7 @@ def run(session: str, target: str, dry: bool = False) -> int:
     if not cands:
         print(f"❌ 无候选（数据缺失，分区 {d0 or '无'}）")
         return 1
-    if d0 < session:      # main 已先拦一次；直调 run() 的兜底（宁可不产，不产陈旧池）
+    if d0 < session:  # main 已先拦一次；直调 run() 的兜底（宁可不产，不产陈旧池）
         print(f"⏸️ 数据分区 {d0} 早于会话日 {session}，不产陈旧池（等分区落盘）")
         return 2
     from market_state import build_market_state
@@ -693,22 +771,40 @@ def run(session: str, target: str, dry: bool = False) -> int:
             before = len(cands)
             cands, dropped = filter_risk_candidates(cands, _risk)
             for c, hit in dropped:
-                print(f"  ⛔ 剔除风险标的 {c.get('code')} {c.get('name') or ''}："
-                      f"{hit.get('reason')}")
+                print(
+                    f"  ⛔ 剔除风险标的 {c.get('code')} {c.get('name') or ''}："
+                    f"{hit.get('reason')}"
+                )
             if not cands:
                 print("❌ 候选全部命中风险清单，本轮不产出池")
                 return 1
             if dropped:
-                print(f"  候选 {before} → {len(cands)}（风险清单剔除 {len(dropped)} 只）")
+                print(
+                    f"  候选 {before} → {len(cands)}（风险清单剔除 {len(dropped)} 只）"
+                )
     except Exception as exc:  # noqa: BLE001 风险清单不可用不阻塞研究
         print(f"⚠️ 风险清单不可用: {exc}")
     cand_json = json.dumps(cands, ensure_ascii=False)
-    news = _news_block(d0)                      # 休市窗口新闻简报（平日晚间为空）
-    time_box = 150 if news else 90              # 有简报时放宽思考时间盒
+    news = _news_block(d0)  # 休市窗口新闻简报（平日晚间为空）
+    research = _research_block(target)  # 研究总控夜间综合稿（权威口径）
+    if research:
+        print(f"  🧠 研究总控 brief 已注入（{len(research)} 字）")
+    else:
+        print("  ⚠️ 无研究总控 brief（夜间综合尚未产出）：本轮只按初筛+新闻产池")
+    research_part = (
+        f"\n【研究总控结论（{_dash8(target)} 交易日前瞻 · 系统级综合判断）】\n{research}\n"
+        if research
+        else "\n【研究总控结论】本次无（夜间综合稿尚未产出）——方向/资金/新闻/模型分数"
+        "只能按本任务输入判断，不得编造。\n"
+    )
+    time_box = 150 if news else 90  # 有简报时放宽思考时间盒
     task = f"""[晚间市场研究任务] 基于 quantdb {d0} 收盘数据已初筛出 {len(cands)} 只候选（附分数/涨跌/成交额）。
 本池将用于 {_dash8(target)} 开盘后的实盘决策（行情数据止于 {_dash8(d0)} 收盘）。
 
 要求（时间盒约 {time_box} 秒，单次调用完成，无逐只取数环节）：
+0. **研究总控优先**：下方【研究总控结论】是系统级当日综合判断（方向/资金/新闻/模型分数/
+   板块/风险），本池必须与之一致；若有分歧，在 market_view 里写明分歧点与依据。
+   它未覆盖的项才按本任务输入判断，不得编造。
 1. 初筛数据已系统算好（涨跌/成交额/复合分/名称），直接使用；池行的 code 必须
    逐字照抄候选初筛（含 .SH/.SZ 后缀），name 必须与 code 对应，不得凭记忆改写或
    自行补全代码；只有当名称缺失或分数明显异常（如 ST/涨跌停残留）时，在 reason 里标注存疑。
@@ -718,16 +814,33 @@ def run(session: str, target: str, dry: bool = False) -> int:
    由你按 初筛分数 + 新闻分子的板块主线与持仓信号 + 昨日新闻→走势回顾 综合判断，
    给出 20 只池（code/name/score/一句话选股理由），按行业分散、剔除重复题材；
    若认为某持仓/题材应换掉，在 reason 里写明换仓逻辑。
-3. 若现有持仓 688183/600309/300750 等本身强势也可保留注明。
-4. 候选中【事件】字段标注解禁/质押/回购风险：近期大比例解禁或质押≥50%的标的
+4. 若现有持仓 688183/600309/300750 等本身强势也可保留注明。
+5. 候选中【事件】字段标注解禁/质押/回购风险：近期大比例解禁或质押≥50%的标的
    建仓需在理由中明确风险对冲，无事件字段=无已知事件风险。
 盘面状态：{state}{_gap_note(d0)}
 {news}
+{research_part}
 候选初筛：{cand_json}
 
-严格以 JSON 输出（无其他文字）：
-{{"date":"{d0}","market_view":"...","sectors":[{{"name":"","strength":"","reason":""}}],
- "pool":[{{"code":"","name":"","score":0,"reason":""}}]}}
+输出两段，缺一不可：
+A. Markdown 正文（≤1200 字）：
+## 明日方向
+一句话结论 + 3 条依据（引用研究总控时注明）。
+## 资金判断
+增量/存量、风格与仓位建议。
+## 新闻与模型分数
+新闻主线如何影响明日；模型批次分数（BUY/HOLD/SELL、均值、边际变化）怎么读。
+## 板块主线
+强/弱板块各 3 个，写明理由。
+## 明日池说明
+选池逻辑、换仓点、主要风险。
+B. 最后附机读块（严格 JSON，无注释、无尾逗号）：
+```json
+{{"date":"{d0}","market_view":"一句话方向（≤60字）","direction":"完整方向叙述",
+ "capital":"资金判断","news":"新闻要点","models":"模型分数解读",
+ "sectors":[{{"name":"","strength":"","reason":""}}],
+ "risks":["..."],"pool":[{{"code":"","name":"","score":0,"reason":""}}]}}
+```
 """
     if dry:
         print(task[:2500])
@@ -739,25 +852,22 @@ def run(session: str, target: str, dry: bool = False) -> int:
         content, usage = f"（研究 agent 失败：{exc}）", None
         brain_ok = False
         print(f"❌ 研究大脑调用失败：{exc}")
-    # JSON 抽取
-    import re
+    # 机读块抽取：优先 ```json 围栏，其次平衡 JSON（正文里的花括号不干扰）。
+    from backend.shared.research_control.runner import extract_machine
 
-    payload = None
-    for m in re.finditer(r"\{[\s\S]*\}", content):
-        try:
-            payload = json.loads(m.group(0))
-        except json.JSONDecodeError:
-            continue
-    payload_ok = isinstance(payload, dict)
+    payload = extract_machine(content)
+    payload_ok = bool(payload)
     if not payload_ok:
         payload = {"date": d0, "pool": [], "market_view": content[:400]}
     payload["date"] = d0
     dpath = NIGHT_POOL_DIR
     dpath.mkdir(parents=True, exist_ok=True)
     (dpath / f"{session}.md").write_text(
-        f"# 晚间市场研究 · {session}（服务 {target}）\n\n{content}", encoding="utf-8")
-    (dpath / f"{session}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=1),
-                                           encoding="utf-8")
+        f"# 晚间市场研究 · {session}（服务 {target}）\n\n{content}", encoding="utf-8"
+    )
+    (dpath / f"{session}.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
     # 候选池写 quantmind 报告目录（兼容 select_from_reports：side/score/reason）。
     # side 恒为 HOLD 占位（无信息量）——消费端（load_pool/pool_rows/提示词）已不再展示，
     # 判断全部由各 agent 依据分数+大盘+板块+新闻综合给出。
@@ -805,40 +915,90 @@ def run(session: str, target: str, dry: bool = False) -> int:
         pool = []
         for p in rows[:20]:
             code = normalize_pool_code(p.get("code")) or str(p.get("code") or "")
-            pool.append({"code": p.get("code"), "name": p.get("name"),
-                         "side": "HOLD", "score": _safe_score(p.get("score")),
-                         "industry": industry_map.get(code, ""),
-                         "events": _events.get(str(p.get("code")), ""),
-                         "reason": str(p.get("reason") or "")[:160]})
+            pool.append(
+                {
+                    "code": p.get("code"),
+                    "name": p.get("name"),
+                    "side": "HOLD",
+                    "score": _safe_score(p.get("score")),
+                    "industry": industry_map.get(code, ""),
+                    "events": _events.get(str(p.get("code")), ""),
+                    "reason": str(p.get("reason") or "")[:160],
+                }
+            )
         if pool:
-            out = {"date": target, "session": session,
-                   "market_direction": {"direction": payload.get("market_view", "")[:80]},
-                   "picks": pool}
+            # 方向/资金/新闻/模型分数随池落盘：消费端（决策上下文、候选池页）先看
+            # ``direction``（80 字短句，旧契约），``summary`` 等长字段供研究面展开。
+            view = str(
+                payload.get("market_view") or payload.get("direction") or ""
+            ).strip()
+            detail = str(payload.get("direction") or view).strip()
+            sectors = payload.get("sectors")
+            risks = payload.get("risks")
+            out = {
+                "date": target,
+                "session": session,
+                "market_direction": {
+                    "direction": view[:80],
+                    "summary": detail[:800],
+                    "capital": str(payload.get("capital") or "")[:600],
+                    "news": str(payload.get("news") or "")[:600],
+                    "models": str(payload.get("models") or "")[:600],
+                    "sectors": sectors if isinstance(sectors, list) else [],
+                    "risks": risks if isinstance(risks, list) else [],
+                },
+                "research_brief": bool(research),
+                "picks": pool,
+            }
             PICKS_DIR.mkdir(parents=True, exist_ok=True)
             (PICKS_DIR / f"{target}_agent_picks.json").write_text(
-                json.dumps(out, ensure_ascii=False), encoding="utf-8")
+                json.dumps(out, ensure_ascii=False), encoding="utf-8"
+            )
             produced = True
-            print(f"✅ 池文件 {target}_agent_picks.json（{len(pool)} 只，数据会话 {session}）")
+            print(
+                f"✅ 池文件 {target}_agent_picks.json（{len(pool)} 只，数据会话 {session}）"
+            )
             try:  # 推送是旁路：失败只打印，绝不改变产池结果
                 push_pool(target, payload, pool)
             except Exception as exc:  # noqa: BLE001
                 print(f"⚠️ 晚间股票池推送异常（不影响产池）: {exc}")
         else:
-            print(f"❌ 未产出有效池（大脑成功={brain_ok}，JSON 可抽={payload_ok}）"
-                  f"——不写 {target}_agent_picks.json（空壳会遮蔽在产池），"
-                  "等 04:30 幂等补跑重试")
+            print(
+                f"❌ 未产出有效池（大脑成功={brain_ok}，JSON 可抽={payload_ok}）"
+                f"——不写 {target}_agent_picks.json（空壳会遮蔽在产池），"
+                "等 04:30 幂等补跑重试"
+            )
     except OSError as exc:  # noqa: BLE001
         print(f"⚠️ 写池文件失败: {exc}")
     # 对话流：pseudo『研究总控』（归到该池服务的交易日——周一早班看得到周一的池）
     try:
-        lf = ROOT / "data" / "agent_data_astock" / "market-research" / "log" / _dash8(target) / "log.jsonl"
+        lf = (
+            ROOT
+            / "data"
+            / "agent_data_astock"
+            / "market-research"
+            / "log"
+            / _dash8(target)
+            / "log.jsonl"
+        )
         lf.parent.mkdir(parents=True, exist_ok=True)
-        row = {"timestamp": datetime.now().astimezone().isoformat(),
-               "signature": "market-research", "kind": "night_pool",
-               "new_messages": [
-                   {"role": "user", "content": f"【晚间市场研究任务】{d0} 收盘数据 → {_dash8(target)} 板块+候选池"},
-                   {"role": "assistant", "content": content},
-               ]}
+        row = {
+            "timestamp": datetime.now().astimezone().isoformat(),
+            "signature": "market-research",
+            "kind": "night_pool",
+            "new_messages": [
+                {
+                    "role": "user",
+                    "content": f"【晚间市场研究任务】{d0} 收盘数据 → {_dash8(target)} 板块+候选池"
+                    + (
+                        "（已注入研究总控夜间综合稿）"
+                        if research
+                        else "（无研究总控稿，仅按初筛+新闻）"
+                    ),
+                },
+                {"role": "assistant", "content": content},
+            ],
+        }
         if usage:
             row["usage"] = usage  # /token-usage 只看带 usage 的行（与对话轮同口径）
         with lf.open("a", encoding="utf-8") as fh:
@@ -853,10 +1013,15 @@ def run(session: str, target: str, dry: bool = False) -> int:
 
 def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--date", default="", help="手工复跑：数据会话日（YYYY-MM-DD / YYYYMMDD）")
+    ap.add_argument(
+        "--date", default="", help="手工复跑：数据会话日（YYYY-MM-DD / YYYYMMDD）"
+    )
     ap.add_argument("--dry", action="store_true")
-    ap.add_argument("--if-missing", action="store_true",
-                    help="幂等补跑（04:30）：目标日池文件已存在则立即退出")
+    ap.add_argument(
+        "--if-missing",
+        action="store_true",
+        help="幂等补跑（04:30）：目标日池文件已存在则立即退出",
+    )
     a = ap.parse_args(argv)
     # 日历闸门（2026-09-12 改 02:30 后的口径）：
     #   ①session = 最近已收盘交易日（凌晨运行时当天会话尚未收盘，自动回看前一天，
@@ -880,15 +1045,25 @@ def main(argv: list | None = None) -> int:
         # （2026-10-14 起失败端根本不落池文件，此处是存量空壳的兼容分支）
         pool_n = -1
         try:
-            pool_n = len(json.loads((PICKS_DIR / f"{target}_agent_picks.json")
-                                     .read_text(encoding="utf-8")).get("picks") or [])
+            pool_n = len(
+                json.loads(
+                    (PICKS_DIR / f"{target}_agent_picks.json").read_text(
+                        encoding="utf-8"
+                    )
+                ).get("picks")
+                or []
+            )
         except (OSError, ValueError, AttributeError):
             pool_n = -1
         if pool_n > 0:
-            print(f"⏭️ {bj:%F %T} 目标日池已存在（{target}_agent_picks.json，{pool_n} 只），补跑跳过")
+            print(
+                f"⏭️ {bj:%F %T} 目标日池已存在（{target}_agent_picks.json，{pool_n} 只），补跑跳过"
+            )
             return 0
-        print(f"⚠️ {bj:%F %T} 目标日池为空/不可读（{target}_agent_picks.json）"
-              f"——视为未产出，执行补跑")
+        print(
+            f"⚠️ {bj:%F %T} 目标日池为空/不可读（{target}_agent_picks.json）"
+            f"——视为未产出，执行补跑"
+        )
     ok, why = check_data_fresh(session)
     if not ok:
         print(f"⏸️ {bj:%F %T} {why}")

@@ -1,0 +1,18 @@
+/** 研究总控 / 市场研究：报告是七段长文，不能走 parseAnalysis 的四段切法（会被切碎）。 */
+function isResearchRound(model: string, modelId?: string): boolean {
+  return model === '市场研究' || modelId === 'market-research';
+}
+
+/** 研究总控摘要：跳过标题/围栏/引用/表格/分隔线，取第一段正文（night 档首条要点即结论）。 */
+function researchSummary(text: string): string {
+  const stripped = text.replace(/```[\s\S]*?```/g, '');
+  for (const raw of stripped.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#') || line.startsWith('>') || line.startsWith('|')) continue;
+    if (/^[-=*_]{3,}$/.test(line)) continue;
+    return line.replace(/^[-*]\s+/, '').replace(/[*_`#]/g, '').trim().slice(0, 160);
+  }
+  return '';
+}
+
+/** 模型对话 — 全部模型混合流：

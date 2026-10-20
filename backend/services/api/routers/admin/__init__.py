@@ -31,6 +31,7 @@ from .risk import router as risk_router
 from .orders import router as orders_router
 from .inference_monitor import router as inference_monitor_router
 from .realtime import router as realtime_admin_router
+from .research_control import router as research_control_router
 
 admin_router = APIRouter()
 admin_router.include_router(
@@ -119,3 +120,6 @@ admin_router.include_router(risk_router, tags=["Admin-Risk"])
 admin_router.include_router(orders_router, tags=["Admin-Orders"])
 admin_router.include_router(inference_monitor_router, tags=["Admin-Inference"])
 admin_router.include_router(realtime_admin_router, prefix="/realtime", tags=["Admin-Realtime"])
+admin_router.include_router(
+    research_control_router, prefix="/research-control", tags=["Admin-ResearchControl"]
+)

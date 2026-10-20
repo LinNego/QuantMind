@@ -135,6 +135,8 @@ def sandbox(npa, monkeypatch, tmp_path):
         ),
     )
     monkeypatch.setattr(npa, "_news_block", lambda d0: "")
+    # 研究总控 brief：默认空（不读真实 repo 档案）；注入路径由专项测试覆盖
+    monkeypatch.setattr(npa, "_research_block", lambda target: "")
     # 证券主表桩：与候选同口径（真实环境里候选代码本身就来自这张表）
     monkeypatch.setattr(
         npa,
@@ -342,6 +344,86 @@ def test_valid_pool_writes_agent_picks_with_usage_row(npa, sandbox, monkeypatch)
     assert rows[0]["signature"] == "market-research"
     assert rows[0]["kind"] == "night_pool"
     assert rows[0]["usage"] == _BRAIN_USAGE
+
+
+# ── 3a. 研究总控 brief 注入 + 富化落盘（2026-10-20） ────────────────────
+
+
+def test_run_injects_research_brief_into_prompt(npa, sandbox, monkeypatch):
+    """研究总控夜间综合稿必须进产池提示词（方向/资金/新闻/模型分数同口径）。"""
+    monkeypatch.setattr(
+        npa,
+        "_research_block",
+        lambda target: (
+            "【研究总控·昨日复盘与今日要点】\n- 明日方向：震荡偏强，半导体主线"
+        ),
+    )
+    seen: dict = {}
+
+    def fake_brain(task, *a, **k):
+        seen["task"] = task
+        return _BRAIN_JSON, dict(_BRAIN_USAGE)
+
+    monkeypatch.setattr(npa, "call_brain", fake_brain)
+
+    assert npa.run(SESSION, TARGET) == 0
+
+    assert "研究总控结论" in seen["task"]
+    assert "震荡偏强，半导体主线" in seen["task"]
+    # 池文件标记本轮确实读过研究总控稿（消费面可辨「有无综合结论」）
+    doc = json.loads(_picks_file(sandbox).read_text(encoding="utf-8"))
+    assert doc["research_brief"] is True
+
+
+def test_run_without_brief_marks_it_and_still_produces(npa, sandbox, monkeypatch):
+    """研究总控未产出不挡产池：提示词注明「本次无」，池照落、标记 False。"""
+    seen: dict = {}
+
+    def fake_brain(task, *a, **k):
+        seen["task"] = task
+        return _BRAIN_JSON, dict(_BRAIN_USAGE)
+
+    monkeypatch.setattr(npa, "call_brain", fake_brain)
+
+    assert npa.run(SESSION, TARGET) == 0
+
+    assert "本次无" in seen["task"]
+    doc = json.loads(_picks_file(sandbox).read_text(encoding="utf-8"))
+    assert doc["research_brief"] is False
+
+
+def test_run_writes_direction_capital_news_models_from_fenced_json(
+    npa, sandbox, monkeypatch
+):
+    """Markdown 正文 + ```json 围栏：正文里的花括号不干扰机读块抽取。"""
+    payload = {
+        **_BRAIN_PAYLOAD,
+        "direction": "震荡偏强，主线在半导体，注意高位分化",
+        "capital": "增量资金有限，偏存量博弈",
+        "news": "半导体政策催化，板块有持续性",
+        "models": "CN/batch 平均 fusion +0.002，BUY 占比约 20%",
+        "risks": ["高位股分化", "量能不足"],
+    }
+    content = (
+        "## 明日方向\n震荡偏强（集合 {测试} 花括号）。\n\n"
+        "## 资金判断\n存量博弈。\n\n"
+        "```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```\n"
+    )
+    monkeypatch.setattr(npa, "call_brain", lambda task, *a, **k: (content, None))
+
+    assert npa.run(SESSION, TARGET) == 0
+
+    doc = json.loads(_picks_file(sandbox).read_text(encoding="utf-8"))
+    md = doc["market_direction"]
+    assert md["direction"] == "震荡偏强，主线在半导体"  # market_view 仍是短句旧契约
+    assert md["summary"] == "震荡偏强，主线在半导体，注意高位分化"
+    assert md["capital"] == "增量资金有限，偏存量博弈"
+    assert md["news"] == "半导体政策催化，板块有持续性"
+    assert md["models"] == "CN/batch 平均 fusion +0.002，BUY 占比约 20%"
+    assert md["risks"] == ["高位股分化", "量能不足"]
+    # 研究纪要保留 Markdown 正文（展示面不再是裸 JSON）
+    notes = sandbox / "logs" / "night_pool" / f"{SESSION}.md"
+    assert "## 明日方向" in notes.read_text(encoding="utf-8")
 
 
 # ── 3b. 产池后的 QQ 推送（板块 + top20） ────────────────────────────────

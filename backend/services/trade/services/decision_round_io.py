@@ -331,9 +331,8 @@ def default_roster() -> tuple[AgentRun, ...]:
         resolve_roster,
     )
 
-    # 文件优先：子进程重启继承的是 supervisor 启动那一刻的旧环境，只读
-    # ``os.environ`` 会让管理台保存过的名册在重启后静默回退（2026-10-19 实测：
-    # max_tokens 16384 在 trade 重启后变回缺省 4000，下一轮又顶格截断）。
+    # 文件优先：子进程重启继承 supervisor 启动时的旧环境，只读 ``os.environ``
+    # 会让保存过的名册在重启后静默回退（2026-10-19：max_tokens 又回缺省 4000）。
     src = effective_env()
     if not str(src.get(ENV_ROSTER) or "").strip():
         return ()
@@ -480,6 +479,7 @@ def default_round_deps() -> RoundDeps:
         read_wake_ctx=_read_wake_ctx,
         # 镜像闸门/回注（P0 审计修）：非镜像部署下 active=False → 两块整段空串
         read_mirror_ctx=_read_mirror_ctx,
+        load_research_brief=feeds.research_brief,  # 研究总控（前一日夜间综合）
     )
 
 

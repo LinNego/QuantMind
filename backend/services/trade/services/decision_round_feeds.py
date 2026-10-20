@@ -12,6 +12,7 @@
 - :func:`l2_snapshots` → 丁2 通达信付费 L2 因子快照（PG ``tdx_l2_snapshot`` 当日最新行）
 - :func:`load_decision_rows` → 丁6 互看 / 丁9 上一轮（审计台账当日行）
 - :func:`read_wake_ctx` → 丙1 唤醒说明文本（写侧在 ``tick.wake_tick``）
+- :func:`research_brief` → 研究总控交易日前瞻（前一日夜间综合 + 当日各档复盘）
 
 分层：与 ``blocks`` 同侧（``io`` → ``feeds``），只许往下（``core``/``wake``/
 ``shared``/simulation 纯助手）——反向拉 io/round/tick/runner 会成环（源码守卫钉死）。
@@ -336,3 +337,18 @@ def read_wake_ctx(client: Any, round_id: str) -> str:
         logger.warning("[DecisionRound] 唤醒上下文读取失败 %s: %s", round_id, exc)
         return ""
     return str(raw or "")
+
+
+def research_brief(target: str) -> str:
+    """研究总控 brief 紧凑文本（``data/research_control/brief/{target}.json``）。
+
+    ``target`` = 目标交易日 ``YYYYMMDD``。无档案（首次上线/当日未跑）→ ``""``；
+    读失败也返回空串——决策轮按「无该块」照常跑，绝不臆造结论。
+    """
+    try:
+        from backend.shared.research_control.dossier import brief_for_prompt
+
+        return brief_for_prompt(target)
+    except Exception as exc:  # noqa: BLE001 研究面读失败不挡决策
+        logger.warning("[DecisionRound] 研究总控 brief 读取失败 %s: %s", target, exc)
+        return ""

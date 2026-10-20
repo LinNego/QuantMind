@@ -774,8 +774,8 @@ export const fetchFutuOrders = async (
   ...dataPatch(
     'components/ChatStream.tsx',
     'chatstream',
-    8,
-    '模型对话结构化渲染：正文块级 markdown + 总结条拆「结论标题 + 正文」',
+    16,
+    '模型对话结构化渲染：正文块级 markdown + 总结条拆「结论标题 + 正文」；研究总控（市场研究）七段全文直出，不再被 parseAnalysis 切碎',
   ),
   ...dataPatch(
     'components/ModelChat.tsx',
@@ -786,8 +786,8 @@ export const fetchFutuOrders = async (
   ...dataPatch(
     'components/ModelChat.css',
     'modelchat-css',
-    4,
-    '对话卡片新闻化：硬投影、无衬线正文、表格/有序列表/围栏/段标样式',
+    5,
+    '对话卡片新闻化：硬投影、无衬线正文、表格/有序列表/围栏/段标样式；研究总控靛蓝身份与长文排版',
   ),
   ...dataPatch(
     'components/EquityChart.tsx',

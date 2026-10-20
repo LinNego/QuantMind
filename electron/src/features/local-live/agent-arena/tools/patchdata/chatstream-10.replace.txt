@@ -1,0 +1,3 @@
+        const isReview = r.kind === 'review';
+        const isResearch = isResearchRound(r.model, r.modelId);
+        const isOpen = isReview ? !open.has(i) : open.has(i);

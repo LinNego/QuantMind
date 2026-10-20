@@ -545,3 +545,21 @@
   .qm-arena-root .mc-meta-cell { border-right: none; }
   .qm-arena-root .mc-decision-body { grid-template-columns: 1fr; }
 }
+
+/* ---------- 研究总控（market-research） ----------
+   七段长文直接进「完整复盘」一节；卡片身份用靛蓝，和新闻橙、普通模型色区分。 */
+.qm-arena-root .mc-mode-chip.research {
+  background: #eef2ff;
+  color: #4338ca;
+  border-color: #c7d2fe;
+}
+.qm-arena-root .mc-research-body {
+  padding: 8px 10px;
+  background: #fcfcff;
+  border-left: 3px solid #6366f1;
+}
+.qm-arena-root .mc-research-body .mc-md-h2 {
+  margin-top: 14px;
+  background: #1e1b4b;
+}
+.qm-arena-root .mc-research-body .mc-md-h3 { background: #eef2ff; color: #312e81; }

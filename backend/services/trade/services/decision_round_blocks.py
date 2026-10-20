@@ -204,6 +204,8 @@ class RoundBlocks:
     extra_context: str = ""
     risk_block: str = ""
     industry_caution_block: str = ""
+    #: 【研究总控·交易日前瞻】（前一日夜间综合 + 当日各档复盘）。空串 = 未接线/未产出。
+    research_block: str = ""
 
 
 def build_round_context(blocks: RoundBlocks, **legacy: Any) -> RebalanceContext:
@@ -222,6 +224,7 @@ def build_round_context(blocks: RoundBlocks, **legacy: Any) -> RebalanceContext:
         extra_context=blocks.extra_context,
         risk_block=blocks.risk_block,
         industry_caution_block=blocks.industry_caution_block,
+        research_block=blocks.research_block,
     )
 
 
@@ -331,6 +334,17 @@ async def enrich_quotes_with_blocks(
         alert = _snap_freshness_alert(snapped, now)
         if alert:
             alerts.append(alert)
+
+    # 【研究总控·交易日前瞻】：前一日夜间综合 + 当日各档复盘 → 决策模型可见。
+    # 未接线/尚未产出是常态（首次上线、当日未跑）：不占位、不告警，绝不臆造。
+    research_block = ""
+    if deps.load_research_brief is not None:
+        try:
+            research_block = str(deps.load_research_brief(now.strftime("%Y%m%d")) or "")
+        except Exception as exc:  # noqa: BLE001 研究面读失败不挡决策
+            logger.warning(
+                "[DecisionRound] %s 研究总控 brief 读取异常: %s", round_id, exc
+            )
 
     # 丁1 盘口 / 丁3 分钟（微观结构面，同属总接线标记）
     orderbook_block = minute_block = l2_block = ""
@@ -487,5 +501,6 @@ async def enrich_quotes_with_blocks(
         extra_context=extra_context,
         risk_block=risk_block,
         industry_caution_block=industry_caution,
+        research_block=research_block,
     )
     return scored_seq, blocks

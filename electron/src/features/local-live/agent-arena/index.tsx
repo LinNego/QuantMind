@@ -8,7 +8,7 @@
  * 页面代码来自 quant-Trader 的 arena 前端，由 `tools/port-from-arena.mjs` 搬运并
  * 作用域化（见同目录 PORTING.md）。要跟着 arena 更新，重跑那个脚本即可。
  */
-import { Activity, Blocks, Bot, Info, LayoutDashboard, Database } from 'lucide-react';
+import { Activity, Blocks, Bot, BrainCircuit, Info, LayoutDashboard, Database } from 'lucide-react';
 import type { RealTradingExtraTab } from '../../../pages/trading/RealTradingPage';
 import type { SettingsExtraPanel } from '../../../pages/trading/tabs/SettingsCenter';
 import AgentLedgerTab from './tabs/AgentLedgerTab';
@@ -17,6 +17,7 @@ import MarketLabTab from './tabs/MarketLabTab';
 import AboutPanel from './settings/AboutPanel';
 import ControlPanel from './settings/ControlPanel';
 import DataPanel from './settings/DataPanel';
+import ResearchControlPanel from './settings/ResearchControlPanel';
 
 /**
  * 追加页签顺序 = 侧栏顺序。**插在「设置」之前**（`composeConsoleTabs` 把设置钉在最后，
@@ -37,8 +38,9 @@ export const ARENA_TABS: readonly RealTradingExtraTab[] = [
   { id: 'arena-market-lab', label: '行情回测', icon: Blocks, render: () => <MarketLabTab /> },
 ];
 
-/** 设置页里的三块（顺序即设置页顶部按钮条上的顺序） */
+/** 设置页里的几块（顺序即设置页顶部按钮条上的顺序） */
 export const ARENA_SETTINGS_PANELS: readonly SettingsExtraPanel[] = [
+  { id: 'arena-research-control', label: '研究总控', icon: BrainCircuit, render: () => <ResearchControlPanel /> },
   { id: 'arena-control', label: '总控', icon: LayoutDashboard, render: () => <ControlPanel /> },
   { id: 'arena-data', label: '数据', icon: Database, render: () => <DataPanel /> },
   { id: 'arena-about', label: '关于', icon: Info, render: () => <AboutPanel /> },

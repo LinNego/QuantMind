@@ -1,0 +1,31 @@
+            {isOpen && (
+              <div className="mc-body">
+                {isResearch && (
+                  <>
+                    <div className="mc-section" data-sec="research">
+                      <div className="mc-section-head static">
+                        <span className="mc-caret">▼</span>
+                        完整复盘（研究总控 · 七段）
+                      </div>
+                      <div className="mc-code mc-prose mc-research-body">{renderMarkdown(r.thought)}</div>
+                    </div>
+                    {r.user && (() => {
+                      const rawOpen = !!exp[expKey(i, 'research-prompt')];
+                      return (
+                        <div className="mc-section" data-sec="research-prompt">
+                          <div
+                            className="mc-section-head"
+                            onClick={() =>
+                              setExp(asUpdater((e) => ({ ...e, [expKey(i, 'research-prompt')]: !rawOpen })))
+                            }
+                          >
+                            <span className="mc-caret">{rawOpen ? '▼' : '▶'}</span>
+                            事实输入（复盘提示词）
+                          </div>
+                          {rawOpen && <div className="mc-code mc-prose">{renderMarkdown(r.user)}</div>}
+                        </div>
+                      );
+                    })()}
+                  </>
+                )}
+                {r.user && !isResearch && (

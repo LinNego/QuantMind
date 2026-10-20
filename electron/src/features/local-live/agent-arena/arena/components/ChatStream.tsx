@@ -54,6 +54,23 @@ function splitSummary(text: string): { headline: string; body: string } {
   return { headline: '', body: t };
 }
 
+/** 研究总控 / 市场研究：报告是七段长文，不能走 parseAnalysis 的四段切法（会被切碎）。 */
+function isResearchRound(model: string, modelId?: string): boolean {
+  return model === '市场研究' || modelId === 'market-research';
+}
+
+/** 研究总控摘要：跳过标题/围栏/引用/表格/分隔线，取第一段正文（night 档首条要点即结论）。 */
+function researchSummary(text: string): string {
+  const stripped = text.replace(/```[\s\S]*?```/g, '');
+  for (const raw of stripped.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#') || line.startsWith('>') || line.startsWith('|')) continue;
+    if (/^[-=*_]{3,}$/.test(line)) continue;
+    return line.replace(/^[-*]\s+/, '').replace(/[*_`#]/g, '').trim().slice(0, 160);
+  }
+  return '';
+}
+
 /** 模型对话 — 全部模型混合流：
  *  不按模型分组，所有模型的最新分析按时间全局倒序混排（每个模型的最新都排前面），
  *  卡片边框按模型配色区分。 */
@@ -168,6 +185,7 @@ export default function ChatStream({
     <div className="mc-list">
       {rounds.map((r, i) => {
         const isReview = r.kind === 'review';
+        const isResearch = isResearchRound(r.model, r.modelId);
         const isOpen = isReview ? !open.has(i) : open.has(i);
         const sec = sections[i] ?? new Set<string>();
         const pa = parsed[i];
@@ -178,9 +196,11 @@ export default function ChatStream({
         const newsSum = isNews ? protoSummary(r.thought, r.modelId) : '';
         const sumText = isReview
           ? '盘后复盘：展开查看逐笔归因 / 行为审计 / 明日预案'
-          : isNews
-            ? newsSum || (r.thought || r.user).replace(/\s+/g, ' ').trim()
-            : pa.summary || (r.thought || r.user).replace(/\s+/g, ' ').trim();
+          : isResearch
+            ? researchSummary(r.thought) || '研究总控报告：展开查看完整七段'
+            : isNews
+              ? newsSum || (r.thought || r.user).replace(/\s+/g, ' ').trim()
+              : pa.summary || (r.thought || r.user).replace(/\s+/g, ' ').trim();
         const { headline: sumHeadline, body: sumBody } = splitSummary(sumText);
         return (
           <div
@@ -204,8 +224,15 @@ export default function ChatStream({
               <span className="mc-model" style={{ color: modelColor(r.model) }}>
                 {shortName(r.model)}
               </span>
-              {isNews ? <span className="mc-mode-chip news">新闻</span> : modeOf(r.user)}
+              {isNews ? (
+                <span className="mc-mode-chip news">新闻</span>
+              ) : isResearch ? (
+                <span className="mc-mode-chip research">研究总控</span>
+              ) : (
+                modeOf(r.user)
+              )}
               {!isNews &&
+                !isResearch &&
                 renderActionTags(r.thought, {
                   fills,
                   model: r.model,
@@ -240,7 +267,35 @@ export default function ChatStream({
             </div>
             {isOpen && (
               <div className="mc-body">
-                {r.user && (
+                {isResearch && (
+                  <>
+                    <div className="mc-section" data-sec="research">
+                      <div className="mc-section-head static">
+                        <span className="mc-caret">▼</span>
+                        完整复盘（研究总控 · 七段）
+                      </div>
+                      <div className="mc-code mc-prose mc-research-body">{renderMarkdown(r.thought)}</div>
+                    </div>
+                    {r.user && (() => {
+                      const rawOpen = !!exp[expKey(i, 'research-prompt')];
+                      return (
+                        <div className="mc-section" data-sec="research-prompt">
+                          <div
+                            className="mc-section-head"
+                            onClick={() =>
+                              setExp(asUpdater((e) => ({ ...e, [expKey(i, 'research-prompt')]: !rawOpen })))
+                            }
+                          >
+                            <span className="mc-caret">{rawOpen ? '▼' : '▶'}</span>
+                            事实输入（复盘提示词）
+                          </div>
+                          {rawOpen && <div className="mc-code mc-prose">{renderMarkdown(r.user)}</div>}
+                        </div>
+                      );
+                    })()}
+                  </>
+                )}
+                {r.user && !isResearch && (
                   <div className={`mc-section ${sec.has('prompt') ? 'folded' : ''}`} data-sec="prompt">
                     <div className="mc-section-head" onClick={() => toggleSection(i, 'prompt')}>
                       <span className="mc-caret">{sec.has('prompt') ? '▶' : '▼'}</span>
@@ -277,7 +332,7 @@ export default function ChatStream({
                     />
                   </div>
                 )}
-                {!isNews && pa.chain && (
+                {!isNews && !isResearch && pa.chain && (
                   <div className={`mc-section ${sec.has('chain') ? 'folded' : ''}`} data-sec="chain">
                     <div className="mc-section-head" onClick={() => toggleSection(i, 'chain')}>
                       <span className="mc-caret">{sec.has('chain') ? '▶' : '▼'}</span>
@@ -301,7 +356,7 @@ export default function ChatStream({
       })()}
                   </div>
                 )}
-                {!isNews && pa.decisions.length > 0 && (
+                {!isNews && !isResearch && pa.decisions.length > 0 && (
                   <div className={`mc-section ${sec.has('decisions') ? 'folded' : ''}`} data-sec="decisions">
                     <div className="mc-section-head" onClick={() => toggleSection(i, 'decisions')}>
                       <span className="mc-caret">{sec.has('decisions') ? '▶' : '▼'}</span>
@@ -344,7 +399,7 @@ export default function ChatStream({
                     )}
                   </div>
                 )}
-                {!isNews && pa.reasoning && (
+                {!isNews && !isResearch && pa.reasoning && (
                   <div className={`mc-section ${sec.has('reason') ? 'folded' : ''}`} data-sec="reason">
                     <div className="mc-section-head" onClick={() => toggleSection(i, 'reason')}>
                       <span className="mc-caret">{sec.has('reason') ? '▶' : '▼'}</span>

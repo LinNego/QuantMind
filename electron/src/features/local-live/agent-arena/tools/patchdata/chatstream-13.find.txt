@@ -1,0 +1,3 @@
+            {isOpen && (
+              <div className="mc-body">
+                {r.user && (

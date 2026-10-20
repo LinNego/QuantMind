@@ -382,9 +382,8 @@ class RoundDeps:
     real_enabled: Callable[[], bool]
     #: () → 当前北京时间（aware）
     now: Callable[[], datetime]
-    #: () → (真单镜像通道是否就绪, 不就绪原因)（P2-2）。口径与镜像链路同一实现
-    #: （``real_mirror_service.real_trading_ready``）。``None``/探测失败 = 探不到，
-    #: 审计记 None——绝不把「没探测」粉饰成「就绪」。生产接线见 `default_round_deps`。
+    #: () → (镜像通道是否就绪, 不就绪原因)（P2-2）。口径同 ``real_mirror_service``。
+    #: ``None``/探测失败 = 探不到，审计记 None——绝不把「没探测」粉饰成「就绪」。
     mirror_ready: Callable[[], tuple[bool, str]] | None = None
     #: (now) → 是否**连续竞价**（09:30-11:30 / 13:00-15:00）；None=未接线退回旧口径。
     is_continuous_trading: Callable[[datetime], bool] | None = None
@@ -410,6 +409,7 @@ class RoundDeps:
     read_wake_ctx: Callable[[str], str] | None = None
     #: () → 镜像上下文（闸门约束+当日跳过；``real_mirror_service.prompt_mirror_context``）。None = 未接线。
     read_mirror_ctx: Callable[[], Mapping[str, Any]] | None = None
+    load_research_brief: Callable[[str], str] | None = None  # 研究总控 brief
 
 
 @dataclass(frozen=True, slots=True)

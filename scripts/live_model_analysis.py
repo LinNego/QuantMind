@@ -405,6 +405,19 @@ def _news_block() -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+def _research_block() -> str:
+    """研究总控 brief（前一日夜间综合 + 当日各档复盘）→ 全局背景。
+
+    缺失（首次上线/当日未跑）返回空串：本轮照常按新闻与持仓分析，绝不臆造。
+    """
+    try:
+        from backend.shared.research_control.dossier import brief_for_prompt
+
+        return brief_for_prompt(datetime.now(CN_TZ).strftime("%Y%m%d"))
+    except Exception:  # noqa: BLE001 研究面读失败不挡本轮
+        return ""
+
+
 _UNSET = object()
 
 
@@ -551,6 +564,12 @@ def build_user_content(
     news = _news_block()
     if news:
         parts.append("【当日新闻分子】\n" + news)
+
+    # 研究总控（系统级综合）：其他 agent 次日可见——方向/资金/新闻/模型分数/
+    # 板块/风险。缺失不占位（空串），本轮按新闻与持仓照常分析。
+    research = _research_block()
+    if research:
+        parts.append("【研究总控·今日前瞻】\n" + research)
 
     parts.append(
         _requirement_block(

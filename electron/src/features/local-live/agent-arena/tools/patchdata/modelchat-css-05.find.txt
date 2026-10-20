@@ -1,0 +1,2 @@
+  .qm-arena-root .mc-decision-body { grid-template-columns: 1fr; }
+}
