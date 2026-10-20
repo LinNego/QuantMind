@@ -1692,3 +1692,107 @@ class TestMainLoopReplacementAndIncremental:
         assert entry["superseded_at"] == "2026-09-05T00:00:00Z"
         assert _superseded_columns(manifest) == {col_a}, "已下架列不许复活"
         assert manifest["fid_b"]["status"] == "materialized"
+
+
+# ── 尾窗刷新（--refresh-since） ────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_tail_h5_start_is_month_stable_and_covers_max_lookback():
+    from datetime import date, timedelta
+
+    from backend.scripts.rd_mined_materialize import _tail_h5_start
+
+    assert _tail_h5_start(date(2026, 10, 19)) == date(2025, 4, 1)
+    # 同月内任意一天的缓存身份一致（每天跑不会换文件名）
+    assert _tail_h5_start(date(2026, 10, 2)) == _tail_h5_start(date(2026, 10, 31))
+    # 18 个月 ≈ 390 个交易日，覆盖 240 日最大回看
+    assert (date(2026, 10, 19) - _tail_h5_start(date(2026, 10, 19))) > timedelta(
+        days=500
+    )
+
+
+@pytest.mark.unit
+def test_tail_cache_is_stale_when_kline_partition_is_newer(tmp_path):
+    """缓存只判存在会复用上一晚的数据面，尾窗末几日静默缺席。"""
+    import os
+
+    from backend.scripts.rd_mined_materialize import _tail_cache_is_stale
+
+    root = tmp_path / "quantdb"
+    part = root / "1_kline_data" / "daily_forward" / "dt=20261019"
+    part.mkdir(parents=True)
+    cache = root / ".h5_cache" / "daily_pv_all__2025-04-01_2026-12-31__fd+l1+l2.h5"
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(b"\x89HDF\r\n\x1a\n")
+
+    base = part.stat().st_mtime
+    # 缓存比最新分区新 → 可复用
+    os.utime(cache, (base + 10, base + 10))
+    assert not _tail_cache_is_stale(cache, root)
+    # 分区比缓存新（当晚同步已落新日）→ 必须重生成
+    os.utime(part, (cache.stat().st_mtime + 10, cache.stat().st_mtime + 10))
+    assert _tail_cache_is_stale(cache, root)
+    # 缓存缺失 → 视为陈旧（调用方随后重新生成）
+    cache.unlink()
+    assert _tail_cache_is_stale(cache, root)
+
+
+@pytest.mark.unit
+def test_select_refresh_targets_only_materialized_day_factors():
+    from backend.scripts.rd_mined_materialize import _select_refresh_targets
+
+    rows = [
+        {
+            "factor_id": "m1",
+            "factor_name": "已物化",
+            "factor_code": "x",
+            "native_freq": "day",
+        },
+        {
+            "factor_id": "m2",
+            "factor_name": "分钟",
+            "factor_code": "x",
+            "native_freq": "1min",
+        },
+        {
+            "factor_id": "m3",
+            "factor_name": "被拒",
+            "factor_code": "x",
+            "native_freq": "day",
+        },
+        {
+            "factor_id": "m4",
+            "factor_name": "无列",
+            "factor_code": "x",
+            "native_freq": "day",
+        },
+    ]
+    manifest = {
+        "m1": {"status": "materialized", "column": "rd_a"},
+        "m2": {"status": "materialized", "column": "rd_b"},
+        "m3": {"status": "rejected_duplicate", "column": "rd_c"},
+        "m4": {"status": "materialized", "column": ""},
+    }
+
+    targets, skipped = _select_refresh_targets(rows, manifest)
+
+    assert [column for _, column in targets] == ["rd_a"]
+    assert skipped == {"not_materialized": 1, "no_column": 1, "minute": 1}
+
+
+@pytest.mark.unit
+def test_refresh_mode_rejects_incompatible_flags():
+    import pytest as _pytest
+
+    from backend.scripts.rd_mined_materialize import _parse_args
+
+    with _pytest.raises(SystemExit):
+        _parse_args(["--refresh-since", "20261009", "--force"])
+    with _pytest.raises(SystemExit):
+        _parse_args(["--refresh-since", "20261009", "--gates-only"])
+    args = _parse_args(
+        ["--refresh-since", "20261009", "--refresh-end", "20261016", "--dry-run"]
+    )
+    assert args.refresh_since == "20261009"
+    assert args.refresh_end == "20261016"

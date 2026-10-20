@@ -811,9 +811,7 @@ def _resolve_h5(h5_path: str | None) -> Path:
     return cache
 
 
-def _generate_shared_h5(
-    cache_path: Path, *, start_date: date | None = None
-) -> None:
+def _generate_shared_h5(cache_path: Path, *, start_date: date | None = None) -> None:
     from backend.services.engine.rd_agent.rd_loop_wrapper import RDLoopWrapper
 
     wrapper = RDLoopWrapper(market=DEFAULT_MARKET)
@@ -841,12 +839,37 @@ def _tail_h5_start(since: date) -> date:
     return date(anchor.year, anchor.month, 1)
 
 
+def _latest_daily_forward_mtime(quantdb_dir: Path) -> float:
+    """最新日K分区目录的 mtime（取全部分区的最大值）；读不到返回 0。"""
+    root = Path(quantdb_dir) / "1_kline_data" / "daily_forward"
+    try:
+        parts = list(root.glob("dt=*"))
+    except OSError:
+        return 0.0
+    return max((part.stat().st_mtime for part in parts), default=0.0)
+
+
+def _tail_cache_is_stale(cache: Path, quantdb_dir: Path) -> bool:
+    """尾窗缓存是否早于最新行情分区。
+
+    缓存名只含「窗口 + 数据集选择」、不含数据截止日：只判文件存在与否，
+    前一晚生成的缓存会被今晚原样复用，尾窗末几日缺席而 refresh 仍可能
+    rc=0（2026-10-20 实测 00:19 生成的缓存只到 20261016）。判据用
+    mtime——日K分区每晚同步后 mtime 必然前移，缓存必须晚于它才可信。
+    """
+    try:
+        cache_mtime = cache.stat().st_mtime
+    except OSError:
+        return True
+    return _latest_daily_forward_mtime(quantdb_dir) > cache_mtime
+
+
 def _resolve_tail_h5(since: date) -> Path:
     """刷新模式数据面：只覆盖 ``since`` 之后所需尾窗的共享缓存。
 
     因子代码最大回看 240 个交易日且无 expanding/cumsum，固定起点尾窗即可
     正确算出新日期值；避免每晚重生成 8GB 全历史缓存。缓存名与生成器同一
-    命名函数（窗口 + 数据集选择），mtime 新鲜时直接复用。
+    命名函数（窗口 + 数据集选择），比最新日K分区新才复用。
     """
     from backend.services.engine.rd_agent.rd_loop_wrapper import (
         _H5_DEFAULT_END,
@@ -863,6 +886,9 @@ def _resolve_tail_h5(since: date) -> Path:
     )
     if cache.is_file() and not _h5_is_valid(cache):
         logger.warning("尾窗 h5 缓存非有效 HDF5，删除重生成：%s", cache)
+        cache.unlink(missing_ok=True)
+    elif cache.is_file() and _tail_cache_is_stale(cache, _quantdb_dir()):
+        logger.info("尾窗 h5 缓存早于最新日K分区，删除重生成：%s", cache)
         cache.unlink(missing_ok=True)
     if not cache.is_file():
         logger.info("生成尾窗数据面 %s ~ 最新（缓存 %s）", start, cache)
@@ -1748,12 +1774,8 @@ async def _run_refresh(args: argparse.Namespace) -> int:
     manifest = _load_manifest(lib_root)
     rows = await _query_candidates(market=args.market)
     factor_ids = set(args.factor_ids) if args.factor_ids else None
-    targets, skipped = _select_refresh_targets(
-        rows, manifest, factor_ids=factor_ids
-    )
-    logger.info(
-        "刷新 %s ~ %s：候选 %d，跳过 %s", since, until, len(targets), skipped
-    )
+    targets, skipped = _select_refresh_targets(rows, manifest, factor_ids=factor_ids)
+    logger.info("刷新 %s ~ %s：候选 %d，跳过 %s", since, until, len(targets), skipped)
     if not targets:
         return 0
     if args.dry_run:
@@ -1801,7 +1823,9 @@ async def _run_refresh(args: argparse.Namespace) -> int:
             )
         except Exception as exc:  # noqa: BLE001 - 单因子失败继续，汇总非零退出
             stats["errors"] += 1
-            logger.exception("[%d/%d] %s 刷新失败：%s", idx, len(targets), factor_id[:8], exc)
+            logger.exception(
+                "[%d/%d] %s 刷新失败：%s", idx, len(targets), factor_id[:8], exc
+            )
     if dirty_library:
         report = _align_partition_schemas(lib_root)
         logger.info("分区 schema 对齐：%s", report)
