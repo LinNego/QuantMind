@@ -710,12 +710,13 @@ CSV：`data/reports/top20_eval_20261020/rolling_20261020/`；
 docker cp skills/batch-inference-analysis/scripts/. quantmind:/tmp/probe_tests/
 docker exec -w /tmp/probe_tests quantmind \
   python -m pytest test_rolling_portfolio_sim.py test_top100_score_probe.py -q
-# 12 passed
+# 14 passed
 ```
 
 - 宿主没有 scipy，测试必须在容器里跑（且要拷全 scripts 目录，探针之间有 import）。
 - 测试锁住：时间退出的成交日与净收益、`blocked_long` 顺延、分数退出、
-  排名退出、两日入场/退出确认、开盘成交价、行业上限跳过与缺参报错。
+  排名退出、两日入场/退出确认、开盘成交价、行业上限跳过与缺参报错、
+  建仓节奏（`ramp_days=1` 首日买满 / 0 报错）。
 - 合成数据不碰数据库；改动 `simulate` 的时点/成本/组合约束逻辑前后都要跑。
 
 ### 15.6 Top100 打分探针：平均分、9–10 月实测、top10 模型集（2026-10-20 新增）
@@ -788,6 +789,11 @@ docker exec -w /tmp quantmind python top100_score_probe.py \
 - `scripts/horizon_combo_probe.py` — T+10 / T+5 / 双周期 26 模型对照。
 - `scripts/industry_cap_probe.py` — 行业上限，两套固定口径：
   `fine`（128 个细分行业）/ `l1`（代码前两位聚合的 30 个一级行业）。
+- `rolling_portfolio_sim.py` 的 `ramp_days` 旋钮：默认 `None` 沿用 `hold`
+  （TopN=10/H10 → 每天 1 只，10 天建满），`1` = 首日一次性买满。
+  100 万 Top10 补测：一次性买满全期 47.0%、9–10 月 +0.3%；每天 1 只
+  43.0%、+0.6%。一次性买满只赢 2025，前向窗口反而略差，且是单日入场
+  押注，**不据此改默认**。
 
 **预注册门槛（先写死再看结果）**：
 

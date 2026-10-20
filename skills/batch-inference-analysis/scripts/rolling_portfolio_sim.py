@@ -295,6 +295,8 @@ class Config:
     fill: str = "close"
     # 单一行业最多占 top_n 的比例；None=不限制。只在买入时约束。
     max_industry_pct: float | None = None
+    # 建仓摊几天；None=沿用 hold（默认行为），1=首个交易日一次性买满。
+    ramp_days: int | None = None
 
 
 @dataclass
@@ -363,6 +365,8 @@ def simulate(
     vp_arr = (
         vwap_px.to_numpy(dtype=np.float64, copy=False) if vwap_px is not None else None
     )
+    if cfg.ramp_days is not None and cfg.ramp_days < 1:
+        raise ValueError("ramp_days 必须 >= 1")
     if cfg.max_industry_pct is not None and industry is None:
         raise ValueError("max_industry_pct 需要 industry")
     if industry is not None and len(industry) != S:
@@ -564,8 +568,9 @@ def simulate(
         vacancies = cfg.top_n - len(positions)
         if ramp_start is None and buy_js and vacancies > 0:
             ramp_start = i
-        if ramp_start is not None and i - ramp_start < cfg.hold:
-            max_buys = min(vacancies, math.ceil(cfg.top_n / cfg.hold))
+        ramp_days = cfg.ramp_days if cfg.ramp_days is not None else cfg.hold
+        if ramp_start is not None and i - ramp_start < ramp_days:
+            max_buys = min(vacancies, math.ceil(cfg.top_n / ramp_days))
         else:
             max_buys = vacancies
         if risk_off:

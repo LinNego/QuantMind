@@ -264,6 +264,61 @@ def test_exit_confirm_two_waits_for_second_weak_day() -> None:
     assert first["exit_d"] == 20250104
 
 
+def test_ramp_days_one_buys_all_names_on_first_day() -> None:
+    # Arrange
+    close, adv, score, avg, blocked_long, blocked_short, market20 = _synthetic()
+    avg = pd.DataFrame(0.0, index=close.index, columns=close.columns)
+    cfg = R.Config(
+        label="ramp-one",
+        top_n=2,
+        hold=5,
+        score_exit=False,
+        ramp_days=1,
+        capital=1_000_000.0,
+        cash_buffer=0.0,
+        cost_side=0.0,
+    )
+
+    # Act
+    res = R.simulate(
+        cfg,
+        close,
+        adv,
+        score,
+        avg,
+        blocked_long,
+        blocked_short,
+        start_i=1,
+        end_i=6,
+        market20=market20,
+    )
+
+    # Assert
+    first_day = res.trades.loc[res.trades["entry_i"] == 1, "symbol"].tolist()
+    assert sorted(first_day) == ["A.SH", "B.SZ"]
+
+
+def test_ramp_days_zero_is_rejected() -> None:
+    # Arrange
+    close, adv, score, avg, blocked_long, blocked_short, market20 = _synthetic()
+    cfg = R.Config(label="ramp-zero", top_n=1, hold=5, ramp_days=0)
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="ramp_days"):
+        R.simulate(
+            cfg,
+            close,
+            adv,
+            score,
+            avg,
+            blocked_long,
+            blocked_short,
+            start_i=1,
+            end_i=6,
+            market20=market20,
+        )
+
+
 def test_industry_cap_skips_extra_name_in_same_industry() -> None:
     # Arrange
     dates = np.arange(20250101, 20250111, dtype="int64")
