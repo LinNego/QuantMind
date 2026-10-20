@@ -1199,6 +1199,7 @@ class RDLoopWrapper:
         debug: bool = False,
         symbols_limit: int | None = None,
         end_date: date | None = None,
+        start_date: date | None = None,
         use_cache: bool = True,
     ) -> bool:
         """从 QuantDB parquet 生成 RD-Agent 期望的 daily_pv.h5 文件。
@@ -1222,6 +1223,11 @@ class RDLoopWrapper:
         失败不降级旧缓存。旧全量缓存冒充「截断数据」会让「全量 vs 截断」对比
         退化成「全量 vs 全量」假通过，故此处失败即返回 False。
 
+        尾窗模式（``start_date``）：把数据面起点前移到指定日（默认窗口仍为
+        ``_H5_DEFAULT_START``）。缓存身份含窗口，因此尾窗缓存与全量缓存各占
+        一个文件；调用方负责保证 ``start_date`` 覆盖因子最大回看。自定义挖掘
+        窗口（``QM_MINING_WINDOW_*``）优先于 ``start_date``。
+
         Returns:
             True if h5 file was generated/already current, False on failure.
         """
@@ -1232,7 +1238,7 @@ class RDLoopWrapper:
         # 用旧默认跨度，行为逐位不变。
         custom = self._custom_windows()
         if custom is None:
-            start_d = _H5_DEFAULT_START
+            start_d = start_date or _H5_DEFAULT_START
             default_end = _H5_DEFAULT_END
         else:
             start_d = custom[0].start
