@@ -70,7 +70,8 @@ async def _save_result(result: dict[str, Any], *, snapshot_date: Any = None) -> 
 async def _run_factor_card(save: bool, *, top: int, dataset: str) -> dict[str, Any]:
     from backend.scripts.eval.factor_card import score_factors
 
-    results = score_factors(dataset, None, top)
+    # 同步 pandas 重活必须离开事件循环（原因见 _run_model_card 的注释）。
+    results = await asyncio.to_thread(score_factors, dataset, None, top)
     if save:
         for r in results:
             await _save_result(r)
@@ -100,17 +101,26 @@ async def _run_model_card(save: bool, *, limit: int = 50) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - 用户模型清单失败不拖垮系统模型卡
         logger.warning("[EvalRunAll] 用户模型清单获取失败: %s", exc)
 
-    for model_id, meta_path in targets:
-        try:
-            results.append(score_model(model_id, meta_path=meta_path))
-        except Exception as exc:  # noqa: BLE001 - 单模型隔离
-            results.append(
-                {
-                    "object_type": "model",
-                    "object_id": model_id,
-                    "error": f"评分失败: {exc}",
-                }
-            )
+    def _score_targets() -> list[dict[str, Any]]:
+        scored: list[dict[str, Any]] = []
+        for model_id, meta_path in targets:
+            try:
+                scored.append(score_model(model_id, meta_path=meta_path))
+            except Exception as exc:  # noqa: BLE001 - 单模型隔离
+                scored.append(
+                    {
+                        "object_type": "model",
+                        "object_id": model_id,
+                        "error": f"评分失败: {exc}",
+                    }
+                )
+        return scored
+
+    # 模型卡是同步 pandas/parquet 重活（百 MB 级 pred 逐模型读+算，实测整卡
+    # 98s）。直接在事件循环里跑会把交易服务 HTTP 全部卡死：看门狗 3×30s 健康
+    # 检查失败 → 杀进程重启 → 当日完成标记还没写 → 下一进程从头再评，形成
+    # 永久崩溃循环（2026-10-20 16:02–16:42 实锤，账户/策略全部不可用）。
+    results.extend(await asyncio.to_thread(_score_targets))
     if save:
         for r in results:
             await _save_result(r)
