@@ -287,6 +287,14 @@ class Config:
     cost_side: float = COST_SIDE
     capital: float = CAPITAL
     use_blocked_short: bool = True
+    # 以下为买卖执行的对齐实验旋钮，默认值保持旧行为不变。
+    exit_rank: int | None = None
+    entry_confirm: int = 1
+    exit_confirm: int = 1
+    # close|open|vwap|open_sell_close_buy|open_buy_close_sell
+    fill: str = "close"
+    # 单一行业最多占 top_n 的比例；None=不限制。只在买入时约束。
+    max_industry_pct: float | None = None
 
 
 @dataclass
@@ -304,6 +312,7 @@ class Position:
     extensions: int = 0
     mfe: float = 0.0
     mae: float = 0.0
+    weak_streak: int = 0
 
 
 @dataclass
@@ -328,6 +337,9 @@ def simulate(
     start_i: int,
     end_i: int,
     market20: pd.Series,
+    open_px: pd.DataFrame | None = None,
+    vwap_px: pd.DataFrame | None = None,
+    industry: np.ndarray | None = None,
 ) -> SimResult:
     dates = close.index.to_numpy(dtype="int64")
     symbols = close.columns.to_numpy()
@@ -337,6 +349,43 @@ def simulate(
     a_arr = avg.to_numpy(dtype=np.float64, copy=False)
     mkt20 = market20.to_numpy(dtype=np.float64, copy=False)
     T, S = px.shape
+
+    use_open_sell = cfg.fill in ("open", "open_sell_close_buy")
+    use_open_buy = cfg.fill in ("open", "open_buy_close_sell")
+    use_vwap = cfg.fill == "vwap"
+    if (use_open_sell or use_open_buy) and open_px is None:
+        raise ValueError(f"fill={cfg.fill} 需要 open_px")
+    if use_vwap and vwap_px is None:
+        raise ValueError("fill=vwap 需要 vwap_px")
+    op_arr = (
+        open_px.to_numpy(dtype=np.float64, copy=False) if open_px is not None else None
+    )
+    vp_arr = (
+        vwap_px.to_numpy(dtype=np.float64, copy=False) if vwap_px is not None else None
+    )
+    if cfg.max_industry_pct is not None and industry is None:
+        raise ValueError("max_industry_pct 需要 industry")
+    if industry is not None and len(industry) != S:
+        raise ValueError("industry 长度必须与标的数一致")
+    # 单行业最多持仓数；缺失行业码 -1 不参与限制。
+    max_per_ind = (
+        max(1, math.ceil(cfg.top_n * cfg.max_industry_pct))
+        if cfg.max_industry_pct is not None
+        else None
+    )
+
+    # 入场确认：需要连续 entry_confirm 天满足 S>=A；逐日布尔矩阵一次算好。
+    confirm_ok: np.ndarray | None = None
+    if cfg.use_avg_filter and cfg.entry_confirm > 1:
+        base_ok = (
+            np.isfinite(s_arr)
+            & np.isfinite(a_arr)
+            & (s_arr >= a_arr + cfg.entry_margin)
+        )
+        confirm_ok = base_ok.copy()
+        for k in range(1, cfg.entry_confirm):
+            confirm_ok[k:] &= base_ok[:-k]
+        confirm_ok[: cfg.entry_confirm - 1] = False
 
     cash = cfg.capital
     positions: dict[int, Position] = {}
@@ -372,10 +421,21 @@ def simulate(
         # 当日可投候选（含已持有；用于展期判定与排序）
         s_row = s_arr[d]
         a_row = a_arr[d]
+        rank_row: np.ndarray | None = None
+        if cfg.exit_rank is not None:
+            finite = np.isfinite(s_row)
+            js_finite = np.flatnonzero(finite)
+            rank_row = np.full(S, np.iinfo(np.int32).max, dtype=np.int64)
+            if js_finite.size:
+                order_all = js_finite[np.argsort(-s_row[js_finite], kind="stable")]
+                rank_row[order_all] = np.arange(1, order_all.size + 1)
         with np.errstate(invalid="ignore"):
             ok = np.isfinite(s_row) & (adv_arr[d] >= adv_gate)
             if cfg.use_avg_filter:
-                ok &= np.isfinite(a_row) & (s_row >= a_row + cfg.entry_margin)
+                if confirm_ok is not None:
+                    ok &= confirm_ok[d]
+                else:
+                    ok &= np.isfinite(a_row) & (s_row >= a_row + cfg.entry_margin)
         if cfg.entry_floor is not None:
             ok &= s_row >= cfg.entry_floor
         js = np.flatnonzero(ok)
@@ -383,13 +443,13 @@ def simulate(
         top_set = set(order[: cfg.top_n].tolist())
 
         # 卖出决策
-        sells: list[tuple[int, bool, bool, bool]] = []
+        sells: list[tuple[int, bool, bool, bool, bool]] = []
         for j, pos in positions.items():
             hold_days = d - pos.entry_i
             due = hold_days >= cfg.hold - 1
             s = s_arr[d, j]
             a = a_arr[d, j]
-            weak = bool(
+            weak_today = bool(
                 cfg.score_exit
                 and cfg.use_avg_filter
                 # hold_days 是决策日相对入场执行日的偏移；实际持有天数 = hold_days + 1。
@@ -397,6 +457,18 @@ def simulate(
                 and math.isfinite(s)
                 and math.isfinite(a)
                 and s < a - cfg.score_buffer
+            )
+            if cfg.exit_confirm > 1:
+                pos.weak_streak = pos.weak_streak + 1 if weak_today else 0
+                weak = weak_today and pos.weak_streak >= cfg.exit_confirm
+            else:
+                weak = weak_today
+            rank_weak = bool(
+                cfg.exit_rank is not None
+                and rank_row is not None
+                and hold_days >= cfg.min_hold - 1
+                and math.isfinite(s)
+                and rank_row[j] > cfg.exit_rank
             )
             p = px[d, j]
             stop = bool(
@@ -409,25 +481,30 @@ def simulate(
                 and cfg.extend
                 and pos.extensions < cfg.max_extend
                 and not weak
+                and not rank_weak
                 and j in top_set
             ):
                 pos.entry_i = d
                 pos.extensions += 1
                 due = False
-            if due or weak or stop:
-                sells.append((j, due, weak, stop))
+            if due or weak or rank_weak or stop:
+                sells.append((j, due, weak, stop, rank_weak))
 
-        sold_js = {j for j, _, _, _ in sells}
+        sold_js = {j for j, _, _, _, _ in sells}
         buy_js = [int(j) for j in order if j not in positions and j not in sold_js]
 
         # 执行卖出（t+1 收盘；跌停/停牌延迟）
         sold_today: set[int] = set()
         sell_cost_total = 0.0
-        for j, due, weak, stop in sells:
+        for j, due, weak, stop, rank_weak in sells:
             pos = positions.get(j)
             if pos is None:
                 continue
-            p = px[i, j]
+            p = (
+                vp_arr[i, j]
+                if use_vwap
+                else (op_arr[i, j] if use_open_sell else px[i, j])
+            )
             if not math.isfinite(p):
                 continue
             if cfg.use_blocked_short and blocked_short[i, j]:
@@ -440,10 +517,12 @@ def simulate(
             net_ret = (proceeds - sell_cost - pos.notional - pos.buy_cost) / (
                 pos.notional + pos.buy_cost
             )
-            if stop and weak:
+            if stop and (weak or rank_weak):
                 reason = "score+stop"
             elif stop:
                 reason = "stop"
+            elif rank_weak:
+                reason = "rank"
             elif weak:
                 reason = "score"
             elif due:
@@ -473,6 +552,7 @@ def simulate(
                     "exit_reason": reason,
                     "due": due,
                     "score_weak": weak,
+                    "rank_weak": rank_weak,
                     "stop_hit": stop,
                     "extensions": pos.extensions,
                 }
@@ -496,14 +576,28 @@ def simulate(
         bought = 0
         buy_notional = 0.0
         buy_cost_total = 0.0
+        ind_counts: dict[int, int] = {}
+        if max_per_ind is not None and industry is not None:
+            for held_j in positions:
+                code = int(industry[held_j])
+                if code >= 0:
+                    ind_counts[code] = ind_counts.get(code, 0) + 1
         for j in buy_js:
             if bought >= max_buys:
                 break
-            p = px[i, j]
+            p = (
+                vp_arr[i, j]
+                if use_vwap
+                else (op_arr[i, j] if use_open_buy else px[i, j])
+            )
             if not math.isfinite(p):
                 continue
             if blocked_long[i, j]:
                 continue
+            if max_per_ind is not None and industry is not None:
+                code = int(industry[j])
+                if code >= 0 and ind_counts.get(code, 0) >= max_per_ind:
+                    continue
             # 现金不够整槽时按可用现金买部分仓，而不是整天放弃（首个买点尤其常见）。
             notional = min(target, cash / (1.0 + cfg.cost_side))
             if notional <= 1.0:
@@ -522,6 +616,10 @@ def simulate(
                 entry_avg=float(a_arr[d, j]),
                 last_price=p,
             )
+            if max_per_ind is not None and industry is not None:
+                code = int(industry[j])
+                if code >= 0:
+                    ind_counts[code] = ind_counts.get(code, 0) + 1
             buy_notional += notional
             buy_cost_total += cost
             bought += 1
@@ -558,9 +656,13 @@ def simulate(
             }
         )
 
-    # 期末清仓（按最后收盘；停牌用最后有效价）
+    # 期末清仓（默认最后收盘；open 成交口径用最后开盘；停牌用最后有效价）
     for j, pos in list(positions.items()):
-        p = px[end_i, j]
+        p = (
+            vp_arr[end_i, j]
+            if use_vwap
+            else (op_arr[end_i, j] if use_open_sell else px[end_i, j])
+        )
         if not math.isfinite(p):
             p = pos.last_price
         proceeds = pos.notional * p / pos.entry_price
@@ -592,6 +694,7 @@ def simulate(
                 "exit_reason": "end",
                 "due": False,
                 "score_weak": False,
+                "rank_weak": False,
                 "stop_hit": False,
                 "extensions": pos.extensions,
             }
@@ -686,6 +789,7 @@ def perf_stats(
                 "trade_avg_hold": float(trades["hold_days"].mean()),
                 "exit_time": int((trades["exit_reason"] == "time").sum()),
                 "exit_score": int((trades["exit_reason"] == "score").sum()),
+                "exit_rank": int((trades["exit_reason"] == "rank").sum()),
                 "exit_stop": int((trades["exit_reason"] == "stop").sum()),
                 "exit_both": int((trades["exit_reason"] == "score+stop").sum()),
                 "exit_end": int((trades["exit_reason"] == "end").sum()),
