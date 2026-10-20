@@ -15,11 +15,16 @@
         ...
     ]}
 
-用法：
+用法（二选一）：
     QM_PASSWORD=... python3 scripts/training/queue_driver.py \\
         --manifest data/training_jobs/_t10_queue_20261018/manifest.json \\
         --state-dir data/training_jobs/_t10_queue_20261018 \\
         --wait-for-file data/training_jobs/_rerun_20261018/DONE
+
+    # 无口令场景：走内部调用密钥（X-Internal-Call + X-User-Id），
+    # 密钥从容器运行时读取，不落盘、不出现在命令行字面量里。
+    QM_INTERNAL_CALL_SECRET="$(docker exec quantmind printenv INTERNAL_CALL_SECRET)" \\
+        python3 scripts/training/queue_driver.py ...
 """
 
 from __future__ import annotations
@@ -58,7 +63,15 @@ def _now() -> str:
 
 
 class QueueDriver:
-    def __init__(self, manifest: Path, state_dir: Path, wait_for_file: Path | None):
+    def __init__(
+        self,
+        manifest: Path,
+        state_dir: Path,
+        wait_for_file: Path | None,
+        internal_secret: str = "",
+        internal_user_id: str = "10000001",
+        internal_tenant_id: str = "default",
+    ):
         self.manifest = manifest
         self.state_dir = state_dir
         self.wait_for_file = wait_for_file
@@ -66,6 +79,15 @@ class QueueDriver:
         self.status_path = state_dir / "status.json"
         self.done_path = state_dir / "DONE"
         self.state: dict[str, Any] = {"tags": {}, "updated_at": _now()}
+        # 内部调用认证：与 admin 路由 get_current_user 的内部头约定一致。
+        # 有密钥就不走登录，避免无口令环境（定时/无人值守）被卡住。
+        self._internal_headers: dict[str, str] = {}
+        if internal_secret:
+            self._internal_headers = {
+                "X-Internal-Call": internal_secret,
+                "X-User-Id": str(internal_user_id),
+                "X-Tenant-Id": str(internal_tenant_id),
+            }
 
     # ---------- 基础 I/O ----------
 
@@ -92,14 +114,14 @@ class QueueDriver:
 
     # ---------- HTTP / Docker ----------
 
-    @staticmethod
     def _http_json(
+        self,
         url: str,
         body: dict[str, Any] | None = None,
         token: str = "",
         timeout: float = 120,
     ) -> tuple[int, dict[str, Any]]:
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", **self._internal_headers}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         data = None if body is None else json.dumps(body).encode("utf-8")
@@ -201,7 +223,7 @@ class QueueDriver:
             time.sleep(30.0)
 
     def _submit(self, payload: dict[str, Any], password: str) -> str:
-        token = self._login(password)
+        token = "" if self._internal_headers else self._login(password)
         waited = 0.0
         while True:
             status, body = self._http_json(
@@ -217,6 +239,11 @@ class QueueDriver:
                 )
                 return run_id
             if status == 401:
+                if self._internal_headers:
+                    raise RuntimeError(
+                        f"内部调用认证被拒 401（检查 INTERNAL_CALL_SECRET 与用户角色）: "
+                        f"{str(body)[:300]}"
+                    )
                 token = self._login(password)
                 continue
             if status == 409:
@@ -393,11 +420,22 @@ def main() -> int:
     args = ap.parse_args()
 
     password = os.getenv("QM_PASSWORD", "")
-    if not password:
-        raise SystemExit("[queue] 未提供 QM_PASSWORD（admin 登录口令）")
+    internal_secret = os.getenv("QM_INTERNAL_CALL_SECRET", "")
+    if not password and not internal_secret:
+        raise SystemExit(
+            "[queue] 未提供认证：QM_PASSWORD（admin 口令）或 "
+            "QM_INTERNAL_CALL_SECRET（内部调用密钥）"
+        )
 
     args.state_dir.mkdir(parents=True, exist_ok=True)
-    driver = QueueDriver(args.manifest, args.state_dir, args.wait_for_file)
+    driver = QueueDriver(
+        args.manifest,
+        args.state_dir,
+        args.wait_for_file,
+        internal_secret=internal_secret,
+        internal_user_id=os.getenv("QM_INTERNAL_USER_ID", "10000001"),
+        internal_tenant_id=os.getenv("QM_INTERNAL_TENANT_ID", "default"),
+    )
     if driver.done_path.exists():
         driver.done_path.unlink()
     return driver.run(password)

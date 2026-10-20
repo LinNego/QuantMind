@@ -27,7 +27,8 @@ import { selectCurrentMarket } from '../../store/slices/uiSlice';
 import { useTradingModeSwitch } from '../../features/shared/useTradingModeSwitch';
 import { useTradeWebSocket } from '../../hooks/useTradeWebSocket';
 import { buildTradingTopBarAccountInfo, resolveTradingAccountMode } from './utils/accountAdapter';
-import { DEFAULT_ACTIVE_TAB, resolveInitialSymbol, resolveInitialTab, type ActiveTab } from './utils/activeTab';
+import { useSearchParams } from 'react-router-dom';
+import { DEFAULT_ACTIVE_TAB, isDeepLinkableTab, resolveInitialSymbol, resolveInitialTab, type ActiveTab } from './utils/activeTab';
 import {
     composeConsoleTabs,
     resolveConsoleTab,
@@ -202,12 +203,37 @@ const RealTradingPage: React.FC<RealTradingPageProps> = ({ forcedTradingMode, to
     // 取值域含追加页签 id，故为 string；基础 9 栏的 id 仍由 consoleTabs 钉在 ActiveTab 上
     const [activeTab, setActiveTab] = useState<string>(initialTab);
 
+    // 页签 ↔ URL 双向同步（replace，不留历史栈）：
+    // - 切页签写 URL：刷新/转发能停在原栏（此前 URL 永远停在进入时那一栏）；
+    // - URL 变化读页签：**页内**深链（如候选信号页里的评估徽章 navigate 到 ?tab=eval）
+    //   不重挂载本组件，useState 初值不会重算 —— 缺这条监听时「页内点徽章无效」。
+    // 白名单与挂载口径一致（utils/activeTab.isDeepLinkableTab，有测试锁定）。
+    const [searchParams, setSearchParams] = useSearchParams();
+    const switchTab = useCallback(
+        (t: string) => {
+            setActiveTab(t);
+            // 离开评估中心时顺带清掉对象深链参数：否则下次从别处进 eval 会
+            // 被残留的 object/object_id 拽到旧对象上。
+            setSearchParams(t === DEFAULT_ACTIVE_TAB ? {} : { tab: t }, { replace: true });
+        },
+        [setSearchParams],
+    );
+
+    // 依赖里**只放 searchParams**（同 FactorResearchPage 的口径注释）：switchTab 是
+    // 「先改 state、后写 URL」，中间那版 searchParams 还是旧值，effect 若跟着 activeTab
+    // 重跑就会把刚切过去的页签拽回去。
+    useEffect(() => {
+        const fromUrl = searchParams.get('tab');
+        if (isDeepLinkableTab(fromUrl)) setActiveTab(fromUrl);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [searchParams]);
+
     // 券商通道卡「去配置凭证」跳转：切到设置页签
     useEffect(() => {
-        const handler = () => setActiveTab('settings');
+        const handler = () => switchTab('settings');
         window.addEventListener('goto-trading-settings', handler);
         return () => window.removeEventListener('goto-trading-settings', handler);
-    }, []);
+    }, [switchTab]);
     const [tenantId] = useState<string>(getEnvTenantId);
     const [userId] = useState(() => {
         try {
@@ -650,8 +676,8 @@ const RealTradingPage: React.FC<RealTradingPageProps> = ({ forcedTradingMode, to
     // 否则内容区渲染成整块空白。公开树无追加页签时 id 集合恒定，该分支恒不触发。
     useEffect(() => {
         const next = resolveConsoleTab(activeTab, tabs, DEFAULT_ACTIVE_TAB);
-        if (next !== activeTab) setActiveTab(next);
-    }, [activeTab, tabs]);
+        if (next !== activeTab) switchTab(next);
+    }, [activeTab, tabs, switchTab]);
 
     // 传给追加页签的运行期上下文：与基础页签同一份数据、同一个刷新入口
     const tabContext = useMemo<RealTradingTabContext>(
@@ -701,7 +727,7 @@ const RealTradingPage: React.FC<RealTradingPageProps> = ({ forcedTradingMode, to
                             {tabs.map(tab => (
                                 <button
                                     key={tab.id}
-                                    onClick={() => setActiveTab(tab.id)}
+                                    onClick={() => switchTab(tab.id)}
                                     className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-[17px] tracking-wide transition-all duration-150
                                         ${activeTab === tab.id
                                             ? 'bg-blue-50 text-blue-600 border border-blue-200/80 shadow-2xs font-bold'
@@ -761,7 +787,7 @@ const RealTradingPage: React.FC<RealTradingPageProps> = ({ forcedTradingMode, to
                     {activeTab === 'signals' && (
                         /* 候选信号：quant-Trader 个股终端左栏复刻（列表/筛选/补推理）；
                            模型刷新（补推理）完成后跳「系统健康」 */
-                        <SignalsExplorerPage onModelRefreshed={() => setActiveTab('desk')} />
+                        <SignalsExplorerPage onModelRefreshed={() => switchTab('desk')} />
                     )}
                     {activeTab === 'eval' && (
                         <div className="h-full overflow-y-auto p-4">
@@ -775,8 +801,8 @@ const RealTradingPage: React.FC<RealTradingPageProps> = ({ forcedTradingMode, to
                                 tradingMode={tradingMode}
                                 onDeploy={handleDeploy}
                                 onStop={handleStop}
-                                onOpenManualTask={() => setActiveTab('manual-task')}
-                                onOpenHistory={() => setActiveTab('history')}
+                                onOpenManualTask={() => switchTab('manual-task')}
+                                onOpenHistory={() => switchTab('history')}
                             />
                     )}
                     {activeTab === 'manual-task' && (
@@ -784,7 +810,7 @@ const RealTradingPage: React.FC<RealTradingPageProps> = ({ forcedTradingMode, to
                             tenantId={tenantId}
                             userId={userId}
                             tradingMode={tradingMode}
-                            onBack={() => setActiveTab('manage')}
+                            onBack={() => switchTab('manage')}
                             // 调用方注入的追加区块（无调用方时为 undefined，逐位不变）。
                             // 回调只返回**元素**、不直接调 hook —— 它是在本组件的渲染里被
                             // 调用的，hook 会挂到本组件上（同 extraTabs 的纪律）。

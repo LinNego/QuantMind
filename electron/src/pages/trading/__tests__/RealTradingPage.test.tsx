@@ -13,6 +13,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, cleanup, fireEvent } from '@testing-library/react';
 import { Provider } from 'react-redux';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import React from 'react';
 import { Activity } from 'lucide-react';
 
@@ -97,11 +98,20 @@ vi.mock('../../../features/auth/services/authService', () => ({
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
 
-const renderPage = (props: React.ComponentProps<typeof RealTradingPage> = {}) =>
+/** 把当前 URL 查询串暴露到 DOM：页签 ↔ URL 双向同步只能从这里观测 */
+const LocationProbe = () => {
+    const location = useLocation();
+    return <div data-testid="location-probe" data-search={location.search} />;
+};
+
+const renderPage = (props: React.ComponentProps<typeof RealTradingPage> = {}, route = '/trading') =>
     render(
-        <Provider store={store}>
-            <RealTradingPage {...props} />
-        </Provider>,
+        <MemoryRouter initialEntries={[route]}>
+            <Provider store={store}>
+                <RealTradingPage {...props} />
+                <LocationProbe />
+            </Provider>
+        </MemoryRouter>,
     );
 
 /** 侧栏文案。锚在「功能导航」标题上，与本仓探针同口径，不按 class 猜结构。 */
@@ -302,5 +312,47 @@ describe('RealTradingPage 外壳接线', () => {
         expect(document.querySelector('[data-testid="banner-probe"]')).not.toBeNull();
         expect(seenBanner).not.toBeNull();
         expect(seenBanner).toBe(seenTab);
+    });
+
+    // ── 页签 ↔ URL 双向同步（U2：徽章深链落地 + 刷新保持位置） ──────────────
+
+    const search = () =>
+        document.querySelector('[data-testid="location-probe"]')?.getAttribute('data-search') ?? '';
+
+    it('切页签写 URL：?tab=eval，切回默认栏清空', () => {
+        renderPage();
+
+        clickTab('评估中心');
+        expect(pane('eval')).not.toBeNull();
+        expect(search()).toBe('?tab=eval');
+
+        clickTab('系统健康');
+        expect(pane('desk')).not.toBeNull();
+        expect(search()).toBe('');
+    });
+
+    it('URL 深链（含对象参数）落地即跳：页内徽章导航不重挂载也生效', () => {
+        // 挂载路径读的是 window.location.hash（jsdom 里为空 → 默认栏），
+        // 这条断言的正是 searchParams 监听把页签拉过去的那半边 —— 缺它则「页内点徽章无效」。
+        renderPage({}, '/trading?tab=eval&object=model&object_id=mdl_x');
+
+        expect(pane('eval')).not.toBeNull();
+        // 页签监听不吞对象参数（评估面板按它预选对象）
+        expect(search()).toBe('?tab=eval&object=model&object_id=mdl_x');
+    });
+
+    it('深链白名单外的 tab 不在页内生效（与挂载口径同一把尺子）', () => {
+        renderPage({}, '/trading?tab=settings');
+
+        expect(pane('desk')).not.toBeNull();
+        expect(pane('settings')).toBeNull();
+    });
+
+    it('切换到非评估栏时清掉对象深链参数（防止下次进 eval 被拽回旧对象）', () => {
+        renderPage({}, '/trading?tab=eval&object=model&object_id=mdl_x');
+        expect(pane('eval')).not.toBeNull();
+
+        clickTab('候选信号');
+        expect(search()).toBe('?tab=signals');
     });
 });

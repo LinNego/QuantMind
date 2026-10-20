@@ -1,4 +1,5 @@
-"""提交跨库 T+5 模型训练（lightgbm/xgboost/catboost/nativetft），并对训练 config.yaml 做回读断言。
+"""提交跨库 T+5 模型训练（lightgbm/xgboost/catboost/nativetft/linear/random_forest/mlp），
+并对训练 config.yaml 做回读断言。
 
 唯一事实源：`data/quantdb/factor_research/screening/training_selection_300.json`
 （`backend/scripts/select_training_features.py` 的产物；`train_plan` + `features_payload`）。
@@ -58,6 +59,18 @@ _MODEL_TYPE_INFO: dict[str, dict[str, str]] = {
     "xgboost": {"token": "XGB", "label": "XGBoost", "file": "model.xgb"},
     "catboost": {"token": "CAT", "label": "CatBoost", "file": "model.cbm"},
     "nativetft": {"token": "TFT", "label": "NativeTFT", "file": "model.pth"},
+    # sklearn 系模型（train.py `_save_model` 统一 pickle 落盘 model.pkl）
+    "linear": {"token": "LIN", "label": "Linear", "file": "model.pkl"},
+    "random_forest": {"token": "RF", "label": "RandomForest", "file": "model.pkl"},
+    "mlp": {"token": "MLP", "label": "MLP", "file": "model.pkl"},
+    # Qlib DL 族：单模型流程由 trainers_dl 固定写 model.pth（`_save_model` 返回
+    # model_<type>.pth 属已知对不上，注册侧按实际文件记 model.pth，加载侧有兜底）
+    "gru": {"token": "GRU", "label": "GRU", "file": "model.pth"},
+    "lstm": {"token": "LSTM", "label": "LSTM", "file": "model.pth"},
+    "alstm": {"token": "ALSTM", "label": "ALSTM", "file": "model.pth"},
+    "transformer": {"token": "TRF", "label": "Transformer", "file": "model.pth"},
+    "tabnet": {"token": "TAB", "label": "TabNet", "file": "model.pth"},
+    "tcn": {"token": "TCN", "label": "TCN", "file": "model.pth"},
 }
 
 # NativeTFT 配方（两轮全窗前例一致：2026-09-17 批 / 2026-09-23 批）。
@@ -69,6 +82,37 @@ _TFT_DL_PARAMS: dict[str, int] = {
     "batch_size": 4000,
     "early_stopping_rounds": 5,
 }
+
+# MLP（sklearn MLPRegressor）配方：batch_size 必须显式传——默认 200 在 650 万行
+# 上是每轮 3.2 万次微型更新（实测 28 分钟跑不完首轮）；n_epochs=8 与 2026-09-17
+# 历史 MLP 批次一致（trainer 把 n_epochs 映射成 max_iter）。
+_MLP_DL_PARAMS: dict[str, int] = {
+    "n_epochs": 8,
+    "batch_size": 4000,
+}
+
+# Qlib DL 族配方（gru/lstm/alstm/transformer/tabnet/tcn）：与 2026-09-17/18
+# 历史批一致。n_epochs 框架默认 200，必须显式收敛到 8；模型专属超参
+# （lr/hidden_size/dropout 等）走 trainers_dl.py 各分支默认。
+_QLIB_DL_TYPES = frozenset(
+    {"gru", "lstm", "alstm", "transformer", "tabnet", "tcn"}
+)
+_QLIB_DL_PARAMS: dict[str, int] = {
+    "n_epochs": 8,
+    "step_len": 20,
+    "batch_size": 4000,
+    "early_stopping_rounds": 5,
+}
+
+
+def _dl_params_for(model_type: str) -> dict[str, int]:
+    if model_type == "nativetft":
+        return dict(_TFT_DL_PARAMS)
+    if model_type == "mlp":
+        return dict(_MLP_DL_PARAMS)
+    if model_type in _QLIB_DL_TYPES:
+        return dict(_QLIB_DL_PARAMS)
+    return {}
 
 
 def _derive_run_names(
@@ -213,9 +257,7 @@ def _build_payload(sel: dict[str, Any], versions: dict[str, str]) -> dict[str, A
         "lgb_params": {},  # 走平台默认（LR/叶子数/正则等）
         # nativetft 显式传配方 dl_params（n_epochs=8 必须传，框架默认 200）；
         # 树模型保持 {}（走各自默认）。
-        "dl_params": (
-            dict(_TFT_DL_PARAMS) if str(tp["model_type"]) == "nativetft" else {}
-        ),
+        "dl_params": _dl_params_for(str(tp["model_type"])),
         "max_time_minutes": int(tp["max_time_minutes"]),
         "context": dict(tp["context"]),
         "explain": {
@@ -348,6 +390,18 @@ def _assert_config(
         if {k: got_dl.get(k) for k in _TFT_DL_PARAMS} != _TFT_DL_PARAMS:
             fails.append(
                 f"model.dl_params 缺项/不符：{got_dl!r}（期望含 {_TFT_DL_PARAMS!r}）"
+            )
+    elif str(tp["model_type"]) == "mlp":
+        got_dl = model.get("dl_params") or {}
+        if {k: got_dl.get(k) for k in _MLP_DL_PARAMS} != _MLP_DL_PARAMS:
+            fails.append(
+                f"model.dl_params 缺项/不符：{got_dl!r}（期望含 {_MLP_DL_PARAMS!r}）"
+            )
+    elif str(tp["model_type"]) in _QLIB_DL_TYPES:
+        got_dl = model.get("dl_params") or {}
+        if {k: got_dl.get(k) for k in _QLIB_DL_PARAMS} != _QLIB_DL_PARAMS:
+            fails.append(
+                f"model.dl_params 缺项/不符：{got_dl!r}（期望含 {_QLIB_DL_PARAMS!r}）"
             )
 
     if str(context.get("market") or "") != str(tp["context"]["market"]):
@@ -489,11 +543,17 @@ async def main() -> None:
             versions_now = {
                 lib: str(cat["version_id"]) for lib, cat in catalogs.items()
             }
-            pinned = _load_pinned_versions(args.pin_versions_from)
+            pinned_all = _load_pinned_versions(args.pin_versions_from)
+            # 只钉本 run 实际使用的库：选型子集（如第二梯队 300）不覆盖基准的全部库时，
+            # 未使用的库版本与本 run 无关（config 也只写用到的库）。
+            missing_pin = sorted(set(versions_now) - set(pinned_all))
+            if missing_pin:
+                _fail(f"钉扎基准缺库 {missing_pin}：无法保证同因子快照")
+            pinned = {lib: pinned_all[lib] for lib in versions_now}
             if pinned != versions_now:
                 diffs = [
                     f"{k}: now={versions_now.get(k)!r} pinned={pinned.get(k)!r}"
-                    for k in sorted(set(pinned) | set(versions_now))
+                    for k in sorted(versions_now)
                     if pinned.get(k) != versions_now.get(k)
                 ]
                 _fail(

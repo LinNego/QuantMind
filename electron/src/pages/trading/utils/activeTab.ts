@@ -31,13 +31,22 @@ export const DEFAULT_ACTIVE_TAB: ActiveTab = 'desk';
  */
 const DEEP_LINKABLE: readonly ActiveTab[] = ['eval', 'signals', 'position'];
 
+/**
+ * 深链白名单判定。挂载（`resolveInitialTab`）与**页内 URL 变化**（`RealTradingPage`
+ * 的 searchParams 监听）必须用同一把尺子：只认白名单，别的一律不跳 —— 页内 URL
+ * 变化若放宽到任意 tab，就会出现「手上输 ?tab=settings 生效、刷新却不生效」的裂缝。
+ */
+export function isDeepLinkableTab(t: string | null | undefined): t is ActiveTab {
+  return DEEP_LINKABLE.includes(t as ActiveTab);
+}
+
 /** 从 `window.location.hash` 解析初始页签；`hash` 传入而非内部读取，便于测试与 SSR。 */
 export function resolveInitialTab(hash: string | null | undefined): ActiveTab {
   if (!hash) return DEFAULT_ACTIVE_TAB;
   const qi = hash.indexOf('?');
   if (qi < 0) return DEFAULT_ACTIVE_TAB;
   const t = new URLSearchParams(hash.slice(qi + 1)).get('tab');
-  return DEEP_LINKABLE.includes(t as ActiveTab) ? (t as ActiveTab) : DEFAULT_ACTIVE_TAB;
+  return isDeepLinkableTab(t) ? t : DEFAULT_ACTIVE_TAB;
 }
 
 /**

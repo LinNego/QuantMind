@@ -5,7 +5,7 @@
  * 这是一个用户可见的约定——进页第一眼先看平台能不能用；被改回去时要有测试拦住。
  */
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_ACTIVE_TAB, resolveInitialSymbol, resolveInitialTab } from '../activeTab';
+import { DEFAULT_ACTIVE_TAB, isDeepLinkableTab, resolveInitialSymbol, resolveInitialTab } from '../activeTab';
 
 describe('resolveInitialTab', () => {
   it('默认落在「系统健康」', () => {
@@ -53,5 +53,26 @@ describe('resolveInitialTab', () => {
     expect(resolveInitialSymbol('#/trading?tab=manage&symbol=SZ000001')).toBeNull();
     expect(resolveInitialSymbol('')).toBeNull();
     expect(resolveInitialSymbol(null)).toBeNull();
+  });
+});
+
+/**
+ * 页内 URL 变化（RealTradingPage 的 searchParams 监听）与挂载解析必须同一把尺子：
+ * 白名单放宽会让「手输 ?tab=settings 生效、刷新却不生效」，收紧会让页内徽章跳转失效。
+ */
+describe('isDeepLinkableTab', () => {
+  it('只认白名单三条（与挂载口径一致）', () => {
+    expect(isDeepLinkableTab('eval')).toBe(true);
+    expect(isDeepLinkableTab('signals')).toBe(true);
+    expect(isDeepLinkableTab('position')).toBe(true);
+  });
+
+  it('其余页签与空值一律不认', () => {
+    expect(isDeepLinkableTab('desk')).toBe(false);
+    expect(isDeepLinkableTab('manage')).toBe(false);
+    expect(isDeepLinkableTab('__evil__')).toBe(false);
+    expect(isDeepLinkableTab('')).toBe(false);
+    expect(isDeepLinkableTab(null)).toBe(false);
+    expect(isDeepLinkableTab(undefined)).toBe(false);
   });
 });
