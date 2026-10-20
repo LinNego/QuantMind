@@ -305,6 +305,15 @@ backend/tests/fixtures/l1_*
 # 新增因子研发工作区（研发期代码/公式，不进仓）
 backend/scripts/l1_factors_dev/
 
+# 自有因子公式：代码即公式，永久不入库（2026-10-20 用户指令，公开仓泄露事件后钉死）。
+# 只保留在工作区；公开仓仅保留编排（materialize_library_tail.py）与契约（contract.py）。
+# 注意：factor_defs_factors.py 是通用求值引擎，具体公式在 data/factor_defs/formulas.json
+# （data 为仓库外符号链接，不在 git）；gap_mined_inputs.py 只做输入映射，均不在此列。
+backend/scripts/factor_materialize/gap_mined.py
+backend/tests/test_factor_materialize_gap_mined.py
+# 今后新增的自有因子公式统一放此私有目录，永不入库
+backend/scripts/factor_materialize/private/
+
 # 内部发布脚本（含 COS 上传与 CDN 刷新，不进开源仓库）
 scripts/cos-publish/
 REFACTOR_PLAN.md
