@@ -5,7 +5,8 @@
 - get_more_info:     88 字段扩展信息（L2TicNum/L2OrderNum/TotalBVol/TotalSVol）
 - get_market_snapshot: Now/Open/LastClose/Volume/Amount + 5档 Buy*[5]/Sell*[5] + Inside/Outside
 
-轮询集合 = 当日推理候选池 Top N（默认 20）+ 全部持仓（tdx + paper）。
+轮询集合 = 当日决策池（与决策轮同源 load_pool_doc，优先）→ 全部持仓（tdx + paper）
+→ 当日推理候选池 Top N（默认 20），合计 ≤50 只；决策池/持仓先占位，分数腿尾随。
 桥读限流 60 次/分钟/IP 与行情推送（≈40/min）共享 → 持仓优先 + 恒定 ≤16/min 节奏，
 全量每 ~6min 刷新一遍；RATE_LIMITED 退避加倍。
 
@@ -84,6 +85,7 @@ l2_status: dict[str, Any] = {
     "last_error": None,
     "rate_limited": False,
     "watchlist_size": 0,
+    "decision_pool_size": 0,
     "symbols": [],
     "snapshots_saved": 0,
     "bridge_ok": True,
@@ -493,17 +495,62 @@ async def fetch_l2_data(symbol_suffix: str, with_more: bool = False) -> tuple[di
     return data, snap_data
 
 
+def _decision_pool_codes(day: str) -> list[str]:
+    """当日决策池（与决策轮同源 ``load_pool_doc``）→ prefix 码，去重保序。
+
+    决策轮提示词只渲染持仓 + 池；只按推理分数建轮询集合时池覆盖常仅 1/20
+    （2026-10-20 实测），付费 L2 等于空转。池文件不在 = 当天还没跑出池（不是
+    错误，返回空）；读失败只告警降级——采集循环不能因池面故障整体退出。
+    """
+    try:
+        from backend.shared.decision_context_source import load_pool_doc
+
+        doc = load_pool_doc(day)
+    except Exception as exc:  # noqa: BLE001 - 池面故障只降级
+        logger.warning("[TdxL2] 决策池读取失败(本轮不覆盖池): %s", exc)
+        return []
+    codes: list[str] = []
+    for row in getattr(doc, "rows", ()) if doc is not None else ():
+        code = StockCodeUtil.to_prefix(str(getattr(row, "code", "") or ""))
+        if code and code not in codes:
+            codes.append(code)
+    return codes
+
+
 def _resolve_watchlist(
-    scores: dict[str, float], tdx_positions: list, paper_positions: list, pool_size: int
+    scores: dict[str, float],
+    tdx_positions: list,
+    paper_positions: list,
+    pool_size: int,
+    *,
+    decision_pool: list[str] | None = None,
 ) -> list[str]:
-    """候选池 Top N + 持仓（prefix 格式），去重保序。"""
-    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:pool_size]
-    watch: list[str] = [StockCodeUtil.to_prefix(s) or s for s, _ in ranked]
+    """决策池 + 持仓 + 候选池 Top N（prefix 格式），去重保序，≤ MAX_WATCHLIST。
+
+    优先级 = 决策池 → 持仓 → 分数 Top-N：池里的票被分数腿挤出上限，决策轮就
+    报「本轮无 L2 快照」。``pool_size`` 只约束分数腿，不约束决策池/持仓。
+    """
+    watch: list[str] = []
+    for raw in decision_pool or ():
+        code = StockCodeUtil.to_prefix(str(raw or ""))
+        if code and code not in watch:
+            watch.append(code)
+            if len(watch) >= MAX_WATCHLIST:
+                return watch
     for pos in list(tdx_positions) + list(paper_positions):
         code = StockCodeUtil.to_prefix(str(pos.get("symbol") or pos.get("stock_code") or ""))
         if code and code not in watch:
             watch.append(code)
-    return watch[:MAX_WATCHLIST]
+            if len(watch) >= MAX_WATCHLIST:
+                return watch
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:pool_size]
+    for sym, _score in ranked:
+        code = StockCodeUtil.to_prefix(sym) or str(sym)
+        if code and code not in watch:
+            watch.append(code)
+            if len(watch) >= MAX_WATCHLIST:
+                break
+    return watch
 
 
 async def _upsert_snapshot(
@@ -615,7 +662,17 @@ async def run_tdx_l2_capture_task(interval_sec: int = 0) -> None:
                 )
             except Exception as exc:
                 logger.warning("[TdxL2] 模拟盘持仓查询失败: %s", exc)
-            watchlist = _resolve_watchlist(scores, tdx_positions, paper_positions, pool_size)
+            # 当日决策池与决策轮同源（load_pool_doc）：池里的票才是 agent 会看
+            # 的票，必须进入轮询集合且优先于分数腿（见 _resolve_watchlist）。
+            decision_pool = _decision_pool_codes(datetime.now().strftime("%Y%m%d"))
+            l2_status["decision_pool_size"] = len(decision_pool)
+            watchlist = _resolve_watchlist(
+                scores,
+                tdx_positions,
+                paper_positions,
+                pool_size,
+                decision_pool=decision_pool,
+            )
             if not watchlist and _last_watchlist:
                 watchlist = list(_last_watchlist)  # 兜底：沿用上次候选池
                 logger.info("[TdxL2] 候选池为空, 沿用上次 %d 只", len(watchlist))
