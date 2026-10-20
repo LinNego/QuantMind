@@ -665,8 +665,9 @@ docker exec -w /tmp quantmind python rolling_portfolio_sim.py \
   （Newey-West t 1.88 / 1.03 / 1.71）。
 - **Top50 > Top20**（全期 6/6 胜、2026 5/6；2026 18.4% vs 7.3%）；**T+10 > T+5**
   （全期 5/6 胜；换手 33.4x vs 56.9x，成本 6.6% vs 11.3%/年）。
-- 分数均值过滤 +6.0pp（2025 +11.3、2026 +0.5）；分数退出 +5.9pp
-  （2025 +11.3、2026 +0.2）；两者主要是 2025 的增益，2026 不伤害。
+- **口径更正（2026-10-20）**：分数均值过滤单独只 +0.1~0.2pp（Top50 全期
+  34.2%→34.3%；2025 0、2026 +0.3）；**+5.9pp 来自分数退出**（2025 +11.3、
+  2026 +0.2），不要再把 +6.0pp 记在入场过滤上。两者主要是 2025 的增益，2026 不伤害。
 - **大盘过滤明确有害**：2026 只有 1.8%；**extend/min_hold 不稳健**；
   **价格止损非单调**（Top50 -6% 最优 41.2%，-8% 反而 39.1%；Top20 则 -8% 最优）。
 - 容量：50 万/500 万 41.6%、1000 万 40.2%、**2000 万 30.3%**、5000 万 30.4%、
@@ -714,3 +715,61 @@ docker exec -w /tmp quantmind python -m pytest test_rolling_portfolio_sim.py -q
 - 宿主没有 scipy，测试必须在容器里跑。
 - 三个测试锁住：时间退出的成交日与净收益、`blocked_long` 顺延、分数退出。
 - 合成数据不碰数据库；改动 `simulate` 的时点/成本逻辑前后都要跑。
+
+### 15.6 Top100 打分探针：平均分、9–10 月实测、top10 模型集（2026-10-20 新增）
+
+用途：回答「模型选出来的股票怎么打分、怎么取前 100、前 100 平均分怎么算；
+9–10 月按这个打分法交易效果如何；换成 IC/超额前 10 个模型会不会更好」。
+
+脚本：`scripts/top100_score_probe.py`（复用 `rolling_portfolio_sim.py` 的
+`simulate` / `load_panels` / `market_daily`，只加 TopN 平均分与模型集切换）。
+
+```bash
+docker cp skills/batch-inference-analysis/scripts/top100_score_probe.py quantmind:/tmp/
+docker cp data/reports/top20_eval_20261020/rolling_20261020/model_capability.csv \
+  quantmind:/tmp/capability_prereg.csv
+
+# 9–10 月前向（冷启动；scores 从 6/1 起算 20 日均值预热）
+docker exec -w /tmp quantmind python top100_score_probe.py \
+  --model-map /tmp/model_map_31.json --capability-csv /tmp/capability_prereg.csv \
+  --start 2026-09-01 --end 2026-10-19 --score-start 2026-06-01 \
+  --out-dir /tmp/top100_probe --memory 4GB --threads 3
+
+# 全期模型集对照（IC10/tail10 的选模型也用这段数据，属样本内选择）
+docker exec -w /tmp quantmind python top100_score_probe.py \
+  --model-map /tmp/model_map_31.json --capability-csv /tmp/capability_prereg.csv \
+  --start 2025-02-20 --end 2026-08-26 --score-start 2025-02-05 \
+  --out-dir /tmp/top100_full --memory 5GB --threads 3
+```
+
+**打分口径**：单模型当日 ADV≥2000 万池内 `percent_rank(pred)` → 13 个百分位
+等权平均（≥8 个模型）→ S∈[0,1]，×100 即“分数”。Top100 = 每日 S 前 100；
+前 100 平均分 = 这 100 个 S 的均值。平均分是**相对排名共识**，不是胜率/预期收益。
+
+**9–10 月结果（29 天，1000 万，净 0.1%/边）**：
+
+| 配置 | 总收益 | 基准 -8.53% 的超额 | 回撤 | 稳态只数 | 入选平均分 |
+|---|---:|---:|---:|---:|---:|
+| Top50 all13 H10 score | +2.11% | +10.64pp | -4.65% | 48.9 | 93.38 |
+| Top100 all13 H10 score | +1.83% | +10.36pp | -4.65% | 98.2 | 91.81 |
+| Top50 IC10 H10 score | +4.22% | +12.76pp | -4.29% | 49.2 | 94.74 |
+| Top100 IC10 H10 score | +2.34% | +10.88pp | -4.71% | 98.3 | 93.40 |
+| Top50 tail10 H10 score | +3.15% | +11.68pp | -4.42% | 49.1 | 93.79 |
+| Top100 tail10 H10 score | +2.28% | +10.81pp | -4.60% | 98.1 | 92.23 |
+
+- **全期（2025-02-20~2026-08-26）**：Top50 all13 年化 40.21%、Top100 34.33%；
+  Top50 tail10 41.11%、Top50 IC10 36.51%。**Top50 > Top100** 的方向不变；
+  **tail10 全期最一致**（Top50/Top100、2025/2026 都是正增益）；IC10 在 Top50
+  的 2025/2026 都落后 all13，9–10 月的好看不能当结论。
+- **分数退出是主增益**：Top100 score +1.83% vs time -0.71%（+2.53pp）；
+  入场过滤单独约 -0.05pp；全期 Top50 入场过滤单独仅 +0.23pp。别再重复计算 +6pp。
+- **平均分**：10/19 前 100 平均 92.35、前 50 平均 94.35；名次 1→100 平滑衰减
+  96.74→89.24；持仓平均分比入选名单低 3~4 分（买入后分数下滑）。
+- **诚实边界**：29 天、一条路径、下跌市、冷启动；前 10 天平均仓位仅 72.9%，
+  建仓期少亏约 1.6pp，但满仓后仍 +3.3%~+3.6% vs 基准 -5.69%；单笔胜率
+  Top100 仅 47.6%、中位数 -0.20%，靠右尾；分数不是止损，亏损股也可能高分。
+- **产出**：`data/reports/top20_eval_20261020/top100_20261020/`（summary、
+  benchmark、daily_top、nav、trades、top100_20261019.csv），全期模型集在
+  `full_period/model_sets/`；报告
+  `data/reports/top20_eval_20261020/Top100打分与9-10月实测_20261020.md`。
+- **不要用 29 天调 N/持有期/模型集**；tail10 只做影子组合，前向 1–3 个月再判。
