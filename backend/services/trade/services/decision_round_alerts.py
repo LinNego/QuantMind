@@ -53,6 +53,7 @@ from backend.shared.alert_delivery import (
     Notifier,
     deliver_alert,
 )
+from backend.shared.text_compact import short_clause
 from backend.shared.decision.contract import SCHEMA_REBALANCE
 from backend.services.trade.services.decision_round_core import (
     SLOTS,
@@ -565,29 +566,12 @@ _STATUS_ICON = {
 
 
 def _short_direction(text: str) -> str:
-    """方向压成一句：折叠空白；超限时在**第一个够长的顶层分句**处截断。
-
-    截断点只认括号外的 ``，；。``——括号内的顿号是列举（如
-    ``大盘偏弱（上证5日-1.7%、平量、低位）``），在那里切会砍出残句。
-    """
-    flat = " ".join(str(text or "").split())
-    if len(flat) <= _DIRECTION_MAX_CHARS:
-        return flat
-    head = flat[:_DIRECTION_MAX_CHARS]
-    cut = -1
-    depth = 0
-    for idx, ch in enumerate(head):
-        if ch == "（":
-            depth += 1
-        elif ch == "）":
-            depth = max(0, depth - 1)
-        elif depth == 0 and ch in "，；。;":
-            if idx + 1 >= _DIRECTION_MIN_CLAUSE_CHARS:
-                cut = idx
-                break
-    if cut >= 0:
-        head = head[:cut]
-    return head.rstrip("，；。、,; ") + "…"
+    """方向压成一句（实现收口在 ``backend.shared.text_compact.short_clause``）。"""
+    return short_clause(
+        str(text or ""),
+        max_chars=_DIRECTION_MAX_CHARS,
+        min_clause_chars=_DIRECTION_MIN_CLAUSE_CHARS,
+    )
 
 
 def _split_highlight(text: str) -> tuple[str, str]:

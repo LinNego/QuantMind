@@ -76,6 +76,8 @@ sys.path.insert(0, str(ROOT))
 # 本脚本目录（``import push_notify`` 同目录解析；keeper 系列脚本同口径）
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from stock_industry import load_industry_map  # noqa: E402
+
 CN_TZ = timezone(timedelta(hours=8))
 LOCK = ROOT / "data" / "logs" / ".live_model_analysis.lock"
 LOG_DIR = ROOT / "data" / "agent_data_astock"
@@ -754,24 +756,88 @@ def append_log(
     return path
 
 
+#: 模型按提示词写的摘要标题（加粗行「**收盘复盘摘要**」也算标题）。
+_SUMMARY_LABEL = "复盘摘要"
+#: 免责声明不是摘要：短行含这些词即跳过（长正文里出现不受影响）。
+_BOILERPLATE_MARKERS = (
+    "仅复盘观点",
+    "不构成自动交易指令",
+    "不构成投资建议",
+    "仅供参考",
+    "本系统不会据此自动下单",
+)
+_BOILERPLATE_MAX_CHARS = 60
+_MD_RULE_RE = re.compile(r"^\s*(?:[-*_]\s*){3,}$")
+_MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*")
+_MD_BULLET_RE = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)])\s+")
+_MD_QUOTE_RE = re.compile(r"^\s{0,3}>\s?")
+
+
+def _classify_line(raw: str) -> tuple[str, str]:
+    """markdown 行 → ``(heading/text/"", 去装饰文本)``；空行与分割线返回空 kind。"""
+    line = str(raw or "").strip()
+    if not line or _MD_RULE_RE.fullmatch(line):
+        return "", ""
+    is_heading = bool(_MD_HEADING_RE.match(line))
+    if is_heading:
+        line = _MD_HEADING_RE.sub("", line)
+    else:
+        line = _MD_BULLET_RE.sub("", line)
+        line = _MD_QUOTE_RE.sub("", line)
+    line = line.replace("**", "").replace("`", "").strip()
+    if not line:
+        return "", ""
+    if not is_heading and len(line) <= 12 and _SUMMARY_LABEL in line:
+        return "heading", line
+    return ("heading" if is_heading else "text"), line
+
+
+def _paragraphs(content: str) -> list[tuple[str, str]]:
+    """按空行分段 → ``[(最近标题, 段文本)]``；标题后的空行不丢标题。"""
+    out: list[tuple[str, str]] = []
+    heading = ""
+    buf: list[str] = []
+
+    def _flush() -> None:
+        nonlocal buf
+        if buf:
+            out.append((heading, " ".join(buf).strip()))
+            buf = []
+
+    for raw in str(content or "").splitlines():
+        kind, text = _classify_line(raw)
+        if kind == "":
+            _flush()
+        elif kind == "heading":
+            _flush()
+            heading = text
+        else:
+            buf.append(text)
+    _flush()
+    return out
+
+
+def _is_boilerplate(text: str) -> bool:
+    return len(text) <= _BOILERPLATE_MAX_CHARS and any(
+        marker in text for marker in _BOILERPLATE_MARKERS
+    )
+
+
 def extract_summary(content: str, limit: int = 160) -> str:
     """从模型回复抽一段话摘要（复盘 QQ 卡片用，纯函数）。
 
-    取第一段非空文本（首个空行前的连续行合并），去掉 markdown 装饰符号；
-    超 ``limit`` 字截断加省略号。模型若按提示词首段给摘要即得摘要；否则退化为
-    「开头一段」——只做裁剪，绝不改写或编造。
+    优先取「复盘摘要」标题下的那段正文；标题、分割线、以及开头孤立的免责声明
+    （「仅复盘观点，不构成自动交易指令」）都**不是**摘要——2026-10-20 实况：
+    旧实现把这些当摘要，卡片上只有标题或免责声明。找不到标题时退回第一个有
+    实质内容的段落。只做裁剪，绝不改写或编造。
     """
-    para: list[str] = []
-    for raw_line in str(content or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            if para:
-                break
-            continue
-        line = re.sub(r"^[#>\-*\s]+", "", line).replace("**", "").replace("`", "")
-        if line.strip():
-            para.append(line.strip())
-    joined = " ".join(para).strip()
+    paras = [
+        (heading, body)
+        for heading, body in _paragraphs(content)
+        if body and not _is_boilerplate(body)
+    ]
+    preferred = [body for heading, body in paras if _SUMMARY_LABEL in heading]
+    joined = (preferred or [body for _, body in paras] or [""])[0]
     if len(joined) > limit:
         joined = joined[: limit - 1].rstrip() + "…"
     return joined
@@ -859,18 +925,105 @@ def format_round_alert(failed: list[str], ok_count: int, total: int) -> tuple[st
     return title, content
 
 
+#: QQ 消息上限 1600（``push_notify.notify`` 超限静默截断）；自留余量。
+_REVIEW_CARD_MAX_CHARS = 1500
+_CARD_RULE = "━" * 14
+
+
+def _format_pool_row(idx: int, row: dict) -> str:
+    """池行：``序号 名称 代码 · 板块 · 分数``（板块缺失显示 —，不编造）。"""
+    code = str(row.get("code") or "").strip()
+    name = str(row.get("name") or "").strip() or code
+    industry = str(row.get("industry") or "").strip() or "—"
+    line = f"{idx:02d} {name} {code} · {industry}"
+    score = row.get("score")
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        line += f" · {float(score):.1f}"
+    return line
+
+
 def format_review_card(
-    summaries: list[tuple[str, str]], now: datetime
+    summaries: list[tuple[str, str]],
+    now: datetime,
+    pool_rows: list[dict] | None = None,
+    max_chars: int = _REVIEW_CARD_MAX_CHARS,
 ) -> tuple[str, str]:
-    """收盘复盘 QQ 卡片（纯函数）→ ``(title, content)``；卡片式纯文本（QQ 拒 markdown）。"""
-    divider = "━" * 14
-    lines = [divider]
+    """收盘复盘 QQ 卡片（纯函数）→ ``(title, content)``；卡片式纯文本（QQ 拒 markdown）。
+
+    ``pool_rows`` = 当日池（``load_pool_snapshot``）：「包括晚上推理出来的模型
+    top20 的股票板块都要发我」（2026-10-20）。超预算时从尾部丢池行并如实
+    标注剩余条数——绝不静默截断半行。
+    """
+    head = [_CARD_RULE]
     for sig, summary in summaries:
-        lines.append(f"◆ {sig}")
-        lines.append(summary or "（本轮无摘要）")
-    lines.append(divider)
-    lines.append("详情见 交易台 › 模型对话")
-    return f"📋 收盘复盘 · {now.strftime('%m-%d')}", "\n".join(lines)
+        head.append(f"◆ {sig}")
+        head.append(summary or "（本轮无摘要）")
+    pool_header = (
+        [_CARD_RULE, f"📦 今日池 · {len(pool_rows)} 只（板块 · 分数）"]
+        if pool_rows
+        else []
+    )
+    tail = [_CARD_RULE, "详情见 交易台 › 模型对话"]
+
+    rows: list[str] = []
+    dropped = 0
+    if pool_rows:
+        budget = max_chars - len("\n".join(head + pool_header + tail))
+        for idx, row in enumerate(pool_rows, 1):
+            line = _format_pool_row(idx, row)
+            cost = len(line) + 1  # 行 + 换行
+            if budget - cost < 0:
+                dropped = len(pool_rows) - idx + 1
+                break
+            rows.append(line)
+            budget -= cost
+    if dropped:
+        rows.append(f"…另有 {dropped} 只见交易台 › 候选池")
+    content = "\n".join(head + pool_header + rows + tail)
+    return f"📋 收盘复盘 · {now.strftime('%m-%d')}", content
+
+
+def load_pool_snapshot(day: datetime) -> list[dict]:
+    """当日池（按**目标交易日**命名）+ 板块 → ``[{code,name,industry,score}]``。
+
+    池文件缺 ``industry``（2026-10-20 前的存量）时用 QuantDB 主表补；主表不可读
+    则显示 —。读不到池返回 ``[]``（卡片不带池段，不编造）。
+    """
+    path = (
+        ROOT
+        / "data"
+        / "reports"
+        / "stock_picks"
+        / f"{day.strftime('%Y%m%d')}_agent_picks.json"
+    )
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    raw = doc.get("picks") or doc.get("candidates") or []
+    if not isinstance(raw, list):
+        return []
+    rows: list[dict] = []
+    for item in raw[:20]:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "code": str(item.get("code") or "").strip(),
+                "name": str(item.get("name") or "").strip(),
+                "industry": str(item.get("industry") or "").strip(),
+                "score": item.get("score"),
+            }
+        )
+    if any(not row["industry"] for row in rows):
+        try:
+            industries = load_industry_map()
+        except Exception:  # noqa: BLE001 板块是装饰，不得拖垮复盘
+            industries = {}
+        for row in rows:
+            if not row["industry"]:
+                row["industry"] = industries.get(row["code"], "")
+    return rows
 
 
 def notify_qq(title: str, content: str) -> bool:
@@ -1017,7 +1170,11 @@ def main() -> int:
             state = _load_alert_state()
             today = now.strftime("%Y-%m-%d")
             if state.get("review_pushed_on") != today:
-                title, content = format_review_card(summaries, now)
+                # 复盘卡同时带上当日池（板块 + 分数）：2026-10-20 用户要求
+                # 「晚上推理出来的模型 top20 的股票板块都要发我」。
+                title, content = format_review_card(
+                    summaries, now, pool_rows=load_pool_snapshot(now)
+                )
                 if notify_qq(title, content):
                     state["review_pushed_on"] = today
                     _save_alert_state(state)

@@ -142,11 +142,30 @@ def test_requirement_block_review_vs_intraday_summary_instruction(lma):
 # ── 2. 摘要抽取与卡片 ─────────────────────────────────────────────────────
 
 
-def test_extract_summary_takes_first_paragraph_and_strips_markdown(lma):
+def test_extract_summary_skips_heading_and_keeps_its_paragraph(lma):
+    """标题不是摘要（2026-10-20 实况：卡片上只有「收盘复盘摘要」四个字）。"""
     content = (
         "# 收盘复盘摘要\n**今日大盘**微跌 `0.3%`。\n\n## 详细展开\n后面还有很多字…"
     )
-    assert lma.extract_summary(content) == "收盘复盘摘要 今日大盘微跌 0.3%。"
+    assert lma.extract_summary(content) == "今日大盘微跌 0.3%。"
+
+
+def test_extract_summary_skips_leading_disclaimer(lma):
+    """免责声明不是摘要（同日实况：deepseek-v4-pro 卡片只显示「仅复盘观点…」）。"""
+    content = (
+        "## 收盘复盘摘要\n仅复盘观点，不构成自动交易指令。\n\n"
+        "## 一、今日大盘\n沪指窄幅震荡，成交缩量。\n\n后面还有很多字…"
+    )
+    assert lma.extract_summary(content) == "沪指窄幅震荡，成交缩量。"
+
+
+def test_extract_summary_handles_bold_label_and_bullets(lma):
+    """模型可能用加粗行当标题、用列表写摘要——都要能抽到正文。"""
+    content = (
+        "**收盘复盘摘要**\n- 大盘：微跌 0.3%\n- 持仓：浮盈 +3.1%\n\n"
+        "## 详细展开\n后面还有很多字…"
+    )
+    assert lma.extract_summary(content) == "大盘：微跌 0.3% 持仓：浮盈 +3.1%"
 
 
 def test_extract_summary_limits_length(lma):
@@ -167,6 +186,71 @@ def test_format_review_card_shape(lma):
     assert "（本轮无摘要）" in content
     assert "━" * 14 in content
     assert "交易台 › 模型对话" in content
+
+
+def test_format_review_card_includes_pool_sectors_and_scores(lma):
+    """「包括晚上推理出来的模型 top20 的股票板块都要发我」——复盘卡带当日池。"""
+    now = datetime(2026, 10, 12, 15, 30, tzinfo=_CN_TZ)
+    rows = [
+        {
+            "code": "688543.SH",
+            "name": "国科军工",
+            "industry": "国防军工",
+            "score": 31.21,
+        },
+        {"code": "300432.SZ", "name": "富临精工", "industry": "", "score": None},
+    ]
+    _, content = lma.format_review_card([("m1", "摘要一")], now, pool_rows=rows)
+    assert "📦 今日池 · 2 只" in content
+    assert "01 国科军工 688543.SH · 国防军工 · 31.2" in content
+    assert "02 富临精工 300432.SZ · —" in content  # 缺板块显示 —，不编造
+
+
+def test_format_review_card_drops_pool_rows_over_budget(lma):
+    now = datetime(2026, 10, 12, 15, 30, tzinfo=_CN_TZ)
+    rows = [
+        {"code": f"6000{i:02d}.SH", "name": "股票", "industry": "行业", "score": 10}
+        for i in range(20)
+    ]
+    _, content = lma.format_review_card(
+        [("m1", "摘要一")], now, pool_rows=rows, max_chars=420
+    )
+    assert len(content) <= 420
+    assert "另有" in content and "交易台" in content
+
+
+def test_load_pool_snapshot_joins_industry(lma, monkeypatch, tmp_path):
+    picks = tmp_path / "data" / "reports" / "stock_picks"
+    picks.mkdir(parents=True)
+    (picks / "20261020_agent_picks.json").write_text(
+        json.dumps(
+            {
+                "picks": [
+                    {"code": "688543.SH", "name": "国科军工", "score": 31.21},
+                    {"code": "300432.SZ", "name": "富临精工", "industry": "汽车零部件"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(lma, "ROOT", tmp_path)
+    monkeypatch.setattr(lma, "load_industry_map", lambda: {"688543.SH": "国防军工"})
+    rows = lma.load_pool_snapshot(datetime(2026, 10, 20, 15, 30))
+    assert rows == [
+        {
+            "code": "688543.SH",
+            "name": "国科军工",
+            "industry": "国防军工",
+            "score": 31.21,
+        },
+        {
+            "code": "300432.SZ",
+            "name": "富临精工",
+            "industry": "汽车零部件",
+            "score": None,
+        },
+    ]
 
 
 # ── 3. 提醒面 ─────────────────────────────────────────────────────────────

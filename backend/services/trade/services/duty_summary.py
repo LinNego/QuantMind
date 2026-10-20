@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -47,6 +48,7 @@ from backend.services.trade.services.daily_pnl_report_task import (
 )
 from backend.shared import duty_receipts as dr
 from backend.shared import qq_notify
+from backend.shared.text_compact import first_line, short_clause
 
 logger = logging.getLogger(__name__)
 
@@ -164,99 +166,125 @@ def aggregate_rounds(raw_entries: Sequence[object], day: date) -> dict[str, Any]
 
 
 def _oneline(text: object, width: int = _SKIP_REASON_WIDTH) -> str:
-    first = (
-        str(text or "").strip().splitlines()[0].strip()
-        if str(text or "").strip()
-        else ""
-    )
-    return first if len(first) <= width else first[: width - 1] + "…"
+    """多行原因只取首行（实现收口在 ``backend.shared.text_compact``）。"""
+    return first_line(text, width)
+
+
+#: 卡片分隔线：QQ 拒 markdown，靠 ━ 划段（与决策轮摘要同口径）。
+_SUMMARY_RULE = "━" * 14
+
+#: 精确否决标签宽度：理由里「：」之后是解释，不上卡（全量在 PG 台账）。
+_VETO_LABEL_MAX_CHARS = 26
+
+
+def _veto_label(reason: object) -> str:
+    """拒绝理由 → 标签：取「：」前的部分；无分隔符则整条（超宽截断）。"""
+    raw = str(reason or "").strip()
+    head = re.split(r"[：:]", raw, maxsplit=1)[0].strip()
+    head = " ".join(head.split()) or raw
+    if len(head) > _VETO_LABEL_MAX_CHARS:
+        head = head[: _VETO_LABEL_MAX_CHARS - 1].rstrip() + "…"
+    return head
 
 
 _REPORT_LINES = {
-    "sent": "收盘报表：已送达",
-    "nodata": "收盘报表：无数据（当日无台账行；数据迟到会补发）",
-    "unsent": "收盘报表：未送达（QQ 推送未成功，任务仍在重试）",
-    "none": "收盘报表：无记录（done/登记键都不在——到点未跑或回执已过期）",
-    "unreadable": "收盘报表：回执不可读（Redis 故障）",
+    "sent": "✅ 收盘报表：已送达",
+    "nodata": "📭 收盘报表：无数据（当日无台账行；数据迟到会补发）",
+    "unsent": "⚠️ 收盘报表：未送达（QQ 推送未成功，任务仍在重试）",
+    "none": "❔ 收盘报表：无记录（done/登记键都不在——到点未跑或回执已过期）",
+    "unreadable": "❌ 收盘报表：回执不可读（Redis 故障）",
 }
 
 
 def render_summary(day: date, materials: Mapping[str, Any]) -> str:
-    """把 ``collect_all`` 的材料渲染成摘要全文（**纯函数**；缺失一律如实）。"""
-    lines: list[str] = [
-        _REPORT_LINES.get(str(materials.get("report")), "收盘报表：状态未知")
-    ]
+    """把 ``collect_all`` 的材料渲染成摘要全文（**纯函数**；缺失一律如实）。
+
+    卡片口径（2026-10-20 用户「qq 通知的排版感觉很乱」）：``━`` 划段、一句一行、
+    计数在前；方向叙述只留首句，且池段与末轮取池段不重复同一段话。
+    """
+    lines: list[str] = [_SUMMARY_RULE]
+    lines.append(
+        _REPORT_LINES.get(str(materials.get("report")), "❔ 收盘报表：状态未知")
+    )
 
     pool = materials.get("pool")
+    pool_direction = ""
     if pool is None:
-        lines.append("池：未生成（文件不在）")
+        lines.append("📦 池：未生成（文件不在）")
     else:
-        line = (
-            f"池：{pool.get('rows', 0)} 只 · 方向：{pool.get('direction') or '—'}"
+        pool_direction = str(pool.get("direction") or "")
+        lines.append(
+            f"📦 池：{pool.get('rows', 0)} 只"
             f" · {Path(str(pool.get('source') or '')).name or '—'}"
         )
+        lines.append(f"　方向：{short_clause(pool_direction) or '—'}")
         missing = tuple(pool.get("missing_columns") or ())
         if missing:
-            line += f"（缺列：{', '.join(str(m) for m in missing)}）"
-        lines.append(line)
+            lines.append(f"　缺列：{', '.join(str(m) for m in missing)}")
 
     rounds = materials.get("rounds") or {"available": False}
     if not rounds.get("available"):
-        lines.append("轮次：日志不可读（Redis 故障）")
+        lines.append("❌ 轮次：日志不可读（Redis 故障）")
     elif not rounds.get("rounds"):
-        lines.append("轮次：0 轮（今日无轮次记录）")
+        lines.append("🔁 轮次：0 轮（今日无轮次记录）")
     else:
         lines.append(
-            f"轮次：{rounds['rounds']} 轮 · 决策 {rounds.get('decisions', 0)}"
+            f"🔁 轮次：{rounds['rounds']} 轮 · 决策 {rounds.get('decisions', 0)}"
             f" · 腿 {rounds.get('legs', 0)} · 提交 {rounds.get('submitted', 0)}"
-            f" · 失败 {rounds.get('failed', 0)} · 审计行 {rounds.get('audit_rows', 0)}"
+            f" · 失败 {rounds.get('failed', 0)} · 审计 {rounds.get('audit_rows', 0)}"
         )
-        last = f"  末轮 {rounds.get('last_slot') or '—'}（{rounds.get('last_status') or '—'}）"
+        if rounds.get("statuses"):
+            pairs = sorted(rounds["statuses"].items(), key=lambda kv: (-kv[1], kv[0]))
+            lines.append("　状态：" + " · ".join(f"{k} {v}" for k, v in pairs))
+        last = f"　末轮 {rounds.get('last_slot') or '—'}（{rounds.get('last_status') or '—'}）"
         if rounds.get("last_note"):
             last += f"：{_oneline(rounds['last_note'], 80)}"
         lines.append(last)
-        if rounds.get("statuses"):
-            pairs = sorted(rounds["statuses"].items(), key=lambda kv: (-kv[1], kv[0]))
-            lines.append("  状态：" + " · ".join(f"{k} {v}" for k, v in pairs))
         if rounds.get("legacy"):
-            lines.append(f"  旧格式条目 {rounds['legacy']} 条（无计数字段，未计入）")
+            lines.append(f"　旧格式条目 {rounds['legacy']} 条（无计数字段，未计入）")
         lp = rounds.get("last_pool")
         if lp is not None:
             lines.append(
-                f"  末轮取池：{lp.get('rows')} 行 · 展示 {lp.get('shown')}"
-                f" · 剔除 {lp.get('dropped')} · 方向：{lp.get('direction') or '—'}"
+                f"　末轮取池：{lp.get('rows')} 行 · 展示 {lp.get('shown')}"
+                f" · 剔除 {lp.get('dropped')}"
             )
+            lp_direction = str(lp.get("direction") or "")
+            if lp_direction and lp_direction != pool_direction:
+                lines.append(f"　末轮方向：{short_clause(lp_direction)}")
 
+    lines.append(_SUMMARY_RULE)
     vetoes = materials.get("vetoes") or {"available": False}
     if not vetoes.get("available"):
-        lines.append("精确否决：台账不可读（PG 故障）")
+        lines.append("❌ 精确否决：台账不可读（PG 故障）")
     elif not vetoes.get("counts"):
-        lines.append("精确否决：无")
+        lines.append("⛔ 精确否决：无")
     else:
         pairs = sorted(vetoes["counts"].items(), key=lambda kv: (-kv[1], kv[0]))
+        total = sum(int(n or 0) for _, n in pairs)
+        lines.append(f"⛔ 精确否决：{total} 次 / {len(pairs)} 类")
         shown = pairs[:VETO_ROWS_MAX]
-        line = "精确否决：" + " · ".join(f"{reason} {n}" for reason, n in shown)
+        for reason, n in shown:
+            lines.append(f"　{n}  {_veto_label(reason)}")
         if len(pairs) > len(shown):
-            line += " …"
-        lines.append(line)
+            lines.append(f"　…另有 {len(pairs) - len(shown)} 类（全量见决策台账）")
 
     mirror = materials.get("mirror") or {"available": False}
     if not mirror.get("available"):
-        lines.append("镜像：台账不可读（Redis 故障）")
+        lines.append("🪞 镜像：台账不可读（Redis 故障）")
     elif not mirror.get("stats"):
-        lines.append("镜像：无跳过/失败记录")
+        lines.append("🪞 镜像：无跳过/失败记录")
     else:
         stats = mirror["stats"]
         lines.append(
-            f"镜像：跳过 {stats.get('skipped_total', 0)}"
+            f"🪞 镜像：跳过 {stats.get('skipped_total', 0)}"
             f" · 失败 {stats.get('failed_total', 0)}"
         )
 
     skips = materials.get("skips") or {"available": False}
     if not skips.get("available"):
-        lines.append("跳发：台账不可读（Redis 故障）")
+        lines.append("⏭️ 跳发：台账不可读（Redis 故障）")
     elif not skips.get("entries"):
-        lines.append("跳发：无")
+        lines.append("⏭️ 跳发：无")
     else:
         labels = {"market_sync": "市场同步", "factor_fill": "因子填充"}
         parts = []
@@ -265,28 +293,31 @@ def render_summary(day: date, materials: Mapping[str, Any]) -> str:
             parts.append(
                 f"{labels.get(job, job)} {market or '—'}（{_oneline(reason)}）"
             )
-        lines.append("跳发：" + " · ".join(parts))
+        if len(parts) == 1:
+            lines.append(f"⏭️ 跳发：{parts[0]}")
+        else:  # 多条逐行，避免一行拼成一条长带
+            lines.append("⏭️ 跳发")
+            lines.extend(f"　{part}" for part in parts)
 
     signal = materials.get("signal") or {"available": False}
     if not signal.get("available"):
-        lines.append("信号：不可读（PG 故障）")
+        lines.append("📈 信号：不可读（PG 故障）")
     elif not signal.get("rows"):
-        lines.append("信号：今日无实时信号写入")
+        lines.append("📈 信号：今日无实时信号写入")
     else:
         last_dt = signal.get("last")
         if not isinstance(last_dt, datetime):
-            lines.append(f"信号：实时信号 {signal['rows']} 条，最后写入时刻不可读")
+            lines.append(f"📈 信号：{signal['rows']} 条，最后写入时刻不可读")
         else:
             at = last_dt.astimezone(TZ).strftime("%H:%M:%S")
             if signal.get("wrote_to_close"):
-                lines.append(
-                    f"信号：实时信号 {signal['rows']} 条，写到 {at}（覆盖收盘段）"
-                )
+                lines.append(f"📈 信号：{signal['rows']} 条 · 写到 {at}（覆盖收盘段）")
             else:
                 lines.append(
-                    f"信号：实时信号 {signal['rows']} 条，只写到 {at}"
+                    f"📈 信号：{signal['rows']} 条 · 只写到 {at}"
                     f"（未覆盖 {SIGNAL_CLOSE_THRESHOLD.strftime('%H:%M')} 后）"
                 )
+    lines.append(_SUMMARY_RULE)
     return "\n".join(lines)
 
 

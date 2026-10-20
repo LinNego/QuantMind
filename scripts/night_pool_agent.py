@@ -36,9 +36,14 @@ sys.path.insert(0, str(ROOT / "prompts"))
 
 from trading_cal import (is_trading_day, next_trading_day,  # noqa: E402
                          prev_trading_day)
+from stock_industry import load_industry_map  # noqa: E402
+from backend.shared.env_flags import normalize_env_flag  # noqa: E402
+from backend.shared.text_compact import short_clause  # noqa: E402
 
 NIGHT_POOL_DIR = ROOT / "logs" / "night_pool"
 PICKS_DIR = ROOT / "data" / "reports" / "stock_picks"
+#: 产池 QQ 推送的去重状态（同目标交易日只推一次；未送达不记 → 下轮补推）
+PUSH_STATE = ROOT / "data" / "logs" / ".night_pool_push_state.json"
 
 #: repo .env（与 live_model_analysis._load_env 同口径：环境变量优先，文件补缺）
 ENV_FILE = ROOT / ".env"
@@ -460,6 +465,114 @@ def _load_env() -> dict:
     return env
 
 
+# ── 产池 QQ 推送（2026-10-20 用户：「top20 的股票板块都要发我」）──────────
+
+_PUSH_RULE = "━" * 14
+#: 方向原文是一整段策略叙述，卡片只留首句（同 ``text_compact.short_clause``）。
+_CARD_DIRECTION_MAX = 50
+#: 板块条目上限：池卡的重点是 20 只票，板块只是背景。
+_CARD_SECTORS_MAX = 6
+
+
+def format_pool_card(target: str, payload: dict, picks: list) -> tuple:
+    """晚间研究产池后的 QQ 卡片（纯函数）→ ``(title, content)``。
+
+    行口径：``序号 名称 代码 · 板块 · 分数``；板块缺失显示 ``—``（不编造）。
+    """
+    title = f"🌙 晚间股票池 · {_dash8(target)[5:]}"
+    lines = [_PUSH_RULE]
+    view = short_clause(
+        str(payload.get("market_view") or ""), max_chars=_CARD_DIRECTION_MAX
+    )
+    if view:
+        lines.append(f"🧭 方向：{view}")
+    sector_lines = []
+    for item in (payload.get("sectors") or [])[:_CARD_SECTORS_MAX]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        strength = str(item.get("strength") or "").strip()
+        reason = short_clause(str(item.get("reason") or ""), max_chars=30,
+                              min_clause_chars=8)
+        head = f"{name}（{strength}）" if strength else name
+        sector_lines.append(f"　{head}：{reason}" if reason else f"　{head}")
+    if sector_lines:
+        lines.append("🔥 板块")
+        lines.extend(sector_lines)
+    lines.append(_PUSH_RULE)
+    lines.append(f"📦 {len(picks)} 只 · 板块 · 分数")
+    for idx, pick in enumerate(picks, 1):
+        code = str(pick.get("code") or "").strip()
+        name = str(pick.get("name") or "").strip() or code
+        industry = str(pick.get("industry") or "").strip() or "—"
+        row = f"{idx:02d} {name} {code} · {industry}"
+        score = pick.get("score")
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            row += f" · {float(score):.1f}"
+        lines.append(row)
+    lines.append(_PUSH_RULE)
+    lines.append("详情见 交易台 › 候选池")
+    return title, "\n".join(lines)
+
+
+def _load_push_state() -> dict:
+    try:
+        data = json.loads(PUSH_STATE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_push_state(state: dict) -> None:
+    try:
+        PUSH_STATE.parent.mkdir(parents=True, exist_ok=True)
+        PUSH_STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001 状态落盘失败只影响去重
+        print(f"⚠️ 推送状态落盘失败: {exc}")
+
+
+def notify_qq(title: str, content: str) -> bool:
+    """推一条 QQ（best-effort）：失败只打印，绝不挡产池。"""
+    try:
+        import push_notify  # scripts/ 同目录
+
+        push_notify.notify(title, content, channel="default")
+        print(f"📨 QQ 已推送：{title}")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ QQ 推送失败（不影响产池）: {exc}")
+        return False
+
+
+def push_pool(
+    target: str, payload: dict, picks: list, *, env: dict | None = None
+) -> bool:
+    """产池后推一条 QQ；同目标交易日只推一次（未送达不记状态，下轮补推）。
+
+    开关 ``QM_NIGHT_POOL_PUSH`` 走全仓唯一词表（``env_flag`` 口径：只有 ``true``
+    判开）；``env`` 缺省时读进程环境 + repo ``.env``。
+    """
+    env = _load_env() if env is None else env
+    if not normalize_env_flag(env.get("QM_NIGHT_POOL_PUSH"), default=True):
+        print("⏭️ 晚间股票池推送关闭（QM_NIGHT_POOL_PUSH 非 true）")
+        return False
+    state = _load_push_state()
+    pushed = state.get("pushed")
+    pushed = dict(pushed) if isinstance(pushed, dict) else {}
+    if pushed.get(target):
+        print(f"⏭️ 晚间股票池已推送（{target}），不重复")
+        return False
+    title, content = format_pool_card(target, payload, picks)
+    if not notify_qq(title, content):
+        return False
+    pushed[target] = datetime.now().astimezone().isoformat(timespec="seconds")
+    state["pushed"] = pushed
+    _save_push_state(state)
+    return True
+
+
 def _brain_endpoint(model: str, env: dict) -> tuple:
     """(base, key)：glm* 走 GLM_* 键，其余走 OPENAI_*（DEEPSEEK_* 兜底）。"""
     if model.startswith("glm"):
@@ -682,10 +795,19 @@ def run(session: str, target: str, dry: bool = False) -> int:
             )
             for c in cands
         }
+        # 板块随池落盘（2026-10-20 用户：「top20 的股票板块都要发我」）；
+        # 主表读不到只降级为空串，消费面显示 —，绝不编造。
+        try:
+            industry_map = load_industry_map()
+        except Exception as exc:  # noqa: BLE001 板块是装饰，不得挡产池
+            industry_map = {}
+            print(f"⚠️ 板块表读取失败（industry 留空）: {exc}")
         pool = []
         for p in rows[:20]:
+            code = normalize_pool_code(p.get("code")) or str(p.get("code") or "")
             pool.append({"code": p.get("code"), "name": p.get("name"),
                          "side": "HOLD", "score": _safe_score(p.get("score")),
+                         "industry": industry_map.get(code, ""),
                          "events": _events.get(str(p.get("code")), ""),
                          "reason": str(p.get("reason") or "")[:160]})
         if pool:
@@ -697,6 +819,10 @@ def run(session: str, target: str, dry: bool = False) -> int:
                 json.dumps(out, ensure_ascii=False), encoding="utf-8")
             produced = True
             print(f"✅ 池文件 {target}_agent_picks.json（{len(pool)} 只，数据会话 {session}）")
+            try:  # 推送是旁路：失败只打印，绝不改变产池结果
+                push_pool(target, payload, pool)
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ 晚间股票池推送异常（不影响产池）: {exc}")
         else:
             print(f"❌ 未产出有效池（大脑成功={brain_ok}，JSON 可抽={payload_ok}）"
                   f"——不写 {target}_agent_picks.json（空壳会遮蔽在产池），"

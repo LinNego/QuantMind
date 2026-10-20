@@ -109,6 +109,9 @@ def sandbox(npa, monkeypatch, tmp_path):
     monkeypatch.setattr(npa, "NIGHT_POOL_DIR", root / "logs" / "night_pool")
     monkeypatch.setattr(npa, "PICKS_DIR", picks)
     monkeypatch.setattr(
+        npa, "PUSH_STATE", root / "data" / "logs" / ".night_pool_push_state.json"
+    )
+    monkeypatch.setattr(
         npa,
         "build_candidates",
         lambda session: (
@@ -138,6 +141,14 @@ def sandbox(npa, monkeypatch, tmp_path):
         "load_names_industry",
         lambda: {"600338.SH": "西藏珠峰", "688183.SH": "生益电子"},
     )
+    # 板块表桩（写池时逐票补 industry；真实环境读 instrument_detail.parquet）
+    monkeypatch.setattr(
+        npa,
+        "load_industry_map",
+        lambda: {"600338.SH": "有色金属", "688183.SH": "电子元件"},
+    )
+    # QQ 推送桩：run() 产池后会推一条，测试绝不碰真网络
+    monkeypatch.setattr(npa, "notify_qq", lambda title, content: True)
     _install_stub_modules(monkeypatch)
     return root
 
@@ -324,10 +335,117 @@ def test_valid_pool_writes_agent_picks_with_usage_row(npa, sandbox, monkeypatch)
     assert [p["code"] for p in doc["picks"]] == ["600338.SH", "688183.SH"]
     assert doc["picks"][0]["side"] == "HOLD"  # 占位侧，无信息量（读侧不展示）
     assert doc["picks"][0]["reason"] == "板块主线"
+    # 板块随池落盘（2026-10-20 用户：「top20 的股票板块都要发我」）
+    assert doc["picks"][0]["industry"] == "有色金属"
+    assert doc["picks"][1]["industry"] == "电子元件"
     rows = _dialogue_rows(sandbox)
     assert rows[0]["signature"] == "market-research"
     assert rows[0]["kind"] == "night_pool"
     assert rows[0]["usage"] == _BRAIN_USAGE
+
+
+# ── 3b. 产池后的 QQ 推送（板块 + top20） ────────────────────────────────
+
+
+def _pool_card_inputs():
+    payload = {
+        "date": "2026-10-13",
+        "market_view": "震荡偏强，主线在半导体；注意高位股分化",
+        "sectors": [
+            {"name": "半导体", "strength": "强", "reason": "资金回流"},
+            {"name": "有色", "strength": "中", "reason": "商品价格反弹"},
+        ],
+    }
+    picks = [
+        {
+            "code": "600338.SH",
+            "name": "西藏珠峰",
+            "industry": "有色金属",
+            "score": 88.0,
+        },
+        {
+            "code": "688183.SH",
+            "name": "生益电子",
+            "industry": "电子元件",
+            "score": 81.0,
+        },
+        {"code": "300911.SZ", "name": "亿田智能", "industry": "", "score": None},
+    ]
+    return payload, picks
+
+
+def test_format_pool_card_has_direction_sectors_and_rows(npa):
+    payload, picks = _pool_card_inputs()
+    title, content = npa.format_pool_card(TARGET, payload, picks)
+
+    assert title == "🌙 晚间股票池 · 10-14"
+    assert "🧭 方向：震荡偏强，主线在半导体；注意高位股分化" in content
+    assert "🔥 板块" in content
+    assert "　半导体（强）：资金回流" in content
+    assert "📦 3 只 · 板块 · 分数" in content
+    assert "01 西藏珠峰 600338.SH · 有色金属 · 88.0" in content
+    assert "02 生益电子 688183.SH · 电子元件 · 81.0" in content
+    assert "03 亿田智能 300911.SZ · —" in content  # 缺板块显示 —，不编造
+    assert "━" * 14 in content
+
+
+def test_format_pool_card_shortens_long_direction(npa):
+    payload, picks = _pool_card_inputs()
+    payload["market_view"] = "震荡偏强（半导体回流、有色反弹、量能温和），" * 4
+    _, content = npa.format_pool_card(TARGET, payload, picks)
+    line = next(x for x in content.splitlines() if x.startswith("🧭 方向："))
+    assert line.endswith("…") and len(line) <= 60
+
+
+def test_push_pool_once_per_target_and_switch(npa, monkeypatch, tmp_path):
+    monkeypatch.setattr(npa, "PUSH_STATE", tmp_path / "push_state.json")
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        npa, "notify_qq", lambda title, content: calls.append((title, content)) or True
+    )
+    payload, picks = _pool_card_inputs()
+
+    assert npa.push_pool(TARGET, payload, picks, env={"QM_NIGHT_POOL_PUSH": "true"})
+    assert not npa.push_pool(TARGET, payload, picks, env={"QM_NIGHT_POOL_PUSH": "true"})
+    assert len(calls) == 1  # 同一目标交易日只推一次
+
+    # 词表唯一读法：只有 true 判开（1/yes/on 都算关）
+    for raw in ("1", "yes", "on", "false", ""):
+        assert not npa.push_pool(
+            "20261022", payload, picks, env={"QM_NIGHT_POOL_PUSH": raw}
+        ), raw
+
+
+def test_push_pool_retries_when_delivery_fails(npa, monkeypatch, tmp_path):
+    """没送达就不记状态——同止损失败告警的纪律，否则这条推送永远没人看到。"""
+    monkeypatch.setattr(npa, "PUSH_STATE", tmp_path / "push_state.json")
+    monkeypatch.setattr(npa, "notify_qq", lambda title, content: False)
+    payload, picks = _pool_card_inputs()
+
+    assert not npa.push_pool(TARGET, payload, picks, env={"QM_NIGHT_POOL_PUSH": "true"})
+    # 未记状态 → 下一次还能推
+    monkeypatch.setattr(npa, "notify_qq", lambda title, content: True)
+    assert npa.push_pool(TARGET, payload, picks, env={"QM_NIGHT_POOL_PUSH": "true"})
+
+
+def test_run_pushes_pool_after_writing_file(npa, sandbox, monkeypatch):
+    monkeypatch.setattr(
+        npa, "call_brain", lambda task, *a, **k: (_BRAIN_JSON, dict(_BRAIN_USAGE))
+    )
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        npa, "notify_qq", lambda title, content: calls.append((title, content)) or True
+    )
+    monkeypatch.setattr(npa, "PUSH_STATE", sandbox / "push_state.json")
+    monkeypatch.setattr(npa, "_load_env", lambda: {})
+
+    assert npa.run(SESSION, TARGET) == 0
+
+    assert len(calls) == 1
+    assert "晚间股票池" in calls[0][0]
+    assert "有色金属" in calls[0][1]
+    doc = json.loads(_picks_file(sandbox).read_text(encoding="utf-8"))
+    assert [p["industry"] for p in doc["picks"]] == ["有色金属", "电子元件"]
 
 
 # ── 4. 纯函数 ───────────────────────────────────────────────────────────

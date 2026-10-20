@@ -234,18 +234,112 @@ def _materials(**over):
 
 
 class TestRenderSummary:
-    def test_full_render_has_all_sections(self):
+    def test_full_render_is_card_layout_with_one_fact_per_line(self):
+        """卡片口径（2026-10-20 用户「排版感觉很乱」）：━ 划段、一句一行。
+
+        旧版把所有精确否决理由用 `` · `` 拼成一行，手机上要滚三行才看到计数；
+        新版一类一行，计数与标签在前，票据细节留在台账。
+        """
         out = ds.render_summary(DAY, _materials())
         lines = out.splitlines()
-        assert "收盘报表：已送达" in lines
-        assert "池：30 只 · 方向：做多 · 20261010_picks.json" in lines
-        assert "轮次：2 轮 · 决策 3 · 腿 3 · 提交 2 · 失败 1 · 审计行 3" not in out
-        assert "轮次：1 轮 · 决策 3 · 腿 3 · 提交 2 · 失败 1 · 审计行 3" in lines
-        assert "  末轮 1445（ok）：提交完成" in lines
-        assert "精确否决：l2.pool_not_member 5 · vcash 2" in lines
-        assert "镜像：跳过 3 · 失败 1" in lines
-        assert "跳发：市场同步 CN（连续非交易日）" in lines
-        assert "信号：实时信号 12 条，写到 15:07:23（覆盖收盘段）" in lines
+        assert lines[0] == "━" * 14
+        assert lines[-1] == "━" * 14
+        assert "✅ 收盘报表：已送达" in lines
+        assert "📦 池：30 只 · 20261010_picks.json" in lines
+        assert "　方向：做多" in lines
+        assert "🔁 轮次：1 轮 · 决策 3 · 腿 3 · 提交 2 · 失败 1 · 审计 3" in lines
+        assert "　状态：ok 1" in lines
+        assert "　末轮 1445（ok）：提交完成" in lines
+        assert "⛔ 精确否决：7 次 / 2 类" in lines
+        assert "　5  l2.pool_not_member" in lines
+        assert "　2  vcash" in lines
+        assert "🪞 镜像：跳过 3 · 失败 1" in lines
+        assert "⏭️ 跳发：市场同步 CN（连续非交易日）" in lines
+        assert "📈 信号：12 条 · 写到 15:07:23（覆盖收盘段）" in lines
+
+    def test_direction_is_shortened_and_not_repeated(self):
+        """方向只留首句判断，且池段与末轮取池段不重复同一段叙述。"""
+        long_dir = (
+            "大盘偏弱（上证5日-1.7%、平量、低位），缩量普跌下生存基调：减弱势仓、"
+            "留现金、禁止逆势买入；监管制度利好中期偏多"
+        )
+        mats = _materials(
+            pool={
+                "rows": 30,
+                "direction": long_dir,
+                "source": "/x/20261010_agent_picks.json",
+                "missing_columns": (),
+            },
+            rounds={
+                "available": True,
+                **ds.aggregate_rounds(
+                    [
+                        _entry(
+                            pool={
+                                "rows": 30,
+                                "shown": 20,
+                                "dropped": 10,
+                                "direction": long_dir,
+                            }
+                        )
+                    ],
+                    DAY,
+                ),
+            },
+        )
+        out = ds.render_summary(DAY, mats)
+        assert "　方向：大盘偏弱（上证5日-1.7%、平量、低位）…" in out
+        assert out.count("大盘偏弱") == 1  # 末轮取池不再重复方向
+        assert "　末轮取池：30 行 · 展示 20 · 剔除 10" in out
+        assert "缩量普跌下生存基调" not in out
+
+    def test_last_round_direction_shown_only_when_different(self):
+        mats = _materials(
+            rounds={
+                "available": True,
+                **ds.aggregate_rounds(
+                    [
+                        _entry(
+                            pool={
+                                "rows": 20,
+                                "shown": 19,
+                                "dropped": 1,
+                                "direction": "先抑后扬，尾盘回暖",
+                            }
+                        )
+                    ],
+                    DAY,
+                ),
+            }
+        )
+        out = ds.render_summary(DAY, mats)
+        assert "　方向：做多" in out
+        assert "　末轮方向：先抑后扬，尾盘回暖" in out
+
+    def test_veto_reasons_render_as_short_labels(self):
+        """否决理由的「：」后解释不上卡（手机一屏只放得下标签与计数）。"""
+        mats = _materials(
+            vetoes={
+                "available": True,
+                "counts": {
+                    "该标的已归属 auto：本执行器一个标的只有一个状态位，"
+                    "先挂的持有（多 agent 仲裁见 P2.7）": 44,
+                    "非交易时段：本轮只出决策与守护规则，不提交腿": 13,
+                },
+            }
+        )
+        out = ds.render_summary(DAY, mats)
+        assert "⛔ 精确否决：57 次 / 2 类" in out
+        assert "　44  该标的已归属 auto" in out
+        assert "　13  非交易时段" in out
+        assert "先挂的持有" not in out
+
+    def test_veto_overflow_is_counted_not_silently_dropped(self):
+        counts = {f"规则{i}": i + 1 for i in range(ds.VETO_ROWS_MAX + 2)}
+        out = ds.render_summary(
+            DAY, _materials(vetoes={"available": True, "counts": counts})
+        )
+        assert "…另有 2 类（全量见决策台账）" in out
 
     def test_pool_missing_columns_shown(self):
         mats = _materials(
@@ -257,7 +351,7 @@ class TestRenderSummary:
             }
         )
         out = ds.render_summary(DAY, mats)
-        assert "缺列：industry, rank" in out
+        assert "　缺列：industry, rank" in out
 
     def test_pool_missing_file(self):
         out = ds.render_summary(DAY, _materials(pool=None))
