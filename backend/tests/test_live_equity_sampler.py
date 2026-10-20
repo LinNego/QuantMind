@@ -248,3 +248,73 @@ async def test_sample_once_missing_ledger_still_writes_account_row(
     )
     assert report["written"] == 1
     assert _read_rows(equity)[0]["agent"] is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_sample_once_default_uses_pg_agents_loader(tmp_path, monkeypatch):
+    """默认账本源是 PG 活账（不是 09-29 冻结的 live_ledger.json）。
+
+    2026-10-20 用户口径：台账/实况只认通达信实盘分账。旧文件账本停在迁移夜，
+    再拿它算虚拟现金会把 09-30 之后的所有真实成交抹掉。
+    """
+    monkeypatch.setattr(sampler, "is_trading_day", lambda day: True)
+    equity = tmp_path / "live_equity.jsonl"
+    called = []
+
+    async def agents_loader():
+        called.append(True)
+        return {
+            "flash": {
+                "positions": {"600036.SH": {"volume": 100, "cost_price": 10.0}},
+                "virtual_cash": 9000.0,
+            }
+        }
+
+    async def account():
+        return 200000.0, 150000.0, False
+
+    async def quotes(codes):
+        return {"600036.SH": 12.0}
+
+    report = await sampler.sample_once(
+        _TRADING_NOW,
+        account_fetcher=account,
+        quote_fetcher=quotes,
+        agents_loader=agents_loader,
+        equity_path=equity,
+    )
+
+    assert called == [True]
+    assert report["written"] == 2
+    row = _read_rows(equity)[1]
+    assert row["agent"] == "flash"
+    assert row["value"] == 10200.0
+    assert row.get("source") == "pg"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_sample_once_pg_ledger_failure_still_writes_account_row(
+    tmp_path, monkeypatch
+):
+    """PG 读败只丢 agent 行（记 skipped），总账户行照写——曲线不断线。"""
+    monkeypatch.setattr(sampler, "is_trading_day", lambda day: True)
+    equity = tmp_path / "live_equity.jsonl"
+
+    async def agents_loader():
+        raise RuntimeError("PG 不可达")
+
+    async def account():
+        return 200000.0, 150000.0, False
+
+    report = await sampler.sample_once(
+        _TRADING_NOW,
+        account_fetcher=account,
+        agents_loader=agents_loader,
+        equity_path=equity,
+    )
+
+    assert report["written"] == 1
+    assert _read_rows(equity)[0]["agent"] is None
+    assert any(s.startswith("ledger_failed:RuntimeError") for s in report["skipped"])

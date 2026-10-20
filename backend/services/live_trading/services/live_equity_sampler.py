@@ -81,12 +81,38 @@ def is_trading_day(day: date) -> bool:
 
 
 def _load_agents(ledger_path: Path) -> dict[str, Any]:
-    """读分账账本（live_ledger.json）的 agents 段；缺失/损坏按空账本（不抛）。"""
+    """读分账账本（live_ledger.json）的 agents 段；缺失/损坏按空账本（不抛）。
+
+    仅作测试/手工指定的显式兜底：生产默认源是 PG 活账（见
+    :func:`_load_pg_agents`）。旧文件在 2026-09-29 迁移夜后已冻结，
+    拿它算虚拟现金会抹掉之后所有真实成交（2026-10-20 用户报障根因）。
+    """
     try:
         doc = json.loads(ledger_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     agents = doc.get("agents") if isinstance(doc, dict) else None
+    return agents if isinstance(agents, dict) else {}
+
+
+async def _load_pg_agents() -> dict[str, Any]:
+    """读 PG 活账（``qm_agent_ledger_*``）的 agents 段。
+
+    身份与决策轮/账本写入方同一处解析（``resolve_db_account_user``）：
+    写错一个身份读到的就是另一本空账。读败由调用方降级（只丢 agent 行，
+    总账户行照写），不在本函数吞异常——降级要留下 ``skipped`` 证据。
+    """
+    from backend.shared.agent_ledger_store import load_ledger
+    from backend.shared.database_manager_v2 import get_session
+    from backend.shared.simulation_account_keys import resolve_db_account_user
+
+    user = resolve_db_account_user("QM_LIVE_EQUITY_ACCOUNT_USER")
+    tenant = (
+        os.getenv("QM_LIVE_EQUITY_ACCOUNT_TENANT", "default") or "default"
+    ).strip()
+    async with get_session(read_only=True) as session:
+        ledger = await load_ledger(session, tenant_id=tenant, user_id=user)
+    agents = ledger.get("agents") if isinstance(ledger, dict) else None
     return agents if isinstance(agents, dict) else {}
 
 
@@ -185,10 +211,16 @@ async def sample_once(
     account_fetcher: Callable[[], Awaitable[tuple[float, float, bool]]] | None = None,
     degraded_fetcher: Callable[[], Awaitable[tuple[float, float, bool]]] | None = None,
     quote_fetcher: Callable[[list[str]], Awaitable[dict[str, float]]] | None = None,
+    agents_loader: Callable[[], Awaitable[dict[str, Any]]] | None = None,
     ledger_path: Path | None = None,
     equity_path: Path | None = None,
 ) -> dict[str, Any]:
-    """采样一轮（幂等：同分钟已写过的行不重复写）。返回报告 dict。"""
+    """采样一轮（幂等：同分钟已写过的行不重复写）。返回报告 dict。
+
+    账本源优先级：``agents_loader``（测试/显式注入）→ ``ledger_path``（显式
+    文件，测试用）→ PG 活账（生产默认）。旧 ``live_ledger.json`` 只是退役
+    快照，生产路径不再读它。
+    """
     now = now or _now_cn()
     if not in_sample_window(now):
         return {"written": 0, "skipped": ["outside_window"]}
@@ -197,7 +229,6 @@ async def sample_once(
 
     from backend.services.agent_arena import arena_config
 
-    ledger_file = ledger_path or (arena_config.logs_dir() / "live_ledger.json")
     out_file = equity_path or (arena_config.logs_dir() / "live_equity.jsonl")
 
     key = now.strftime("%Y-%m-%d %H:%M")
@@ -240,7 +271,23 @@ async def sample_once(
         )
 
     # ② 每 agent 分账行：虚拟现金 + 名下持仓 × 桥实时价
-    agents = _load_agents(ledger_file)
+    agents: dict[str, Any] = {}
+    ledger_source = "pg"
+    if agents_loader is not None:
+        try:
+            agents = await agents_loader() or {}
+        except Exception as exc:  # noqa: BLE001 - 读败只丢 agent 行，总账户行照写
+            skipped.append(f"ledger_failed:{type(exc).__name__}")
+            logger.warning("净值采样账本读取失败，本分钟跳过 agent 行: %s", exc)
+    elif ledger_path is not None:
+        ledger_source = "file"
+        agents = _load_agents(ledger_path)
+    else:
+        try:
+            agents = await _load_pg_agents()
+        except Exception as exc:  # noqa: BLE001 - 同上
+            skipped.append(f"ledger_failed:{type(exc).__name__}")
+            logger.warning("净值采样 PG 活账读取失败，本分钟跳过 agent 行: %s", exc)
     if agents:
         codes: list[str] = []
         for rec in agents.values():
@@ -280,6 +327,8 @@ async def sample_once(
                     "date": date_str,
                     "ts": ts,
                     "value": round(_agent_virtual_cash(rec) + mkt, 2),
+                    # 读侧靠它区分「修复后的 PG 实盘点」与退役文件算出的旧点
+                    "source": ledger_source,
                 }
             )
 
