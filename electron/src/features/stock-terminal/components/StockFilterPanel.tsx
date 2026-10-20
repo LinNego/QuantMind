@@ -2,10 +2,11 @@
 
 import { useEffect, useState } from 'react';
 import { SlidersHorizontal, X, RotateCcw, ShieldAlert } from 'lucide-react';
-import { Select } from 'antd';
+import { Select, type SelectProps } from 'antd';
 
 // 概念板块限宽 200px（网格列约束）+ 选中项省略号，避免长概念名把后面控件挤在一起
 import { stockTerminalService } from '../services/stockTerminalService';
+import { buildModelSelectOptions } from '../modelOptions';
 import type { StockModelOption } from '../types';
 import { MarketCalendarFilter } from './MarketCalendarFilter';
 import { EXCLUDE_ON } from '../riskModel';
@@ -227,12 +228,11 @@ export function StockFilterPanel({ filters, onChange, total, fullTotal, models: 
         )}
         <Select allowClear showSearch size="small" placeholder="推理模型" value={filters.model || undefined}
           optionFilterProp="label" onChange={v => set({ model: v })}
-          options={modelOptions.map(m => ({
-            // `has_signals_30d=false`（上游推理近 30 天没产出该模型的分）只在文案上加弱化后缀，
-            // 让它仍然可选 —— 用户要能一眼分清「这款没信号」和「界面漏了」。老后端无此字段 → 不加。
-            label: `${m.display_name || m.model_id}${m.has_signals_30d === false ? ' · 近 30 天无信号' : ''}`,
-            value: m.model_id,
-          }))} />
+          // 注册表全量可选：近 90 天无信号的模型单独分组（仍可选），
+          // 近 30 天无信号的加弱化后缀——用户要能一眼分清「没信号」和「界面漏了」。
+          // listHeight 放大到能一次看全有信号的常用模型，减少「只能看到几款」的错觉。
+          options={buildModelSelectOptions(modelOptions) as SelectProps['options']}
+          listHeight={480} />
         {extraRight && <div className="flex items-center justify-end min-w-0">{extraRight}</div>}
       </div>
 

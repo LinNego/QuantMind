@@ -123,6 +123,11 @@ export interface StockModelOption {
    * 「这款没信号」和「界面漏了」。老后端无此字段 → undefined，按「未知」渲染。
    */
   has_signals_30d?: boolean;
+  /**
+   * 近 90 天是否有打分行。`false` 的项来自注册表（尚未跑推理的新模型），
+   * 仍然**可选**，只是归到「近 90 天无信号」分组；老后端无此字段 → undefined。
+   */
+  has_signals_90d?: boolean;
 }
 
 export interface StockListResponse {

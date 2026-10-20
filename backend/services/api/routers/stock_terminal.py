@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from backend.services.api.stock_terminal_models import merge_model_options
 from backend.services.api.user_app.middleware.auth import get_current_user
 from backend.shared.database_manager_v2 import get_session
 from backend.shared.logging_config import get_logger
@@ -57,8 +58,9 @@ _UNIVERSE_TTL = 300.0
 _universe_cache: dict[str, Any] = {"df": None, "ts": 0.0, "trade_date": ""}
 # universe 重建锁：to_thread 并发请求同时过期时只重建一次（读 2 parquet + merge）
 _universe_lock = threading.Lock()
-# 推理模型下拉选项缓存：model JOIN+GROUP BY 2.3s/次，按日频更新，TTL 与 universe 一致
-_model_options_cache: dict[str, Any] = {"v": None, "ts": 0.0}
+# 推理模型下拉选项缓存：model JOIN+GROUP BY 2.3s/次，按日频更新，TTL 与 universe 一致。
+# 按页面市场分别缓存（CN/HK 的注册表收口不同；信号模型部分两者相同）。
+_model_options_cache: dict[str, dict[str, Any]] = {}
 _concept_cache: dict[str, Any] = {"ts": 0.0, "symbol_map": {}}
 # 宽基指数归属缓存：全量 7 个权重文件构建 symbol→归属映射，按 TTL 刷新
 _index_membership_cache: dict[str, Any] = {"ts": 0.0, "map": {}}
@@ -81,7 +83,7 @@ def reset_terminal_caches() -> None:
     global _DATA_DIR
     _DATA_DIR = None
     _universe_cache.update({"df": None, "ts": 0.0, "trade_date": ""})
-    _model_options_cache.update({"v": None, "ts": 0.0})
+    _model_options_cache.clear()
     _concept_cache.update({"ts": 0.0, "symbol_map": {}})
     _index_membership_cache.update({"ts": 0.0, "map": {}})
 
@@ -2238,16 +2240,21 @@ async def list_stocks(
     except Exception as exc:  # noqa: BLE001
         logger.warning("facets failed: %s", exc)
 
-    # 推理模型选项（供筛选下拉）：最近 90 天内有信号的全部模型（真实 model_id + display_name）。
+    # 推理模型选项（供筛选下拉）：**注册表全量（非归档）∪ 最近 90 天有信号的模型**。
+    # 只列「有信号」会让新训练、尚未跑推理的模型在下拉里消失——用户看到的就是
+    # 「模型显示不全」（2026-10-20 复报）。信号事实只用于分组与「近 30 天无信号」
+    # 标注，不再决定选项是否存在。
     # engine_signal_scores.model_version 恒为 'inference_script'（历史遗留无意义），
     # 真实模型标识在 qm_model_inference_runs.model_id（同 model_training history 逻辑）。
     # JOIN+GROUP BY 全表 2.3s/次，结果按日频更新——缓存 _UNIVERSE_TTL 消除重复开销。
     # **任何请求都回选项**（原先只在无 model 参数时计算，导致选完模型刷新后
     # `models` 变空、下拉看起来「越筛越少」；选项集是全局口径，本就与筛选无关）。
+    _market_scope = "HK" if m == "HK" else "CN"
     model_options: list[dict[str, Any]] = []
     _now = time.time()
-    if _model_options_cache["v"] is not None and _now - _model_options_cache["ts"] < _UNIVERSE_TTL:
-        model_options = _model_options_cache["v"]
+    _scope_cache = _model_options_cache.get(_market_scope)
+    if _scope_cache is not None and _now - _scope_cache["ts"] < _UNIVERSE_TTL:
+        model_options = _scope_cache["v"]
     else:
         try:
             async with get_session() as _s:
@@ -2258,11 +2265,20 @@ async def list_stocks(
                     "WHERE tenant_id='default' ORDER BY trade_date DESC LIMIT 1"
                 )
                 _latest_date = (await _s.execute(_txt(_date_sql))).scalar_one_or_none()
-                if _latest_date is not None:
-                    _from = _latest_date - _timedelta(days=90)
-                    # 30 天新鲜度：上游批量推理失败时某些模型会静默停更，
-                    # 把事实带到下拉框，用户才分得清「这款没信号」和「界面漏了」
-                    _recent_cut = _latest_date - _timedelta(days=30)
+                _from = (
+                    _latest_date - _timedelta(days=90)
+                    if _latest_date is not None
+                    else None
+                )
+                # 30 天新鲜度：上游批量推理失败时某些模型会静默停更，
+                # 把事实带到下拉框，用户才分得清「这款没信号」和「界面漏了」
+                _recent_cut = (
+                    _latest_date - _timedelta(days=30)
+                    if _latest_date is not None
+                    else None
+                )
+                _mrows = []
+                if _from is not None:
                     _mrows = (
                         await _s.execute(
                             _txt(
@@ -2279,32 +2295,39 @@ async def list_stocks(
                             {"d_from": _from},
                         )
                     ).fetchall()
-                    _mids = [str(_r[0]) for _r in _mrows]
-                    _meta_map: dict[str, str] = {}
-                    if _mids:
-                        _meta_rows = (
-                            await _s.execute(
-                                _txt(
-                                    "SELECT model_id, metadata_json FROM qm_user_models "
-                                    "WHERE model_id = ANY(:mids)"
-                                ),
-                                {"mids": _mids},
-                            )
-                        ).fetchall()
-                        for _mid2, _meta_json in _meta_rows:
-                            _meta = _meta_json if isinstance(_meta_json, dict) else {}
-                            _meta_map[str(_mid2)] = (
-                                _meta.get("display_name") or _meta.get("model_name") or ""
-                            )
-                    for _mid, _latest in _mrows:
-                        model_options.append({
-                            "model_id": str(_mid),
-                            "display_name": _meta_map.get(str(_mid), ""),
-                            "has_signals_30d": bool(
-                                _latest is not None and _latest >= _recent_cut
-                            ),
-                        })
-                _model_options_cache.update({"v": model_options, "ts": time.time()})
+                # 注册表全量：未归档模型都应可选（含 status=candidate）。市场收口
+                # 在纯函数里做（CN 收 CN+CUSTOM，HK 收 HK+CUSTOM），CUSTOM 为通用池。
+                _reg_rows = (
+                    await _s.execute(
+                        _txt(
+                            "SELECT model_id, "
+                            "COALESCE(metadata_json->>'display_name', "
+                            "         metadata_json->>'model_name', '') AS display_name, "
+                            "COALESCE(metadata_json->>'market', '') AS market "
+                            "FROM qm_user_models "
+                            "WHERE tenant_id='default' "
+                            "AND status IS DISTINCT FROM 'archived' "
+                            "ORDER BY updated_at DESC NULLS LAST"
+                        )
+                    )
+                ).fetchall()
+                model_options = merge_model_options(
+                    ({"model_id": str(_r[0]), "latest": _r[1]} for _r in _mrows),
+                    (
+                        {
+                            "model_id": str(_r[0]),
+                            "display_name": _r[1] or "",
+                            "market": _r[2] or "",
+                        }
+                        for _r in _reg_rows
+                    ),
+                    recent_cut=_recent_cut,
+                    market_scope=_market_scope,
+                )
+                _model_options_cache[_market_scope] = {
+                    "v": model_options,
+                    "ts": time.time(),
+                }
         except Exception as exc:  # noqa: BLE001
             logger.warning("model options for list failed: %s", exc)
 
