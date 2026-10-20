@@ -312,12 +312,14 @@ def test_merge_fills_pg_days_after_file_history_ends_before_cutover():
     ]
 
 
-def test_merge_drops_file_line_when_seam_disagrees():
-    """迁移缺口造成的接缝断层：旧线不许拼到失真新线上（否则画出假断崖）。
+def test_merge_seam_disagrees_keeps_file_history_skips_pg_daily():
+    """迁移缺口造成的接缝断层：保留冻结点前的真实采样，跳过 PG 反推日线。
 
     2026-10-20 实测：pro 文件线末点 102,967.8 vs PG 首点 84,780.8（-17.7%）、
     glm 96,670.34 vs 85,334.34（-11.7%）——都是期初持仓未入 PG 账的迁移缺口，
-    不是市场波动。旧线整段弃用，曲线从 PG 可信段起；宁可少一段历史，不画假线。
+    不是市场波动。PG 日线是从今日账本反推的重建值，断层说明它的历史水平不可
+    信；旧线（冻结前分钟采样）保留，但中间不混入 PG 重建日线，直接连到当日
+    PG 尾点——两端都是真值，也不再把整段历史吞掉。
     """
     file_data = {
         "total": [],
@@ -339,8 +341,10 @@ def test_merge_drops_file_line_when_seam_disagrees():
     }
     pts = lf.merge_live_equity(file_data, pg_series)["agents"]["pro"]
 
-    assert [p["date"] for p in pts] == ["2026-09-29", "2026-09-30", "2026-10-20"]
-    assert pts[0]["value"] == 84780.8  # 不再出现 102,967.8 → 84,780.8 的断崖
+    # 旧线保留（左侧历史不再消失）；PG 反推日线（09-30）被跳过，避免把
+    # 不可信的重建值画成真实逐日曲线；当日 source=pg 的尾点仍然收尾。
+    assert [p["date"] for p in pts] == ["2026-09-11", "2026-09-29", "2026-10-20"]
+    assert pts[1]["value"] == 102967.8
     assert pts[-1]["ts"] == "2026-10-20T13:05:00+08:00"
 
 

@@ -26,9 +26,6 @@ export interface ChartLine {
   dashSegs?: [number, number][];
   /** 绝对金额线：不参与 pct 归一化，走右侧独立刻度（如分账合计 ¥30 万量级） */
   abs?: boolean;
-  /** 断口：这些时间点起是"跨非交易日"后的第一个采样点，线在此断开不与前点相连
-   *  （周末/法定节假日不画线；数据点仍在，tooltip 可见） */
-  gapStarts?: Set<number>;
   /** 成交标记：时间就近吸附到采样点，画买入 ▲（线下）/ 卖出 ▼（线上）小三角。
    *  用途：空仓段虚线转回实线的界点在全览（分钟级 900 点）下只有几像素宽，
    *  标记让「今天买回来了没有、几点买的」不放大也看得见（2026-09-11）。 */
@@ -57,8 +54,6 @@ export interface BenchLine {  id: string;
   label: string;
   color: string;
   points: { t: number; v: number }[]; // v 为指数点位
-  /** 断口（跨非交易日后的第一个点），同 ChartLine.gapStarts */
-  gapStarts?: Set<number>;
 }
 
 const margin = { top: 16, right: 16, bottom: 34, left: 62 };
@@ -222,8 +217,6 @@ const ChartStatic = memo(function ChartStatic({
             <Group opacity={hoverId != null ? (hl ? 1 : 0.35) : focus ? 0.55 : 0.9}>
               <Area
                 data={display.bench.points}
-                defined={(p: { t: number; v: number }) =>
-                  !display.bench?.gapStarts?.has(p.t)}
                 x={(p: { t: number; v: number }) => xScale(idxOf(p.t)) ?? 0}
                 y0={() => yScale(baseV) ?? 0}
                 y1={(p: { t: number; v: number }) => yScale(p.v) ?? 0}
@@ -232,8 +225,6 @@ const ChartStatic = memo(function ChartStatic({
               />
               <LinePath
                 data={display.bench.points}
-                defined={(p: { t: number; v: number }) =>
-                  !display.bench?.gapStarts?.has(p.t)}
                 x={(p) => xScale(idxOf(p.t)) ?? 0}
                 y={(p) => yScale(p.v) ?? 0}
                 stroke={display.bench.color}
@@ -260,7 +251,6 @@ const ChartStatic = memo(function ChartStatic({
             <Group key={l.id} opacity={hoverId != null ? (hl ? 1 : 0.35) : focusActive ? 1 : 0.45}>
               <Area
                 data={l.points}
-                defined={(p: { t: number; v: number }) => !l.gapStarts?.has(p.t)}
                 x={(p: { t: number; v: number }) => xScale(idxOf(p.t)) ?? 0}
                 y0={() => yOf(l, baseV) ?? 0}
                 y1={(p: { t: number; v: number }) => yOf(l, p.v) ?? 0}
@@ -271,14 +261,16 @@ const ChartStatic = memo(function ChartStatic({
                   空仓段 4 4 虚线，其余保持实线（或未聚焦时的 6 5 淡线） */}
               {((l.dashSegs && l.dashSegs.length) ? dashWindows(l.points.length, l.dashSegs) : [[0, l.points.length]])
                 .map(([s, e], k) => {
-                  const segPts = l.points.slice(s, e);
+                  // 相邻窗口多带一个点：窗口按 [start,end) 切，不重叠时每个
+                  // 实/虚边界都会少画一条线（整条线在切点处"断开"一格）；
+                  // 多带一点让边界线段至少被一侧画出，线始终连续。
+                  const segPts = l.points.slice(s, Math.min(e + 1, l.points.length));
                   if (!segPts.length) return null;
                   const dashed = !!l.dashSegs?.some(([a, b]) => s >= a && s <= b);
                   return (
                     <LinePath
                       key={`${l.id}-${k}`}
                       data={segPts}
-                      defined={(p: { t: number; v: number }) => !l.gapStarts?.has(p.t)}
                       x={(p) => xScale(idxOf(p.t)) ?? 0}
                       y={(p) => yOf(l, p.v) ?? 0}
                       stroke={l.color}
@@ -1030,17 +1022,6 @@ const legendChip = (active: boolean, color: string): React.CSSProperties => ({
   color: active ? '#fff' : '#555', fontSize: 11, cursor: 'pointer',
 });
 
-/** 相邻采样点自然日差 ≥2 = 中间隔了非交易日（周末/法定节假日）→ 线在此断开 */
-const dayFloor = (t: number) => Math.floor(t / 86400000);
-
-const gapStartsOf = (pts: { t: number }[]): Set<number> => {
-  const s = new Set<number>();
-  for (let i = 1; i < pts.length; i++) {
-    if (dayFloor(pts[i].t) - dayFloor(pts[i - 1].t) >= 2) s.add(pts[i].t);
-  }
-  return s;
-};
-
 /** 等距时间序列降采样（分钟净值 5k 点 → ≤900 点/线，SVG 渲染上限；保留首尾）。
  *  卡顿治理（2026-09-07）：4944 点 × N agent 线每 20s 全量重绘是主渲染瓶颈之一。 */
 export const MAX_CHART_POINTS = 900;
@@ -1062,8 +1043,7 @@ export const toChartLine = (
   points: EquityPoint[],
 ): ChartLine => {
   const pts = points.map((p) => ({ t: dayjs(p.date).valueOf(), v: p.equity }));
-  const gaps = gapStartsOf(pts);            // 断点基于全量序列判断（抽稀后相邻距会失真）
-  return { id, label, color, points: downsample(pts), gapStarts: gaps };
+  return { id, label, color, points: downsample(pts) };
 };
 
 /** dashSegs（[from,to] 含两端）→ 实/虚渲染窗口 [start,end) 列表（升序、首尾补齐）。
@@ -1094,12 +1074,10 @@ export const toBenchLine = (
 ): BenchLine | null => {
   if (!points.length) return null;
   const pts = points.map((p) => ({ t: dayjs(p.time).valueOf(), v: p.close }));
-  const gaps = gapStartsOf(pts);
   return {
     id: `bench-${label}`,
     label,
     color,
     points: downsample(pts),
-    gapStarts: gaps,
   };
 };
