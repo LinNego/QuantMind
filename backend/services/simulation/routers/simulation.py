@@ -14,6 +14,9 @@ from backend.services.simulation.services.simulation_manager import (
     require_sim_user_id,
 )
 from backend.services.simulation.services.ocr_service import SimulationOCRService
+from backend.services.simulation.services.position_metrics import (
+    compute_floating_pnl,
+)
 from backend.services.trade_shared.trade_config import settings
 from backend.shared.database_manager_v2 import get_db_manager
 from backend.shared.stock_utils import StockCodeUtil
@@ -560,6 +563,11 @@ async def get_simulation_account(
             account["position_count"] = len(_positions)
     except Exception:
         pass
+    # 未实现盈亏：与实盘账户契约同名同义（前端顶栏「浮动盈亏」卡直接消费）。
+    # 口径单源在 position_metrics；一行都定不了价时不写该键（缺失 ≠ 0.00）。
+    floating_pnl = compute_floating_pnl(account.get("positions"))
+    if floating_pnl is not None:
+        account["floating_pnl"] = floating_pnl
     account["total_return_ratio"] = (total_pnl / initial_equity) if initial_equity > 0 else 0.0
     # 日收益率（今日实时锚点，智能图表每日收益率用）
     account["daily_return_ratio"] = (today_pnl / day_open_equity) if day_open_equity > 0 else 0.0

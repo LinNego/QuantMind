@@ -132,16 +132,28 @@ const deriveFloatingPnl = (accountInfo: AccountInfo | null): number => {
   const explicitFloating = toFiniteNumber((accountInfo as any)?.floating_pnl, Number.NaN);
   if (Number.isFinite(explicitFloating)) return explicitFloating;
 
+  // 持仓有两种形态：实盘/组合快照是数组，模拟账户（/simulation/account）是
+  // dict[symbol, position]。只认数组时，模拟盘持仓再多也会恒显示 0.00。
   const raw = (accountInfo as any)?.positions;
-  const positions: any[] = Array.isArray(raw) ? raw : [];
+  const positions: any[] = Array.isArray(raw)
+    ? raw
+    : (raw && typeof raw === 'object' ? Object.values(raw) : []);
   if (positions.length === 0) return 0;
 
   return positions.reduce((sum: number, pos: any) => {
-    const volume = toFiniteNumber(pos.volume, 0);
-    const lastPrice = toFiniteNumber(pos.last_price ?? pos.price ?? pos.current_price, 0);
+    if (!pos || typeof pos !== 'object') return sum;
+    const volume = toFiniteNumber(pos.volume ?? pos.qty ?? pos.quantity ?? pos.total_volume, 0);
+    let lastPrice = toFiniteNumber(pos.last_price ?? pos.price ?? pos.current_price, 0);
     const costPrice = toFiniteNumber(pos.cost_price ?? pos.avg_cost ?? pos.avg_price ?? pos.cost, 0);
+    // 缺现价时用市值反推（模拟账户存量行可能只带 market_value）
+    if (lastPrice <= 0) {
+      const marketValue = toFiniteNumber(pos.market_value, 0);
+      lastPrice = volume > 0 && marketValue > 0 ? marketValue / volume : 0;
+    }
     if (volume <= 0 || lastPrice <= 0 || costPrice <= 0) return sum;
-    return sum + ((lastPrice - costPrice) * volume);
+    const side = String(pos.side ?? 'long').trim().toLowerCase();
+    const pnlPerShare = side === 'short' ? (costPrice - lastPrice) : (lastPrice - costPrice);
+    return sum + (pnlPerShare * volume);
   }, 0);
 };
 

@@ -159,6 +159,105 @@ describe('accountAdapter', () => {
     expect(view.initial_equity).toBe(75);
   });
 
+  it('should derive floating pnl from dict-shaped positions (simulation account)', () => {
+    // 事故（2026-10-20 模拟交易顶栏）：/simulation/account 的 positions 是
+    // dict[symbol, position]，且不返回顶层 floating_pnl —— 派生逻辑只认数组，
+    // 78 只持仓的浮动盈亏恒显示 0.00 / 0.00%。
+    const view = buildTradingTopBarAccountInfo(
+      {
+        total_asset: 1_032_736.63,
+        cash: 25_058.63,
+        market_value: 1_007_678,
+        position_count: 2,
+        positions: {
+          '002552.SZ': {
+            symbol: '002552.SZ',
+            volume: 500,
+            last_price: 41.66,
+            cost_price: 54.61,
+            market_value: 20_830,
+            side: 'long',
+          },
+          '300489.SZ': {
+            symbol: '300489.SZ',
+            volume: 100,
+            last_price: 231.53,
+            cost_price: 222,
+            market_value: 23_153,
+            side: 'long',
+          },
+        },
+      } as any,
+      null,
+    );
+
+    const expected = (41.66 - 54.61) * 500 + (231.53 - 222) * 100;
+    expect(view.floating_pnl).toBeCloseTo(expected);
+    expect(view.floating_pnl_percent).toBeCloseTo(expected / 1_007_678);
+    expect(view.position_count).toBe(2);
+  });
+
+  it('should invert floating pnl for short positions in dict shape', () => {
+    const view = buildTradingTopBarAccountInfo(
+      {
+        total_asset: 100_000,
+        cash: 60_000,
+        market_value: 40_000,
+        positions: {
+          'AAPL': {
+            symbol: 'AAPL',
+            volume: 100,
+            last_price: 90,
+            cost_price: 100,
+            side: 'short',
+          },
+        },
+      } as any,
+      null,
+    );
+
+    expect(view.floating_pnl).toBeCloseTo((100 - 90) * 100);
+  });
+
+  it('should fall back to market_value when a dict position has no last price', () => {
+    const view = buildTradingTopBarAccountInfo(
+      {
+        total_asset: 12_500,
+        cash: 2_500,
+        market_value: 10_000,
+        positions: {
+          '600000.SH': {
+            symbol: '600000.SH',
+            volume: 1_000,
+            cost_price: 9,
+            market_value: 10_000,
+            side: 'long',
+          },
+        },
+      } as any,
+      null,
+    );
+
+    expect(view.floating_pnl).toBeCloseTo((10_000 / 1_000 - 9) * 1_000);
+  });
+
+  it('should still derive floating pnl from array positions', () => {
+    const view = buildTradingTopBarAccountInfo(
+      {
+        total_asset: 12_500,
+        cash: 2_500,
+        market_value: 10_000,
+        positions: [
+          { volume: 1_000, last_price: 10, cost_price: 9 },
+          { volume: 500, last_price: 8, cost_price: 9 },
+        ],
+      } as any,
+      null,
+    );
+
+    expect(view.floating_pnl).toBeCloseTo(1_000 - 500);
+  });
+
   it('should derive initial equity from total asset minus total pnl even when baseline exists', () => {
     const view = buildTradingTopBarAccountInfo(
       {
