@@ -381,3 +381,316 @@ curl -s -H "$AUTH" "$BASE/api/v1/selection/score-calibration/{task_id}"
 | 跨模型对比 | 统一用百分位排名，不用原始分数 |
 | 想选最优模型 | 对比各模型校准结果 + 回测指标 |
 | 校准接口慢 | 减少 days 或 horizons，或缓存结果 |
+
+## 11. Top20 离线评估（选股准确性 / 容量 / 可投资性）
+
+用途：批量推理补齐后，评估「每个模型每日 Top20」在样本外（`split='test'`）的
+真实选股能力，并拆解 ST、板块、市值、流动性。与 §1-§10 的「单日信号解读」不同，
+这一节是**跨 19 个月、逐日 Top20 组合**的回测。
+
+脚本（本技能 `scripts/`）：
+
+| 脚本 | 作用 |
+|------|------|
+| `top20_model_eval.py` | 主评估：IC / Top20 超额 / 胜率 / 分位 / 组合年化回撤 / 容量；含等权融合与共识投票 |
+| `model_rank_corr.py` | 同日预测秩相关（Spearman），判断模型冗余、选融合成员 |
+| `top20_composition.py` | Top20 的 ST / 板块 / 市值 / ADV 拆解，及「非ST」「ADV≥0.5亿」变体 |
+
+运行（容器内，需 pandas/duckdb）：
+
+```bash
+docker cp skills/batch-inference-analysis/scripts/top20_model_eval.py quantmind:/tmp/
+docker cp skills/batch-inference-analysis/scripts/model_rank_corr.py quantmind:/tmp/
+docker cp skills/batch-inference-analysis/scripts/top20_composition.py quantmind:/tmp/
+
+docker exec -w /app quantmind python /tmp/top20_model_eval.py \
+  --output-dir /tmp/top20_eval_20261020
+docker exec -w /app quantmind python /tmp/top20_model_eval.py \
+  --output-dir /tmp/top20_eval_adv05 --min-adv-yi 0.5
+docker exec -w /tmp quantmind python /tmp/top20_composition.py \
+  --output-dir /tmp/top20_eval_20261020/composition
+```
+
+> `top20_composition.py` 会 `import top20_model_eval`，必须 `-w /tmp`（两个脚本
+> 同目录）。`--model-map` 是 `{model_id, model_type, horizon}` 的 JSON 列表；
+> 脚本自己拼 `pred_path = PRED_ROOT/<model_id>/pred.parquet`。
+
+口径（踩过的坑）：
+
+- `pred.parquet` 只取 `split='test'`；`trade_date` 是**数据日 T**，收益
+  `close(T+1+h)/close(T+1)-1`（前复权 `daily_forward`）。
+- 买入日用 `trade_mask.blocked_long` 剔除 T+1 涨停/停牌；`blocked_long` 不含 ST。
+- 组合每 h 个交易日等权换仓，往返成本 0.2%；换手 ~80-90%/期。
+- `daily_forward.amount` 单位是**万元**，转亿元 ×1e-4（脚本常量 `AMOUNT_TO_YI`）。
+- **`precision20`（与事后 Top20 重合率）不是模型好坏指标**：事后 Top20 被
+  涨停/北交所彩票票主导，模型命中率只有 0.1-0.6%、lift 0.3-1.6x，但 Top20
+  组合照样有 0.4-2.2%/期的超额。评价看 IC、Top20 超额、日胜率、年化、回撤。
+- **共识行（`ensemble_summary.csv` 的 `scope=consensus`）的 IC / `pct_med` /
+  `top_decile_rate` 是在共识子集内部算的**，不可与全市场口径比较；只有
+  `top_ret` / `top_excess` / `win_day` / `port_*` / `avg_selected` 有意义。
+- ST 名单来自 `instrument_detail` 的**当前快照**（静态），历史回测有前视；
+  实盘规则「不买 ST」本身是免费改进（见 composition 的「非ST」行）。
+- 1% ADV 容量 = 20 只 × 1% × ADV 中位。树模型 Top20 通常只有 700-900 万，
+  TFT 1800-3300 万，T+10 TCN 约 4800 万——容量是这类微盘模型最硬的约束。
+
+产出（`--output-dir`）：`REPORT.md`、`summary_common.csv`、`summary_yearly.csv`、
+`monthly_ic.csv`、`ensemble_summary.csv`、`top20_latest_T*.csv`、
+`composition/composition_T*.csv`、`model_rank_corr_T*.csv`。
+
+本次 13 模型（T+5/T+10）与 5 模型（T+20）的结论与选股设计见
+`data/reports/top20_eval_20261020/`。
+
+## 12. 共识阈值 / 周期 / 大盘过滤（2026-10-20 新增）
+
+用途：回答「按分数 > X 数票能不能共识」「T+5/T+10/T+20 哪个好」「加大盘过滤会不会更好」。
+脚本：`scripts/consensus_threshold_probe.py`（复用 `top20_model_eval.py` 的取数口径）。
+
+```bash
+docker cp skills/batch-inference-analysis/scripts/consensus_threshold_probe.py quantmind:/tmp/
+docker exec -w /tmp quantmind python /tmp/consensus_threshold_probe.py \
+  --model-map /tmp/model_map_31.json --horizon 10 \
+  --start 2025-02-01 --end 2026-08-31 --min-adv-yi 0.5 \
+  --output-dir /tmp/consensus_threshold_20261020 --memory 4GB --threads 2
+```
+
+结论（T+10，2025-02~2026-08，测试集）：
+
+- **统一绝对分数阈值不可用**：同一天 `pred>0.10`，RF 0 只、三棵树各 1 只，
+  LSTM 449、MLP 377。分数尺度不可比，固定阈值=让深模型垄断票数。
+- 可比的票 = 每个模型自己的当日 **Top20**（约 99.6 分位）。13 模型 Top20
+  投票 ≥3 票：16.7 只，每 10 日超额 0.798%，年化 41.3%，回撤 −17.5%。
+- 放宽到 P99：超额 0.814% 接近，但年化 30.9%、回撤 −22.0%；P95 更差
+  （0.621% / 27.1%）。**票的质量比票的数量重要**：Top20 的 3 票平均
+  1.64%/10d，P95 的 10 票反而更低。
+- T+10 优于 T+5（13 个模型里 12 个 IC 更高；T+5 2026 年化仅 0.4%）。
+  T+20 只有 5 个模型，Top20 ≥3 票只剩 8.3 只，不能做 13 模型共识；
+  单 CAT T+20 年化 49.7%、回撤 −13.0%，适合大资金单模型核心。
+- 大盘过滤（MA10/20/60、breadth20/60）全部把年化砍半（40.4%→14–25%），
+  只有 breadth20 风险调整后更好（21.3%/−3.9%），但 51% 时间空仓、样本里
+  只有一段熊市。**不作为核心规则。**
+- 过拟合警告：T+10 只有 39 个非重叠 10 日周期、2026 只有 16 个；本轮试了
+  51 个策略-周期配置 + 72 个过滤组合。P95 在 2025 年化 51.1%、2026 −0.4%，
+  就是阈值过拟合的样本。用 2025 设计、2026 验证、纸面跟踪 2–3 个周期再上真钱。
+
+产出：`threshold_grid.csv`（全变体）、`threshold_yearly.csv`（2025/2026）、
+`market_filter.csv`、`picks_*.csv`；本次结果已复制到
+`data/reports/top20_eval_20261020/threshold_20261020/`。
+
+## 13. 单票止损 / 移动止盈（2026-10-20 新增）
+
+用途：回答「-7% 止损 + 移动止盈能不能控回撤」「2025 vs 2026 是否都有效」。
+脚本：`scripts/stop_loss_probe.py`（读取第 12 节的 `picks_*.csv`，复用
+`top20_model_eval.py` 的 DuckDB / 成本口径）。
+
+```bash
+docker cp skills/batch-inference-analysis/scripts/stop_loss_probe.py quantmind:/tmp/
+docker exec quantmind python /tmp/stop_loss_probe.py \
+  --picks /tmp/consensus_threshold_20261020/picks_Top20投票_k=3.csv \
+  --strategy "Top20投票 k=3" --horizon 10 \
+  --out-dir /tmp/stop_trail_consensus
+```
+
+实现要点（改脚本前必读）：
+
+- 入场 = `buy_d` 收盘，持有 `horizon` 日；基线校验必须打印
+  `baseline fwd max abs diff`，正常应 <1e-15。
+- 停牌日（close NaN）用上一有效收盘前填，标记 `tradable=False`，当日不触发止损；
+  只有入场/到期价缺失才丢弃该笔。
+- 止损：`entry*(1-sl)`，日线 `low` 触发，跳空按 `open` 成交；
+  收盘模式只看 `close`，按当日收盘退出。
+- 移动止盈：浮盈 ≥ 激活线后启动，`high_water*(1-trail)` 触发；
+  high-water 当日只更新，次日才参与触发。
+- 提前卖出的现金留到下一次换仓，年化按等权组合计算（保守）；
+  年度指标在年内重新采样并重置换手，与全期不可相加。
+
+结论（Top20 投票 k=3，T+10，2025-02~2026-08）：
+
+- **-7% 固定止损不可用**：全期 41.3%→24.6%、回撤 -17.5%→-24.5%；
+  2025 74.2%→65.1%，2026 18.4%→**-1.9%**。叠加 +10%/5% 移动止盈后
+  2026 仍为 -4.2%。CAT / P95 两套口径同向。
+- 原因：22.0% 的持仓曾跌破 -7%，这批票持有到期平均 **-4.7%**，
+  止损卖在 -7.0%，单笔负期望 -2.3pp；-5%/-10%/-15% 各档同理
+  （`stop_minus_hold` 全为正）。2026 触发率 34.1% vs 2025 14.1%，
+  频率翻倍把 2026 拖到负收益。
+- 移动止盈单独用接近中性：+10%/5% 盘中 39.1%/-17.0%，收盘触发
+  41.8%/-18.3%（基线 41.3%/-17.5%）。+15%/3% 收盘 41.7%/-18.3%，
+  2025/2026 都不恶化，可作为轻量锁定盈利单的叠加，但不要期待增收益。
+- 回撤控制应放组合层（仓位、市场过滤、集中度），不要逐票固定百分比砍仓。
+
+产出：`stop_trail_grid.csv`、`stop_trail_yearly.csv`、
+`stop_trail_breach_counterfactual.csv`（跌破阈值的事后反事实）、
+`stop_trail_exit_diagnostics.csv`、`stop_trail_mfe_mae.csv`、逐笔 picks、
+`REPORT.md`；本次结果在
+`data/reports/top20_eval_20261020/stop_trail_20261020/`。
+
+## 14. 周度买卖：周一买 / 周五清仓（2026-10-20 新增）
+
+用途：回答「周一买、周五全平、下周一再买」这套周度节奏在 2025–2026 的表现，
+以及「能上实盘的是 T+5 还是 T+10」。**注意这与第 12 节的 10 日持有结论不同**：
+10 日持有下 T+10 共识最优（41.3%）；周度 4 日持有下共识要选 T+5，单模型选
+T+10 CAT。
+
+脚本：
+
+- `scripts/weekly_schedule_probe.py`：读第 12 节的 `picks_*.csv`，跑三个变体
+  「周一买/周五卖」「周一买/持 5 日」「双周买/持 10 日」，输出全期/年度。
+- `scripts/per_model_weekly.py`：读 `--model-map`（`{model_id, model_type,
+  horizon}` JSON），对 13 个 T+5 + 13 个 T+10 逐模型跑「周一买/周五卖」，
+  每个模型自己在 ADV≥0.5 亿池内取 Top20。
+
+```bash
+docker cp skills/batch-inference-analysis/scripts/weekly_schedule_probe.py quantmind:/tmp/
+docker cp skills/batch-inference-analysis/scripts/per_model_weekly.py quantmind:/tmp/
+docker exec -w /tmp quantmind python /tmp/weekly_schedule_probe.py \
+  --picks-t5 /tmp/consensus_threshold_T5_20261020/picks_Top20投票_k=3.csv \
+  --picks-t10 /tmp/consensus_threshold_20261020/picks_Top20投票_k=3.csv \
+  --picks-t5-cat /tmp/consensus_threshold_T5_20261020/picks_单CAT_ADV_Top20.csv \
+  --picks-t10-cat /tmp/consensus_threshold_20261020/picks_单CAT_ADV_Top20.csv \
+  --out-dir /tmp/weekly_schedule
+docker exec -w /tmp quantmind python /tmp/per_model_weekly.py \
+  --model-map /tmp/model_map_31.json \
+  --start 2025-02-01 --end 2026-08-31 \
+  --out-dir /tmp/per_model_weekly
+```
+
+口径 / 实现要点：
+
+- `week_windows(dates)` 按 ISO 年/周切分交易日，返回
+  `(signal_d=上一周最后一日, buy_d=本周第一日, sell_d=本周最后一日)`；
+  `signal_d` 通常是周五，`buy_d` 是周一，`sell_d` 是周五。
+- `build_rows(..., hold=0)`：`hold=0` 在 `sell_d` 收盘卖；`hold=5/10` 从
+  `buy_d` 起算第 5/10 个交易日卖。双周变体用 `windows[::2]`，保证资金不重叠。
+- `window_return`：区间内第一个有效收盘买入、最后一个有效收盘卖出；
+  少于 2 个有效点返回 NaN（停牌/退市）。
+- 等权、逐周转仓，成本 `0.2% × turnover`；`summarize` 的年化按每周期
+  5/252 年；`yearly_rows` 在年内重新采样并重置换手，**与全期不可相加**。
+- `per_model_weekly.py` 的 ADV 用 `amount` 20 日均值（`amount` 单位万元，
+  阈值 `5000` = 0.5 亿），在 ADV-ok 池内按 `pred` 排序取 Top20，再 join
+  `next_map` / `blocked_long` / `instrument_detail`；必须 `-w /tmp`（与
+  `top20_model_eval.py`、`weekly_schedule_probe.py` 同目录）。
+- 主结果**不剔除 ST**；`--drop-st` 用 `instrument_detail.IsSTGP` 当前快照，
+  历史回测属前视，**不要把 ex-ST 数字当历史证据**。
+
+结论（2025-02~2026-08，80–81 周）：
+
+- **单模型：T+10 CAT。** 周一收盘买 2025 21.2% / 2026 46.2%（全期 30.9%，
+  回撤 -16.8%）；周一开盘买 37.7% / 44.9%（全期 40.6%，回撤 -15.1%）；
+  约 19.8 只，ADV≥0.5 亿，容量约 1370 万。两年、两种买入价都为正。
+- **共识：T+5 共识，不是 T+10 共识。** 收盘买 19.2% / 18.0%（全期 18.7%）；
+  开盘买 40.4% / 28.4%（全期 35.3%）。T+10 共识只有 9.8% / 10.2%（收盘）、
+  34.2% / 22.7%（开盘）。但 T+5 共识 ADV 容量只有 700–900 万。
+- **T+5 CAT 不能上实盘**：2026 收盘 -4.3%、开盘 -0.9%，回撤 -22.7%~-24.0%。
+- **逐模型 T+10 只赢 6/13（2025 4/13、2026 6/13）**：树模型 CAT/XGB 受益于
+  T+10；NativeTFT/MLP/ALSTM/Transformer 在 T+5 更好；LSTM 两个周期都差。
+  没有全局「T+10 一定好」。
+- **4 日持有只捕获 T+10 的 45–59%**：T+5 的 4 日约等于其 5 日的 81%；
+  T+10 的 4 日只有其 10 日的 45–59%。T+10 CAT 赢是因为 2026 picks 更强
+  （4 日 0.53% vs T+5 CAT 0.10%），不是周期匹配。
+- **开盘买的大部分是市场 beta**：全市场等权周一开盘→收盘 2025 约 +0.54%/周、
+  2026 约 +0.19%/周，与 picks 的周一盘中同量级；小盘股开盘集合竞价容量有限，
+  保守预算用收盘买。
+- **周五信号本身翻转**：2025 周五信号是四策略里最差的星期几，2026 是最好的；
+  周度年度强弱带有星期几择时，2026 的 46% 不要外推。
+- **成本/集中度**：周换手 ~0.78，0.2% 往返每年拖 ~9pp；0.3% 时 T+10 CAT
+  25.9%、T+5 共识 14.0%。T+10 CAT 2026 最好 5 周 +47.5%，去掉后 28 周合计
+  -18.7%；2025 更均衡（最好 5 周 +16.9%，去掉后 +1.8%）。
+
+产出：`weekly_summary.csv`、`weekly_yearly.csv`、`open_entry_summary.csv`、
+`per_model_weekly_summary.csv`、`per_model_weekly_yearly.csv`、
+`cost_sensitivity.csv`、`term_structure.csv`、`weekday_signal.csv`、
+`monday_intraday.csv`；本次报告与 CSV 在
+`data/reports/top20_eval_20261020/周度买卖_20261020.md` 与
+`data/reports/top20_eval_20261020/weekly_20261020/`。
+
+## 15. 滚动持仓模拟：TopN × T+5/T+10 × 分数均值 + 每日替补（2026-10-20 新增）
+
+用途：回答「如果上实盘，2025–2026 怎么跑、Top20 还是 Top50、T+5 还是 T+10、
+1000 万怎么分、分数弱了怎么用替补滚动」。这是第 11–14 节的组合层收口：
+第 11 节看单模型 Top20 准确性，第 12 节看共识阈值，第 13 节看止损，第 14 节看
+周度节奏；本节把「每日可换 + 分数均值过滤 + 分数退出 + 等权 50 槽」放在一起跑。
+
+脚本：`scripts/rolling_portfolio_sim.py`（依赖同目录 `top20_model_eval.py`）。
+
+### 15.1 预注册口径
+
+- **综合分 S**：13 个同周期模型每日在 **ADV≥2000 万** 池内的截面百分位均值；
+  ≥8 个模型有分才有效（回测里恒 13，门槛从未触发，实盘保留作推理失败保护）。
+- **A**：该股过去 20 个交易日 S 的均值，**不含当日**，至少 10 个观测。
+- **入场**：`S_t >= A_t`；排序 `S_t` 降序；TopN（20 / 50）。
+- **执行**：t 收盘决策，**t+1 收盘**成交；买入日 `blocked_long` 跳过，
+  卖出日 `blocked_short` 顺延；卖出与买入同一收盘时点。
+- **持有**：H 个交易日（T+5 用 T+5 综合分，T+10 用 T+10 综合分）。
+- **提前退出**：`S_t < A_t - score_buffer`（默认 0.03）；可选收盘价止损。
+- **替补**：退出后的空位用当日符合条件的下一名补上，继续滚动，不空等。
+- **资金**：1000 万，N 个等权槽位；单票目标 `NAV*(1-2%)/N`；1% ADV 上限；
+  现金不足时部分成交。
+- **成本**：单边 0.1%（压力 0.15%）。
+- **建仓**：前 H 个交易日每天 `ceil(N/H)` 只，避免一次性全仓。
+
+### 15.2 运行
+
+```bash
+docker cp skills/batch-inference-analysis/scripts/rolling_portfolio_sim.py quantmind:/tmp/
+docker cp skills/batch-inference-analysis/scripts/top20_model_eval.py quantmind:/tmp/
+
+# 主网格 + 2025 Calmar 选优 + 扩展 + 容量
+docker exec -w /tmp quantmind python rolling_portfolio_sim.py \
+  --mode all --memory 4GB --threads 3 --out-dir /tmp/rolling_sim_full
+
+# 补充网格：min_hold / 无均值过滤 / Top20 止损 / Top50 最短持有
+docker exec -w /tmp quantmind python rolling_portfolio_sim.py \
+  --mode supp --memory 4GB --threads 3 --out-dir /tmp/rolling_supp2
+```
+
+- `pilot` 小样本冒烟；`main` 12 主配置；`supp` 补充网格；`all` = 主网格 →
+  **只用 2025 Calmar** 选优 → 扩展 + 容量。
+- 内存 4GB / 线程 3 是为了与回填等任务共存；单独跑可用 8GB / 4 线程。
+- 必须 `-w /tmp`，且 `top20_model_eval.py` 与脚本同目录。
+
+### 15.3 主结果（2025-02-19 ~ 2026-08-26，371 天，净 0.1% 单边）
+
+| 配置 | 2025 年化 | 2026 年化 | 全期年化 | 全期回撤 | Sharpe | Calmar |
+|---|---:|---:|---:|---:|---:|---:|
+| Top20 H5 分数 | 35.4% | 5.6% | 21.9% | -26.8% | 1.01 | 0.82 |
+| Top20 H10 分数 | 40.6% | 7.3% | 25.4% | -24.8% | 1.11 | 1.02 |
+| Top20 H10 分数+止损8 | 40.7% | 11.6% | 27.6% | -23.2% | 1.16 | 1.19 |
+| Top50 H5 分数 | 48.6% | 10.6% | 31.2% | -24.0% | 1.31 | 1.30 |
+| **Top50 H10 分数** | **58.7%** | **18.4%** | **40.2%** | **-23.8%** | **1.56** | **1.69** |
+| Top50 H10 时间 | 47.5% | 18.2% | 34.3% | -23.1% | 1.41 | 1.48 |
+
+- 推荐：**Top50 / T+10 / S≥20 日均值 / 分数退出 buffer 0.03 / 每日替补 /
+  1000 万 50 等权（每只约 19.6 万）/ 2% 现金 / 1% ADV**。
+- 基准（同池等权）：2025 37.45%、2026 -2.94%、全期 18.63%；策略超额
+  +21.28 / +21.33 / +21.58pp；alpha 年化 +21.3 / +20.8 / +18.8%
+  （Newey-West t 1.88 / 1.03 / 1.71）。
+- **Top50 > Top20**（6 个对照 5 胜；2026 18.4% vs 7.3%）；**T+10 > T+5**
+  （5/6 胜；换手 33.4x vs 56.9x，成本 6.6% vs 11.3%/年）。
+- 分数均值过滤 +6.0pp（2025 +11.3、2026 +0.5）；分数退出 +5.9pp
+  （2025 +11.3、2026 +0.2）；两者主要是 2025 的增益，2026 不伤害。
+- **大盘过滤明确有害**：2026 只有 1.8%；**extend/min_hold 不稳健**；
+  **价格止损非单调**（Top50 -6% 最优 41.2%，-8% 反而 39.1%；Top20 则 -8% 最优）。
+- 容量：50 万/500 万 41.6%、1000 万 40.2%、**2000 万 30.3%**、5000 万 30.4%、
+  1 亿 21.4%；**1000 万是 50 只等权的甜点，2000 万是悬崖**。
+- 诚实边界：2026 是半 OOS（选择规则只用 2025）；DSR 0.90；bootstrap 年化
+  95% 区间 [-7.7%, +109.5%]；2026 alpha t 1.0–1.3；2026 回撤 -23.8%、下行捕获
+  0.97；先模拟盘/小资金 1–3 个月，不要直接上 1000 万。
+
+### 15.4 产出
+
+`rolling_summary.csv`、`rolling_yearly.csv`、`rolling_robustness.csv`、
+`rolling_rank_stability.csv`、`model_capability.csv`、`nav_*.csv`、
+`trades_*.csv`、`supp_rolling_summary.csv`、`supp_rolling_yearly.csv`。
+本次报告：`data/reports/top20_eval_20261020/滚动实盘_20261020.md`；
+CSV：`data/reports/top20_eval_20261020/rolling_20261020/`。
+
+### 15.5 测试
+
+```bash
+docker cp skills/batch-inference-analysis/scripts/test_rolling_portfolio_sim.py quantmind:/tmp/
+docker exec -w /tmp quantmind python -m pytest test_rolling_portfolio_sim.py -q
+# 3 passed
+```
+
+- 宿主没有 scipy，测试必须在容器里跑。
+- 三个测试锁住：时间退出的成交日与净收益、`blocked_long` 顺延、分数退出。
+- 合成数据不碰数据库；改动 `simulate` 的时点/成本逻辑前后都要跑。
