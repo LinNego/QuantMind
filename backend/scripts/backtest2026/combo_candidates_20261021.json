@@ -1,0 +1,256 @@
+{
+  "schema_version": 1,
+  "frozen_at": "2026-10-21T12:00:00+00:00",
+  "market": "CN",
+  "description": "次日上涨命中率组合研究：16 个候选冻结配置。检验窗只看一次；C7/C12/C16 只用选择窗拟合。",
+  "feature_signature": {
+    "factor_schema_hash": "e405bd8c8f9e36ab575008664313f653db840b1e9064d1f5527c794a0de5c3a4",
+    "feature_count": 300,
+    "data_source": "quantdb_factors",
+    "factor_source": "l1_factors"
+  },
+  "horizons": {
+    "primary": 10,
+    "secondary": 5
+  },
+  "splits": {
+    "selection": ["2025-02-05", "2025-12-31"],
+    "validation": ["2026-01-05", "2026-04-30"],
+    "test": ["2026-05-06", "2026-08-26"]
+  },
+  "members": {
+    "T10": ["LGB", "XGB", "CAT", "TFT", "RF", "LIN", "MLP", "GRU", "LSTM", "ALSTM", "TAB", "TCN", "TRF"],
+    "T5": ["LGB", "XGB", "CAT", "TFT", "RF", "LIN", "MLP", "GRU", "LSTM", "ALSTM", "TAB", "TCN", "TRF"],
+    "tree5_T10": ["LGB", "XGB", "CAT", "RF", "TAB"],
+    "tree4_T10": ["LGB", "XGB", "CAT", "RF"],
+    "cross_family_T10": ["LGB", "XGB", "CAT", "TFT", "TAB"],
+    "xgb_cat_T10": ["XGB", "CAT"],
+    "tree5_T5": ["LGB", "XGB", "CAT", "RF", "TAB"]
+  },
+  "evaluation": {
+    "top_k": 50,
+    "secondary_top_k": 20,
+    "min_coverage_default": 8,
+    "min_listing_days": 60,
+    "cost_bps": 6,
+    "consensus_threshold": 0.7,
+    "consensus_min_count": 9
+  },
+  "bootstrap": {
+    "n_boot": 2000,
+    "block": "M",
+    "seed": 20261021
+  },
+  "rebalance": {
+    "capital": 10000000.0,
+    "top_k": 50,
+    "hold_days": 10,
+    "entry_per_day": 5,
+    "target_positions": 50,
+    "cash_buffer": 0.02,
+    "adv_participation": 0.01,
+    "exit_delta": 0.03,
+    "lookback": 20,
+    "min_lookback_days": 15,
+    "fee_rate": 0.0003
+  },
+  "report_reference": {
+    "source": "data/reports/top20_eval_20261020/滚动实盘_20261020.md",
+    "full_period_annual": 0.402,
+    "max_drawdown": -0.238,
+    "tolerance": 0.05
+  },
+  "candidates": [
+    {
+      "id": "C0_full13_T10",
+      "name": "全13·T+10 等权",
+      "horizon": 10,
+      "members": "T10",
+      "method": "mean",
+      "min_coverage": 8,
+      "purposes": ["next_day", "rebalance"],
+      "baseline": true
+    },
+    {
+      "id": "C1_full13_T5",
+      "name": "全13·T+5 等权",
+      "horizon": 5,
+      "members": "T5",
+      "method": "mean",
+      "min_coverage": 8,
+      "purposes": ["next_day"]
+    },
+    {
+      "id": "C2_tree5_T10",
+      "name": "树族5·T+10",
+      "horizon": 10,
+      "members": "tree5_T10",
+      "method": "mean",
+      "min_coverage": 4,
+      "purposes": ["next_day", "rebalance"]
+    },
+    {
+      "id": "C3_tree4_T10",
+      "name": "树族4·T+10",
+      "horizon": 10,
+      "members": "tree4_T10",
+      "method": "mean",
+      "min_coverage": 3,
+      "purposes": ["next_day", "rebalance"]
+    },
+    {
+      "id": "C4_consensus9_T10",
+      "name": "全13·共识≥9",
+      "horizon": 10,
+      "members": "T10",
+      "method": "mean",
+      "min_coverage": 9,
+      "purposes": ["next_day", "rebalance"]
+    },
+    {
+      "id": "C5_consensus11_T10",
+      "name": "全13·共识≥11",
+      "horizon": 10,
+      "members": "T10",
+      "method": "mean",
+      "min_coverage": 11,
+      "purposes": ["next_day", "rebalance"]
+    },
+    {
+      "id": "C6_xgb_cat_T10",
+      "name": "XGB+CAT·T+10",
+      "horizon": 10,
+      "members": "xgb_cat_T10",
+      "method": "mean",
+      "min_coverage": 2,
+      "purposes": ["next_day"]
+    },
+    {
+      "id": "C7_top4_sel_T10",
+      "name": "选择窗前4·T+10",
+      "horizon": 10,
+      "members": "T10",
+      "method": "mean",
+      "min_coverage": 3,
+      "purposes": ["next_day"],
+      "selection_rule": {
+        "kind": "top_n_by_selection_hit",
+        "n": 4,
+        "metric": "hit_exec_top50"
+      }
+    },
+    {
+      "id": "C8_cross_family_T10",
+      "name": "跨族5·T+10",
+      "horizon": 10,
+      "members": "cross_family_T10",
+      "method": "mean",
+      "min_coverage": 4,
+      "purposes": ["next_day", "rebalance"]
+    },
+    {
+      "id": "C9_mix_T10_T5",
+      "name": "T+10 + T+5 混合",
+      "horizon": 10,
+      "members": ["T10", "T5"],
+      "method": "mean",
+      "min_coverage": 16,
+      "purposes": ["next_day"]
+    },
+    {
+      "id": "C10_trimmed_T10",
+      "name": "全13·截尾均值",
+      "horizon": 10,
+      "members": "T10",
+      "method": "trimmed",
+      "trim": 2,
+      "min_coverage": 8,
+      "purposes": ["next_day", "rebalance"]
+    },
+    {
+      "id": "C11_median_T10",
+      "name": "全13·分位中位数",
+      "horizon": 10,
+      "members": "T10",
+      "method": "median",
+      "min_coverage": 8,
+      "purposes": ["next_day", "rebalance"]
+    },
+    {
+      "id": "C12_ic_weighted_T10",
+      "name": "全13·IC 加权",
+      "horizon": 10,
+      "members": "T10",
+      "method": "mean",
+      "min_coverage": 8,
+      "purposes": ["next_day", "rebalance"],
+      "weight_rule": {
+        "kind": "selection_ic",
+        "metric": "ic_next_day"
+      }
+    },
+    {
+      "id": "C13_single_xgb_T10",
+      "name": "单模型 XGB·T+10",
+      "horizon": 10,
+      "members": ["XGB"],
+      "method": "mean",
+      "min_coverage": 1,
+      "purposes": ["next_day", "rebalance"]
+    },
+    {
+      "id": "C14_tree5_T5",
+      "name": "树族5·T+5",
+      "horizon": 5,
+      "members": "tree5_T5",
+      "method": "mean",
+      "min_coverage": 4,
+      "purposes": ["next_day"]
+    },
+    {
+      "id": "C15_consensus_gate_T10",
+      "name": "全13·高共识门槛",
+      "horizon": 10,
+      "members": "T10",
+      "method": "mean",
+      "min_coverage": 8,
+      "consensus_gate": {
+        "threshold": 0.7,
+        "min_count": 9
+      },
+      "purposes": ["next_day", "rebalance"]
+    },
+    {
+      "id": "C16_meta_logit_T10",
+      "name": "元逻辑回归·T+10（探索）",
+      "horizon": 10,
+      "members": "T10",
+      "method": "meta_logit",
+      "min_coverage": 8,
+      "purposes": ["next_day"],
+      "exploratory": true,
+      "meta": {
+        "l2": 1.0,
+        "max_iter": 500
+      }
+    }
+  ],
+  "criteria": {
+    "min_hit_lift": 0.015,
+    "bootstrap_ci_lower_gt": 0.0,
+    "bh_q": 0.10,
+    "validation_delta_gt": 0.0,
+    "gate_annual_tolerance": 0.02,
+    "gate_drawdown_tolerance": 0.03,
+    "cost_bps": 6,
+    "min_monthly_win_ratio": 0.60,
+    "max_leave_one_out_delta": 0.01,
+    "max_ci_width": 0.04
+  },
+  "kill_criteria": {
+    "K-R1_min_coverage_ratio": 0.90,
+    "K-R2_max_ci_width": 0.04,
+    "K-R3_annual_tolerance": 0.05,
+    "K-R4_no_recommendation": true
+  }
+}
