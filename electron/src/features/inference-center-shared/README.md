@@ -25,12 +25,14 @@
 ```
 inference-center-shared/
 ├── adapter.tsx                        ★ InferenceCenterProvider / useInferenceCenter
-├── pages/InferenceCenterShell.tsx     ★ 顶栏 + 两个顶层 Tab 的完整状态机（约 1000 行）
+├── pages/InferenceCenterShell.tsx     ★ 顶栏 + 顶层 Tab 的完整状态机
+├── hooks/useComboWorkspace.ts         组合选股工作区状态（组合/榜单/滚动/计划加载）
 └── components/                        市场无关的展示组件
     ├── StockForecastChart.tsx         K 线 + P10/P50/P90 预测扇形（currencySymbol 参数化）
     ├── ModelScoreCurveGrid.tsx        多模型分数曲线小卡
     ├── FeatureDriversPanel.tsx        SHAP / 启发式因子归因
-    └── ModelConsensusPanel.tsx        多模型共识矩阵
+    ├── ModelConsensusPanel.tsx        多模型共识矩阵
+    └── combo/                         组合选股工作区（榜单/滚动/证据/调仓计划/补推弹窗）
 ```
 
 ## 适配器要提供什么
@@ -92,3 +94,32 @@ inference-center-shared/
   训练出第一个期货模型后本页自动可用，前端无需改动（见细案「激活清单」）。
 - **期货品种目录 = 热力图全集**，包含国内主力与上金所现货延期品种；点进无日K的品种
   （如部分 `Au(T+D)`）时 K 线区诚实报「未找到期货标的」404，不做假数据兜底。
+
+## 组合选股工作区（2026-10-21）
+
+- 入口：推理中心顶栏「组合选股」Tab（`components/combo/ComboWorkspace.tsx`），
+  数据全部走 `services/blendService.ts` → `/api/v1/models/blends/*`。
+- **组合（blend）≠ 融合模型（fusion）**：blend 只在推理时对成员模型的截面分位做加权合成，
+  **不训练新模型、不改写成员 `pred`**；成员必须同市场、同预测周期（horizon）。
+- 系统会自动给出「推荐/观察」候选组合（同签名分组 + 证据等级），也可以人工勾选同周期模型；
+  默认推荐口径来自 2026-10-21 的 13 个 T+10 模型研究。
+- 分数口径：组合分由成员 `rank_pct` 加权（可选 trim / consensus）得到；
+  展示层统一走 `researchScore`（0–100 截面分位），**缺失一律显示「—」，绝不显示成 0**。
+- **词表边界（合规）**：展示面只说位置——靠前/靠后/居中、新进/留存/退出；
+  不出现买入/卖出。调仓计划确认按钮明确写「仅纸面记录」，不产生任何委托。
+- 滚动建仓：最近 N+1 个交易日每日 TopK；`held_days` 只统计**本窗口内**连续在榜天数，
+  断榜后再次入选按「新进」计，不伪造连续持有。
+- 后端对应 `model_blend_service.py`（服务）与 `blend_engine.py`（纯函数）。
+  **路由必须注册在 `model_training` 的 `GET /{model_id}` 兜底之前**，否则 `/blends/*` 会被吞。
+- 窗口分有进程内 `_window_cache`（键含成员/权重/参数/截止日）；实测 13 模型 × 300 维下
+  冷启约 5.6s、热启 <1s，未另加 Redis 榜单缓存，避免缓存与推理快照错位。
+
+## 多模型串行补推（模型治理）
+
+- 入口：模型治理多选 → 「一键推理至最新日期」→ `components/combo/BackfillJobModal.tsx`。
+- 流程：预览摊开逐模型缺口/排除项/预估耗时 → 起 job → 弹窗按 2s 轮询
+  （页面隐藏时暂停）→ 终态清掉 `qm:inference:backfill-job` 并通知父级刷新模型列表。
+- 关掉弹窗任务继续跑；重开凭 localStorage 里的 job_id 恢复轮询。
+  取消语义是「当前交易日完成后停止」，按钮态如实显示「已请求取消」。
+- 服务端同一时间只允许一个活跃补推任务，heartbeat 过期可被回收；
+  逐日合并 `pred` 走 `pred_merge` 文件锁，单日失败隔离并计入「部分成功」，不中断整条链。
