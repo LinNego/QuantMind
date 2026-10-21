@@ -5,16 +5,20 @@
  * 不滚动时不可见（1920 实测 `offsetHeight - clientHeight === 0`），
  * `::-webkit-scrollbar` 与 `scrollbar-width` 都换不来常驻轨道。所以常驻轨道
  * 由 `RollingBuildPanel` 自己渲染（`combo-rolling-scrollbar`，滑块几何见
- * `scrollGeometry`），本文件只保留原生滚动的上色作为兜底（触控板/滚轮滚动）。
+ * `scrollGeometry`）。
+ *
+ * 2026-10-21：底部只允许一条横条。原生**横向**滚动条必须隐藏（否则与常驻轨道
+ * 叠成两条）；原生**纵向**滚动条保留，用于看板内部上下滚动。
+ * 注意 Chromium 一旦设置标准 `scrollbar-width` / `scrollbar-color` 就会忽略
+ * `::-webkit-scrollbar` 伪元素，所以这里改用纯 WebKit 伪元素控制两个轴。
  */
-.rolling-board-scroll {
-  scrollbar-width: thin; /* Firefox */
-  scrollbar-color: #94a3b8 #e2e8f0;
-}
-
 .rolling-board-scroll::-webkit-scrollbar {
   width: 10px;
-  height: 10px;
+  height: 0;
+}
+
+.rolling-board-scroll::-webkit-scrollbar:horizontal {
+  display: none;
 }
 
 .rolling-board-scroll::-webkit-scrollbar-track {

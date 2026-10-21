@@ -9,7 +9,7 @@
 import type { BlendRollingPerformance } from '../../../../services/blendTypes';
 import { formatAmount, formatReturnPct, returnToneClass } from './comboRankingModel';
 import { formatPct, formatSignedAmount, formatWinRate } from './periodReturnModel';
-import { formatDays, formatMultiple, formatRatio } from './portfolioMetricsModel';
+import { formatCount, formatDays, formatMultiple, formatRatio } from './portfolioMetricsModel';
 import type { MetricItem, MetricSection } from './PortfolioMetricsStrip';
 
 function benchmarkHint(performance: BlendRollingPerformance): string {
@@ -125,15 +125,22 @@ export function buildRollingMetricSections(
     {
       key: 'counts',
       label: '批次',
-      value: `${performance.batches}（结算 ${performance.settled_batches} · 浮动 ${performance.open_batches}）`,
-      hint: `已计价 ${performance.priced_batches} · 缺价 ${performance.unpriced_batches} · 部分缺价 ${performance.partial_batches}`,
+      // 字段缺失（旧后端 / 半截载荷）一律 `—`，绝不把 undefined 渲染到界面
+      value: `${formatCount(performance.batches)}（结算 ${formatCount(
+        performance.settled_batches,
+      )} · 浮动 ${formatCount(performance.open_batches)}）`,
+      hint: `已计价 ${formatCount(performance.priced_batches)} · 缺价 ${formatCount(
+        performance.unpriced_batches,
+      )} · 部分缺价 ${formatCount(performance.partial_batches)}`,
       testId: 'combo-rolling-batches',
     },
     {
       key: 'win',
       label: '批次胜率',
       value: formatWinRate(performance.win_rate_pct),
-      hint: `盈 ${performance.wins} / 亏 ${performance.losses} / 平 ${performance.flats}（仅已结算批次）`,
+      hint: `盈 ${formatCount(performance.wins)} / 亏 ${formatCount(
+        performance.losses,
+      )} / 平 ${formatCount(performance.flats)}（仅已结算批次）`,
     },
     {
       key: 'profit_factor',

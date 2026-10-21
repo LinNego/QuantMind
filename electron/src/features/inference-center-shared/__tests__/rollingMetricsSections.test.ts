@@ -114,6 +114,29 @@ describe('buildRollingMetricSections', () => {
     expect(ir?.value).toBe('—');
   });
 
+  it('旧后端缺少批次计数字段：显示 —，绝不渲染 undefined', () => {
+    const legacy = {
+      ...performance(),
+      batches: undefined,
+      settled_batches: undefined,
+      open_batches: undefined,
+      priced_batches: undefined,
+      unpriced_batches: undefined,
+      partial_batches: undefined,
+      wins: undefined,
+      losses: undefined,
+      flats: undefined,
+    } as unknown as BlendRollingPerformance;
+    const sections = buildRollingMetricSections(legacy);
+    const counts = find(sections, 'combo-rolling-batches');
+    expect(counts?.value).toBe('—（结算 — · 浮动 —）');
+    expect(String(counts?.hint)).not.toMatch(/undefined/);
+    const win = sections
+      .flatMap((section) => section.items)
+      .find((item) => item.key === 'win');
+    expect(String(win?.hint)).not.toMatch(/undefined/);
+  });
+
   it('合规：展示面不出现买卖字眼', () => {
     const text = JSON.stringify(buildRollingMetricSections(performance()));
     expect(text).not.toMatch(/买入|卖出|加仓|减仓|清仓/);
