@@ -138,6 +138,8 @@ def test_report_snapshot_hit_returns_scalars_and_window(qdb_root):
     assert meta["window"]["horizon"] == "fwd_ret_5"
     assert meta["stale"] is False
     assert meta["fallback_used"] == 0
+    # 新鲜快照不该挂「怎么重建」的提示：提示只在出问题时出现
+    assert meta["rebuild_hint"] is None
 
 
 @pytest.mark.unit
@@ -227,6 +229,12 @@ def test_stale_flag_for_old_snapshot(qdb_root):
 
     assert result["meta"]["stale"] is True
     assert result["meta"]["report_date"] == "2020-01-01"
+    # 过期提示必须给出**可执行**的下一步：快照是离线构建产物，日更数据
+    # 不会自动重建（用户 2026-10-21 现场：「我都更新最新了啊」）
+    hint = result["meta"]["rebuild_hint"]
+    assert hint and "重建快照" in hint
+    assert "因子研究" in hint
+    assert "数据同步" in hint
 
 
 @pytest.mark.unit

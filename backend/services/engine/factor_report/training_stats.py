@@ -315,6 +315,14 @@ def build_fields_stats(market: str | None, source_dataset: str, columns) -> dict
                 window=index.window,
                 stale=index.stale,
             )
+            if index.stale:
+                # 快照是离线构建产物：日更行情/因子数据**不会**重建它
+                # （构建入口在因子研究报告页）。这里必须说清楚，否则用户看到
+                # 「快照超过 30 天未更新」只能干瞪眼——数据明明已经更新过了。
+                meta["rebuild_hint"] = (
+                    "快照为离线构建产物，数据同步不会自动重建；"
+                    "可在「因子研究 → 因子报告」页点「重建快照」"
+                )
             for col in cols:
                 stat = index.factors.get(col)
                 if stat is not None:

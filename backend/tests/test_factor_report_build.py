@@ -90,6 +90,16 @@ def test_start_build_passes_registry_build_start(monkeypatch, tmp_path):
     assert (tmp_path / "report" / "build.pid").read_text().strip() == "4242"
 
 
+def test_l1_factors_rebuild_keeps_snapshot_window():
+    """l1_factors 的快照评估期自 20170103 起，注册表必须显式钉住起点。
+
+    缺 ``build_start`` 时一键重建走构建器默认 ``--years 5``：盘上 L1 数据自
+    2016 起，重建会把 2017–2021 静默砍掉，页面上的「评估期」从 2017 变成
+    2021 且无任何报错。构建器的注释只点名了 rd_mined，这里补上 l1_factors。
+    """
+    assert ds.DATASETS["l1_factors"].get("build_start") == "20170103"
+
+
 def test_start_build_short_circuits_when_already_running(monkeypatch, tmp_path):
     def no_popen(*a, **k):
         raise AssertionError("已在构建时不得再启动第二个子进程")

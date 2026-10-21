@@ -100,6 +100,10 @@ _CN_DATASETS: dict[str, dict] = {
         "library_rule": "fixed:factor_defs",
         "universe": "A股全市场 · 因子清单库（日频可复现因子）",
     },
+    # L1 快照评估期自 20170103 起（2016 年为因子回看暖机段，不纳入评估）。
+    # **必须显式 build_start**：盘上 L1 数据自 20160104 起，而构建器默认
+    # --years 5 会把 2017–2021 静默砍掉——一键重建后页面的「评估期」会从
+    # 2017 变成 2021，且全链无报错（2026-10-21 发现）。
     "l1_factors": {
         "label": "L1 因子（量价/换手/波动等基础因子）",
         "dir_parts": ("6_ml_datasets", "l1_factors"),
@@ -107,6 +111,7 @@ _CN_DATASETS: dict[str, dict] = {
         "meta_cols": _ID_COLS + _OHLCV_COLS,
         "library_rule": "fixed:L1",
         "universe": "A股全市场 · L1 因子（量价/换手/波动等基础因子）",
+        "build_start": "20170103",
     },
     "l2_factors": {
         "label": "L2 因子（逐笔微观结构，覆盖期短于 L1）",
