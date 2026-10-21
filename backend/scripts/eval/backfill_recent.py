@@ -335,7 +335,9 @@ def main() -> int:
             horizon=args.horizon,
             tenant_id=args.tenant,
             save=not args.dry_run,
-            runner=(None if args.dry_run else None),
+            # `--dry-run` 必须真的传下去：只在计划阶段返回，不调 runner、不写行、
+            # 不写序列侧车。此前这里漏传 dry_run 且 `runner` 恒 None，演练会真跑。
+            dry_run=args.dry_run,
         )
     )
     if args.dry_run:

@@ -25,7 +25,10 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
+
+from backend.shared import eval_trigger
 
 logger = logging.getLogger(__name__)
 
@@ -127,11 +130,22 @@ def _settle_done_marker(
     return "done_with_errors"
 
 
-async def run_eval_scores_once(*, save: bool = True) -> dict:
-    """执行一次六卡评分（手动重跑与 worker 共用同一入口），随后回填近期 pending。"""
+async def run_eval_scores_once(
+    *, save: bool = True, trade_date: str | None = None
+) -> dict:
+    """执行一次六卡评分（手动重跑与 worker 共用同一入口），随后回填近期 pending。
+
+    `trade_date` 只影响每日选股卡（按指定交易日评），其余卡仍是当日快照；
+    手动重跑传历史日期时不会把别的卡回退到过去。
+    """
     from backend.scripts.eval.run_all import run_all
 
-    summary = await run_all(save=save)
+    summary = await run_all(
+        trade_date,
+        save=save,
+        factor_top=_env_int("EVAL_FACTOR_TOP", 20),
+        strategy_limit=_env_int("EVAL_STRATEGY_LIMIT", 20),
+    )
     logger.info(
         "[EvalScores] 六卡完成：落分=%s 异常=%s 耗时=%ss",
         summary.get("total_scored"),
@@ -167,6 +181,83 @@ async def run_backfill_once() -> dict:
     return result
 
 
+async def handle_manual_run(client, request: dict) -> dict | None:
+    """消费一个手动重评请求：状态机（running → done/error）+ 跑批。
+
+    返回六卡 summary（失败 → None）。**不写当日 done 标记**：手动跑批可能发生在
+    16:00 前（数据未收盘），把它当定时跑会吞掉当天真正的 EOD。是否补写标记由
+    worker 循环按「已过定时点 + 六卡无异常」决定。
+    """
+    started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        eval_trigger.write_run_status(
+            client,
+            eval_trigger.build_run_status(
+                "running",
+                request=request,
+                started_at=started_at,
+                note="trade worker 已接手，正在重算六卡",
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - 状态写失败不阻止跑批
+        logger.warning("[EvalScores] 手动重评状态写入失败（running）: %s", exc)
+
+    logger.info(
+        "[EvalScores] 手动重评开始：request=%s date=%s",
+        request.get("request_id"),
+        request.get("date"),
+    )
+    try:
+        summary = await run_eval_scores_once(
+            save=True, trade_date=request.get("date")
+        )
+    except Exception as exc:  # noqa: BLE001 - 手动跑批失败落状态，不杀 worker
+        logger.error("[EvalScores] 手动重评失败: %s", exc, exc_info=True)
+        try:
+            eval_trigger.write_run_status(
+                client,
+                eval_trigger.build_run_status(
+                    "error",
+                    request=request,
+                    error=f"{type(exc).__name__}: {exc}",
+                    started_at=started_at,
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    backfill_errors = (summary.get("backfill") or {}).get("errors") or []
+    note = "六卡评分完成" + (
+        f"；回填 {len(backfill_errors)} 条异常（不阻塞六卡）" if backfill_errors else ""
+    )
+    try:
+        eval_trigger.write_run_status(
+            client,
+            eval_trigger.build_run_status(
+                "done",
+                request=request,
+                summary=summary,
+                started_at=started_at,
+                note=note,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[EvalScores] 手动重评状态写入失败（done）: %s", exc)
+    logger.info(
+        "[EvalScores] 手动重评完成：落分=%s 异常=%s 耗时=%ss",
+        summary.get("total_scored"),
+        summary.get("total_errors"),
+        summary.get("elapsed_sec"),
+    )
+    return summary
+
+
+def after_scheduled_time(now: datetime, hour: int, minute: int) -> bool:
+    """当前是否已过当日定时点（纯函数，便于单测）。"""
+    return (now.hour, now.minute) >= (int(hour), int(minute))
+
+
 async def run_eval_scores_worker() -> None:
     """常驻循环：每交易日到点后跑一次，成功写 Redis 当日标记；心跳入调度注册表。"""
     cfg = _config()
@@ -191,37 +282,86 @@ async def run_eval_scores_worker() -> None:
             now = datetime.now(TZ)
             date_str = now.strftime("%Y%m%d")
             client = _raw_client(get_trade_redis())
-            already = False
-            if client is not None:
-                try:
-                    already = bool(client.exists(_DONE_KEY.format(date=date_str)))
-                except Exception:  # noqa: BLE001
-                    already = False
-            if (
-                now.weekday() < 5
-                and (now.hour, now.minute) >= (target_h, target_m)
-                and not already
-            ):
-                summary = await run_eval_scores_once(save=True)
-                # 完成标记只看**六卡**异常：回填失败不该让整轮每分钟重跑一次六卡。
-                # 回填自带 21 天回看窗口，明天那一轮会把它一起补上（自愈）。
-                backfill_errors = (summary.get("backfill") or {}).get("errors") or []
-                if backfill_errors:
-                    logger.warning("[EvalScores] 回填未全部成功：%s", backfill_errors)
-                if client is not None:
+            if client is None:
+                # 没 Redis 既不能加锁也不能读写请求/完成标记；硬跑会在每轮循环里
+                # 重复重算六卡（旧实现的隐式行为）。明确跳过，下一轮再试。
+                logger.warning("[EvalScores] trade Redis 不可用：本轮跳过")
+            else:
+                lock_token = uuid.uuid4().hex
+                if not eval_trigger.acquire_run_lock(client, lock_token):
+                    logger.info("[EvalScores] 另一评分轮次持锁中，本轮跳过")
+                else:
                     try:
-                        outcome = _settle_done_marker(
-                            client, date_str, summary, cfg["max_attempts"]
-                        )
-                        if outcome == "done_with_errors":
-                            logger.warning(
-                                "[EvalScores] 连续 %s 轮存在异常，已达尝试预算：带错落当日"
-                                "完成标记，不再重跑（errors=%s）",
-                                cfg["max_attempts"],
-                                summary.get("errors"),
-                            )
-                    except Exception:  # noqa: BLE001
-                        pass
+                        manual = None
+                        try:
+                            manual = eval_trigger.consume_run_request(client)
+                        except Exception as exc:  # noqa: BLE001 - 坏请求不杀循环
+                            logger.warning("[EvalScores] 读取手动重评请求失败: %s", exc)
+
+                        if manual:
+                            summary = await handle_manual_run(client, manual)
+                            # 手动跑批只有「已过定时点 + 六卡无异常」才补当日完成
+                            # 标记；16:00 前的手动跑批绝不能吞掉真正的 EOD。
+                            if (
+                                summary is not None
+                                and int(summary.get("total_errors") or 0) == 0
+                                and after_scheduled_time(now, target_h, target_m)
+                            ):
+                                try:
+                                    _settle_done_marker(
+                                        client,
+                                        date_str,
+                                        summary,
+                                        cfg["max_attempts"],
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
+                        else:
+                            already = False
+                            try:
+                                already = bool(
+                                    client.exists(_DONE_KEY.format(date=date_str))
+                                )
+                            except Exception:  # noqa: BLE001
+                                already = False
+                            if (
+                                now.weekday() < 5
+                                and after_scheduled_time(now, target_h, target_m)
+                                and not already
+                            ):
+                                summary = await run_eval_scores_once(save=True)
+                                # 完成标记只看**六卡**异常：回填失败不该让整轮每分钟
+                                # 重跑一次六卡。回填自带 21 天回看窗口，明天那轮会补上。
+                                backfill_errors = (
+                                    summary.get("backfill") or {}
+                                ).get("errors") or []
+                                if backfill_errors:
+                                    logger.warning(
+                                        "[EvalScores] 回填未全部成功：%s",
+                                        backfill_errors,
+                                    )
+                                try:
+                                    outcome = _settle_done_marker(
+                                        client,
+                                        date_str,
+                                        summary,
+                                        cfg["max_attempts"],
+                                    )
+                                    if outcome == "done_with_errors":
+                                        logger.warning(
+                                            "[EvalScores] 连续 %s 轮存在异常，已达尝试"
+                                            "预算：带错落当日完成标记，不再重跑"
+                                            "（errors=%s）",
+                                            cfg["max_attempts"],
+                                            summary.get("errors"),
+                                        )
+                                except Exception:  # noqa: BLE001
+                                    pass
+                    finally:
+                        try:
+                            eval_trigger.release_run_lock(client, lock_token)
+                        except Exception:  # noqa: BLE001
+                            pass
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

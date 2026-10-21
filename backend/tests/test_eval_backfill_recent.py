@@ -152,3 +152,60 @@ def test_plan_backfill_end_to_end_on_yyyymmdd_bar_dates():
     # 08-31 之后 5 根 = horizon → 还差一根；09-01 之后 4 根 → 更不够
     assert counts == {"2026-08-31": 5, "2026-09-01": 4}
     assert plan_backfill(scored, counts, horizon=HORIZON) == []
+
+
+# ── CLI 接线（P0-1，2026-10-21）──────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_cli_passes_dry_run_and_never_injects_runner(monkeypatch):
+    """`--dry-run` 必须真的传到 `backfill_recent`，且不得注入 runner。
+
+    历史缺陷：CLI 用 `save=not args.dry_run` + `runner=(None if args.dry_run else None)`
+    ——`runner` 恒为 None，`dry_run` 根本没传；于是 `--dry-run` 仍走真实重跑分支
+    （写 eval_scores 与序列侧车），演练语义失效。
+    """
+    import importlib
+    import sys
+
+    mod = importlib.import_module("backend.scripts.eval.backfill_recent")
+    captured: dict = {}
+
+    async def fake_backfill(**kwargs):
+        captured.update(kwargs)
+        return {"errors": [], "note": "计划回填 0 天", "planned": 0}
+
+    monkeypatch.setattr(mod, "backfill_recent", fake_backfill)
+    monkeypatch.setattr(
+        sys, "argv", ["backfill_recent.py", "--dry-run", "--days", "7", "--horizon", "3"]
+    )
+
+    assert mod.main() == 0
+
+    assert captured["dry_run"] is True
+    assert captured["save"] is False
+    assert captured["days"] == 7
+    assert captured["horizon"] == 3
+    assert "runner" not in captured
+
+
+@pytest.mark.unit
+def test_cli_real_run_keeps_save_and_does_not_inject_runner(monkeypatch):
+    """非 dry-run：save=True，runner 仍由 `_runner_for` 内部决定（CLI 不硬塞）。"""
+    import importlib
+    import sys
+
+    mod = importlib.import_module("backend.scripts.eval.backfill_recent")
+    captured: dict = {}
+
+    async def fake_backfill(**kwargs):
+        captured.update(kwargs)
+        return {"errors": [], "note": "回填 0 条"}
+
+    monkeypatch.setattr(mod, "backfill_recent", fake_backfill)
+    monkeypatch.setattr(sys, "argv", ["backfill_recent.py"])
+
+    assert mod.main() == 0
+    assert captured["dry_run"] is False
+    assert captured["save"] is True
+    assert "runner" not in captured

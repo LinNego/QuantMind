@@ -75,7 +75,20 @@ async def _run_factor_card(save: bool, *, top: int, dataset: str) -> dict[str, A
     if save:
         for r in results:
             await _save_result(r)
-    return _score_summary(results)
+    summary = _score_summary(results)
+    # 覆盖元数据：本轮评了多少 / 总共多少 / 排名口径。卡上已有同一份，
+    # 汇总再抬一份是给 CLI 与调度日志看，不额外查库。
+    coverage = next(
+        (
+            (r.get("inputs_version") or {}).get("coverage")
+            for r in results
+            if isinstance(r.get("inputs_version"), dict)
+        ),
+        None,
+    )
+    if coverage:
+        summary["coverage"] = coverage
+    return summary
 
 
 async def _run_model_card(save: bool, *, limit: int = 50) -> dict[str, Any]:
@@ -133,10 +146,14 @@ async def _run_strategy_card(save: bool, *, limit: int) -> dict[str, Any]:
         score_strategy,
     )
 
+    limit = max(1, int(limit))
+    # 候选池留余量：结果文件被清理的历史行会被 skip，不能让它把名额吃掉。
+    candidate_limit = min(500, max(20, limit * 4))
+    candidates = await candidate_backtest_ids(limit=candidate_limit)
     results: list[dict[str, Any]] = []
     errors: list[str] = []
     skipped = 0
-    for backtest_id in await candidate_backtest_ids(limit=max(4, limit * 4)):
+    for backtest_id in candidates:
         if len(results) >= limit:
             break
         try:
@@ -157,6 +174,16 @@ async def _run_strategy_card(save: bool, *, limit: int) -> dict[str, Any]:
     summary = _score_summary(results)
     summary["skipped"] = skipped
     summary["errors"] = summary["errors"] + errors
+    # 覆盖元数据：候选 = 库里有结果文件的已完成回测；scored = 真正落分的条数；
+    # cap_reached = 是否被本卡上限截断（false 表示候选池已跑完，不是漏评）。
+    summary["coverage"] = {
+        "candidates": len(candidates),
+        "scored": len(results),
+        "skipped": skipped,
+        "limit": limit,
+        "candidate_limit": candidate_limit,
+        "cap_reached": len(results) >= limit,
+    }
     return summary
 
 
@@ -221,7 +248,7 @@ async def run_all(
     tenant: str = "default",
     factor_top: int = 20,
     factor_dataset: str = "alpha_library",
-    strategy_limit: int = 5,
+    strategy_limit: int = 20,
     account_window: int = 30,
 ) -> dict[str, Any]:
     """顺序跑六卡（单卡隔离）→ 汇总。返回结构含各卡计数与 errors。"""
@@ -280,6 +307,7 @@ async def _main_async(args) -> dict[str, Any]:
             save=not args.no_save,
             horizon=args.horizon,
             tenant=args.tenant,
+            factor_top=args.factor_top,
             strategy_limit=args.strategy_limit,
         )
     finally:
@@ -297,7 +325,18 @@ def main() -> int:
     parser.add_argument("--no-save", action="store_true", help="只评不落表（演练）")
     parser.add_argument("--horizon", type=int, default=5)
     parser.add_argument("--tenant", default="default")
-    parser.add_argument("--strategy-limit", type=int, default=5)
+    parser.add_argument(
+        "--factor-top",
+        type=int,
+        default=20,
+        help="因子卡按 |IC| 评前 N 个；0 = 全部（默认 20）",
+    )
+    parser.add_argument(
+        "--strategy-limit",
+        type=int,
+        default=20,
+        help="策略卡每轮最多评多少条已完成回测（默认 20）",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     summary = asyncio.run(_main_async(args))

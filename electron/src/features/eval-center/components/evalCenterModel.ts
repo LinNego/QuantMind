@@ -1,6 +1,6 @@
 /** 评估中心纯函数（评分卡展示模型；可单测，无副作用） */
 
-import type { EvalScoreRow } from '../types/evalCenter';
+import type { EvalRunStatus, EvalScoreRow } from '../types/evalCenter';
 
 export interface GradeMeta {
   label: string;
@@ -219,4 +219,86 @@ export function filterEvalRows(
     const haystack = `${row.object_id} ${row.display_name || ''} ${labels.primary} ${labels.secondary}`;
     return haystack.toLowerCase().includes(q);
   });
+}
+
+/**
+ * 本轮覆盖说明（P1，2026-10-21）：把「评了多少 / 总共多少 / 为什么只有这些」
+ * 从 `inputs_version.coverage` 翻成人话。没有覆盖元数据（老库/旧卡）→ null，
+ * 页面不显示——**绝不猜 0/0**。
+ */
+export function coverageNote(rows: EvalScoreRow[] | null | undefined): string | null {
+  const row = (rows || [])[0];
+  const raw = row?.inputs_version?.['coverage'];
+  if (!row || !raw || typeof raw !== 'object') return null;
+  const cov = raw as Record<string, unknown>;
+  const num = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+  if (row.object_type === 'strategy') {
+    const candidates = num(cov['candidates']);
+    const scored = num(cov['scored']);
+    if (candidates === null || scored === null) return null;
+    const skipped = num(cov['skipped']) ?? 0;
+    const limit = num(cov['limit']);
+    const cap =
+      cov['cap_reached'] === true
+        ? `（已达上限${limit !== null ? ` ${limit} 条` : ''}，未覆盖全部候选）`
+        : '（候选池已跑完）';
+    return `本轮候选 ${candidates} 条已完成回测，评分 ${scored} 条${
+      skipped > 0 ? `，跳过 ${skipped} 条` : ''
+    }${cap}`;
+  }
+
+  if (row.object_type === 'factor') {
+    const scored = num(cov['scored']);
+    const total = num(cov['total']);
+    if (scored === null || total === null) return null;
+    if (cov['selection'] === 'explicit') return '本轮为单因子评分（1/1）';
+    if (cov['all'] === true) return `本轮全量评分 ${scored} / ${total} 个因子`;
+    const requested = num(cov['requested_top']);
+    return `本轮按 |IC| 评前 ${scored} / 共 ${total} 个因子${
+      requested !== null ? `（上限 ${requested}）` : ''
+    }；全量重评用 CLI --factor-top 0`;
+  }
+
+  return null;
+}
+
+export interface RunStatusView {
+  label: string;
+  detail: string;
+  tone: 'running' | 'done' | 'error';
+  /** 是否应继续轮询（queued/running） */
+  active: boolean;
+}
+
+/** 手动重评状态 → 页面文案（idle → null，不渲染状态条）。 */
+export function runStatusView(
+  status: EvalRunStatus | null | undefined
+): RunStatusView | null {
+  if (!status || status.state === 'idle') return null;
+  if (status.state === 'queued') {
+    return { label: '排队中', detail: '等待 trade worker 消费', tone: 'running', active: true };
+  }
+  if (status.state === 'running') {
+    return { label: '评分中', detail: '六卡重算中，约 1–3 分钟', tone: 'running', active: true };
+  }
+  if (status.state === 'done') {
+    const scored = status.total_scored ?? 0;
+    const errors = status.total_errors ?? 0;
+    const rerun = status.backfill?.rerun;
+    const detail = `落分 ${scored}，异常 ${errors}${
+      typeof rerun === 'number' ? `；回填 ${rerun} 条` : ''
+    }`;
+    return { label: '已完成', detail, tone: 'done', active: false };
+  }
+  if (status.state === 'error') {
+    return {
+      label: '失败',
+      detail: status.errors?.[0] || status.note || '未知错误',
+      tone: 'error',
+      active: false,
+    };
+  }
+  return null;
 }

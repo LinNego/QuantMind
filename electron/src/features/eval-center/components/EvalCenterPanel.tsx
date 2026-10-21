@@ -15,30 +15,47 @@
  * 本文件只做编排，口径全在 `evalCenterModel` / `evalInsightModel` / `evalSeriesModel`。
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   AlertTriangle,
   Award,
   CalendarCheck,
+  CheckCircle2,
   Cpu,
   HeartPulse,
   Inbox,
   Landmark,
+  Loader2,
+  Play,
   RefreshCw,
   Search,
   Sigma,
   Target,
   Wallet,
+  XCircle,
 } from 'lucide-react';
 import {
   getEvalObjectTypes,
+  getEvalRunStatus,
   getScoreHistory,
   getStrategyHealth,
   listScores,
+  requestEvalRun,
 } from '../services/evalCenterService';
-import type { EvalObjectType, EvalScoreRow, StrategyHealthArchive } from '../types/evalCenter';
-import { filterEvalRows, parseObjectDeepLink } from './evalCenterModel';
+import type {
+  EvalObjectType,
+  EvalRunStatus,
+  EvalScoreRow,
+  StrategyHealthArchive,
+} from '../types/evalCenter';
+import {
+  coverageNote,
+  filterEvalRows,
+  parseObjectDeepLink,
+  runStatusView,
+} from './evalCenterModel';
+import { useAppSelector } from '../../../store';
 import { useUiMode } from '../../shared/useUiMode';
 import { SelfHealthUpload } from './SelfHealthUpload';
 import { EvalOverviewBand } from './EvalOverviewBand';
@@ -88,6 +105,13 @@ export const EvalCenterPanel: React.FC = () => {
   const [query, setQuery] = useState('');
   /** 徽章深链待选中对象：等该类型榜单落地后再点中（榜单在途时 selectedId 无处可指） */
   const [pendingSelect, setPendingSelect] = useState<{ type: string; id: string } | null>(null);
+  /** 手动重评（管理员）：排队 → worker 消费 → done/error，状态面只读后端契约 */
+  const isAdmin = useAppSelector((state) => Boolean(state.auth.user?.is_admin));
+  const [runStatus, setRunStatus] = useState<EvalRunStatus | null>(null);
+  const [runBusy, setRunBusy] = useState(false);
+  const [runError, setRunError] = useState('');
+  const [confirmRun, setConfirmRun] = useState(false);
+  const runView = useMemo(() => runStatusView(runStatus), [runStatus]);
 
   // 徽章深链（?object=model&object_id=…）：面板已挂载时再次点徽章也生效（searchParams 变化触发）
   const [searchParams] = useSearchParams();
@@ -106,10 +130,31 @@ export const EvalCenterPanel: React.FC = () => {
     }
   };
 
+  const refreshRunStatus = useCallback(async () => {
+    try {
+      const resp = await getEvalRunStatus();
+      setRunStatus(resp?.data || null);
+    } catch (err: unknown) {
+      setRunError(errorText(err));
+    }
+  }, []);
+
   useEffect(() => {
     void loadObjectTypes();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 管理员进页先读一次最近状态（可能是上一轮刚跑完的 done/error）
+  useEffect(() => {
+    if (isAdmin) void refreshRunStatus();
+  }, [isAdmin, refreshRunStatus]);
+
+  // 排队/评分中每 5s 轮询；done/error 自动停（状态条保留，可手动关闭）
+  useEffect(() => {
+    if (!isAdmin || !runView?.active) return;
+    const timer = window.setInterval(() => void refreshRunStatus(), 5000);
+    return () => window.clearInterval(timer);
+  }, [isAdmin, runView?.active, refreshRunStatus]);
 
   useEffect(() => {
     const ot = deepLink?.objectType;
@@ -177,6 +222,31 @@ export const EvalCenterPanel: React.FC = () => {
     }
   };
 
+  // 手动重评完成 → 自动刷新榜单（保留选中）；只在状态跨到 done 时触发
+  useEffect(() => {
+    if (runStatus?.state === 'done' && activeType) {
+      void loadRows(activeType, { keepSelection: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runStatus?.state]);
+
+  const startRun = async () => {
+    setRunBusy(true);
+    setRunError('');
+    try {
+      const resp = await requestEvalRun();
+      setRunStatus(resp?.data?.status || null);
+      setConfirmRun(false);
+    } catch (err: unknown) {
+      setRunError(errorText(err));
+      setConfirmRun(false);
+      // 409（已有排队/执行中）等场景：把后端当前状态拉回来，状态条比错误条更准
+      void refreshRunStatus();
+    } finally {
+      setRunBusy(false);
+    }
+  };
+
   const loadDetail = async (type: string, objectId: string) => {
     try {
       if (type === 'strategy_health') {
@@ -206,6 +276,7 @@ export const EvalCenterPanel: React.FC = () => {
   };
 
   const visibleRows = useMemo(() => filterEvalRows(rows, query), [rows, query]);
+  const coverage = useMemo(() => coverageNote(rows), [rows]);
 
   const selectedRow = useMemo(
     () => rows.find((r) => r.object_id === selectedId) || null,
@@ -223,17 +294,116 @@ export const EvalCenterPanel: React.FC = () => {
           <h2 className="text-lg font-bold text-slate-800">评估中心</h2>
           <p className="text-[11px] text-slate-400">每日收盘自动评分 · 回测完成自动体检</p>
         </div>
-        <button
-          type="button"
-          onClick={() => void refresh()}
-          disabled={loading}
-          title="重取类型表与榜单（保留当前选中对象）"
-          className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-        >
-          <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-          刷新
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          {isAdmin &&
+            (confirmRun ? (
+              <div className="flex items-center gap-1.5 rounded-xl border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] text-amber-800">
+                <span>重算六卡约 1–3 分钟</span>
+                <button
+                  type="button"
+                  onClick={() => void startRun()}
+                  disabled={runBusy}
+                  className="rounded-lg bg-amber-600 px-2 py-0.5 font-bold text-white hover:bg-amber-700 disabled:opacity-50"
+                >
+                  开始
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmRun(false)}
+                  disabled={runBusy}
+                  className="rounded-lg px-2 py-0.5 text-amber-800 hover:bg-amber-100 disabled:opacity-50"
+                >
+                  取消
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  setRunError('');
+                  setConfirmRun(true);
+                }}
+                disabled={runBusy || Boolean(runView?.active)}
+                title="管理员：立即重算六卡与每日选股回填（由 trade worker 执行）"
+                className="inline-flex items-center gap-1 rounded-xl border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs text-blue-700 hover:bg-blue-100 disabled:opacity-50"
+              >
+                {runBusy || runView?.active ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Play className="w-3.5 h-3.5" />
+                )}
+                {runView?.active ? runView.label : '立即重评'}
+              </button>
+            ))}
+          <button
+            type="button"
+            onClick={() => void refresh()}
+            disabled={loading}
+            title="重取类型表与榜单（保留当前选中对象）"
+            className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+            刷新
+          </button>
+        </div>
       </div>
+
+      {/* 手动重评状态条：排队/评分中持续可见，done/error 可关闭 */}
+      {runView && (
+        <div
+          className={`flex items-start gap-2 rounded-2xl border p-3 text-xs ${
+            runView.tone === 'error'
+              ? 'border-rose-200 bg-rose-50 text-rose-800'
+              : runView.tone === 'done'
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                : 'border-blue-200 bg-blue-50 text-blue-800'
+          }`}
+        >
+          {runView.tone === 'running' ? (
+            <Loader2 className="w-4 h-4 mt-0.5 shrink-0 animate-spin" />
+          ) : runView.tone === 'done' ? (
+            <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
+          ) : (
+            <XCircle className="w-4 h-4 mt-0.5 shrink-0" />
+          )}
+          <div className="min-w-0 flex-1">
+            <span className="font-bold">手动重评 · {runView.label}</span>
+            <span className="ml-2">{runView.detail}</span>
+            {runStatus?.note && (
+              <div className="mt-0.5 text-[11px] opacity-80">{runStatus.note}</div>
+            )}
+            {runStatus?.state === 'error' &&
+              (runStatus.errors || []).length > 1 && (
+                <div className="mt-0.5 text-[11px] opacity-80">
+                  {(runStatus.errors || []).slice(1, 3).join('；')}
+                </div>
+              )}
+          </div>
+          {!runView.active && (
+            <button
+              type="button"
+              onClick={() => setRunStatus(null)}
+              className="shrink-0 rounded-lg px-2 py-0.5 text-[11px] hover:bg-white/60"
+            >
+              关闭
+            </button>
+          )}
+        </div>
+      )}
+
+      {runError && (
+        <div className="flex items-start gap-2 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+          <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span className="flex-1">{runError}</span>
+          <button
+            type="button"
+            onClick={() => setRunError('')}
+            className="shrink-0 rounded-lg px-2 py-0.5 text-[11px] hover:bg-amber-100"
+          >
+            关闭
+          </button>
+        </div>
+      )}
 
       {/* 类型页签（图标 + 胶囊；短名，全称在悬停里） */}
       <div className="flex w-fit max-w-full flex-wrap items-center gap-1 rounded-full border border-slate-200 bg-slate-100 p-0.5">
@@ -256,6 +426,13 @@ export const EvalCenterPanel: React.FC = () => {
           );
         })}
       </div>
+
+      {/* 本轮覆盖说明（P1）：只显示后端写入的 coverage，不猜 0/0 */}
+      {coverage && (
+        <div className="rounded-xl border border-slate-200/80 bg-slate-50 px-3 py-1.5 text-[10px] leading-relaxed text-slate-500">
+          {coverage}
+        </div>
+      )}
 
       {/* 榜单已有数据时的局部错误（如下钻详情失败）：顶部横幅提示；整榜失败走下方错误态块 */}
       {error && rows.length > 0 && (
@@ -285,7 +462,7 @@ export const EvalCenterPanel: React.FC = () => {
           <div className="space-y-4">
             <div className="flex flex-col items-center gap-2 rounded-2xl border border-slate-200/80 bg-slate-50 p-6 text-center text-sm text-slate-500">
               <HeartPulse className="w-8 h-8 text-slate-300" />
-              暂无体检留档（回测完成后自动生成；月度复检每月留档）——下方可直接自助体检：
+              暂无体检留档：留档只覆盖托管策略（有 strategies 行的回测），模板型/未关联策略的回测体检请到回测中心查看——下方可直接自助体检：
             </div>
             <SelfHealthUpload />
           </div>

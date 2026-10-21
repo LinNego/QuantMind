@@ -736,3 +736,127 @@ async def test_run_all_e2e_no_save():
     if summary["total_scored"] == 0:
         pytest.skip("环境无可用评分数据")
     assert summary["elapsed_sec"] > 0
+
+
+# ── 覆盖元数据（P1，2026-10-21）──────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_select_factor_names_default_all_and_explicit():
+    """默认 20 / `top<=0` = 全部 / 超总数收敛 / 显式单因子。
+
+    旧实现 `int(top or 20)` 把 0 当 20——显式全量根本做不到。
+    """
+    import pandas as pd
+
+    from backend.scripts.eval.factor_card import (
+        DEFAULT_FACTOR_TOP,
+        select_factor_names,
+    )
+
+    df = pd.DataFrame(
+        {
+            "factor": [f"f{i}" for i in range(25)],
+            "ic": [0.01 * (i + 1) for i in range(25)],
+        }
+    )
+
+    names, total, requested = select_factor_names(df, top=None)
+    assert (len(names), total, requested) == (DEFAULT_FACTOR_TOP, 25, 20)
+
+    names, total, requested = select_factor_names(df, top=0)
+    assert (len(names), total, requested) == (25, 25, 0)
+    assert names[0] == "f24"  # |IC| 最大在前
+
+    names, total, requested = select_factor_names(df, top=100)
+    assert (len(names), total, requested) == (25, 25, 100)
+
+    names, total, requested = select_factor_names(df, factor="f3", top=0)
+    assert (names, total, requested) == (["f3"], 1, 1)
+
+
+@pytest.mark.unit
+def test_score_factors_writes_coverage_on_every_card(monkeypatch):
+    """覆盖元数据必须随卡落 `inputs_version.coverage`（页面据此解释 20/429）。"""
+    import pandas as pd
+
+    import backend.scripts.eval.factor_card as factor_card
+
+    df = pd.DataFrame(
+        {
+            "factor": [f"f{i}" for i in range(25)],
+            "date": [20260901] * 25,  # 生产 schema：date 为 int（可转 float）
+            "ic": [0.01 * (i + 1) for i in range(25)],
+        }
+    )
+    monkeypatch.setattr(factor_card, "_load_dataset", lambda _ds: (df, {}))
+    monkeypatch.setattr(factor_card, "_pfs_for", lambda *a, **k: ({}, {"note": "skip"}))
+    monkeypatch.setattr(
+        factor_card, "save_series", lambda *a, **k: {"written": False, "bytes": 0, "note": ""}
+    )
+
+    cards = factor_card.score_factors("toy", top=None)
+    assert len(cards) == 20
+    cov = cards[0]["inputs_version"]["coverage"]
+    assert cov["scored"] == 20 and cov["total"] == 25
+    assert cov["requested_top"] == 20 and cov["all"] is False
+    assert cov["rank_by"] == "abs_mean_ic"
+
+    all_cards = factor_card.score_factors("toy", top=0)
+    assert len(all_cards) == 25
+    assert all_cards[0]["inputs_version"]["coverage"]["all"] is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_run_strategy_card_coverage_cap_and_skips(monkeypatch):
+    """策略卡覆盖：候选数、落分数、跳过数、是否被上限截断。"""
+    import backend.scripts.eval.run_all as run_all
+    import backend.scripts.eval.strategy_card as strategy_card
+
+    async def fake_candidates(*, limit):
+        assert limit >= 20
+        return ["b1", "b2", "b3"]
+
+    async def fake_score(*, backtest_id):
+        if backtest_id == "b1":
+            return {"object_type": "strategy", "object_id": "b1", "score": 80.0}
+        if backtest_id == "b2":
+            return {"error": "结果文件已清理", "skipped": True}
+        return {"object_type": "strategy", "object_id": "b3", "score": 70.0}
+
+    monkeypatch.setattr(strategy_card, "candidate_backtest_ids", fake_candidates)
+    monkeypatch.setattr(strategy_card, "score_strategy", fake_score)
+
+    summary = await run_all._run_strategy_card(save=False, limit=2)
+    cov = summary["coverage"]
+    assert cov == {
+        "candidates": 3,
+        "scored": 2,
+        "skipped": 1,
+        "limit": 2,
+        "candidate_limit": 20,
+        "cap_reached": True,
+    }
+    assert summary["n"] == 2 and summary["skipped"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_run_strategy_card_cap_not_reached_when_pool_exhausted(monkeypatch):
+    """候选池跑完但没到上限：cap_reached=False（是没更多候选，不是漏评）。"""
+    import backend.scripts.eval.run_all as run_all
+    import backend.scripts.eval.strategy_card as strategy_card
+
+    async def fake_candidates(*, limit):
+        return ["b1", "b2"]
+
+    async def fake_score(*, backtest_id):
+        return {"object_type": "strategy", "object_id": backtest_id, "score": 70.0}
+
+    monkeypatch.setattr(strategy_card, "candidate_backtest_ids", fake_candidates)
+    monkeypatch.setattr(strategy_card, "score_strategy", fake_score)
+
+    summary = await run_all._run_strategy_card(save=False, limit=20)
+    assert summary["coverage"]["scored"] == 2
+    assert summary["coverage"]["cap_reached"] is False

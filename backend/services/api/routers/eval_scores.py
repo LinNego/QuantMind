@@ -20,8 +20,10 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
-from backend.services.api.user_app.middleware.auth import get_current_user
+from backend.services.api.user_app.middleware.auth import get_current_user, require_admin
+from backend.shared import eval_trigger
 from backend.shared.database_manager_v2 import get_session
 from backend.shared.market_labels import MARKET_LABELS
 
@@ -754,6 +756,96 @@ async def object_series(
             "version": loaded["version"],
         },
     }
+
+
+class EvalRunRequest(BaseModel):
+    """手动重评请求体；`date` 只影响每日选股卡（其余卡仍是当日快照）。"""
+
+    date: str | None = None
+
+
+def _trade_redis():
+    """trade 库（db2）客户端——与 worker 读请求键必须同库，否则结构性空转。"""
+    from backend.services.trade_shared.redis_client import get_redis as get_trade_redis
+
+    return get_trade_redis()
+
+
+@router.post("/run")
+async def trigger_eval_run(
+    payload: EvalRunRequest | None = None,
+    current_user: dict = Depends(require_admin),
+) -> dict[str, Any]:
+    """手动重评（管理员）：写 Redis 指令，由 trade worker 消费。
+
+    不在 API 进程跑评分：模型卡/因子 PFS 是百秒级 pandas/parquet 重活，会把交易
+    HTTP 全部卡死（2026-10-20 看门狗崩溃循环的根因）。这里只做三件事：参数校验、
+    去重、写 `eval:run:request`。
+    """
+    if not eval_trigger.eval_worker_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "eval_worker_disabled",
+                "message": "评分 worker 已关闭（EVAL_SCORES_WORKER_ENABLED=0），手动重评不会被消费",
+            },
+        )
+    raw_date = payload.date if payload is not None else None
+    try:
+        date_str = eval_trigger.validate_run_date(raw_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        req = eval_trigger.request_run(
+            _trade_redis(),
+            requested_by=current_user.get("user_id"),
+            tenant_id=current_user.get("tenant_id") or "default",
+            date_str=date_str,
+        )
+    except eval_trigger.EvalRunBusy as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "eval_run_busy",
+                "message": "已有评估重评在排队或执行，请等待完成",
+                "status": exc.status,
+            },
+        ) from exc
+    except eval_trigger.EvalRunUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "eval_trigger_unavailable",
+                "message": "trade Redis 不可用，无法排队；请检查 Redis 连接",
+            },
+        ) from exc
+
+    return {
+        "success": True,
+        "data": {
+            "request": req,
+            "status": eval_trigger.build_run_status("queued", request=req),
+        },
+    }
+
+
+@router.get("/run/status")
+async def eval_run_status(
+    current_user: dict = Depends(require_admin),
+) -> dict[str, Any]:
+    """最近一次手动重评状态；无记录 → `idle`（不是 404，前端不必判空）。"""
+    try:
+        status = eval_trigger.read_run_status(_trade_redis())
+    except eval_trigger.EvalRunUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "eval_trigger_unavailable",
+                "message": "trade Redis 不可用，无法读取重评状态",
+            },
+        ) from exc
+    return {"success": True, "data": status}
 
 
 @router.get("/object-types")

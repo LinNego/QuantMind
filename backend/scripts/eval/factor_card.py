@@ -315,6 +315,34 @@ def _parse_correlation(raw: Any) -> tuple[list[str], list[list[Any]]]:
     return [str(n) for n in names], matrix
 
 
+#: EOD 默认只评 |mean IC| 前 N 个因子（PFS 取数成本高；全量是显式动作）
+DEFAULT_FACTOR_TOP = 20
+
+
+def select_factor_names(
+    df: Any, *, factor: str | None = None, top: int | None = None
+) -> tuple[list[str], int, int]:
+    """选出本轮要评的因子 → `(names, total, requested_top)`（纯函数）。
+
+    - 显式 `factor`：只评这一个，`total=1`（覆盖元数据仍写 1/1）；
+    - `top is None`：默认 20（EOD 预算，保持既有行为）；
+    - `top <= 0`：**全部**（显式全量；旧实现 `int(top or 20)` 把 0 当成 20）；
+    - `top > 0`：`min(top, total)`。
+    """
+    if factor:
+        return [str(factor)], 1, 1
+    means = (
+        df.groupby("factor", observed=True)["ic"]
+        .mean()
+        .abs()
+        .sort_values(ascending=False)
+    )
+    total = int(len(means))
+    requested_top = DEFAULT_FACTOR_TOP if top is None else int(top)
+    limit = total if requested_top <= 0 else min(requested_top, total)
+    return [str(n) for n in means.index[:limit]], total, requested_top
+
+
 def score_factors(
     dataset: str = "alpha_library",
     factor: str | None = None,
@@ -337,17 +365,18 @@ def score_factors(
         str(f.get("factor") or f.get("name")): f for f in (report.get("factors") or [])
     }
 
-    if factor:
-        names = [factor]
-    else:
-        # top N：按 |mean ic| 排名
-        means = (
-            df.groupby("factor", observed=True)["ic"]
-            .mean()
-            .abs()
-            .sort_values(ascending=False)
-        )
-        names = [str(n) for n in means.index[: int(top or 20)]]
+    names, total, requested_top = select_factor_names(df, factor=factor, top=top)
+    # 覆盖元数据随卡落 `inputs_version`：页面要能说清「评了多少、为什么只有这些」。
+    # 这不是评分维度，不进 weights，也不影响总分。
+    coverage: dict[str, Any] = {
+        "selection": "explicit" if factor else "top_abs_mean_ic",
+        "requested_top": requested_top,
+        "scored": len(names),
+        "total": total,
+        "all": len(names) >= total,
+    }
+    if not factor:
+        coverage["rank_by"] = "abs_mean_ic"
 
     pfs_map, pfs_evidence = _pfs_for(dataset, names, enabled=with_pfs)
 
@@ -393,6 +422,7 @@ def score_factors(
             "inputs_version": {
                 "weights": WEIGHTS,
                 "dataset": dataset,
+                "coverage": coverage,
                 "pfs": {**pfs_evidence, "enabled": bool(with_pfs)},
                 # 长序列走 `data/eval_series/factor/<code>.json`（§1.6）：列表接口
                 # 只带标量，序列按需取——写失败在这里如实留痕，不静默丢图
@@ -466,7 +496,10 @@ def main() -> int:
     parser.add_argument("--dataset", default="alpha_library")
     parser.add_argument("--factor", default=None)
     parser.add_argument(
-        "--top", type=int, default=None, help="按 |IC| 排名批量评前 N 个"
+        "--top",
+        type=int,
+        default=None,
+        help="按 |IC| 排名批量评前 N 个；0 = 全部（默认 20）",
     )
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--json", action="store_true")

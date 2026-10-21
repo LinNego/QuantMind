@@ -252,7 +252,7 @@ async def test_eval_api_endpoints_real_db():
                         "oid": model_id,
                         "d": _date.fromisoformat(day),
                         "s": score,
-                        "dims": '{"oos_predictive": {"score": %s}}' % score,
+                        "dims": f'{{"oos_predictive": {{"score": {score}}}}}',
                     },
                 )
             # 第二个模型对象：U3 截断断言需要 ≥2 个对象
@@ -278,8 +278,12 @@ async def test_eval_api_endpoints_real_db():
                         "d": _date.fromisoformat(day),
                         "u": user["user_id"],
                         "v": verdict,
-                        "dims": '{"verdict_label": "标签%s", "reasons": ["r"], "suggestions": []}' % verdict,
-                        "ver": '{"backtest_id": "bt-%s", "evidence_source": "backtest"}' % day,
+                        "dims": (
+                            '{"verdict_label": "标签'
+                            + verdict
+                            + '", "reasons": ["r"], "suggestions": []}'
+                        ),
+                        "ver": f'{{"backtest_id": "bt-{day}", "evidence_source": "backtest"}}',
                     },
                 )
             await session.commit()
@@ -531,3 +535,105 @@ async def test_upload_health_check_real_report():
     with pytest.raises(HTTPException) as exc:
         await upload_health_check(payload={"content": "1,2"}, current_user={"tenant_id": "default", "user_id": "1"})
     assert exc.value.status_code == 400
+
+
+# ── 手动重评入口（P2，2026-10-21）────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_eval_run_endpoints_are_admin_only_and_do_not_run_scoring():
+    src = (_BACKEND / "services/api/routers/eval_scores.py").read_text(encoding="utf-8")
+    assert '@router.post("/run")' in src
+    assert '@router.get("/run/status")' in src
+    assert "Depends(require_admin)" in src
+    # API 进程不得直接跑评分：重活必须在 trade worker
+    assert "from backend.scripts.eval.run_all import run_all" not in src
+    assert "run_eval_scores_once" not in src
+    # 指令必须走 shared 契约（键名唯一出处）
+    assert "from backend.shared import eval_trigger" in src
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_trigger_eval_run_queues(monkeypatch):
+    from backend.services.api.routers import eval_scores as router
+
+    req = {
+        "request_id": "r1",
+        "date": "2026-10-21",
+        "tenant_id": "default",
+        "requested_by": "1",
+        "requested_at": "2026-10-21T07:00:00+00:00",
+    }
+    monkeypatch.setattr(router.eval_trigger, "eval_worker_enabled", lambda: True)
+    monkeypatch.setattr(router, "_trade_redis", lambda: object())
+    monkeypatch.setattr(router.eval_trigger, "request_run", lambda *a, **k: req)
+    monkeypatch.setattr(
+        router.eval_trigger,
+        "build_run_status",
+        lambda state, **k: {"state": state, "request_id": req["request_id"]},
+    )
+
+    resp = await router.trigger_eval_run(
+        router.EvalRunRequest(date="2026-10-21"),
+        current_user={"user_id": 1, "tenant_id": "default"},
+    )
+    assert resp["success"] is True
+    assert resp["data"]["request"]["request_id"] == "r1"
+    assert resp["data"]["status"]["state"] == "queued"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_trigger_eval_run_validation_and_gates(monkeypatch):
+    from backend.services.api.routers import eval_scores as router
+
+    # 非管理员由 Depends(require_admin) 拦；直调测试在这里只验业务闸门
+    monkeypatch.setattr(router.eval_trigger, "eval_worker_enabled", lambda: False)
+    with pytest.raises(HTTPException) as exc:
+        await router.trigger_eval_run(
+            router.EvalRunRequest(date=None), current_user={"user_id": 1}
+        )
+    assert exc.value.status_code == 503
+
+    monkeypatch.setattr(router.eval_trigger, "eval_worker_enabled", lambda: True)
+    with pytest.raises(HTTPException) as exc:
+        await router.trigger_eval_run(
+            router.EvalRunRequest(date="20261021"), current_user={"user_id": 1}
+        )
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_trigger_eval_run_busy_returns_409_with_status(monkeypatch):
+    from backend.services.api.routers import eval_scores as router
+
+    def fake_request(*a, **k):
+        raise router.eval_trigger.EvalRunBusy({"state": "running", "request_id": "r0"})
+
+    monkeypatch.setattr(router.eval_trigger, "eval_worker_enabled", lambda: True)
+    monkeypatch.setattr(router, "_trade_redis", lambda: object())
+    monkeypatch.setattr(router.eval_trigger, "request_run", fake_request)
+
+    with pytest.raises(HTTPException) as exc:
+        await router.trigger_eval_run(None, current_user={"user_id": 1})
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "eval_run_busy"
+    assert exc.value.detail["status"]["state"] == "running"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_eval_run_status_returns_idle_when_no_record(monkeypatch):
+    from backend.services.api.routers import eval_scores as router
+
+    monkeypatch.setattr(router, "_trade_redis", lambda: object())
+    monkeypatch.setattr(
+        router.eval_trigger,
+        "read_run_status",
+        lambda _r: router.eval_trigger.idle_status(),
+    )
+    resp = await router.eval_run_status(current_user={"user_id": 1})
+    assert resp["success"] is True
+    assert resp["data"]["state"] == "idle"

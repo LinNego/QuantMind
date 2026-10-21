@@ -318,22 +318,37 @@ def _run_shadow_compare(date_str: str | None, force: bool) -> int:
 
 
 def _run_eval_scores(date_str: str | None, force: bool) -> int:
+    """手动重跑六卡 + 每日选股回填（与 EOD worker **同一入口**）。
+
+    历史缺陷：这里只调 `run_all`，不跑回填；worker 的 `run_eval_scores_once`
+    两件事都做。于是「手动补跑」比「自动跑批」少一段，pending † 不会闭合。
+    唯一入口收口在 `run_eval_scores_once`，控制台不再另写一份编排。
+    """
     import asyncio
 
-    from backend.scripts.eval.run_all import run_all
+    from backend.services.trade.services.eval_scores_service import (
+        run_eval_scores_once,
+    )
     from backend.shared.database_manager_v2 import close_database
 
     async def _run():
         try:
-            return await run_all(date_str, save=True)
+            return await run_eval_scores_once(save=True, trade_date=date_str)
         finally:
             await close_database()
 
     summary = asyncio.run(_run())
+    backfill = summary.get("backfill") or {}
+    backfill_note = backfill.get("note") or (
+        "已关闭" if backfill.get("disabled") else "无回填结果"
+    )
     print(
         f"eval_scores {summary.get('date')}: 落分={summary.get('total_scored')} "
         f"异常={summary.get('total_errors')} 耗时={summary.get('elapsed_sec')}s"
     )
+    print(f"  回填：{backfill_note}")
+    if backfill.get("errors"):
+        print(f"  回填异常 {len(backfill['errors'])} 条（不阻塞六卡结果）")
     return 0 if summary.get("total_scored") else 1
 
 

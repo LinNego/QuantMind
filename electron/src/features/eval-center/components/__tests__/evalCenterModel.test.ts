@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import type { EvalScoreRow } from '../../types/evalCenter';
+import type { EvalRunStatus, EvalScoreRow } from '../../types/evalCenter';
 import {
   averageScore,
+  coverageNote,
   dimensionViews,
   filterEvalRows,
   formatNumber,
@@ -13,6 +14,7 @@ import {
   historySeries,
   parseObjectDeepLink,
   rowLabels,
+  runStatusView,
 } from '../evalCenterModel';
 
 function makeRow(overrides: Partial<EvalScoreRow> = {}): EvalScoreRow {
@@ -215,5 +217,162 @@ describe('数值格式化（实测量与曲线标注共用口径）', () => {
     expect(formatSignedPct(-0.081)).toBe('-8.1%');
     expect(formatSignedPct(0)).toBe('0.0%');
     expect(formatSignedPct(null)).toBe('—');
+  });
+});
+
+describe('coverageNote 本轮覆盖说明', () => {
+  it('策略：达上限时明确说明未覆盖全部候选', () => {
+    const note = coverageNote([
+      makeRow({
+        object_type: 'strategy',
+        inputs_version: {
+          coverage: {
+            candidates: 80,
+            scored: 20,
+            skipped: 60,
+            limit: 20,
+            candidate_limit: 80,
+            cap_reached: true,
+          },
+        },
+      }),
+    ]);
+    expect(note).toContain('候选 80 条');
+    expect(note).toContain('评分 20 条');
+    expect(note).toContain('跳过 60 条');
+    expect(note).toContain('已达上限 20 条');
+  });
+
+  it('策略：候选池已跑完时不谎称触顶；无跳过不显示跳过', () => {
+    const note = coverageNote([
+      makeRow({
+        object_type: 'strategy',
+        inputs_version: {
+          coverage: { candidates: 7, scored: 7, skipped: 0, limit: 20, cap_reached: false },
+        },
+      }),
+    ]);
+    expect(note).toContain('候选 7 条');
+    expect(note).toContain('候选池已跑完');
+    expect(note).not.toContain('跳过');
+    expect(note).not.toContain('已达上限');
+  });
+
+  it('因子：单因子 / 全量 / 按 |IC| 前 N 三种口径各自成句', () => {
+    const explicit = coverageNote([
+      makeRow({
+        object_type: 'factor',
+        inputs_version: {
+          coverage: { selection: 'explicit', scored: 1, total: 1, all: true },
+        },
+      }),
+    ]);
+    expect(explicit).toBe('本轮为单因子评分（1/1）');
+
+    const all = coverageNote([
+      makeRow({
+        object_type: 'factor',
+        inputs_version: {
+          coverage: { selection: 'top_abs_mean_ic', scored: 429, total: 429, all: true },
+        },
+      }),
+    ]);
+    expect(all).toBe('本轮全量评分 429 / 429 个因子');
+
+    const top = coverageNote([
+      makeRow({
+        object_type: 'factor',
+        inputs_version: {
+          coverage: {
+            selection: 'top_abs_mean_ic',
+            scored: 20,
+            total: 429,
+            all: false,
+            requested_top: 20,
+          },
+        },
+      }),
+    ]);
+    expect(top).toContain('前 20 / 共 429 个因子');
+    expect(top).toContain('上限 20');
+    expect(top).toContain('--factor-top 0');
+  });
+
+  it('缺 coverage / 结构不完整 / 未知类型 → null（不猜 0/0）', () => {
+    expect(coverageNote([])).toBeNull();
+    expect(coverageNote([makeRow()])).toBeNull();
+    expect(
+      coverageNote([
+        makeRow({ object_type: 'strategy', inputs_version: { coverage: { scored: 5 } } }),
+      ])
+    ).toBeNull();
+    expect(
+      coverageNote([
+        makeRow({ object_type: 'model', inputs_version: { coverage: { scored: 5, total: 5 } } }),
+      ])
+    ).toBeNull();
+  });
+});
+
+describe('runStatusView 手动重评状态', () => {
+  function makeStatus(overrides: Partial<EvalRunStatus> = {}): EvalRunStatus {
+    return {
+      state: 'queued',
+      request_id: 'r1',
+      date: null,
+      trigger: 'manual',
+      requested_by: '1',
+      requested_at: '2026-10-21T08:00:00+00:00',
+      started_at: null,
+      finished_at: null,
+      total_scored: null,
+      total_errors: null,
+      errors: [],
+      backfill: null,
+      elapsed_sec: null,
+      note: '',
+      ...overrides,
+    };
+  }
+
+  it('idle / null 不渲染状态条', () => {
+    expect(runStatusView(null)).toBeNull();
+    expect(runStatusView(makeStatus({ state: 'idle' }))).toBeNull();
+  });
+
+  it('queued / running 保持轮询并显示等待文案', () => {
+    const queued = runStatusView(makeStatus({ state: 'queued' }));
+    expect(queued?.active).toBe(true);
+    expect(queued?.label).toBe('排队中');
+    const running = runStatusView(makeStatus({ state: 'running' }));
+    expect(running?.active).toBe(true);
+    expect(running?.label).toBe('评分中');
+  });
+
+  it('done 汇总落分/异常/回填且停止轮询', () => {
+    const view = runStatusView(
+      makeStatus({
+        state: 'done',
+        total_scored: 42,
+        total_errors: 1,
+        backfill: { rerun: 3 },
+      })
+    );
+    expect(view?.active).toBe(false);
+    expect(view?.tone).toBe('done');
+    expect(view?.detail).toContain('落分 42');
+    expect(view?.detail).toContain('异常 1');
+    expect(view?.detail).toContain('回填 3 条');
+  });
+
+  it('error 优先显示首个错误，缺错误时回落 note', () => {
+    const withError = runStatusView(
+      makeStatus({ state: 'error', errors: ['RuntimeError: boom'] })
+    );
+    expect(withError?.tone).toBe('error');
+    expect(withError?.detail).toBe('RuntimeError: boom');
+
+    const fallback = runStatusView(makeStatus({ state: 'error', note: '回填异常' }));
+    expect(fallback?.detail).toBe('回填异常');
   });
 });

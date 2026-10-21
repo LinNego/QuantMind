@@ -147,3 +147,52 @@ export interface StrategyHealthResponse {
   data: StrategyHealthArchive;
   meta: { count: number };
 }
+
+/** 手动重评状态（后端 `shared/eval_trigger.py` 稳定契约；只增不改） */
+export type EvalRunState = 'idle' | 'queued' | 'running' | 'done' | 'error';
+
+export interface EvalRunBackfill {
+  planned?: number | null;
+  rerun?: number | null;
+  still_pending?: number | null;
+  disabled?: boolean;
+  note?: string;
+  errors?: string[];
+}
+
+export interface EvalRunStatus {
+  state: EvalRunState;
+  request_id: string | null;
+  date: string | null;
+  trigger: string;
+  requested_by: string | null;
+  tenant_id?: string | null;
+  requested_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  total_scored: number | null;
+  total_errors: number | null;
+  errors: string[];
+  backfill: EvalRunBackfill | null;
+  elapsed_sec: number | null;
+  note: string;
+}
+
+export interface EvalRunTriggerResponse {
+  success: boolean;
+  data: {
+    request: {
+      request_id: string;
+      date: string | null;
+      tenant_id: string;
+      requested_by: string;
+      requested_at: string;
+    };
+    status: EvalRunStatus;
+  };
+}
+
+export interface EvalRunStatusResponse {
+  success: boolean;
+  data: EvalRunStatus;
+}
