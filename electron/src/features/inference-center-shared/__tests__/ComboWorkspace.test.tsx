@@ -6,6 +6,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type {
+  BlendPeriodResponse,
   BlendRankingResponse,
   BlendRecord,
   BlendRollingResponse,
@@ -24,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   getDates: vi.fn(),
   getRanking: vi.fn(),
   getRolling: vi.fn(),
+  getPeriod: vi.fn(),
   createPlan: vi.fn(),
   listPlans: vi.fn(),
   confirmPlan: vi.fn(),
@@ -142,6 +144,78 @@ function rolling(): BlendRollingResponse {
   };
 }
 
+function period(): BlendPeriodResponse {
+  return {
+    blend_id: 'blend-1',
+    requested: { start: '2026-04-22', end: '2026-10-19', capital: 10000000, positions: 50 },
+    effective: {
+      start: '2026-08-27',
+      end: '2026-10-19',
+      first_scoring_day: '2026-08-27',
+      last_scoring_day: '2026-10-19',
+    },
+    template: { entry_per_day: 5, hold_days: 10, target_positions: 50, method: 'mean' },
+    summary: {
+      initial_capital: 10000000,
+      final_equity: 11234000,
+      total_return_pct: 12.34,
+      profit_amount: 1234000,
+      realized_pnl_amount: 900000,
+      unrealized_pnl_amount: 334000,
+      max_drawdown_pct: -3.21,
+      trading_days: 32,
+      scoring_days: 32,
+      entries: 160,
+      exits: 110,
+      closed_trades: 110,
+      open_positions: 50,
+      wins: 60,
+      losses: 50,
+      flats: 0,
+      win_rate_pct: 54.55,
+      avg_trade_return_pct: 0.88,
+      avg_positions: 42.97,
+      entry_convention: 'close',
+      fee_convention: 'none',
+      data_quality: 'complete',
+      scoring_coverage_pct: 100,
+    },
+    months: [
+      {
+        month: '2026-09',
+        start_date: '2026-09-01',
+        end_date: '2026-09-30',
+        start_equity: 10000000,
+        end_equity: 11234000,
+        return_pct: 12.34,
+        profit_amount: 1234000,
+        entries: 105,
+        exits: 70,
+        closed_trades: 70,
+        month_end_positions: 50,
+        win_rate_pct: 54.55,
+        partial: false,
+      },
+    ],
+    daily: [
+      { date: '2026-09-01', equity: 10000000, cash: 5000000, positions: 40, entries: 5, exits: 5, return_pct: null },
+      { date: '2026-09-30', equity: 11234000, cash: 4000000, positions: 50, entries: 3, exits: 2, return_pct: 1.2 },
+    ],
+    trades: [
+      {
+        symbol: 'SZ002790', code: 'SZ002790', name: '瑞尔特',
+        entry_date: '2026-08-27', exit_date: '2026-09-10',
+        entry_price: 5.99, exit_price: 8.46, shares: 33389.99, notional: 200000,
+        return_pct: 41.24, pnl_amount: 82470.78, held_days: 10,
+        exit_reason: '到期', deferred: false,
+      },
+    ],
+    open: [],
+    warnings: [],
+    members: [],
+  };
+}
+
 function renderWorkspace() {
   return render(<ComboWorkspace market="CN" marketLabel="A股市场" />);
 }
@@ -155,6 +229,7 @@ beforeEach(() => {
   mocks.getRanking.mockResolvedValue(ranking());
   mocks.preview.mockResolvedValue(ranking());
   mocks.getRolling.mockResolvedValue(rolling());
+  mocks.getPeriod.mockResolvedValue(period());
   mocks.listPlans.mockResolvedValue({ items: [] });
   mocks.createPlan.mockResolvedValue({});
   mocks.confirmPlan.mockResolvedValue({});
@@ -176,7 +251,7 @@ describe('ComboWorkspace', () => {
       template_id: 'tpl-base',
       weights: null,
     });
-    expect(mocks.getDates).toHaveBeenCalledWith('blend-new');
+    expect(mocks.getDates).toHaveBeenCalledWith('blend-new', 365);
     await waitFor(() =>
       expect(mocks.getRanking).toHaveBeenCalledWith('blend-new', { date: '2026-10-20' }),
     );
@@ -239,6 +314,29 @@ describe('ComboWorkspace', () => {
     fireEvent.click(screen.getByRole('tab', { name: '滚动建仓' }));
     await waitFor(() => expect(mocks.getRolling).toHaveBeenCalled());
     expect(await screen.findByTestId('combo-rolling-pick-2026-10-20-SH600001')).toHaveTextContent('新进');
+  });
+
+  it('周期收益 Tab 懒加载：首进按默认参数算一次并渲染总收益', async () => {
+    renderWorkspace();
+    await screen.findByText('浦发银行');
+    expect(mocks.getPeriod).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('tab', { name: '周期收益' }));
+    await waitFor(() => expect(mocks.getPeriod).toHaveBeenCalledWith('blend-1', {}));
+    expect(await screen.findByTestId('combo-period-total-return')).toHaveTextContent('+12.34%');
+    expect(screen.getByTestId('combo-period-summary')).toHaveTextContent('已了结');
+    // 展示面合规：不得出现方向性交易字眼
+    expect(screen.queryByText(/买入|卖出/)).toBeNull();
+  });
+
+  it('切到模板时周期收益 Tab 显示先保存组合的空态', async () => {
+    renderWorkspace();
+    await screen.findByText('浦发银行');
+    fireEvent.click(screen.getByTestId('combo-item-template-tpl-base'));
+    await waitFor(() => expect(mocks.preview).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('tab', { name: '周期收益' }));
+    expect(await screen.findByText(/保存为组合后可计算周期收益/)).toBeInTheDocument();
+    expect(mocks.getPeriod).not.toHaveBeenCalled();
   });
 
   it('组合没有任何完整评分日：榜单给明确空因，不发无日期请求', async () => {

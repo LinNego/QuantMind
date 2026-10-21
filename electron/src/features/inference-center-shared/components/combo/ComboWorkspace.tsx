@@ -14,6 +14,7 @@ import { ComboList } from './ComboList';
 import { ComboBuilderModal } from './ComboBuilderModal';
 import { ComboRankingTable } from './ComboRankingTable';
 import { RollingBuildPanel } from './RollingBuildPanel';
+import { PeriodReturnPanel } from './PeriodReturnPanel';
 import { RebalancePlanPanel } from './RebalancePlanPanel';
 import { ComboEvidencePanel } from './ComboEvidencePanel';
 
@@ -176,6 +177,29 @@ export const ComboWorkspace: React.FC<ComboWorkspaceProps> = ({
                   loading={state.rollingLoading}
                   error={state.rollingError}
                   onRetry={state.reloadRolling}
+                />
+              ),
+            },
+            {
+              key: 'period',
+              label: '周期收益',
+              children: isTemplate ? (
+                <div className="h-full flex items-center justify-center bg-white border border-slate-200 rounded-xl">
+                  <Empty description="保存为组合后可计算周期收益（模板参数 × 自定义区间）">
+                    <Button type="primary" onClick={() => openBuilder([], true)}>
+                      保存当前模板为组合
+                    </Button>
+                  </Empty>
+                </div>
+              ) : (
+                <PeriodReturnPanel
+                  blend={state.selectedBlend}
+                  period={state.period}
+                  loading={state.periodLoading}
+                  error={state.periodError}
+                  dates={state.dates}
+                  onCalculate={(query) => void state.loadPeriod(query)}
+                  onRetry={state.reloadPeriod}
                 />
               ),
             },

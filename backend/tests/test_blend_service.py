@@ -2072,3 +2072,444 @@ async def test_service_confirm_plan_real_ledger_open_and_duplicate():
             ).scalar_one() == 1
     finally:
         await _cleanup_blends()
+
+
+# ── 周期收益（固定持有期滚动桶，P6 / 2026-10-21） ─────────────────────────
+
+
+PERIOD_DAYS = [
+    date(2026, 10, 5),
+    date(2026, 10, 6),
+    date(2026, 10, 7),
+    date(2026, 10, 8),
+    date(2026, 10, 9),
+]
+
+
+def _period_row(symbol: str, rank: int = 1) -> dict:
+    return {
+        "symbol": symbol,
+        "score": 1.0 - rank * 0.01,
+        "rank": rank,
+        "row_rank": rank,
+        "coverage": 2,
+        "pct": 1.0 - rank * 0.01,
+        "position": "靠前",
+    }
+
+
+def _period_blend(**overrides) -> dict:
+    blend = {
+        "blend_id": "bl_period",
+        "members": [],
+        "method": "mean",
+        "weighting": "equal",
+        "min_coverage": 2,
+        "consensus_min_count": 0,
+        "trim_count": 2,
+        "entry_per_day": 1,
+        "rolling_window": 5,
+        "target_positions": 1,
+    }
+    blend.update(overrides)
+    return blend
+
+
+def _period_service(
+    rows_by_day,
+    *,
+    days=None,
+    closes=None,
+    common_date=PERIOD_DAYS[-1],
+    members=None,
+):
+    svc = _service(members or [_model("a"), _model("b")])
+    calls: dict = {}
+
+    async def fake_members(_blend):
+        return list(members or [_model("a"), _model("b")])
+
+    async def fake_calendar(start, end):
+        calls["calendar"] = {"start": start, "end": end}
+        return list(PERIOD_DAYS if days is None else days)
+
+    async def fake_range(**kwargs):
+        calls["range_stats"] = kwargs
+        return rows_by_day
+
+    async def fake_closes(symbols, start, end):
+        calls["close_history"] = {
+            "symbols": list(symbols),
+            "start": start,
+            "end": end,
+        }
+        return dict(closes or {})
+
+    async def fake_names():
+        return {"SH600000": "浦发银行"}
+
+    async def fake_common_date(**_kwargs):
+        calls["common_date"] = True
+        return common_date
+
+    svc.members_from_blend = fake_members
+    svc._calendar_days = fake_calendar
+    svc._range_stats = fake_range
+    svc._close_history = fake_closes
+    svc._stock_names = fake_names
+    svc.latest_common_date = fake_common_date
+    return svc, calls
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_builds_fixed_hold_summary_months_and_serializes_dates():
+    rows = {day: [_period_row("SH600000")] for day in PERIOD_DAYS}
+    closes = {"SH600000": {day: 10 + index for index, day in enumerate(PERIOD_DAYS)}}
+    svc, calls = _period_service(rows, closes=closes)
+
+    payload = await svc.period(
+        _period_blend(),
+        tenant_id="t",
+        user_id="u",
+        start_date=PERIOD_DAYS[0],
+        end_date=PERIOD_DAYS[-1],
+        capital=1000.0,
+        positions=1,
+    )
+
+    assert calls["range_stats"]["start_date"] == PERIOD_DAYS[0]
+    assert calls["range_stats"]["end_date"] == PERIOD_DAYS[-1]
+    assert calls["range_stats"]["top_k"] == 1
+    assert payload["requested"] == {
+        "start": PERIOD_DAYS[0].isoformat(),
+        "end": PERIOD_DAYS[-1].isoformat(),
+        "capital": 1000.0,
+        "positions": 1,
+    }
+    assert payload["effective"]["start"] == PERIOD_DAYS[0].isoformat()
+    assert payload["template"] == {
+        "entry_per_day": 1,
+        "hold_days": 5,
+        "target_positions": 1,
+        "method": "mean",
+    }
+    summary = payload["summary"]
+    assert summary["entries"] == 1
+    assert summary["open_positions"] == 1
+    assert summary["closed_trades"] == 0
+    assert summary["final_equity"] == pytest.approx(1400.0)
+    assert summary["total_return_pct"] == pytest.approx(40.0)
+    assert summary["profit_amount"] == pytest.approx(400.0)
+    assert summary["data_quality"] == "complete"
+    assert summary["scoring_coverage_pct"] == pytest.approx(100.0)
+    assert summary["entry_convention"] == "close"
+    assert summary["fee_convention"] == "none"
+    # P=1 < E×H=5：稳态桶大于持仓上限，组合会在满仓后暂停建仓
+    assert payload["warnings"] == ["positions_cap"]
+    assert [row["month"] for row in payload["months"]] == ["2026-10"]
+    assert payload["months"][0]["start_date"] == PERIOD_DAYS[0].isoformat()
+    assert payload["months"][0]["return_pct"] == pytest.approx(40.0)
+    open_row = payload["open"][0]
+    assert open_row["name"] == "浦发银行"
+    assert open_row["entry_date"] == PERIOD_DAYS[0].isoformat()
+    assert open_row["mark_date"] == PERIOD_DAYS[-1].isoformat()
+    assert payload["trades"] == []
+    assert payload["daily"][0]["date"] == PERIOD_DAYS[0].isoformat()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_clamps_effective_start_and_flags_partial_coverage():
+    rows = {
+        PERIOD_DAYS[0]: [_period_row("SH600000")],
+        PERIOD_DAYS[1]: [_period_row("SH600000")],
+    }
+    closes = {"SH600000": dict.fromkeys(PERIOD_DAYS, 10.0)}
+    svc, _ = _period_service(rows, closes=closes)
+
+    payload = await svc.period(
+        _period_blend(rolling_window=2),
+        tenant_id="t",
+        user_id="u",
+        start_date=date(2026, 9, 28),
+        end_date=PERIOD_DAYS[-1],
+        capital=1000.0,
+        positions=1,
+    )
+
+    assert payload["requested"]["start"] == "2026-09-28"
+    assert payload["effective"]["start"] == PERIOD_DAYS[0].isoformat()
+    assert payload["effective"]["first_scoring_day"] == PERIOD_DAYS[0].isoformat()
+    assert payload["effective"]["last_scoring_day"] == PERIOD_DAYS[1].isoformat()
+    assert "effective_start_clamped" in payload["warnings"]
+    assert "scoring_gap" in payload["warnings"]
+    assert "partial_data" in payload["warnings"]
+    assert payload["summary"]["data_quality"] == "partial"
+    assert payload["summary"]["scoring_coverage_pct"] == pytest.approx(40.0)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_rejects_single_scoring_day():
+    rows = {PERIOD_DAYS[0]: [_period_row("SH600000")]}
+    svc, _ = _period_service(rows, closes={})
+
+    with pytest.raises(BlendError) as exc:
+        await svc.period(
+            _period_blend(),
+            tenant_id="t",
+            user_id="u",
+            start_date=PERIOD_DAYS[0],
+            end_date=PERIOD_DAYS[-1],
+        )
+    assert exc.value.code == "insufficient_scoring_days"
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_rejects_coverage_below_thirty_percent():
+    days = [
+        date.fromordinal(PERIOD_DAYS[0].toordinal() + offset) for offset in range(10)
+    ]
+    rows = {
+        days[0]: [_period_row("SH600000")],
+        days[5]: [_period_row("SH600000")],
+    }
+    svc, _ = _period_service(rows, days=days, closes={})
+
+    with pytest.raises(BlendError) as exc:
+        await svc.period(
+            _period_blend(),
+            tenant_id="t",
+            user_id="u",
+            start_date=days[0],
+            end_date=days[-1],
+        )
+    assert exc.value.code == "insufficient_coverage"
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_rejects_range_longer_than_trading_day_budget():
+    days = [
+        date.fromordinal(PERIOD_DAYS[0].toordinal() + offset) for offset in range(301)
+    ]
+    rows = {day: [_period_row("SH600000")] for day in days[:2]}
+    svc, _ = _period_service(rows, days=days, closes={})
+
+    with pytest.raises(BlendError) as exc:
+        await svc.period(
+            _period_blend(),
+            tenant_id="t",
+            user_id="u",
+            start_date=days[0],
+            end_date=days[-1],
+        )
+    assert exc.value.code == "range_too_long"
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_non_mean_method_uses_tighter_range_cap():
+    days = [
+        date.fromordinal(PERIOD_DAYS[0].toordinal() + offset) for offset in range(121)
+    ]
+    rows = {day: [_period_row("SH600000")] for day in days[:2]}
+    svc, _ = _period_service(rows, days=days, closes={})
+
+    with pytest.raises(BlendError) as exc:
+        await svc.period(
+            _period_blend(method="trimmed"),
+            tenant_id="t",
+            user_id="u",
+            start_date=days[0],
+            end_date=days[-1],
+        )
+    assert exc.value.code == "range_too_long"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_fails_closed_when_quote_source_unavailable():
+    rows = {day: [_period_row("SH600000")] for day in PERIOD_DAYS}
+    svc, _ = _period_service(rows, closes={})
+
+    with pytest.raises(BlendError) as exc:
+        await svc.period(
+            _period_blend(),
+            tenant_id="t",
+            user_id="u",
+            start_date=PERIOD_DAYS[0],
+            end_date=PERIOD_DAYS[-1],
+            capital=1000.0,
+        )
+    assert exc.value.code == "quote_source_unavailable"
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_maps_simulation_warnings_into_machine_codes():
+    rows = {day: [_period_row("SH600000")] for day in PERIOD_DAYS}
+    # 缺 D0 价格：不入场并计数；H=1、P=10 → 稳态填不满告警
+    closes = {"SH600000": dict.fromkeys(PERIOD_DAYS[1:], 10.0)}
+    svc, _ = _period_service(rows, closes=closes)
+
+    payload = await svc.period(
+        _period_blend(rolling_window=1),
+        tenant_id="t",
+        user_id="u",
+        start_date=PERIOD_DAYS[0],
+        end_date=PERIOD_DAYS[-1],
+        capital=1000.0,
+        positions=10,
+    )
+
+    assert "missing_entry_price" in payload["warnings"]
+    assert "underfill" in payload["warnings"]
+    assert payload["summary"]["entries"] == 4
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("positions", [0, 51])
+async def test_period_rejects_positions_outside_one_to_fifty(positions):
+    svc, _ = _period_service({}, closes={})
+    with pytest.raises(BlendError):
+        await svc.period(
+            _period_blend(),
+            tenant_id="t",
+            user_id="u",
+            start_date=PERIOD_DAYS[0],
+            end_date=PERIOD_DAYS[-1],
+            positions=positions,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_rejects_non_positive_capital():
+    svc, _ = _period_service({}, closes={})
+    with pytest.raises(BlendError):
+        await svc.period(
+            _period_blend(),
+            tenant_id="t",
+            user_id="u",
+            start_date=PERIOD_DAYS[0],
+            end_date=PERIOD_DAYS[-1],
+            capital=0,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_rejects_start_after_end():
+    svc, _ = _period_service({}, closes={})
+    with pytest.raises(BlendError):
+        await svc.period(
+            _period_blend(),
+            tenant_id="t",
+            user_id="u",
+            start_date=PERIOD_DAYS[-1],
+            end_date=PERIOD_DAYS[0],
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_defaults_positions_from_template_and_end_from_latest():
+    rows = {day: [_period_row("SH600000")] for day in PERIOD_DAYS}
+    closes = {"SH600000": dict.fromkeys(PERIOD_DAYS, 10.0)}
+    svc, calls = _period_service(rows, closes=closes)
+
+    payload = await svc.period(
+        _period_blend(target_positions=3, rolling_window=1),
+        tenant_id="t",
+        user_id="u",
+        start_date=PERIOD_DAYS[0],
+    )
+
+    assert calls["common_date"] is True
+    assert calls["range_stats"]["top_k"] == 3
+    assert payload["requested"]["positions"] == 3
+    assert payload["requested"]["end"] == PERIOD_DAYS[-1].isoformat()
+    assert payload["template"]["target_positions"] == 3
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_rejects_invalid_template_entry_or_hold():
+    svc, _ = _period_service({}, closes={})
+    with pytest.raises(BlendError):
+        await svc.period(
+            _period_blend(entry_per_day=0),
+            tenant_id="t",
+            user_id="u",
+            start_date=PERIOD_DAYS[0],
+            end_date=PERIOD_DAYS[-1],
+        )
+    with pytest.raises(BlendError):
+        await svc.period(
+            _period_blend(rolling_window=61),
+            tenant_id="t",
+            user_id="u",
+            start_date=PERIOD_DAYS[0],
+            end_date=PERIOD_DAYS[-1],
+        )
+
+
+# ── 真库：区间快路与窗口慢路对拍（K1 正确性判据） ────────────────────────
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_range_stats_matches_window_stats_on_real_db():
+    await _probe_db()
+    svc = ModelBlendService()
+    members = await _real_t10_members(2)
+    start = SAMPLE_DATE - timedelta(days=10)
+    fast = await svc._range_stats(
+        tenant_id="default",
+        user_id="10000001",
+        members=members,
+        weights=None,
+        method="mean",
+        trim_count=2,
+        min_coverage=2,
+        consensus_min_count=0,
+        start_date=start,
+        end_date=SAMPLE_DATE,
+        top_k=50,
+    )
+    window = await svc._window_stats(
+        tenant_id="default",
+        user_id="10000001",
+        members=members,
+        weights=None,
+        method="mean",
+        trim_count=2,
+        min_coverage=2,
+        consensus_min_count=0,
+        end_date=SAMPLE_DATE,
+        lookback=10,
+        top_k=50,
+        symbols=[],
+    )
+    window_rows = window["top_rows"]
+    overlapping = sorted(day for day in window_rows if start <= day <= SAMPLE_DATE)
+    assert overlapping, "对拍区间没有共同数据日"
+    for day in overlapping:
+        fast_rows = fast.get(day) or []
+        slow_rows = window_rows[day]
+        assert [row["symbol"] for row in fast_rows] == [
+            row["symbol"] for row in slow_rows
+        ], day
+        for fast_row, slow_row in zip(fast_rows, slow_rows, strict=True):
+            assert fast_row["score"] == pytest.approx(slow_row["score"], abs=1e-10)
+            assert fast_row["rank"] == slow_row["rank"]
+            assert fast_row["coverage"] == slow_row["coverage"]
+            assert fast_row["pct"] == pytest.approx(slow_row["pct"], abs=1e-10)

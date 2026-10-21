@@ -16,6 +16,8 @@ import { blendService, blendErrorMessage } from '../../../services/blendService'
 import type {
   BlendDatesResponse,
   BlendEvidenceResponse,
+  BlendPeriodQuery,
+  BlendPeriodResponse,
   BlendPlan,
   BlendPlanRequest,
   BlendRankingResponse,
@@ -25,7 +27,7 @@ import type {
 } from '../../../services/blendTypes';
 import { templateToCreateRequest } from '../components/combo/comboRankingModel';
 
-export type ComboTab = 'ranking' | 'rolling' | 'plan' | 'evidence';
+export type ComboTab = 'ranking' | 'rolling' | 'period' | 'plan' | 'evidence';
 
 export interface ComboSelection {
   kind: 'blend' | 'template';
@@ -62,6 +64,13 @@ export interface ComboWorkspaceState {
   rollingLoading: boolean;
   rollingError: string | null;
   reloadRolling: () => void;
+
+  period: BlendPeriodResponse | null;
+  periodLoading: boolean;
+  periodError: string | null;
+  /** 周期收益按参数显式触发（建仓日/截止日/资金/持仓上限） */
+  loadPeriod: (params?: BlendPeriodQuery) => Promise<void>;
+  reloadPeriod: () => void;
 
   plan: BlendPlan | null;
   planLoading: boolean;
@@ -106,6 +115,10 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
   const [rollingError, setRollingError] = useState<string | null>(null);
   const [rollingNonce, setRollingNonce] = useState(0);
 
+  const [period, setPeriod] = useState<BlendPeriodResponse | null>(null);
+  const [periodLoading, setPeriodLoading] = useState(false);
+  const [periodError, setPeriodError] = useState<string | null>(null);
+
   const [plan, setPlan] = useState<BlendPlan | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
@@ -118,6 +131,11 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
 
   const autoCreateRef = useRef(false);
   const evidenceRequestedRef = useRef(false);
+  /** 周期收益首次进入 Tab 自动按默认参数算一次；之后的参数由面板显式触发 */
+  const periodRequestedRef = useRef(false);
+  /** 面板「重新计算」用最近一次参数（默认参数也算） */
+  const lastPeriodQueryRef = useRef<BlendPeriodQuery>({});
+  const periodSeqRef = useRef(0);
 
   const selectedBlend = useMemo(
     () => (selection?.kind === 'blend' ? blends.find((b) => b.blend_id === selection.id) ?? null : null),
@@ -127,6 +145,50 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
     () => (selection?.kind === 'template' ? templates.find((t) => t.template_id === selection.id) ?? null : null),
     [selection, templates],
   );
+  const selectionKey = selection ? `${selection.kind}:${selection.id}` : null;
+
+  // ── 周期收益（显式参数触发，禁止并发响应互相覆盖）────────────────────
+  const loadPeriod = useCallback(
+    async (params: BlendPeriodQuery = {}) => {
+      if (!selectedBlend) return;
+      lastPeriodQueryRef.current = params;
+      const seq = periodSeqRef.current + 1;
+      periodSeqRef.current = seq;
+      setPeriodLoading(true);
+      setPeriodError(null);
+      try {
+        const resp = await blendService.getPeriod(selectedBlend.blend_id, params);
+        if (seq === periodSeqRef.current) setPeriod(resp);
+      } catch (err) {
+        if (seq === periodSeqRef.current) setPeriodError(blendErrorMessage(err));
+      } finally {
+        if (seq === periodSeqRef.current) setPeriodLoading(false);
+      }
+    },
+    [selectedBlend],
+  );
+
+  const reloadPeriod = useCallback(() => {
+    void loadPeriod(lastPeriodQueryRef.current);
+  }, [loadPeriod]);
+
+  // 组合切换：周期结果属于旧组合，必须清空并允许新组合首次自动计算
+  useEffect(() => {
+    periodRequestedRef.current = false;
+    lastPeriodQueryRef.current = {};
+    periodSeqRef.current += 1;
+    setPeriod(null);
+    setPeriodError(null);
+    setPeriodLoading(false);
+  }, [selectionKey]);
+
+  // 首次进入「周期收益」Tab：按模板默认参数算一次（用户改参数后由面板触发）
+  useEffect(() => {
+    if (selection?.kind !== 'blend' || tab !== 'period' || !datesReady) return;
+    if (periodRequestedRef.current) return;
+    periodRequestedRef.current = true;
+    void loadPeriod({});
+  }, [selection, tab, datesReady, loadPeriod]);
 
   // ── 组合列表 + 模板 ────────────────────────────────────────────────
   const loadSnapshot = useCallback(async () => {
@@ -202,7 +264,8 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
     setDatesReady(false);
     setDatesLoading(true);
     blendService
-      .getDates(selection.id)
+      // 周期收益可回看半年甚至更长，日期下拉要覆盖到后端上限附近
+      .getDates(selection.id, 365)
       .then((resp: BlendDatesResponse) => {
         if (!alive) return;
         setDates(resp.dates ?? []);
@@ -425,6 +488,11 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
     rollingLoading,
     rollingError,
     reloadRolling: () => setRollingNonce((n) => n + 1),
+    period,
+    periodLoading,
+    periodError,
+    loadPeriod,
+    reloadPeriod,
     plan,
     planLoading,
     planError,

@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import time
+from bisect import bisect_left, bisect_right
 from datetime import date, timedelta
 from typing import Any
 from collections.abc import Mapping, Sequence
@@ -36,6 +37,7 @@ from backend.services.engine.inference.blend_engine import (
     position_of,
     rank_pct_from_rank,
 )
+from backend.services.engine.inference.period_performance import simulate_period
 from backend.services.engine.inference.rolling_performance import (
     compute_rolling_performance,
 )
@@ -62,6 +64,17 @@ MIN_MEMBERS = 2
 #: T+5 全组模板实有 24 个同签名模型，上限必须容得下整组模板
 MAX_MEMBERS = 30
 CN_MARKET = "CN"
+#: 周期收益：区间上限（交易日）。300 ≈ 14 个月，覆盖「最近半年/近一年」。
+MAX_PERIOD_TRADING_DAYS = 300
+#: median/trimmed 走慢路（逐行折叠符号），区间收紧，避免同步接口超时。
+MAX_NON_MEAN_PERIOD_DAYS = 120
+#: 评分覆盖率下限：低于 30% 拒绝计算，30~80% 标 partial。
+MIN_PERIOD_COVERAGE = 0.30
+PARTIAL_PERIOD_COVERAGE = 0.80
+#: 周期收益默认初始资金（元）
+DEFAULT_PERIOD_CAPITAL = 10_000_000.0
+#: 周期收益持仓上限硬上限（用户口径「最多 50 只」）
+MAX_PERIOD_POSITIONS = 50
 #: 行业/市值快照缓存（秒）：快照是最新截面，不按日分区
 PROFILE_CACHE_TTL_SECONDS = 300.0
 _PROFILE_CACHE: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
@@ -246,6 +259,75 @@ def _window_cache_put(key: str, payload: Mapping[str, Any]) -> None:
     while len(_window_cache) >= _WINDOW_CACHE_MAX_ENTRIES:
         _window_cache.pop(next(iter(_window_cache)))
     _window_cache[key] = (now + _WINDOW_CACHE_TTL_SECONDS, _clone_window(payload))
+
+
+#: 周期区间缓存：历史日的组合排名在推理落定后不再变化。
+#: 与窗口缓存分开计容，互不挤占（周期视图一次要 32~300 天）。
+_RANGE_CACHE_TTL_SECONDS = 120.0
+_RANGE_CACHE_MAX_ENTRIES = 16
+_range_cache: dict[str, tuple[float, dict[date, list[dict[str, Any]]]]] = {}
+
+
+def _range_cache_key(
+    *,
+    tenant_id: str,
+    user_id: str,
+    members: Sequence[tuple[str, float]],
+    method: str,
+    trim_count: int,
+    min_coverage: int,
+    consensus_min_count: int,
+    start_date: date,
+    end_date: date,
+    top_k: int,
+) -> str:
+    raw = json.dumps(
+        {
+            "kind": "range",
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "members": sorted(
+                (str(mid), round(float(weight), 12)) for mid, weight in members
+            ),
+            "method": method,
+            "trim_count": int(trim_count),
+            "min_coverage": int(min_coverage),
+            "consensus_min_count": int(consensus_min_count),
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "top_k": int(top_k),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _range_cache_get(key: str) -> dict[date, list[dict[str, Any]]] | None:
+    entry = _range_cache.get(key)
+    if entry is None:
+        return None
+    expires_at, payload = entry
+    if expires_at <= time.monotonic():
+        _range_cache.pop(key, None)
+        return None
+    return {day: [dict(row) for row in rows] for day, rows in payload.items()}
+
+
+def _range_cache_put(
+    key: str, payload: Mapping[date, Sequence[Mapping[str, Any]]]
+) -> None:
+    now = time.monotonic()
+    for stale in [
+        cached for cached, (expires_at, _) in _range_cache.items() if expires_at <= now
+    ]:
+        _range_cache.pop(stale, None)
+    while len(_range_cache) >= _RANGE_CACHE_MAX_ENTRIES:
+        _range_cache.pop(next(iter(_range_cache)))
+    _range_cache[key] = (
+        now + _RANGE_CACHE_TTL_SECONDS,
+        {day: [dict(row) for row in rows] for day, rows in payload.items()},
+    )
 
 
 class ModelBlendService:
@@ -992,6 +1074,220 @@ class ModelBlendService:
             "warnings": [],
         }
 
+    async def period(
+        self,
+        blend: Mapping[str, Any],
+        *,
+        tenant_id: str,
+        user_id: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        capital: float = DEFAULT_PERIOD_CAPITAL,
+        positions: int | None = None,
+    ) -> dict[str, Any]:
+        """周期收益：固定持有期滚动桶（收盘建仓/到期收盘退出，无费用）。
+
+        与 ``rolling()`` 的区别：``rolling()`` 是**窗口内每日换仓**的看板，
+        本方法按模板 ``entry_per_day × rolling_window`` 真正持有到到期日，
+        初始资金按 ``positions`` 等分，可跨月/跨半年统计。
+        """
+        members = await self.members_from_blend(blend)
+        if len(members) < MIN_MEMBERS:
+            raise BlendError(f"组合至少需要 {MIN_MEMBERS} 个模型")
+        weights = _weights_from_members(blend, members)
+        member_ids = [str(m["model_id"]) for m in members]
+        min_coverage = int(blend.get("min_coverage") or 2)
+        method = str(blend.get("method") or "mean")
+        entry_per_day = int(blend.get("entry_per_day") or 5)
+        hold_days = int(blend.get("rolling_window") or 10)
+        template_positions = int(blend.get("target_positions") or 50)
+        if not 1 <= entry_per_day <= 50:
+            raise BlendError("模板的每日新进数必须在 [1, 50]")
+        if not 1 <= hold_days <= 60:
+            raise BlendError("模板的持有天数必须在 [1, 60]")
+        target_positions = (
+            min(max(1, template_positions), MAX_PERIOD_POSITIONS)
+            if positions is None
+            else int(positions)
+        )
+        if not 1 <= target_positions <= MAX_PERIOD_POSITIONS:
+            raise BlendError(f"持仓上限必须在 [1, {MAX_PERIOD_POSITIONS}]")
+        if not _finite(capital) or float(capital) <= 0:
+            raise BlendError("初始资金必须是正数")
+        capital = float(capital)
+
+        target_end = end_date or await self.latest_common_date(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            model_ids=member_ids,
+            required=min_coverage,
+        )
+        if target_end is None:
+            raise BlendError(
+                "所选模型没有共同数据日：请先对成员做串行补推，或调低最低覆盖数",
+                code="no_common_date",
+            )
+        target_start = start_date or (target_end - timedelta(days=180))
+        if target_start > target_end:
+            raise BlendError("建仓日不能晚于截止日")
+        calendar_days = await self._calendar_days(target_start, target_end)
+        if not calendar_days:
+            raise BlendError("所选区间内没有交易日")
+        if len(calendar_days) > MAX_PERIOD_TRADING_DAYS:
+            raise BlendError(
+                f"区间最多 {MAX_PERIOD_TRADING_DAYS} 个交易日（约 14 个月），"
+                f"请把建仓日推后（当前 {len(calendar_days)} 个交易日）",
+                status_code=422,
+                code="range_too_long",
+            )
+        if method != "mean" and len(calendar_days) > MAX_NON_MEAN_PERIOD_DAYS:
+            raise BlendError(
+                f"{method} 方法最多支持 {MAX_NON_MEAN_PERIOD_DAYS} 个交易日，"
+                "请缩短区间或改用均值组合",
+                status_code=422,
+                code="range_too_long",
+            )
+
+        rows_by_day = await self._range_stats(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            members=members,
+            weights=weights,
+            method=method,
+            trim_count=int(blend.get("trim_count") or 2),
+            min_coverage=min_coverage,
+            consensus_min_count=int(blend.get("consensus_min_count") or 0),
+            start_date=target_start,
+            end_date=target_end,
+            top_k=target_positions,
+        )
+        day_set = set(calendar_days)
+        scoring_days = sorted(day for day in rows_by_day if day in day_set)
+        if len(scoring_days) < 2:
+            raise BlendError(
+                "该区间评分日不足 2 天，无法形成滚动周期：请放宽区间，"
+                "或先对成员做串行补推",
+                status_code=422,
+                code="insufficient_scoring_days",
+            )
+        effective_start = scoring_days[0]
+        effective_end = target_end
+        sim_days = [day for day in calendar_days if day >= effective_start]
+        coverage_ratio = len(scoring_days) / len(sim_days) if sim_days else 0.0
+        if coverage_ratio < MIN_PERIOD_COVERAGE:
+            raise BlendError(
+                f"评分覆盖率仅 {coverage_ratio:.0%}（评分日 {len(scoring_days)} / "
+                f"交易日 {len(sim_days)}），不足以统计周期收益；请缩短区间",
+                status_code=422,
+                code="insufficient_coverage",
+            )
+
+        picks_by_day = {
+            day: [str(row["symbol"]) for row in rows[:target_positions]]
+            for day, rows in rows_by_day.items()
+            if effective_start <= day <= effective_end
+        }
+        symbols = sorted(
+            {symbol for picks in picks_by_day.values() for symbol in picks}
+        )
+        closes = (
+            await self._close_history(symbols, effective_start, effective_end)
+            if symbols
+            else {}
+        )
+        if not closes:
+            raise BlendError(
+                "行情源不可用，未计算周期收益（不使用 0 价或伪造行情）",
+                status_code=422,
+                code="quote_source_unavailable",
+            )
+
+        result = simulate_period(
+            days=sim_days,
+            picks_by_day=picks_by_day,
+            closes=closes,
+            capital=capital,
+            positions=target_positions,
+            entry_per_day=entry_per_day,
+            hold_days=hold_days,
+        )
+        names = await self._stock_names()
+        warnings: list[str] = []
+        if target_start < effective_start:
+            warnings.append("effective_start_clamped")
+        if coverage_ratio < 1.0:
+            warnings.append("scoring_gap")
+        if coverage_ratio < PARTIAL_PERIOD_COVERAGE:
+            warnings.append("partial_data")
+        counts = result["warnings"]
+        for code in ("missing_entry_price", "deferred_exit", "stale_mark"):
+            if int(counts.get(code) or 0) > 0:
+                warnings.append(code)
+        if counts.get("positions_cap"):
+            warnings.append("positions_cap")
+        if counts.get("underfill"):
+            warnings.append("underfill")
+
+        summary = dict(result["summary"])
+        summary["data_quality"] = (
+            "partial" if coverage_ratio < PARTIAL_PERIOD_COVERAGE else "complete"
+        )
+        summary["scoring_coverage_pct"] = round(coverage_ratio * 100.0, 2)
+
+        def trade_row(row: Mapping[str, Any], *, exit_side: bool) -> dict[str, Any]:
+            symbol = str(row["symbol"])
+            payload = {
+                **row,
+                "code": symbol,
+                "name": names.get(symbol) or "",
+                "entry_date": row["entry_date"].isoformat(),
+            }
+            if exit_side:
+                payload["exit_date"] = row["exit_date"].isoformat()
+            else:
+                payload["mark_date"] = row["mark_date"].isoformat()
+            return payload
+
+        month_rows = [
+            {
+                **row,
+                "start_date": row["start_date"].isoformat(),
+                "end_date": row["end_date"].isoformat(),
+            }
+            for row in result["months"]
+        ]
+        daily_rows = [
+            {**row, "date": row["date"].isoformat()} for row in result["daily"]
+        ]
+        return {
+            "blend_id": str(blend["blend_id"]),
+            "requested": {
+                "start": target_start.isoformat(),
+                "end": target_end.isoformat(),
+                "capital": capital,
+                "positions": target_positions,
+            },
+            "effective": {
+                "start": effective_start.isoformat(),
+                "end": effective_end.isoformat(),
+                "first_scoring_day": scoring_days[0].isoformat(),
+                "last_scoring_day": scoring_days[-1].isoformat(),
+            },
+            "template": {
+                "entry_per_day": entry_per_day,
+                "hold_days": hold_days,
+                "target_positions": template_positions,
+                "method": method,
+            },
+            "summary": summary,
+            "months": month_rows,
+            "daily": daily_rows,
+            "trades": [trade_row(row, exit_side=True) for row in result["trades"]],
+            "open": [trade_row(row, exit_side=False) for row in result["open"]],
+            "warnings": warnings,
+            "members": self._member_payload(members, {}, weights),
+        }
+
     async def create_blend(
         self,
         *,
@@ -1259,6 +1555,184 @@ class ModelBlendService:
             for row in rows
         ]
 
+    async def _range_stats(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        members: Sequence[Mapping[str, Any]],
+        weights: Mapping[str, float] | None,
+        method: str,
+        trim_count: int,
+        min_coverage: int,
+        consensus_min_count: int,
+        start_date: date,
+        end_date: date,
+        top_k: int,
+    ) -> dict[date, list[dict[str, Any]]]:
+        """区间内每日组合分 TopK（``start_date <= day <= end_date``）。
+
+        ``mean`` 走快路：SQL 先按 `(data_trade_date, 原始 symbol)` 聚合
+        `SUM(pct×w) / SUM(w)`，Python 再折叠前缀并排序（与 ``_window_stats``
+        逐日对拍 diff=0，见 ``test_blend_service``）。逐行正则折叠符号是
+        慢路的瓶颈（32 天实测 ~10s / 12.5s），快路约 4s。
+
+        ``median/trimmed`` 无法在折叠前做可合并聚合，复用 ``_window_stats``；
+        调用方须先把区间限制在 120 个交易日内。
+        """
+        if method not in {"mean", "median", "trimmed"}:
+            raise BlendError(f"未知组合方法：{method}")
+        if method != "mean":
+            lookback = max(1, (end_date - start_date).days + 5)
+            window = await self._window_stats(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                members=members,
+                weights=weights,
+                method=method,
+                trim_count=trim_count,
+                min_coverage=min_coverage,
+                consensus_min_count=consensus_min_count,
+                end_date=end_date,
+                lookback=lookback,
+                top_k=top_k,
+                symbols=[],
+            )
+            return {
+                day: rows
+                for day, rows in (window.get("top_rows") or {}).items()
+                if start_date <= day <= end_date
+            }
+
+        model_ids = [str(m["model_id"]) for m in members]
+        ordered_weights = [
+            float((weights or {}).get(model_id, 1.0)) for model_id in model_ids
+        ]
+        equal_weights = all(
+            abs(weight - ordered_weights[0]) < 1e-12 for weight in ordered_weights
+        )
+        weight_join = ""
+        weight_params: dict[str, Any] = {}
+        if equal_weights:
+            score_expr = "SUM(e.rank_pct)"
+            weight_sum_expr = "COUNT(*)"
+        else:
+            score_expr = "SUM(e.rank_pct * CAST(w.weight AS float8))"
+            weight_sum_expr = "SUM(CAST(w.weight AS float8))"
+            rows = ", ".join(
+                f"(:wm{i}, CAST(:ww{i} AS float8))" for i in range(len(model_ids))
+            )
+            weight_join = (
+                f"JOIN (VALUES {rows}) AS w(model_id, weight)"
+                " ON w.model_id = e.model_id"
+            )
+            for index, (model_id, weight) in enumerate(
+                zip(model_ids, ordered_weights, strict=True)
+            ):
+                weight_params[f"wm{index}"] = model_id
+                weight_params[f"ww{index}"] = weight
+
+        cache_key = _range_cache_key(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            members=list(zip(model_ids, ordered_weights, strict=True)),
+            method=method,
+            trim_count=trim_count,
+            min_coverage=min_coverage,
+            consensus_min_count=consensus_min_count,
+            start_date=start_date,
+            end_date=end_date,
+            top_k=top_k,
+        )
+        cached = _range_cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        sql = f"""
+            WITH {_RUNS_CTE}
+            SELECT r.data_trade_date, e.symbol AS raw_symbol,
+                   {score_expr} AS wscore,
+                   {weight_sum_expr} AS wsum,
+                   COUNT(*) AS coverage,
+                   COUNT(*) FILTER (WHERE e.rank_pct >= 0.70) AS consensus
+            FROM runs r
+            JOIN engine_signal_scores e ON e.run_id = r.run_id
+            {weight_join}
+            WHERE e.tenant_id = :tenant_id AND e.user_id = :user_id
+              AND e.rank_pct IS NOT NULL
+            GROUP BY r.data_trade_date, e.symbol
+        """
+        async with get_session(read_only=True) as session:
+            rows = (
+                await session.execute(
+                    text(sql),
+                    {
+                        "tenant_id": tenant_id,
+                        "user_id": user_id,
+                        "model_ids": model_ids,
+                        "start": start_date,
+                        "end": end_date,
+                        **weight_params,
+                    },
+                )
+            ).all()
+
+        # 原始形态 → 前缀式：合并 (Σ pct×w, Σw, coverage, consensus)
+        merged: dict[date, dict[str, list[float]]] = {}
+        for day, raw_symbol, wscore, wsum, coverage, consensus in rows:
+            key = day if isinstance(day, date) else date.fromisoformat(str(day))
+            prefix = StockCodeUtil.to_prefix(str(raw_symbol)) or str(raw_symbol)
+            acc = merged.setdefault(key, {}).get(prefix)
+            if acc is None:
+                merged[key][prefix] = [
+                    float(wscore),
+                    float(wsum),
+                    int(coverage),
+                    int(consensus),
+                ]
+            else:
+                acc[0] += float(wscore)
+                acc[1] += float(wsum)
+                acc[2] += int(coverage)
+                acc[3] += int(consensus)
+
+        out: dict[date, list[dict[str, Any]]] = {}
+        for day, symbols in merged.items():
+            scored: list[tuple[str, float, int]] = []
+            for symbol, acc in symbols.items():
+                weight_sum = acc[1]
+                coverage = int(acc[2])
+                if weight_sum <= 0 or coverage < min_coverage:
+                    continue
+                if consensus_min_count > 0 and int(acc[3]) < consensus_min_count:
+                    continue
+                scored.append((symbol, acc[0] / weight_sum, coverage))
+            if not scored:
+                continue
+            scored.sort(key=lambda row: (-row[1], -row[2], row[0]))
+            n_total = len(scored)
+            ascending = sorted(score for _, score, _ in scored)
+            top_rows: list[dict[str, Any]] = []
+            for row_rank, (symbol, score, coverage) in enumerate(
+                scored[: max(1, int(top_k))], start=1
+            ):
+                # 与 _window_stats 同口径：降序名次、升序名次、截面分位
+                pct = rank_pct_from_rank(bisect_left(ascending, score) + 1, n_total)
+                top_rows.append(
+                    {
+                        "symbol": symbol,
+                        "score": float(score),
+                        "rank": n_total - bisect_right(ascending, score) + 1,
+                        "row_rank": row_rank,
+                        "coverage": coverage,
+                        "pct": pct,
+                        "position": position_of(pct),
+                    }
+                )
+            out[day] = top_rows
+        _range_cache_put(cache_key, out)
+        return {day: [dict(row) for row in rows] for day, rows in out.items()}
+
     async def _window_stats(
         self,
         *,
@@ -1505,6 +1979,28 @@ class ModelBlendService:
         return out
 
     # ── 调仓计划 ────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def _calendar_days(start: date, end: date) -> list[date]:
+        """``[start, end]`` 内的 A 股交易日（升序，含首尾）。
+
+        日历不可用时退化为自然日（与 ``_trading_days`` 同一兜底口径），
+        这样周期视图不会因为日历服务故障直接 500。
+        """
+        if end < start:
+            return []
+        try:
+            from backend.shared.trading_calendar import trading_days_xcal
+
+            days = trading_days_xcal("CN", start, end + timedelta(days=1))
+        except Exception:  # pragma: no cover - 日历不可用时退化为自然日
+            days = None
+        if not days:
+            days = [
+                start + timedelta(days=offset)
+                for offset in range((end - start).days + 1)
+            ]
+        return [day for day in days if start <= day <= end]
 
     @staticmethod
     async def _trading_days(end: date, *, need: int) -> list[date]:

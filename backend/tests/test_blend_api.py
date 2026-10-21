@@ -91,6 +91,20 @@ class _FakeService:
             "summary": {"unique_symbols": 0, "new_today": 0, "exited_today": 0},
         }
 
+    async def period(self, blend, **kwargs):
+        self._record("period", blend=blend, **kwargs)
+        return {
+            "blend_id": "bl_x",
+            "requested": {},
+            "effective": {},
+            "summary": {"total_return_pct": 0.0},
+            "months": [],
+            "daily": [],
+            "trades": [],
+            "open": [],
+            "warnings": [],
+        }
+
     async def plan(self, blend, **kwargs):
         self._record("plan", blend=blend, **kwargs)
         return dict(self.plan_payload)
@@ -387,6 +401,71 @@ def test_rolling_defaults_and_bounds(api):
     # 越界由 Query 约束在进服务前拦下
     assert client.get(f"{BASE}/bl_x/rolling", params={"window": 0}).status_code == 422
     assert client.get(f"{BASE}/bl_x/rolling", params={"per_day": 51}).status_code == 422
+
+
+def test_period_passes_range_capital_positions_and_dates(api):
+    client, service, persistence = api
+    persistence.blends["bl_x"] = _blend()
+    resp = client.get(
+        f"{BASE}/bl_x/period",
+        params={
+            "start": "2026-08-01",
+            "end": "2026-10-19",
+            "capital": 5000000,
+            "positions": 20,
+        },
+    )
+    assert resp.status_code == 200
+    name, kwargs = service.calls[-1]
+    assert name == "period"
+    assert kwargs["start_date"] == date(2026, 8, 1)
+    assert kwargs["end_date"] == date(2026, 10, 19)
+    assert kwargs["capital"] == 5000000
+    assert kwargs["positions"] == 20
+    assert kwargs["blend"]["blend_id"] == "bl_x"
+    assert kwargs["tenant_id"] == "default"
+    assert kwargs["user_id"] == "10000001"
+
+
+def test_period_defaults_and_query_bounds(api):
+    client, service, persistence = api
+    persistence.blends["bl_x"] = _blend()
+    assert client.get(f"{BASE}/bl_x/period").status_code == 200
+    _, kwargs = service.calls[-1]
+    assert kwargs["start_date"] is None
+    assert kwargs["end_date"] is None
+    assert kwargs["capital"] == 10_000_000.0
+    assert kwargs["positions"] is None
+    # 越界由 Query 在进服务前拦下；坏日期由 _parse_date 拦成 400
+    for params in (
+        {"positions": 0},
+        {"positions": 51},
+        {"capital": 0},
+        {"capital": 1e13},
+    ):
+        assert client.get(f"{BASE}/bl_x/period", params=params).status_code == 422, (
+            params
+        )
+    assert (
+        client.get(f"{BASE}/bl_x/period", params={"start": "2026-13-01"}).status_code
+        == 400
+    )
+
+
+def test_period_maps_business_error_to_detail_code(api):
+    client, service, persistence = api
+    persistence.blends["bl_x"] = _blend()
+    service.errors["period"] = BlendError(
+        "评分日不足", status_code=422, code="insufficient_scoring_days"
+    )
+    resp = client.get(f"{BASE}/bl_x/period")
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["code"] == "insufficient_scoring_days"
+
+
+def test_period_404s_unknown_blend(api):
+    client, _service, _persistence = api
+    assert client.get(f"{BASE}/bl_unknown/period").status_code == 404
 
 
 def test_create_plan_without_overrides_leaves_config_to_service(api):

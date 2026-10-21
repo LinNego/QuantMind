@@ -19,6 +19,8 @@ import type {
   BlendDatesResponse,
   BlendEvidenceResponse,
   BlendPatchRequest,
+  BlendPeriodQuery,
+  BlendPeriodResponse,
   BlendPlan,
   BlendPlanRequest,
   BlendPreviewRequest,
@@ -34,6 +36,8 @@ const BASE_PATH = '/models/blends';
 /** 计划冷启动实测 ~8s（含行情/成交额读取），给足余量；轮询类请求仍用 30s */
 const PLAN_TIMEOUT_MS = 60_000;
 const ROLLING_TIMEOUT_MS = 45_000;
+/** 周期收益冷启动实测 ~6s（32 评分日）；300 交易日上限按 kill 判据留足余量 */
+const PERIOD_TIMEOUT_MS = 90_000;
 
 class BlendService {
   private client: AxiosInstance;
@@ -160,6 +164,29 @@ class BlendService {
           per_day: params.per_day ?? 5,
         },
         timeout: ROLLING_TIMEOUT_MS,
+      },
+    );
+    return resp.data;
+  }
+
+  /**
+   * 周期收益：固定持有期滚动桶（收盘价建仓/退出，无手续费与滑点）。
+   * 只读研究计算，不产生任何委托。
+   */
+  async getPeriod(
+    blendId: string,
+    params: BlendPeriodQuery = {},
+  ): Promise<BlendPeriodResponse> {
+    const resp = await this.client.get<BlendPeriodResponse>(
+      `${BASE_PATH}/${blendId}/period`,
+      {
+        params: {
+          start: params.start,
+          end: params.end,
+          capital: params.capital,
+          positions: params.positions,
+        },
+        timeout: PERIOD_TIMEOUT_MS,
       },
     );
     return resp.data;

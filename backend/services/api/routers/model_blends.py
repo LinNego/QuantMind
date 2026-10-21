@@ -367,6 +367,30 @@ async def get_blend_rolling(
     )
 
 
+@router.get("/{blend_id}/period", summary="周期收益（固定持有期滚动，收盘口径无费用）")
+async def get_blend_period(
+    blend_id: str,
+    start_str: str | None = Query(default=None, alias="start"),
+    end_str: str | None = Query(default=None, alias="end"),
+    capital: float = Query(default=10_000_000.0, gt=0, le=1e12),
+    positions: int | None = Query(default=None, ge=1, le=50),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    tenant_id, user_id = _owner(current_user)
+    blend = await _get_blend_or_404(blend_id, tenant_id=tenant_id, user_id=user_id)
+    return await _run(
+        ModelBlendService().period(
+            blend,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            start_date=_parse_date(start_str),
+            end_date=_parse_date(end_str),
+            capital=capital,
+            positions=positions,
+        )
+    )
+
+
 @router.get("/{blend_id}/ranking", summary="当日组合榜单")
 async def get_blend_ranking(
     blend_id: str,

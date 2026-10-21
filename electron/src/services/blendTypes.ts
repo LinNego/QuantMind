@@ -211,6 +211,144 @@ export interface BlendRollingResponse {
   warnings: string[];
 }
 
+// ── 周期收益（固定持有期滚动桶，收盘口径无费用）──────────────────────
+
+export interface BlendPeriodRequested {
+  start: string;
+  end: string;
+  capital: number;
+  positions: number;
+}
+
+/** 实际生效区间：请求区间被可用评分日夹取后的结果 */
+export interface BlendPeriodEffective {
+  start: string;
+  end: string;
+  first_scoring_day: string;
+  last_scoring_day: string;
+}
+
+export interface BlendPeriodTemplate {
+  entry_per_day: number;
+  hold_days: number;
+  target_positions: number;
+  method: BlendMethod;
+}
+
+export type BlendPeriodDataQuality = 'complete' | 'partial';
+
+export interface BlendPeriodSummary {
+  initial_capital: number;
+  final_equity: number;
+  total_return_pct: number | null;
+  profit_amount: number;
+  realized_pnl_amount: number;
+  unrealized_pnl_amount: number;
+  max_drawdown_pct: number | null;
+  trading_days: number;
+  scoring_days: number;
+  entries: number;
+  exits: number;
+  closed_trades: number;
+  open_positions: number;
+  wins: number;
+  losses: number;
+  flats: number;
+  win_rate_pct: number | null;
+  avg_trade_return_pct: number | null;
+  avg_positions: number;
+  /** 固定口径：收盘价建仓/退出 */
+  entry_convention: string;
+  /** 固定口径：不计手续费/印花税/滑点 */
+  fee_convention: string;
+  data_quality: BlendPeriodDataQuality;
+  scoring_coverage_pct: number;
+}
+
+export interface BlendPeriodMonth {
+  month: string;
+  start_date: string;
+  end_date: string;
+  start_equity: number;
+  end_equity: number;
+  return_pct: number | null;
+  profit_amount: number;
+  entries: number;
+  exits: number;
+  closed_trades: number;
+  month_end_positions: number;
+  win_rate_pct: number | null;
+  /** 区间首月/末月未覆盖整月 */
+  partial: boolean;
+}
+
+export interface BlendPeriodDaily {
+  date: string;
+  equity: number;
+  cash: number;
+  positions: number;
+  entries: number;
+  exits: number;
+  return_pct: number | null;
+}
+
+export interface BlendPeriodTrade {
+  symbol: string;
+  code: string;
+  name: string;
+  entry_date: string;
+  exit_date: string;
+  entry_price: number;
+  exit_price: number;
+  shares: number;
+  notional: number;
+  return_pct: number | null;
+  pnl_amount: number;
+  held_days: number;
+  exit_reason: string;
+  /** 到期日缺价顺延到下一个有效收盘价 */
+  deferred: boolean;
+}
+
+export interface BlendPeriodOpen {
+  symbol: string;
+  code: string;
+  name: string;
+  entry_date: string;
+  mark_date: string;
+  entry_price: number;
+  mark_price: number;
+  shares: number;
+  notional: number;
+  return_pct: number | null;
+  pnl_amount: number;
+  held_days: number;
+  /** 期末无有效收盘价，沿用上一有效价 */
+  stale: boolean;
+}
+
+export interface BlendPeriodResponse {
+  blend_id: string;
+  requested: BlendPeriodRequested;
+  effective: BlendPeriodEffective;
+  template: BlendPeriodTemplate;
+  summary: BlendPeriodSummary;
+  months: BlendPeriodMonth[];
+  daily: BlendPeriodDaily[];
+  trades: BlendPeriodTrade[];
+  open: BlendPeriodOpen[];
+  /** 机读码：effective_start_clamped / scoring_gap / partial_data / … */
+  warnings: string[];
+  members: BlendRankingMember[];
+}
+
+export interface BlendPeriodQuery {
+  start?: string;
+  end?: string;
+  capital?: number;
+  positions?: number;
+}
+
 export interface BlendPlanConfig {
   capital: number;
   top_k: number;
