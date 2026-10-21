@@ -5,12 +5,12 @@ import {
   Archive, Brain, Clock, XCircle, X,
   ChevronRight, Play, Download, ChevronDown,
   ChevronUp, Shield, Zap, ListFilter, Activity,
-  Compass, Sparkles, Pencil,
+  Compass, Sparkles, Pencil, ArrowUpDown,
 } from 'lucide-react';
 import {
   Button, Card, Tag, Typography, Empty, Spin, message,
   Progress, Divider, Row, Col, Input, Modal, Tabs, Switch,
-  DatePicker, Table, Badge, Tooltip, Select,
+  DatePicker, Table, Badge, Tooltip, Select, Dropdown,
 } from 'antd';
 import { clsx } from 'clsx';
 import dayjs from 'dayjs';
@@ -46,6 +46,15 @@ import {
   AttributionAnalysisPanel,
 } from './modelRegistryPanels';
 import { FusionModal } from './FusionModal';
+import {
+  MODEL_SORT_OPTIONS,
+  ModelListPrefs,
+  ModelSortKey,
+  loadModelListPrefs,
+  saveModelListPrefs,
+  sortModelRecords,
+  toggleId,
+} from './modelRegistryListPrefs';
 import { PublishModelModal } from './hub/PublishModelModal';
 import { DriftTabPanel } from './DriftTabPanel';
 import { MarketRegimePanel } from './MarketRegimePanel';
@@ -62,6 +71,8 @@ import { selectCurrentMarket } from '../store/slices/uiSlice';
 import { getMarketConfig } from '../config/marketConfig';
 const { Text } = Typography;
 
+type ModelListTab = 'active' | 'favorites' | 'archived';
+
 export const ModelRegistryPage: React.FC = () => {
   const navigate = useNavigate();
   const currentMarket = useAppSelector(selectCurrentMarket);
@@ -72,7 +83,8 @@ export const ModelRegistryPage: React.FC = () => {
   const selectedIdRef = React.useRef<string | null>(null);
   React.useEffect(() => { selectedIdRef.current = selectedId; }, [selectedId]);
   const [showPublishModal, setShowPublishModal] = useState(false);
-  const [showArchived, setShowArchived] = useState(false);
+  const [listTab, setListTab] = useState<ModelListTab>('active');
+  const [listPrefs, setListPrefs] = useState<ModelListPrefs>(() => loadModelListPrefs(currentMarket));
   const [searchQuery, setSearchQuery] = useState('');
   const [settingDefault, setSettingDefault] = useState(false);
   const [archiving, setArchiving] = useState(false);
@@ -114,11 +126,21 @@ export const ModelRegistryPage: React.FC = () => {
   const allModels = userModels;
   const activeModels = allModels.filter(m => m.status !== 'archived');
   const archivedModels = allModels.filter(m => m.status === 'archived');
-  const displayModels = (showArchived ? allModels : activeModels).filter(m =>
-    !searchQuery ||
-    m.model_id.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    modelDisplayName(m).toLowerCase().includes(searchQuery.toLowerCase())
+  const favoriteModels = allModels.filter(m => listPrefs.favorites.includes(m.model_id));
+  const tabModels =
+    listTab === 'favorites' ? favoriteModels
+      : listTab === 'archived' ? archivedModels
+        : activeModels;
+  const displayModels = sortModelRecords(
+    tabModels.filter(m =>
+      !searchQuery ||
+      m.model_id.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      modelDisplayName(m).toLowerCase().includes(searchQuery.toLowerCase())
+    ),
+    { pinned: listPrefs.pinned, sortKey: listPrefs.sortKey },
   );
+  const activeSortLabel =
+    MODEL_SORT_OPTIONS.find(o => o.key === listPrefs.sortKey)?.shortLabel ?? '排序';
 
   const selectedModel = userModels.find(m => m.model_id === selectedId) ?? null;
   const meta = selectedModel ? getMeta(selectedModel) : {} as ReturnType<typeof getMeta>;
@@ -216,6 +238,26 @@ export const ModelRegistryPage: React.FC = () => {
   }, [currentMarket]);
 
   useEffect(() => { loadModels(); }, [loadModels]);
+
+  // 偏好按市场隔离：切换市场时重新装载（各市场模型集合与 ID 空间不同）
+  useEffect(() => {
+    setListPrefs(loadModelListPrefs(currentMarket));
+  }, [currentMarket]);
+
+  const updateListPrefs = (patch: Partial<ModelListPrefs>) => {
+    const next = { ...listPrefs, ...patch };
+    setListPrefs(next);
+    saveModelListPrefs(currentMarket, next);
+  };
+
+  const handleTogglePin = (modelId: string) => {
+    // 最近置顶的排最前，方便刚钉上去的模型立刻可见
+    updateListPrefs({ pinned: toggleId(listPrefs.pinned, modelId, true) });
+  };
+
+  const handleToggleFavorite = (modelId: string) => {
+    updateListPrefs({ favorites: toggleId(listPrefs.favorites, modelId) });
+  };
 
   const handleFusionCreated = async (modelId: string) => {
     setShowFusionModal(false);
@@ -550,7 +592,7 @@ export const ModelRegistryPage: React.FC = () => {
       <div className={PAGE_LAYOUT.frameClass}>
         <div className="flex flex-row h-full w-full overflow-hidden">
           {/* ═══ 左侧边栏 ═══ */}
-          <div className="w-[300px] flex-shrink-0 border-r border-slate-100 bg-white flex flex-col shadow-lg shadow-slate-100/50 z-10 h-full overflow-hidden">
+          <div className="w-[360px] flex-shrink-0 border-r border-slate-100 bg-white flex flex-col shadow-lg shadow-slate-100/50 z-10 h-full overflow-hidden">
             {/* 顶部标题 + 搜索 */}
             <div className="px-5 pt-5 pb-4 border-b border-slate-50">
               <div className="flex items-center justify-between mb-4">
@@ -594,20 +636,20 @@ export const ModelRegistryPage: React.FC = () => {
             </div>
             {/* 分类切换 */}
             <div className="px-4 pt-3 pb-2 flex gap-1">
-              <button
-                onClick={() => setShowArchived(false)}
-                className={clsx(
-                  'flex-1 py-1 rounded-lg text-[10px] font-black tracking-widest transition-all',
-                  !showArchived ? 'bg-blue-600 text-white shadow shadow-blue-200' : 'text-slate-400 hover:text-slate-600'
-                )}
-              >使用中 ({activeModels.length})</button>
-              <button
-                onClick={() => setShowArchived(true)}
-                className={clsx(
-                  'flex-1 py-1 rounded-lg text-[10px] font-black tracking-widest transition-all',
-                  showArchived ? 'bg-slate-800 text-white' : 'text-slate-400 hover:text-slate-600'
-                )}
-              >已归档 ({archivedModels.length})</button>
+              {([
+                { key: 'active' as const, label: `使用中 (${activeModels.length})`, activeCls: 'bg-blue-600 text-white shadow shadow-blue-200' },
+                { key: 'favorites' as const, label: `收藏 (${favoriteModels.length})`, activeCls: 'bg-amber-500 text-white shadow shadow-amber-200' },
+                { key: 'archived' as const, label: `已归档 (${archivedModels.length})`, activeCls: 'bg-slate-800 text-white' },
+              ]).map(tab => (
+                <button
+                  key={tab.key}
+                  onClick={() => setListTab(tab.key)}
+                  className={clsx(
+                    'flex-1 py-1 rounded-lg text-[10px] font-black tracking-widest transition-all',
+                    listTab === tab.key ? tab.activeCls : 'text-slate-400 hover:text-slate-600'
+                  )}
+                >{tab.label}</button>
+              ))}
             </div>
             {/* 模型列表 */}
             <div className="flex-1 overflow-y-auto px-3 pb-5 space-y-1.5 custom-scrollbar">
@@ -615,23 +657,54 @@ export const ModelRegistryPage: React.FC = () => {
                 <div className="flex items-center justify-center py-16"><Spin /></div>
               ) : displayModels.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-16 gap-4">
-                  <Empty description={<span className="text-xs text-slate-400">暂无模型</span>} />
-                  <Button
-                    type="primary" size="small"
-                    className="rounded-xl bg-blue-600 border-none font-bold text-xs"
-                    icon={<Brain size={12} />}
-                    onClick={() => navigate('/model-training')}
-                  >去训练模型</Button>
+                  <Empty
+                    description={
+                      <span className="text-xs text-slate-400">
+                        {searchQuery ? '没有匹配的模型'
+                          : listTab === 'favorites' ? '还没有收藏的模型（点卡片右上角书签收藏）'
+                            : listTab === 'archived' ? '暂无归档模型'
+                              : '暂无模型'}
+                      </span>
+                    }
+                  />
+                  {listTab === 'active' && (
+                    <Button
+                      type="primary" size="small"
+                      className="rounded-xl bg-blue-600 border-none font-bold text-xs"
+                      icon={<Brain size={12} />}
+                      onClick={() => navigate('/model-training')}
+                    >去训练模型</Button>
+                  )}
                 </div>
               ) : (
                 <>
-                  <div className="px-2 pt-2 pb-1 flex items-center justify-between">
-                    <div className="flex items-center gap-1.5">
+                  <div className="px-2 pt-2 pb-1 flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5 min-w-0">
                       <Brain size={10} className="text-blue-500" />
-                      <span className="text-[9px] font-black text-blue-500 tracking-widest">我的模型资产</span>
+                      <span className="text-[9px] font-black text-blue-500 tracking-widest whitespace-nowrap">我的模型资产</span>
                     </div>
-                    {fusionMode && (
-                      <span className="text-[9px] font-black text-purple-600 tracking-widest">融合模式 · 勾选成员</span>
+                    {!fusionMode ? (
+                      <Dropdown
+                        trigger={['click']}
+                        placement="bottomRight"
+                        menu={{
+                          selectable: true,
+                          selectedKeys: [listPrefs.sortKey],
+                          items: MODEL_SORT_OPTIONS.map(o => ({ key: o.key, label: o.label })),
+                          onClick: ({ key }) => updateListPrefs({ sortKey: key as ModelSortKey }),
+                        }}
+                      >
+                        <button
+                          type="button"
+                          title="模型排序"
+                          className="flex items-center gap-1 px-1.5 py-1 rounded-md text-[9px] font-black text-slate-400 hover:text-blue-600 hover:bg-blue-50 transition-all shrink-0"
+                        >
+                          <ArrowUpDown size={10} />
+                          {activeSortLabel}
+                        </button>
+                      </Dropdown>
+                    ) : (
+                      <span className="text-[9px] font-black text-purple-600 tracking-widest whitespace-nowrap">融合模式 · 勾选成员</span>
                     )}
                   </div>
                   {displayModels.map(model => (
@@ -645,6 +718,10 @@ export const ModelRegistryPage: React.FC = () => {
                       }}
                       onSetDefault={() => void handleSetDefaultById(model.model_id)}
                       canSetDefault={!fusionMode && !model.is_default && model.status !== 'archived'}
+                      isPinned={listPrefs.pinned.includes(model.model_id)}
+                      isFavorite={listPrefs.favorites.includes(model.model_id)}
+                      onTogglePin={() => handleTogglePin(model.model_id)}
+                      onToggleFavorite={() => handleToggleFavorite(model.model_id)}
                       selectable={fusionMode}
                       selected={fusionSelected.includes(model.model_id)}
                       onToggleSelect={() => toggleFusionSelect(model)}

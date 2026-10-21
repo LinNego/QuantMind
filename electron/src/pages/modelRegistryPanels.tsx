@@ -1,5 +1,5 @@
 import React, { useMemo, useState, useEffect, useCallback } from 'react';
-import { Button, Card, Tag, Typography, Empty, Spin, Progress, Divider, Input, Modal, Tabs, Table, Drawer, Collapse, Select, Pagination, message, Space, Alert, Checkbox } from 'antd';
+import { Button, Card, Tag, Typography, Empty, Spin, Progress, Divider, Input, Modal, Tabs, Table, Drawer, Collapse, Select, Pagination, message, Space, Alert, Checkbox, Tooltip } from 'antd';
 import { clsx } from 'clsx';
 import { EvalScoreBadge } from '../components/shared/EvalScoreBadge';
 import dayjs from 'dayjs';
@@ -8,6 +8,7 @@ import {
   History, Archive, Brain, CheckCircle2, Clock, XCircle, Trash2,
   ChevronRight, Play, Cpu, TrendingUp, Download, ChevronDown,
   ChevronUp, Shield, Zap, Activity, ListFilter, BarChart3, Info, AlertCircle,
+  Pin, Bookmark,
 } from 'lucide-react';
 import {
   UserModelRecord,
@@ -119,13 +120,22 @@ export const ModelCard: React.FC<{
   onClick: () => void;
   onSetDefault: () => void;
   canSetDefault: boolean;
+  /** 置顶 / 收藏（本地偏好，见 modelRegistryListPrefs）。 */
+  isPinned?: boolean;
+  isFavorite?: boolean;
+  onTogglePin?: () => void;
+  onToggleFavorite?: () => void;
   /** 融合模式：卡片显示复选框，点击行为交回页面（选中/取消）。 */
   selectable?: boolean;
   selected?: boolean;
   onToggleSelect?: () => void;
   /** 融合模式下该模型不可作成员（系统模型/未就绪）：复选框置灰，点击给警告。 */
   selectDisabled?: boolean;
-}> = ({ model, isSelected, onClick, onSetDefault, canSetDefault, selectable = false, selected = false, onToggleSelect, selectDisabled = false }) => {
+}> = ({
+  model, isSelected, onClick, onSetDefault, canSetDefault,
+  isPinned = false, isFavorite = false, onTogglePin, onToggleFavorite,
+  selectable = false, selected = false, onToggleSelect, selectDisabled = false,
+}) => {
   const sc = getStatusConfig(model.status);
   const mt = extractModelType(model);
   const fc = getMeta(model).feature_count ?? null;
@@ -166,7 +176,43 @@ export const ModelCard: React.FC<{
           )}
           {model.is_default && <Star size={9} fill="#fbbf24" className="text-amber-400" />}
         </div>
-        <Text className="text-[8px] text-slate-400 font-mono whitespace-nowrap shrink-0">{createdLabel}</Text>
+        <div className="flex items-center gap-1 shrink-0">
+          {onTogglePin && (
+            <Tooltip title={isPinned ? '取消置顶' : '置顶'}>
+              <button
+                type="button"
+                aria-label={isPinned ? '取消置顶' : '置顶'}
+                onClick={(e) => { e.stopPropagation(); onTogglePin(); }}
+                className={clsx(
+                  'w-5 h-5 flex items-center justify-center rounded-md transition-colors',
+                  isPinned
+                    ? 'text-blue-600 bg-blue-50'
+                    : 'text-slate-300 hover:text-slate-500 hover:bg-slate-100',
+                )}
+              >
+                <Pin size={10} fill={isPinned ? 'currentColor' : 'none'} />
+              </button>
+            </Tooltip>
+          )}
+          {onToggleFavorite && (
+            <Tooltip title={isFavorite ? '取消收藏' : '收藏'}>
+              <button
+                type="button"
+                aria-label={isFavorite ? '取消收藏' : '收藏'}
+                onClick={(e) => { e.stopPropagation(); onToggleFavorite(); }}
+                className={clsx(
+                  'w-5 h-5 flex items-center justify-center rounded-md transition-colors',
+                  isFavorite
+                    ? 'text-amber-500 bg-amber-50'
+                    : 'text-slate-300 hover:text-amber-500 hover:bg-amber-50',
+                )}
+              >
+                <Bookmark size={10} fill={isFavorite ? 'currentColor' : 'none'} />
+              </button>
+            </Tooltip>
+          )}
+          <Text className="text-[8px] text-slate-400 font-mono whitespace-nowrap">{createdLabel}</Text>
+        </div>
       </div>
       <div className="flex items-start justify-between gap-2">
         <Text className={clsx('font-black text-[11px] tracking-tight truncate block leading-tight min-w-0', isSelected ? 'text-blue-700' : 'text-slate-800')}>
