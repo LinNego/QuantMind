@@ -75,6 +75,7 @@ def test_review_content_has_index_block_positions_day_pct_and_requirement(lma):
         {},
         ledger=_ledger(_pos()),
         availability={"601000.SH": 1000},
+        real_volumes={"601000.SH": 1000},
         price_reader=price_reader,
         snapshot_reader=snapshot_reader,
         mode="review",
@@ -104,6 +105,7 @@ def test_review_content_index_unavailable_degrades_honestly(lma):
     content, _ = lma.build_user_content(
         {},
         ledger=_ledger(),
+        real_volumes={},
         snapshot_reader=lambda env, code: {},
         mode="review",
     )
@@ -116,6 +118,7 @@ def test_intraday_content_unchanged_shape(lma):
         {},
         ledger=_ledger(_pos()),
         availability={"601000.SH": 1000},
+        real_volumes={"601000.SH": 1000},
         price_reader=lambda env, code: 10.0,
         snapshot_reader=lambda env, code: (_ for _ in ()).throw(
             AssertionError("intraday 不应调用 snapshot_reader")
@@ -133,6 +136,133 @@ def test_account_unreachable_still_forbids_position_commentary_both_modes(lma):
         content, gaps = lma.build_user_content({}, ledger=None, mode=mode)
         assert gaps == ["account_unreachable"]
         assert "禁止" in content and "编造" in content
+
+
+# ── 1b. 账本幻影仓（读侧闸门，2026-10-21 用户报障）────────────────────────
+# 昨天手工清仓走桥委托、``orders.agent=NULL`` 按设计不进分账 → 账本留着幻影仓，
+# 复盘轮只读账本，次日仍在点评已清仓的票。闸门 = 账本持仓 ∩ 真实账户持仓。
+
+
+def test_ledger_phantoms_dropped_by_real_account_gate(lma):
+    """真实账户只剩 600760，账本里的 601000（已清仓）不得进入提示词。"""
+    ledger = _ledger(
+        _pos("600760.SH", cost=46.97, volume=100),
+        _pos("601000.SH", cost=4.54, volume=300),
+    )
+
+    content, gaps = lma.build_user_content(
+        {},
+        ledger=ledger,
+        real_volumes={"600760.SH": 100},
+        availability={},
+        price_reader=lambda env, code: 47.0,
+        snapshot_reader=lambda env, code: {},
+        mode="review",
+    )
+
+    assert "600760.SH" in content
+    assert "601000.SH" not in content
+    # 额度按可见持仓重算：100 × 46.97
+    assert "用户授予 ¥100,000 ｜ 已用（持仓成本） ¥4,697 ｜ 剩余 ¥95,303" in content
+    assert "ledger_phantom_positions" in gaps
+
+
+def test_fully_liquidated_ledger_degrades_to_empty_requirement(lma):
+    """账本只剩幻影仓 → 复盘按「空仓」模板，禁止点评持仓。"""
+    ledger = _ledger(_pos("601668.SH", cost=4.54, volume=100))
+
+    content, gaps = lma.build_user_content(
+        {},
+        ledger=ledger,
+        real_volumes={},
+        price_reader=lambda env, code: 4.5,
+        snapshot_reader=lambda env, code: {},
+        mode="review",
+    )
+
+    assert "601668.SH" not in content
+    assert "【你名下的持仓】空仓" in content
+    assert "不要点评持仓" in content
+    assert "ledger_phantom_positions" in gaps
+
+
+def test_real_account_unreadable_keeps_ledger_and_flags_gap(lma):
+    """真实账户读不到 → **不做剔除**（宁可旧账，不可少显示真仓），但留痕。"""
+    ledger = _ledger(_pos("601000.SH"))
+
+    content, gaps = lma.build_user_content(
+        {},
+        ledger=ledger,
+        real_volumes=None,
+        price_reader=lambda env, code: 4.6,
+        snapshot_reader=lambda env, code: {},
+        mode="review",
+    )
+
+    assert "601000.SH" in content
+    assert "real_positions_unavailable" in gaps
+
+
+def test_partial_manual_sell_clips_visible_volume_to_real_account(lma):
+    """部分手工卖出（账本 300 / 真实 200）→ 可见量与额度都按真实量收敛。"""
+    ledger = _ledger(_pos("601000.SH", cost=4.54, volume=300))
+
+    content, gaps = lma.build_user_content(
+        {},
+        ledger=ledger,
+        real_volumes={"601000.SH": 200},
+        availability={"601000.SH": 200},
+        price_reader=lambda env, code: 4.6,
+    )
+
+    assert "| 601000.SH | 唐山港 | 200 | 200 | 4.540 |" in content
+    assert "已用（持仓成本） ¥908 ｜ 剩余 ¥99,092" in content
+    assert gaps == []
+
+
+def test_snapshot_age_treats_naive_timestamp_as_utc(lma):
+    """``real_account_snapshots.snapshot_at`` 是 naive UTC（历史坑）。"""
+    now = datetime(2026, 10, 21, 8, 0, tzinfo=timezone.utc)
+    assert lma._snapshot_age_seconds("2026-10-21T07:30:00", now=now) == 1800
+    assert lma._snapshot_age_seconds(None, now=now) is None
+    assert lma._snapshot_age_seconds("not-a-time", now=now) is None
+
+
+def test_read_real_position_volumes_prefers_fresh_snapshot(lma, monkeypatch):
+    monkeypatch.setattr(
+        lma,
+        "_real_position_volumes_from_snapshot",
+        lambda env, now=None: {"600760.SH": 100},
+    )
+    monkeypatch.setattr(
+        lma,
+        "_real_position_volumes_from_bridge",
+        lambda env: (_ for _ in ()).throw(AssertionError("快照可用时不应再打桥")),
+    )
+    assert lma.read_real_position_volumes({}) == ({"600760.SH": 100}, "snapshot")
+
+
+def test_read_real_position_volumes_falls_back_to_bridge_when_snapshot_stale(
+    lma, monkeypatch
+):
+    monkeypatch.setattr(
+        lma, "_real_position_volumes_from_snapshot", lambda env, now=None: None
+    )
+    monkeypatch.setattr(
+        lma, "_real_position_volumes_from_bridge", lambda env: {"600760.SH": 100}
+    )
+    assert lma.read_real_position_volumes({}) == ({"600760.SH": 100}, "bridge")
+
+
+def test_read_real_position_volumes_unavailable_when_both_sources_fail(
+    lma, monkeypatch
+):
+    def boom(env, now=None):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(lma, "_real_position_volumes_from_snapshot", boom)
+    monkeypatch.setattr(lma, "_real_position_volumes_from_bridge", lambda env: None)
+    assert lma.read_real_position_volumes({}) == (None, "unavailable")
 
 
 def test_requirement_block_review_vs_intraday_summary_instruction(lma):
@@ -444,6 +574,7 @@ def _run_main(lma, monkeypatch, tmp_path, argv, *, env=None):
         lma, "read_agent_ledgers", lambda e, agents: {a: _ledger() for a in agents}
     )
     monkeypatch.setattr(lma, "_bridge_availability", lambda e: {})
+    monkeypatch.setattr(lma, "read_real_position_volumes", lambda e: ({}, "test"))
     called: list[str] = []
     monkeypatch.setattr(
         lma,

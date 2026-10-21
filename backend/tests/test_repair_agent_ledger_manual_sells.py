@@ -1,0 +1,261 @@
+"""未归属真单成交吸收（分账幻影仓修复）计划器测试。
+
+背景：``agent_ledger_fill`` 纪律 1——``orders.agent`` 为空的成交（人工在桥里点的
+单、风控单）不写分账账本。人工清仓后账本留下幻影仓，决策轮「已用额度」、实况页
+agent 净值、arena 台账仍按幻影算。修复工具把这批成交按**真实成交价**吸收进账本。
+
+计划器只做判定与分配（不碰 DB），本测试钉死四条保守判据：
+
+1. 真实账户仍持有该标的 → 不动（``real_account_still_holds``）；
+2. 未归属卖出总量不足以覆盖账本持仓 → 不动（``unattributed_sells_insufficient``）；
+3. 账本行的 ``buy_ts`` 不早于可分配卖出（含未知 buy_ts）→ 不动，卖出解释不了新仓；
+4. 真实持仓读不到 → 整批不动（``real_positions_unavailable``）。
+
+分配按 ``buy_ts`` FIFO：同一只票多家 agent 分摊一笔人工卖单时，先买的先出；
+账本的 fill 唯一键是 ``(tenant,user,trade_date,fill_key)``（**不含 agent**），
+所以键里必须带 agent——两家同持一只票时第二家的流水才不会被幂等守卫吞掉。
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timezone
+
+import pytest
+
+from backend.shared.decision.manual_sell_absorption import (
+    REASON_BOUGHT_AFTER_SELL,
+    REASON_BUY_TS_UNKNOWN,
+    REASON_INSUFFICIENT,
+    REASON_NO_SELL_EVIDENCE,
+    REASON_REAL_UNAVAILABLE,
+    REASON_STILL_HELD,
+    plan_absorption,
+)
+
+
+def _dt(day: int, hour: int, minute: int = 0, month: int = 10) -> datetime:
+    """2026-<month>-<day> HH:MM UTC（测试里只用 UTC 时刻）。"""
+    return datetime(2026, month, day, hour, minute, tzinfo=timezone.utc)
+
+
+def _row(
+    agent: str,
+    code: str,
+    volume: float,
+    cost_price: float,
+    buy_ts: datetime | None,
+) -> dict:
+    return {
+        "agent": agent,
+        "code": code,
+        "volume": volume,
+        "cost_price": cost_price,
+        "buy_ts": buy_ts,
+    }
+
+
+def _sell(
+    order_id: str,
+    code: str,
+    volume: float,
+    price: float,
+    executed_at: datetime | None = None,
+    *,
+    agent: str = "",
+) -> dict:
+    executed_at = executed_at or _dt(20, 5, 15)
+    return {
+        "order_id": order_id,
+        "code": code,
+        "volume": volume,
+        "price": price,
+        "executed_at": executed_at,
+        "trade_date": executed_at.date(),
+        "agent": agent,
+    }
+
+
+@pytest.mark.unit
+def test_shares_one_manual_sell_between_two_agents_with_distinct_keys():
+    """601668 实况：一笔人工卖单 200 股，flash/pro 各 100，键必须按 agent 区分。"""
+    rows = [
+        _row("deepseek-v4-flash", "601668.SH", 100, 4.54, _dt(19, 1, 35)),
+        _row("deepseek-v4-pro", "601668.SH", 100, 4.54, _dt(19, 9, 0)),
+    ]
+    plan = plan_absorption(
+        rows,
+        [_sell("b8eb003d", "601668.SH", 200, 4.49)],
+        {"601668.SH": 0},
+    )
+
+    assert not plan.skipped
+    assert len(plan.fills) == 2
+    assert {f.agent for f in plan.fills} == {"deepseek-v4-flash", "deepseek-v4-pro"}
+    keys = [f.fill_key for f in plan.fills]
+    assert keys == [
+        "manual-absorb:b8eb003d:deepseek-v4-flash",
+        "manual-absorb:b8eb003d:deepseek-v4-pro",
+    ]
+    assert len(set(keys)) == 2
+    assert sum(f.volume for f in plan.fills) == pytest.approx(200)
+    assert all(f.price == pytest.approx(4.49) for f in plan.fills)
+    assert plan.proceeds_by_agent == {
+        "deepseek-v4-flash": pytest.approx(449.00),
+        "deepseek-v4-pro": pytest.approx(449.00),
+    }
+    # 已实现盈亏按账本成本价算（4.49 - 4.54）× 100
+    assert plan.pnl_by_agent == {
+        "deepseek-v4-flash": pytest.approx(-5.00),
+        "deepseek-v4-pro": pytest.approx(-5.00),
+    }
+
+
+@pytest.mark.unit
+def test_fifo_allocation_across_multiple_sell_orders():
+    """一笔持仓由两笔人工卖单清掉：按成交时间先后拆成两条流水。"""
+    rows = [_row("agent-a", "601000.SH", 300, 4.54, _dt(20, 3, 1))]
+    sells = [
+        _sell("ord-late", "601000.SH", 100, 4.80, _dt(20, 5, 17)),
+        _sell("ord-early", "601000.SH", 200, 4.70, _dt(20, 5, 15)),
+    ]
+    plan = plan_absorption(rows, sells, {"601000.SH": 0})
+
+    assert [f.order_id for f in plan.fills] == ["ord-early", "ord-late"]
+    assert [f.volume for f in plan.fills] == [200, 100]
+    assert plan.proceeds_by_agent == {"agent-a": pytest.approx(200 * 4.70 + 100 * 4.80)}
+
+
+@pytest.mark.unit
+def test_skips_code_still_held_by_real_account():
+    rows = [_row("agent-a", "600760.SH", 100, 46.97, _dt(16, 3, 0))]
+    plan = plan_absorption(
+        rows, [_sell("ord-1", "600760.SH", 100, 47.0)], {"600760.SH": 100}
+    )
+
+    assert plan.fills == ()
+    assert [s.reason for s in plan.skipped] == [REASON_STILL_HELD]
+
+
+@pytest.mark.unit
+def test_skips_when_unattributed_sells_cannot_cover_ledger():
+    rows = [_row("agent-a", "601857.SH", 200, 12.33, _dt(19, 5, 0))]
+    plan = plan_absorption(
+        rows, [_sell("ord-1", "601857.SH", 100, 12.7)], {"601857.SH": 0}
+    )
+
+    assert plan.fills == ()
+    assert [s.reason for s in plan.skipped] == [REASON_INSUFFICIENT]
+    assert "200" in plan.skipped[0].detail and "100" in plan.skipped[0].detail
+
+
+@pytest.mark.unit
+def test_skips_when_no_unattributed_sell_evidence():
+    rows = [_row("agent-a", "601857.SH", 200, 12.33, _dt(19, 5, 0))]
+    plan = plan_absorption(rows, [], {"601857.SH": 0})
+
+    assert plan.fills == ()
+    assert [s.reason for s in plan.skipped] == [REASON_NO_SELL_EVIDENCE]
+
+
+@pytest.mark.unit
+def test_skips_position_bought_after_the_manual_sell():
+    """卖出之后才买的仓不由这笔卖出解释——整只票不动。"""
+    rows = [
+        _row("agent-a", "601985.SH", 100, 9.398, _dt(20, 3, 1)),
+        _row("agent-b", "601985.SH", 100, 9.40, _dt(21, 1, 0)),  # 卖出后新买
+    ]
+    plan = plan_absorption(
+        rows, [_sell("ord-1", "601985.SH", 200, 9.45)], {"601985.SH": 0}
+    )
+
+    assert plan.fills == ()
+    assert [s.reason for s in plan.skipped] == [REASON_BOUGHT_AFTER_SELL]
+
+
+@pytest.mark.unit
+def test_skips_rows_without_buy_ts():
+    rows = [_row("agent-a", "601985.SH", 100, 9.398, None)]
+    plan = plan_absorption(
+        rows, [_sell("ord-1", "601985.SH", 100, 9.45)], {"601985.SH": 0}
+    )
+
+    assert plan.fills == ()
+    assert [s.reason for s in plan.skipped] == [REASON_BUY_TS_UNKNOWN]
+
+
+@pytest.mark.unit
+def test_real_positions_unavailable_blocks_everything():
+    rows = [
+        _row("agent-a", "601985.SH", 100, 9.398, _dt(20, 3, 1)),
+        _row("agent-b", "601000.SH", 300, 4.54, _dt(20, 3, 1)),
+    ]
+    plan = plan_absorption(rows, [_sell("ord-1", "601985.SH", 100, 9.45)], None)
+
+    assert plan.fills == ()
+    assert {s.code for s in plan.skipped} == {"601985.SH", "601000.SH"}
+    assert all(s.reason == REASON_REAL_UNAVAILABLE for s in plan.skipped)
+
+
+@pytest.mark.unit
+def test_attributed_sells_are_not_absorbed():
+    """带 agent 的卖单是真单落账路径的活，吸收器不许碰。"""
+    rows = [_row("agent-a", "601985.SH", 100, 9.398, _dt(20, 3, 1))]
+    plan = plan_absorption(
+        rows,
+        [_sell("ord-1", "601985.SH", 100, 9.45, agent="deepseek-v4-flash")],
+        {"601985.SH": 0},
+    )
+
+    assert plan.fills == ()
+    assert [s.reason for s in plan.skipped] == [REASON_NO_SELL_EVIDENCE]
+
+
+@pytest.mark.unit
+def test_plan_is_independent_of_input_row_order():
+    rows_a = [
+        _row("agent-b", "601668.SH", 100, 4.54, _dt(19, 9, 0)),
+        _row("agent-a", "601668.SH", 100, 4.54, _dt(19, 1, 35)),
+    ]
+    rows_b = list(reversed(rows_a))
+    sells = [_sell("ord-1", "601668.SH", 200, 4.49)]
+
+    plan_a = plan_absorption(rows_a, sells, {"601668.SH": 0})
+    plan_b = plan_absorption(rows_b, sells, {"601668.SH": 0})
+
+    assert [(f.agent, f.order_id, f.volume) for f in plan_a.fills] == [
+        (f.agent, f.order_id, f.volume) for f in plan_b.fills
+    ]
+    # 先买先出：agent-a（10-19 01:35）拿第一段
+    assert plan_a.fills[0].agent == "agent-a"
+
+
+@pytest.mark.unit
+def test_zero_volume_and_invalid_rows_are_ignored():
+    rows = [
+        _row("agent-a", "601985.SH", 0, 9.398, _dt(20, 3, 1)),
+        _row("agent-a", "601000.SH", 200, 4.54, _dt(20, 3, 1)),
+    ]
+    plan = plan_absorption(
+        rows,
+        [
+            _sell("ord-1", "601985.SH", 100, 9.45),
+            _sell("ord-2", "601000.SH", 200, 0),  # 价格非法 → 不算证据
+        ],
+        {"601985.SH": 0, "601000.SH": 0},
+    )
+
+    assert plan.fills == ()
+    # 0 股行不产生任何报告（它本就不该在账本里）；价格非法的卖出不算证据
+    assert {s.code: s.reason for s in plan.skipped} == {
+        "601000.SH": REASON_NO_SELL_EVIDENCE,
+    }
+
+
+@pytest.mark.unit
+def test_trade_date_comes_from_sell_not_processing_day():
+    rows = [_row("agent-a", "601985.SH", 100, 9.398, _dt(20, 3, 1))]
+    sell = _sell("ord-1", "601985.SH", 100, 9.45, _dt(20, 5, 15))
+    plan = plan_absorption(rows, [sell], {"601985.SH": 0})
+
+    assert plan.fills[0].trade_date == date(2026, 10, 20)
+    assert plan.fills[0].filled_at == _dt(20, 5, 15)

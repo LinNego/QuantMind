@@ -178,6 +178,10 @@ def _bridge_account(env: dict[str, str]) -> dict | None:
 LEDGER_TENANT = "default"
 DEFAULT_LEDGER_USER = "10000001"
 LEDGER_CONNECT_TIMEOUT_S = 5
+#: 真实持仓快照的最长可采信时长（秒）。tdx/qmt 两条同步链 30s 一落，900s 是三倍
+#: 冗余；超过即视为不可用于对账——陈旧快照两头骗人：已卖的不消失、今日新买的
+#: 看不见（唯一事实源见 ``backend/shared/real_positions.py``）。
+REAL_POSITION_MAX_AGE_S = 900
 
 
 def _ledger_identity(env: dict[str, str]) -> tuple[str, str]:
@@ -307,6 +311,169 @@ def _ledger_view(
     return out
 
 
+# ── 真实持仓对账（读侧幻影仓闸门）────────────────────────────────────────
+# 2026-10-21 用户报障：昨天在通达信桥手工清仓 6 只，今天 15:30 复盘仍在逐只
+# 点评它们。根因是「手工单 ``orders.agent=NULL`` → ``agent_ledger_fill`` 按设计
+# 不入分账 → 账本保留幻影仓」，而本脚本只读账本。这里按「账本持仓 ∩ 真实账户
+# 持仓」裁掉已不在账户里的票——**只裁可见性，不改账本**（源头清理是另一件事）。
+
+
+def _snapshot_age_seconds(
+    snapshot_at: object, *, now: datetime | None = None
+) -> float | None:
+    """``snapshot_at`` → 距现在秒数（解析不了返回 ``None``）。
+
+    库里存 **naive UTC**（见 ``real_account_snapshots`` 的历史坑），这里按 UTC
+    解释；带 tz 的按原样换算。真实持仓是 30s 级热数据，绝对新鲜度必须自己判
+    ——``merge_real_sources`` 只能剔除「相对其他源停更」的源。
+    """
+    if snapshot_at is None:
+        return None
+    if isinstance(snapshot_at, str):
+        text = snapshot_at.strip()
+        if not text:
+            return None
+        try:
+            snapshot_at = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(snapshot_at, datetime):
+        return None
+    if snapshot_at.tzinfo is None:
+        snapshot_at = snapshot_at.replace(tzinfo=timezone.utc)
+    ref = now or datetime.now(timezone.utc)
+    return (ref - snapshot_at.astimezone(timezone.utc)).total_seconds()
+
+
+def _real_position_volumes_from_snapshot(
+    env: dict[str, str], *, now: datetime | None = None
+) -> dict[str, float] | None:
+    """PG 快照 → ``{suffix 码: 持股数}``；过期/空/PG 读败 → ``None``。
+
+    与决策轮同源（``real_positions.load_real_positions_sync``：多源并集、相对
+    停更剔除、活跃券商优先），只换同步驱动。symbol 归一为 suffix —— 账本持仓
+    列就是这一口径。
+    """
+    from backend.shared.real_positions import load_real_positions_sync
+    from backend.shared.stock_utils import StockCodeUtil
+
+    tenant, user = _ledger_identity(env)
+    positions, meta = load_real_positions_sync(
+        tenant, user, connect=lambda: _pg_connect(env)
+    )
+    age_s = _snapshot_age_seconds(meta.get("snapshot_at"), now=now)
+    if age_s is None:
+        print("⚠️ 实盘持仓快照无时间戳，不可用于对账")
+        return None
+    if age_s > REAL_POSITION_MAX_AGE_S:
+        print(f"⚠️ 实盘持仓快照不可用于对账（最新快照 {age_s:.0f}s 前）")
+        return None
+    out: dict[str, float] = {}
+    for symbol, pos in positions.items():
+        try:
+            volume = float(pos.get("volume") or 0)
+        except (TypeError, ValueError):
+            continue
+        if volume <= 0:
+            continue
+        out[StockCodeUtil.to_suffix(str(symbol))] = volume
+    return out
+
+
+def _real_position_volumes_from_bridge(env: dict[str, str]) -> dict[str, float] | None:
+    """桥实时账户 → ``{suffix 码: 持股数}``；桥不可达 → ``None``。
+
+    **0 股模板行不是持仓**（桥清仓后仍会返回，2026-10-20 实测），按
+    ``total_volume > 0`` 过滤；可卖量（T+1）不参与对账。
+    """
+    acct = _bridge_account(env)
+    if acct is None:
+        return None
+    out: dict[str, float] = {}
+    for p in acct.get("positions") or []:
+        code = str(p.get("stock_code") or "").strip()
+        try:
+            volume = float(p.get("total_volume") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not code or volume <= 0:
+            continue
+        out[code] = volume
+    return out
+
+
+def read_real_position_volumes(
+    env: dict[str, str], *, now: datetime | None = None
+) -> tuple[dict[str, float] | None, str]:
+    """真实账户持仓 ``{suffix 码: 持股数}`` + 来源（snapshot/bridge/unavailable）。
+
+    **只用于对账**（把账本幻影仓挡在提示词外），不展示总额、不下单。快照优先
+    （与决策轮同源）；快照过期/读败 → 桥实时账户兜底；两者都不可信 → ``None``
+    ——调用方**不做剔除**（不知道就别动：宁可显示旧账，不可少显示真仓），只在
+    ``data_gaps`` 留痕。
+    """
+    try:
+        volumes = _real_position_volumes_from_snapshot(env, now=now)
+        if volumes is not None:
+            return volumes, "snapshot"
+    except Exception as exc:  # noqa: BLE001 读败 → 桥兜底，不中断整轮
+        print(f"⚠️ 实盘持仓快照读取失败（改走桥账户对账）: {exc}")
+    volumes = _real_position_volumes_from_bridge(env)
+    if volumes is not None:
+        return volumes, "bridge"
+    return None, "unavailable"
+
+
+def reconcile_ledger_positions(
+    ledger: dict, real_volumes: dict[str, float] | None
+) -> tuple[dict, list[str]]:
+    """账本持仓 ∩ 真实账户持仓 → ``(新账本视图, 被剔除的代码)``（纯函数）。
+
+    ``real_volumes`` = ``{suffix 码: 真实持股数}``；``None`` = 真实账户不可信 →
+    **原样返回**（不做剔除）。
+
+    规则：
+    * 真实账户里没有（或为 0 股）→ 整行剔除（幻影仓）；
+    * 真实量 < 账本量 → 可见量夹到真实量（部分手工卖出，账本只记归属、账户才是
+      事实）；
+    * 真实量 ≥ 账本量 → 不动（同一只票可被多家模型同时持有，真实量是合计）。
+
+    额度按**可见持仓**重算 ``used/remaining``：幻影仓的成本不是当下的敞口。
+    """
+    if real_volumes is None:
+        return ledger, []
+    kept: list[dict] = []
+    dropped: list[str] = []
+    for p in ledger.get("positions") or []:
+        code = str(p.get("code") or "")
+        real_volume = real_volumes.get(code)
+        try:
+            volume = float(p.get("volume") or 0)
+        except (TypeError, ValueError):
+            continue
+        if real_volume is None or real_volume <= 0 or volume <= 0:
+            dropped.append(code)
+            continue
+        kept.append({**p, "volume": min(volume, float(real_volume))})
+    quota = float(ledger.get("quota") or 0.0)
+    used = 0.0
+    for p in kept:
+        try:
+            used += float(p["volume"]) * float(p["cost_price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    used = round(used, 2)
+    return (
+        {
+            **ledger,
+            "positions": kept,
+            "used": used,
+            "remaining": round(quota - used, 2),
+        },
+        dropped,
+    )
+
+
 def _bridge_availability(env: dict[str, str]) -> dict[str, int]:
     """每只票的桥实时可卖量（T+1）。**只取代码→可卖量，不读 asset 三数。**"""
     acct = _bridge_account(env)
@@ -430,6 +597,7 @@ def build_user_content(
     price_reader=None,
     snapshot_reader=None,
     mode: str = "intraday",
+    real_volumes: dict[str, float] | None | object = _UNSET,
 ) -> tuple[str, list[str]]:
     """拼**本 agent 的分账额度 + 持仓** + 新闻的提示词正文。
 
@@ -447,9 +615,15 @@ def build_user_content(
 
     ``ledger`` 缺省才现读（单测/一次性调用）；生产轮次由 ``main`` 一次读好传入，
     避免逐模型重复连库。``price_reader``/``snapshot_reader`` 缺省走真实桥。
+
+    ``real_volumes`` = 真实账户持仓 ``{suffix 码: 持股数}``（``None`` = 读不到）：
+    账本持仓先与它取交集再拼提示词——手工清仓走 ``orders.agent=NULL``，按设计
+    不进分账，账本会留下幻影仓（2026-10-21 用户报障）。缺省才现读。
     """
     if ledger is _UNSET:
         ledger = read_agent_ledgers(env, [agent]).get(agent) if agent else None
+    if real_volumes is _UNSET:
+        real_volumes, _real_source = read_real_position_volumes(env)
     read_price = price_reader or _bridge_price
     read_snapshot = snapshot_reader or _bridge_snapshot
     available_map = availability or {}
@@ -481,6 +655,21 @@ def build_user_content(
     has_account = ledger is not None
     has_positions = False
     if has_account and isinstance(ledger, dict):
+        positions = list(ledger.get("positions") or [])
+        if positions:
+            if real_volumes is None:
+                # 真实账户不可信：**不做剔除**（宁可显示旧账，不可少显示真仓），
+                # 但要留痕——下一轮仍可能带着幻影仓复盘。
+                gaps.append("real_positions_unavailable")
+            else:
+                ledger, dropped = reconcile_ledger_positions(ledger, real_volumes)
+                positions = list(ledger.get("positions") or [])
+                if dropped:
+                    gaps.append("ledger_phantom_positions")
+                    print(
+                        f"⚠️ 账本里 {len(dropped)} 只持仓已不在真实账户，"
+                        f"本轮不展示：{', '.join(dropped)}"
+                    )
         quota = float(ledger.get("quota") or 0.0)
         used = float(ledger.get("used") or 0.0)
         remaining = float(ledger.get("remaining") or 0.0)
@@ -491,7 +680,6 @@ def build_user_content(
             "- 你只能在这个额度内决策；账户总资产、可用资金与其他 agent 的额度"
             "不是你的可见范围。"
         )
-        positions = list(ledger.get("positions") or [])
         if positions:
             has_positions = True
             if is_review:
@@ -1109,6 +1297,12 @@ def main() -> int:
         # **只出现该 agent 自己的那本账**，不读真实账户总额。
         ledgers = read_agent_ledgers(env, runnable)
         availability = _bridge_availability(env)
+        # 一轮读一次真实账户持仓（幻影仓闸门）：账本管归属，账户管事实。
+        real_volumes, real_source = read_real_position_volumes(env)
+        if real_volumes is None:
+            print("⚠️ 真实账户持仓不可读：本轮不做幻影仓剔除（账本原样展示）")
+        else:
+            print(f"实盘持仓对账源：{real_source}（{len(real_volumes)} 只）")
         account_down = bool(runnable) and all(
             ledgers.get(sig) is None for sig in runnable
         )
@@ -1146,14 +1340,16 @@ def main() -> int:
                     agent=sig,
                     ledger=ledgers.get(sig),
                     availability=availability,
+                    real_volumes=real_volumes,
                     mode=mode,
                 )
                 if data_gaps:
-                    print(
-                        f"⚠️ {sig} 数据缺口："
-                        + ",".join(data_gaps)
-                        + "（提示词已降级为无账户模板）"
+                    degraded = (
+                        "（提示词已降级为无账户模板）"
+                        if "account_unreachable" in data_gaps
+                        else ""
                     )
+                    print(f"⚠️ {sig} 数据缺口：" + ",".join(data_gaps) + degraded)
                 content, usage = call_model(env, sig, model, user_content)
                 append_log(user_content, content, sig, usage, data_gaps, mode=mode)
                 ok.append(f"{sig} {len(content)}字")
