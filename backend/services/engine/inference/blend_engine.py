@@ -82,6 +82,19 @@ def percent_rank_map(scores: Mapping[str, float]) -> dict[str, float]:
     }
 
 
+def rank_pct_from_rank(rank: int, n_total: int) -> float:
+    """**升序**名次 → 截面分位（``compute_rank_pct`` 的标量版，供 SQL 窗口函数复用）。
+
+    SQL 侧 ``RANK() OVER (ORDER BY score ASC)`` 的并列取最小名次，与
+    ``signal_contract.compute_rank_pct`` 一致。注意：榜单展示的「排名」是
+    **降序**名次（分最高者为 1），不能直接喂进本函数——2026-10-21 滚动建仓
+    曾把降序名次当升序，导致榜首显示「综合分 0.0 · 靠后」。
+    """
+    if int(n_total) <= 1:
+        return 0.0
+    return (int(rank) - 1) / (int(n_total) - 1)
+
+
 def member_percent_ranks(
     member_scores: Mapping[str, Mapping[str, float]],
 ) -> dict[str, dict[str, float]]:

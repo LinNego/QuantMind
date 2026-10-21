@@ -34,6 +34,10 @@ from backend.services.engine.inference.blend_engine import (
     combine_member_ranks,
     dispersion_band,
     position_of,
+    rank_pct_from_rank,
+)
+from backend.services.engine.inference.rolling_performance import (
+    compute_rolling_performance,
 )
 from backend.services.engine.inference.blend_plan import (
     DEFAULT_LOOKBACK,
@@ -889,6 +893,43 @@ class ModelBlendService:
         rows_by_day = stats.get("top_rows") or {}
         days = sorted(day for day in rows_by_day if day <= target)[-(int(window) + 1) :]
 
+        # ── 收盘价损益（尾盘买入口径，2026-10-21）─────────────────────────
+        picks_by_day = {
+            day: [
+                str(row["symbol"])
+                for row in (rows_by_day.get(day) or [])[: int(per_day)]
+            ]
+            for day in days
+        }
+        symbols = sorted(
+            {symbol for picked in picks_by_day.values() for symbol in picked}
+        )
+        closes = await self._close_history(symbols, days[0], days[-1]) if days else {}
+        performance = compute_rolling_performance(days, picks_by_day, closes)
+
+        def exit_payload(trade: Mapping[str, Any]) -> dict[str, Any]:
+            symbol = str(trade["symbol"])
+            profile = profiles.get(symbol) or {}
+            return {
+                "symbol": symbol,
+                "code": symbol,
+                "name": names.get(symbol) or "",
+                "industry": profile.get("industry"),
+                "market_cap_yi": profile.get("market_cap_yi"),
+                "entry_date": trade["entry_date"].isoformat(),
+                "exit_date": trade["exit_date"].isoformat(),
+                "entry_price": trade["entry_price"],
+                "exit_price": trade["exit_price"],
+                "return_pct": trade["return_pct"],
+                "held_days": trade["held_days"],
+                "entry_from_window_start": trade["entry_from_window_start"],
+            }
+
+        exit_rows_by_day = {
+            day: [exit_payload(trade) for trade in trades]
+            for day, trades in performance["exits_by_day"].items()
+        }
+
         streak: dict[str, int] = {}
         previous: set[str] = set()
         columns: list[dict[str, Any]] = []
@@ -917,6 +958,7 @@ class ModelBlendService:
                     "date": day.isoformat(),
                     "picks": picks,
                     "exits": sorted(previous - today),
+                    "exit_rows": exit_rows_by_day.get(day, []),
                 }
             )
             # 断榜后再次入选按「新进」计，不伪造连续持有
@@ -941,6 +983,11 @@ class ModelBlendService:
                 ),
                 "new_today": sum(1 for pick in latest["picks"] if pick["is_new"]),
                 "exited_today": len(latest["exits"]),
+                # 收盘价口径：买入=入选日收盘，卖出=退出日收盘（未计费用）
+                "performance": {
+                    **performance["stats"],
+                    "entry_convention": "close",
+                },
             },
             "warnings": [],
         }
@@ -1318,10 +1365,17 @@ class ModelBlendService:
                      RANK() OVER (
                        PARTITION BY data_trade_date ORDER BY score DESC
                      ) AS score_rank,
+                     -- 分位必须用**升序**名次（分最低者 rank=1 → pct=0），
+                     -- 与 compute_rank_pct / PG percent_rank() 同口径。
+                     -- 用降序名次会把榜首算成 pct=0（「综合分 0.0 · 靠后」）。
+                     RANK() OVER (
+                       PARTITION BY data_trade_date ORDER BY score ASC
+                     ) AS pct_rank,
                      COUNT(*) OVER (PARTITION BY data_trade_date) AS n_total
               FROM weighted
             )
-            SELECT data_trade_date, symbol, score, coverage, rn, score_rank, n_total
+            SELECT data_trade_date, symbol, score, coverage, rn, score_rank,
+                   pct_rank, n_total
             FROM ranked
             WHERE rn <= :top_k OR symbol = ANY(:symbols)
             ORDER BY data_trade_date, rn
@@ -1360,20 +1414,16 @@ class ModelBlendService:
         by_date: dict[date, dict[str, float]] = {}
         top_by_date: dict[date, set[str]] = {}
         top_rows_by_date: dict[date, list[dict[str, Any]]] = {}
-        for day, symbol, score, coverage, rn, score_rank, n_total in rows:
+        for day, symbol, score, coverage, rn, score_rank, pct_rank, n_total in rows:
             key = day if isinstance(day, date) else date.fromisoformat(str(day))
             symbol = str(symbol)
             if _finite(score):
                 by_date.setdefault(key, {})[symbol] = float(score)
             if int(rn) <= top_k:
                 top_by_date.setdefault(key, set()).add(symbol)
-                # pct 与 blend_engine.percent_rank_map 同口径：(最小名次-1)/(n-1)；
+                # pct 与 blend_engine.percent_rank_map 同口径：(升序名次-1)/(n-1)；
                 # 缺总数为 1 时按 0.0（与 compute_rank_pct 的 n==1 分支一致）。
-                pct = (
-                    0.0
-                    if int(n_total) <= 1
-                    else (int(score_rank) - 1) / (int(n_total) - 1)
-                )
+                pct = rank_pct_from_rank(int(pct_rank), int(n_total))
                 top_rows_by_date.setdefault(key, []).append(
                     {
                         "symbol": symbol,
@@ -1548,6 +1598,56 @@ class ModelBlendService:
             if today is not None and today[1] > 0:
                 prices[prefix] = today[1]
         return prices, avg_amounts, []
+
+    @staticmethod
+    async def _close_history(
+        symbols: Sequence[str], start: date, end: date
+    ) -> dict[str, dict[date, float]]:
+        """窗口内每日收盘价（未复权）：``symbol → {date: close}``。
+
+        尾盘买入口径：买入/卖出都用当日收盘价，不引入盘中价。行情源不可用
+        或读取失败返回空映射——损益展示为 `—`，不猜 0。
+        """
+        suffix_to_prefix: dict[str, str] = {}
+        for symbol in symbols:
+            suffix = StockCodeUtil.to_suffix(symbol)
+            if suffix:
+                suffix_to_prefix[suffix] = symbol
+        if not suffix_to_prefix or end < start:
+            return {}
+        try:
+            from backend.services.engine.data_platform.quantdb_hub import (
+                QuantDBDataHub,
+            )
+
+            hub = QuantDBDataHub.get_instance()
+            if hub is None or not hub.available:
+                return {}
+            # 同步 parquet/DuckDB 读取放线程池，避免阻塞 engine 事件循环
+            frame = await asyncio.to_thread(
+                hub.fetch_daily_kline_batch,
+                list(suffix_to_prefix),
+                start,
+                end,
+                adjust="none",
+            )
+        except Exception as exc:  # pragma: no cover - 行情缺失按缺失处理
+            logger.warning("滚动建仓读取收盘价失败: %s", exc)
+            return {}
+        if frame is None or frame.empty:
+            return {}
+        out: dict[str, dict[date, float]] = {}
+        for _, row in frame.iterrows():
+            prefix = suffix_to_prefix.get(str(row.get("symbol")))
+            if not prefix:
+                continue
+            raw_day = row.get("trade_date")
+            day = raw_day.date() if hasattr(raw_day, "date") else _parse_date(raw_day)
+            close = row.get("close")
+            if day is None or not _finite(close) or float(close) <= 0:
+                continue
+            out.setdefault(prefix, {})[day] = float(close)
+        return out
 
     @staticmethod
     async def _risk_flags(

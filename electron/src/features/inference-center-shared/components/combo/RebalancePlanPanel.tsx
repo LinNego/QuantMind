@@ -37,6 +37,7 @@ import {
   planDisplayRows,
   type PlanDisplayRow,
 } from './comboRankingModel';
+import './comboTable.css';
 
 export interface RebalancePlanPanelProps {
   plan: BlendPlan | null;
@@ -603,7 +604,9 @@ export const RebalancePlanPanel: React.FC<RebalancePlanPanelProps> = ({
           dataSource={rows}
           columns={columns}
           pagination={false}
-          scroll={{ x: 1500, y: 'calc(100vh - 430px)' }}
+          // 同榜单：按内容收敛，宽屏不按比例拉伸，窄屏才横向滚动
+          // （收敛靠 comboTable.css 覆盖 rc-table 内联的 min-width:100%）
+          scroll={{ x: 'max-content', y: 'calc(100vh - 430px)' }}
           locale={{ emptyText: '计划为空' }}
         />
       </div>

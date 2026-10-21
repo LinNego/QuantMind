@@ -135,16 +135,67 @@ export interface BlendRollingPick {
   market_cap_yi?: number | null;
 }
 
+/** 一笔已了结的滚动持仓（收盘价买入 → 退出日收盘价卖出） */
+export interface BlendRollingExit {
+  symbol: string;
+  code?: string;
+  name: string;
+  industry?: string | null;
+  market_cap_yi?: number | null;
+  entry_date: string;
+  exit_date: string;
+  entry_price: number | null;
+  exit_price: number | null;
+  /** 收盘价口径收益（%）；缺行情为 null（展示 —，绝不写 0） */
+  return_pct: number | null;
+  /** 本窗口内在榜天数（与卡片 held_days 同口径） */
+  held_days: number;
+  /** 入场日 = 窗口首列（更早的入场日不可见，按窗口起点计） */
+  entry_from_window_start: boolean;
+}
+
 export interface BlendRollingColumn {
   date: string;
   picks: BlendRollingPick[];
+  /** 兼容旧字段：退出代码列表 */
   exits: string[];
+  /** 退出明细（含收盘价损益）；旧后端可能缺失 */
+  exit_rows?: BlendRollingExit[];
+}
+
+/** 滚动窗口整体涨跌统计（收盘价、等权、未计费用） */
+export interface BlendRollingPerformance {
+  entry_convention?: string;
+  closed_trades: number;
+  priced_trades: number;
+  unpriced_trades: number;
+  wins: number;
+  losses: number;
+  flats: number;
+  win_rate_pct: number | null;
+  avg_return_pct: number | null;
+  median_return_pct: number | null;
+  best_symbol: string | null;
+  best_return_pct: number | null;
+  worst_symbol: string | null;
+  worst_return_pct: number | null;
+  open_positions: number;
+  open_priced: number;
+  open_avg_return_pct: number | null;
+  /** 每日等权持有当日 TopK、次日收盘换仓的累计收益（%） */
+  cycle_return_pct: number | null;
+  cycle_days: number;
+  cycle_priced_days: number;
+  cycle_win_days: number;
+  cycle_loss_days: number;
 }
 
 export interface BlendRollingSummary {
   unique_symbols: number;
   new_today: number;
   exited_today: number;
+  /** 旧后端可能缺失 */
+  performance?: BlendRollingPerformance;
 }
 
 export interface BlendRollingResponse {

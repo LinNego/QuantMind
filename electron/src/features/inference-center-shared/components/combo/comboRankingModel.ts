@@ -16,6 +16,7 @@ import type {
   BlendPurpose,
   BlendRankingRow,
   BlendRollingColumn,
+  BlendRollingExit,
   BlendRollingPick,
   ComboTemplate,
   DispersionBand,
@@ -121,6 +122,99 @@ export function columnBySymbol(column: BlendRollingColumn | null | undefined): M
 export function exitLabel(column: BlendRollingColumn | null | undefined): string {
   const exits = column?.exits ?? [];
   return exits.length ? exits.join('、') : '';
+}
+
+/**
+ * 收盘价损益（%）：带符号两位小数。**缺失 → `—`，绝不显示成 0**。
+ * 0 是合法收益（平盘），与「没有行情」不是一回事。
+ */
+export function formatReturnPct(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return RESEARCH_SCORE_MISSING;
+  const sign = value > 0 ? '+' : '';
+  return `${sign}${value.toFixed(2)}%`;
+}
+
+/**
+ * A 股口径：**红 = 盈、绿 = 亏**；0 持平走中性色，缺失走灰。
+ * 与 `ROLLING_TONE`（新进/留存，刻意不用红绿）分属两套语义，不要合并。
+ */
+export function returnToneClass(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 'text-slate-400';
+  if (value > 0) return 'text-red-600';
+  if (value < 0) return 'text-green-600';
+  return 'text-slate-500';
+}
+
+/** 价格两位小数；缺失/非正数 → `—`（价格 0 不可能是有效收盘价） */
+export function formatPrice(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return RESEARCH_SCORE_MISSING;
+  }
+  return value.toFixed(2);
+}
+
+/**
+ * 退出弹窗：`入选 … 收盘 x → 退出 … 收盘 y · 持有 n 日 [· 按窗口起点计]`。
+ *
+ * 展示面合规：不写「买入/卖出」（研究视图只说名单与位置），口径用
+ * 「入选日/退出日收盘价」表达；两个价格都是当日真实收盘价。
+ */
+export function exitTradeLabel(row: BlendRollingExit): string {
+  const trade =
+    `入选 ${row.entry_date} 收盘 ${formatPrice(row.entry_price)}` +
+    ` → 退出 ${row.exit_date} 收盘 ${formatPrice(row.exit_price)}`;
+  const parts = [trade, `持有 ${row.held_days} 日`];
+  if (row.entry_from_window_start) parts.push('按窗口起点计');
+  return parts.join(' · ');
+}
+
+// ── 横向滚动条 ─────────────────────────────────────────────────────────
+
+export interface ScrollGeometry {
+  visible: boolean;
+  /** 滑块宽度（px） */
+  thumbWidth: number;
+  /** 滑块左偏移（px） */
+  thumbLeft: number;
+  /** 滚动进度 0–1（无障碍 `aria-valuenow` 用） */
+  progress: number;
+}
+
+/** 滑块最小宽度（px）：窗口再长也留得住，不至于只剩一个点 */
+const MIN_SCROLL_THUMB_PX = 28;
+
+/**
+ * 横向滚动条几何：由**视口/内容/滚动位置**三个实测值算出滑块的位置与宽度。
+ *
+ * 为什么自己画：Electron/Chrome 在 Linux 默认用**覆盖式滚动条**，不滚动时
+ * 完全不可见（1920 实测 `offsetHeight - clientHeight === 0`），`::-webkit-scrollbar`
+ * 与 `scrollbar-width` 都拿不到常驻轨道。「滚动建仓」是 11 列的长条看板，
+ * 没有常驻滑块用户不知道还能往右拖，所以轨道与滑块由组件渲染。
+ *
+ * 没有横向溢出（内容不多 1px）→ `visible: false`，不占版面。
+ */
+export function scrollGeometry(input: {
+  clientWidth: number;
+  scrollWidth: number;
+  scrollLeft: number;
+  trackWidth: number;
+}): ScrollGeometry {
+  const { clientWidth, scrollWidth, scrollLeft, trackWidth } = input;
+  const maxScroll = scrollWidth - clientWidth;
+  if (
+    !Number.isFinite(maxScroll) ||
+    maxScroll <= 1 ||
+    !Number.isFinite(trackWidth) ||
+    trackWidth <= 0 ||
+    !Number.isFinite(scrollLeft)
+  ) {
+    return { visible: false, thumbWidth: 0, thumbLeft: 0, progress: 0 };
+  }
+  const ratio = Math.min(1, Math.max(0, clientWidth / scrollWidth));
+  const thumbWidth = Math.min(trackWidth, Math.max(MIN_SCROLL_THUMB_PX, ratio * trackWidth));
+  const travel = trackWidth - thumbWidth;
+  const progress = Math.min(1, Math.max(0, scrollLeft / maxScroll));
+  return { visible: true, thumbWidth, thumbLeft: progress * travel, progress };
 }
 
 // ── 计划 ───────────────────────────────────────────────────────────────

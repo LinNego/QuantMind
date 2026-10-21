@@ -11,6 +11,7 @@ import type {
   BlendPlanRow,
   BlendRankingRow,
   BlendRollingColumn,
+  BlendRollingExit,
   ComboTemplate,
 } from '../../../services/blendTypes';
 import {
@@ -22,15 +23,20 @@ import {
   coverageLabel,
   dispersionLabel,
   exitLabel,
+  exitTradeLabel,
   formatAmount,
+  formatPrice,
+  formatReturnPct,
   historyLabel,
   isPlanStale,
   planDisplayRows,
   positionLabel,
   rankingCsvFilename,
+  returnToneClass,
   rollingHeldLabel,
   rollingStatus,
   scoreLabel,
+  scrollGeometry,
   templateGradeLabel,
   templateRollingDefaults,
   templateToCreateRequest,
@@ -207,6 +213,104 @@ describe('滚动视图的色块与状态', () => {
     expect(columnBySymbol(column).get('SH600000')?.name).toBe('A');
     expect(exitLabel(column)).toBe('SZ000001');
     expect(exitLabel(null)).toBe('');
+  });
+});
+
+describe('滚动退出损益（收盘价买卖口径）', () => {
+  it('收益格式带符号、两位小数；缺失 — 而不是 0', () => {
+    expect(formatReturnPct(1.234)).toBe('+1.23%');
+    expect(formatReturnPct(-0.456)).toBe('-0.46%');
+    expect(formatReturnPct(0)).toBe('0.00%');
+    expect(formatReturnPct(null)).toBe('—');
+    expect(formatReturnPct(undefined)).toBe('—');
+    expect(formatReturnPct(Number.NaN)).toBe('—');
+  });
+
+  it('A股红涨绿跌：盈红、亏绿、持平中性、缺失灰', () => {
+    expect(returnToneClass(1)).toBe('text-red-600');
+    expect(returnToneClass(-1)).toBe('text-green-600');
+    expect(returnToneClass(0)).toBe('text-slate-500');
+    expect(returnToneClass(null)).toBe('text-slate-400');
+  });
+
+  it('价格两位小数，缺失 —', () => {
+    expect(formatPrice(10.5)).toBe('10.50');
+    expect(formatPrice(0)).toBe('—');
+    expect(formatPrice(null)).toBe('—');
+  });
+
+  it('退出弹窗：入选→退出收盘价、持有天数、窗口起点标注，且不含买卖字眼', () => {
+    const exit: BlendRollingExit = {
+      symbol: 'SZ000001',
+      name: '平安银行',
+      entry_date: '2026-10-08',
+      exit_date: '2026-10-10',
+      entry_price: 20,
+      exit_price: 18,
+      return_pct: -10,
+      held_days: 2,
+      entry_from_window_start: true,
+    };
+    const label = exitTradeLabel(exit);
+    expect(label).toBe(
+      '入选 2026-10-08 收盘 20.00 → 退出 2026-10-10 收盘 18.00 · 持有 2 日 · 按窗口起点计',
+    );
+    expect(label).not.toMatch(/买入|卖出/);
+    expect(exitTradeLabel({ ...exit, entry_from_window_start: false })).not.toContain('窗口起点');
+    expect(exitTradeLabel({ ...exit, entry_price: null })).toContain('收盘 —');
+  });
+});
+
+describe('横向滚动条几何', () => {
+  it('无横向溢出时不渲染轨道（不多占 1px）', () => {
+    expect(scrollGeometry({ clientWidth: 1200, scrollWidth: 1200, scrollLeft: 0, trackWidth: 1200 }))
+      .toEqual({ visible: false, thumbWidth: 0, thumbLeft: 0, progress: 0 });
+    // 1px 误差也算无溢出：浏览器取整常见
+    expect(scrollGeometry({ clientWidth: 1200, scrollWidth: 1201, scrollLeft: 0, trackWidth: 1200 }).visible)
+      .toBe(false);
+  });
+
+  it('滑块宽度按视口/内容比例，位置按进度映射到剩余行程', () => {
+    const start = scrollGeometry({
+      clientWidth: 1580,
+      scrollWidth: 1836,
+      scrollLeft: 0,
+      trackWidth: 1580,
+    });
+    expect(start.visible).toBe(true);
+    expect(start.thumbWidth).toBeCloseTo((1580 / 1836) * 1580, 4);
+    expect(start.thumbLeft).toBe(0);
+    expect(start.progress).toBe(0);
+
+    const end = scrollGeometry({
+      clientWidth: 1580,
+      scrollWidth: 1836,
+      scrollLeft: 256,
+      trackWidth: 1580,
+    });
+    expect(end.progress).toBe(1);
+    expect(end.thumbLeft).toBeCloseTo(1580 - end.thumbWidth, 4);
+  });
+
+  it('进度夹在 0–1：越界滚动值不把滑块甩出轨道', () => {
+    const base = { clientWidth: 500, scrollWidth: 900, trackWidth: 500 };
+    expect(scrollGeometry({ ...base, scrollLeft: -40 }).progress).toBe(0);
+    expect(scrollGeometry({ ...base, scrollLeft: 9999 }).progress).toBe(1);
+    const mid = scrollGeometry({ ...base, scrollLeft: 200 });
+    expect(mid.progress).toBeCloseTo(0.5, 6);
+    expect(mid.thumbLeft).toBeCloseTo((500 - mid.thumbWidth) / 2, 4);
+  });
+
+  it('内容极长时滑块有最小宽度，仍可抓取', () => {
+    const geom = scrollGeometry({ clientWidth: 100, scrollWidth: 10000, scrollLeft: 0, trackWidth: 100 });
+    expect(geom.thumbWidth).toBe(28);
+    expect(geom.thumbWidth).toBeLessThanOrEqual(100);
+  });
+
+  it('非法/未布局尺寸一律不可见（首帧 jsdom clientWidth=0）', () => {
+    expect(scrollGeometry({ clientWidth: 0, scrollWidth: 0, scrollLeft: 0, trackWidth: 0 }).visible).toBe(false);
+    expect(scrollGeometry({ clientWidth: Number.NaN, scrollWidth: 900, scrollLeft: 0, trackWidth: 500 }).visible).toBe(false);
+    expect(scrollGeometry({ clientWidth: 500, scrollWidth: 900, scrollLeft: Number.NaN, trackWidth: 500 }).visible).toBe(false);
   });
 });
 

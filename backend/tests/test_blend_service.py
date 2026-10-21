@@ -1258,7 +1258,7 @@ def _roll_row(symbol: str, rank: int) -> dict:
     }
 
 
-def _rolling_service(rows_by_day, *, models=None):
+def _rolling_service(rows_by_day, *, models=None, closes=None, profiles=None):
     """替身窗口：只喂表头三列（符号/分数/名次），其余口径由真库用例覆盖。"""
     members = models or [_model("a"), _model("b")]
     svc = _service(members)
@@ -1269,7 +1269,14 @@ def _rolling_service(rows_by_day, *, models=None):
         return {"scores": {}, "top": {}, "top_rows": rows_by_day, "days": []}
 
     async def fake_names():
-        return {"SH600000": "浦发银行"}
+        return {"SH600000": "浦发银行", "SZ000001": "平安银行"}
+
+    async def fake_profiles(_market):
+        return dict(profiles or {})
+
+    async def fake_closes(symbols, start, end):
+        calls["close_history"] = {"symbols": list(symbols), "start": start, "end": end}
+        return dict(closes or {})
 
     async def fake_common_date(**_kwargs):
         calls["common_date"] = True
@@ -1283,6 +1290,8 @@ def _rolling_service(rows_by_day, *, models=None):
 
     svc._window_stats = fake_window_stats
     svc._stock_names = fake_names
+    svc._stock_profiles = fake_profiles
+    svc._close_history = fake_closes
     svc.latest_common_date = fake_common_date
     svc._next_trading_day = fake_next
     svc.members_from_blend = fake_members
@@ -1348,11 +1357,31 @@ async def test_rolling_builds_streaks_new_flags_and_exits():
     assert by_day[d0.isoformat()]["exits"] == []
     assert by_day[d1.isoformat()]["exits"] == ["SH600000"]
     assert by_day[d2.isoformat()]["exits"] == ["SZ000002"]
-    assert payload["summary"] == {
-        "unique_symbols": 5,
-        "new_today": 3,
-        "exited_today": 1,
-    }
+    summary = payload["summary"]
+    assert summary["unique_symbols"] == 5
+    assert summary["new_today"] == 3
+    assert summary["exited_today"] == 1
+    # 无行情时损益如实缺失（不写 0），但笔数按退出事件计数
+    assert summary["performance"]["entry_convention"] == "close"
+    assert summary["performance"]["closed_trades"] == 2
+    assert summary["performance"]["priced_trades"] == 0
+    assert summary["performance"]["win_rate_pct"] is None
+    assert by_day[d1.isoformat()]["exit_rows"] == [
+        {
+            "symbol": "SH600000",
+            "code": "SH600000",
+            "name": "浦发银行",
+            "industry": None,
+            "market_cap_yi": None,
+            "entry_date": d0.isoformat(),
+            "exit_date": d1.isoformat(),
+            "entry_price": None,
+            "exit_price": None,
+            "return_pct": None,
+            "held_days": 1,
+            "entry_from_window_start": True,
+        }
+    ]
     assert payload["data_trade_date"] == D_ROLL.isoformat()
     assert (
         payload["target_date"] == date.fromordinal(D_ROLL.toordinal() + 1).isoformat()
@@ -1361,6 +1390,53 @@ async def test_rolling_builds_streaks_new_flags_and_exits():
     assert calls["window_stats"]["lookback"] == 10
     assert calls["window_stats"]["top_k"] == 5
     assert calls["window_stats"]["symbols"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_exit_rows_carry_close_based_pnl_and_profile():
+    """退出行 = 收盘价买入/卖出损益 + 名称/行业/市值，供前端弹窗直接展示。"""
+    d0, d1 = _roll_days(1, 0)
+    rows = {
+        d0: [_roll_row("SH600000", 1), _roll_row("SZ000001", 2)],
+        d1: [_roll_row("SH600000", 1)],
+    }
+    closes = {
+        "SH600000": {d0: 10.0, d1: 11.0},
+        "SZ000001": {d0: 20.0, d1: 18.0},
+    }
+    profiles = {"SZ000001": {"industry": "银行", "market_cap_yi": 2200.0}}
+    svc, calls = _rolling_service(rows, closes=closes, profiles=profiles)
+
+    payload = await svc.rolling(
+        {"blend_id": "bl_x"}, tenant_id="t", user_id="u", window=10, per_day=5
+    )
+
+    column = payload["columns"][-1]
+    assert column["exits"] == ["SZ000001"]
+    assert len(column["exit_rows"]) == 1
+    exit_row = column["exit_rows"][0]
+    assert exit_row["symbol"] == "SZ000001"
+    assert exit_row["name"] == "平安银行"
+    assert exit_row["industry"] == "银行"
+    assert exit_row["market_cap_yi"] == pytest.approx(2200.0)
+    assert exit_row["entry_price"] == pytest.approx(20.0)
+    assert exit_row["exit_price"] == pytest.approx(18.0)
+    assert exit_row["return_pct"] == pytest.approx(-10.0)
+    assert exit_row["held_days"] == 1
+    assert exit_row["entry_from_window_start"] is True
+
+    perf = payload["summary"]["performance"]
+    assert perf["closed_trades"] == 1
+    assert perf["wins"] == 0
+    assert perf["losses"] == 1
+    assert perf["win_rate_pct"] == pytest.approx(0.0)
+    assert perf["avg_return_pct"] == pytest.approx(-10.0)
+    assert perf["open_positions"] == 1
+    assert perf["open_avg_return_pct"] == pytest.approx(10.0)
+    assert calls["close_history"]["symbols"] == ["SH600000", "SZ000001"]
+    assert calls["close_history"]["start"] == d0
+    assert calls["close_history"]["end"] == d1
 
 
 @pytest.mark.unit

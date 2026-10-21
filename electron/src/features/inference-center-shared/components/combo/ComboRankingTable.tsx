@@ -25,6 +25,7 @@ import {
   rankingCsvFilename,
   scoreLabel,
 } from './comboRankingModel';
+import './comboTable.css';
 
 const POSITION_HINT =
   '位置仅描述该标的在本组合当日综合分排序中的相对位置，不构成任何交易建议。';
@@ -136,14 +137,14 @@ export const ComboRankingTable: React.FC<ComboRankingTableProps> = ({
     {
       title: '排名',
       dataIndex: 'rank',
-      width: 64,
+      width: 56,
       align: 'right',
       render: (v: number) => <span className="font-mono text-[11px] font-bold text-slate-500">{v}</span>,
     },
     {
       title: '代码',
       dataIndex: 'code',
-      width: 104,
+      width: 96,
       render: (v: string, row) => (
         <span className="font-mono text-[11px] font-bold text-slate-800">{v || row.symbol}</span>
       ),
@@ -151,14 +152,14 @@ export const ComboRankingTable: React.FC<ComboRankingTableProps> = ({
     {
       title: '名称',
       dataIndex: 'name',
-      width: 120,
+      width: 110,
       ellipsis: true,
       render: (v: string) => <span className="text-xs text-slate-700">{v || '—'}</span>,
     },
     {
       title: '综合分',
       dataIndex: 'research_score',
-      width: 88,
+      width: 80,
       align: 'right',
       sorter: (a, b) => (a.research_score ?? -1) - (b.research_score ?? -1),
       render: (_v, row) => (
@@ -172,7 +173,7 @@ export const ComboRankingTable: React.FC<ComboRankingTableProps> = ({
         </Tooltip>
       ),
       dataIndex: 'position',
-      width: 80,
+      width: 76,
       align: 'center',
       render: (_v, row) => {
         const label = positionLabel(row);
@@ -186,7 +187,7 @@ export const ComboRankingTable: React.FC<ComboRankingTableProps> = ({
     {
       title: '覆盖',
       dataIndex: 'coverage',
-      width: 72,
+      width: 68,
       align: 'center',
       render: (v: number) => (
         <span className="font-mono text-[11px] text-slate-600">{coverageLabel(v, memberCount)}</span>
@@ -195,22 +196,28 @@ export const ComboRankingTable: React.FC<ComboRankingTableProps> = ({
     {
       title: '分歧',
       dataIndex: 'dispersion_band',
-      width: 64,
+      width: 60,
       align: 'center',
       render: (v: string) => <span className="text-[11px] text-slate-600">{dispersionLabel(v)}</span>,
     },
     {
       title: '历史标注',
       dataIndex: 'history',
-      width: 220,
-      render: (_v, row) => (
-        <span className="text-[11px] text-slate-600">{historyLabel(row.history, holdDays)}</span>
-      ),
+      width: 180,
+      ellipsis: true,
+      render: (_v, row) => {
+        const label = historyLabel(row.history, holdDays);
+        return (
+          <Tooltip title={label}>
+            <span className="text-[11px] text-slate-600">{label}</span>
+          </Tooltip>
+        );
+      },
     },
     {
       title: '行业',
       dataIndex: 'industry',
-      width: 88,
+      width: 100,
       ellipsis: true,
       render: (v: string | null | undefined) => (
         <span className="text-[11px] text-slate-600">{v || '—'}</span>
@@ -219,7 +226,7 @@ export const ComboRankingTable: React.FC<ComboRankingTableProps> = ({
     {
       title: '市值(亿)',
       dataIndex: 'market_cap_yi',
-      width: 84,
+      width: 80,
       align: 'right',
       render: (v: number | null | undefined) => (
         <span className="font-mono text-[11px] text-slate-600">
@@ -295,10 +302,15 @@ export const ComboRankingTable: React.FC<ComboRankingTableProps> = ({
           dataSource={rows}
           columns={columns}
           pagination={{ defaultPageSize: 50, pageSizeOptions: [50, 100, 200], showSizeChanger: true }}
-          scroll={{ x: 980, y: 'calc(100vh - 300px)' }}
+          // 列宽按内容收敛。数字 x（旧值 980）在宽屏会被拉伸到 1.5–1.6 倍
+          // （1920 实测名称 184px、历史标注 337px），窄屏又强制横滚。
+          // 仅设 max-content 不够：rc-table 内联的 min-width:100% 仍会在宽屏
+          // 撑满容器（1920 实测 1.68 倍），必须配合 comboTable.css 抬 min-width。
+          scroll={{ x: 'max-content', y: 'calc(100vh - 300px)' }}
           expandable={{
             expandedRowRender: (row) => <ContributionTable row={row} members={members} />,
             rowExpandable: () => true,
+            columnWidth: 36,
           }}
           locale={{ emptyText: loading ? ' ' : error ? ' ' : '该组合当日没有可展示的标的' }}
         />

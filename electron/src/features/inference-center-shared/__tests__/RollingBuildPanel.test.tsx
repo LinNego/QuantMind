@@ -3,8 +3,11 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
-import type { BlendRollingResponse } from '../../../services/blendTypes';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import type {
+  BlendRollingPerformance,
+  BlendRollingResponse,
+} from '../../../services/blendTypes';
 import { RollingBuildPanel } from '../components/combo/RollingBuildPanel';
 
 function rolling(over: Partial<BlendRollingResponse> = {}): BlendRollingResponse {
@@ -45,6 +48,34 @@ function rolling(over: Partial<BlendRollingResponse> = {}): BlendRollingResponse
 }
 
 const baseProps = { loading: false, error: null, onRetry: vi.fn() };
+
+function performance(over: Partial<BlendRollingPerformance> = {}): BlendRollingPerformance {
+  return {
+    entry_convention: 'close',
+    closed_trades: 2,
+    priced_trades: 2,
+    unpriced_trades: 0,
+    wins: 1,
+    losses: 1,
+    flats: 0,
+    win_rate_pct: 50,
+    avg_return_pct: 0,
+    median_return_pct: 0,
+    best_symbol: 'SH600009',
+    best_return_pct: 10,
+    worst_symbol: 'SH600008',
+    worst_return_pct: -10,
+    open_positions: 2,
+    open_priced: 2,
+    open_avg_return_pct: 3.25,
+    cycle_return_pct: 4.5,
+    cycle_days: 1,
+    cycle_priced_days: 1,
+    cycle_win_days: 1,
+    cycle_loss_days: 0,
+    ...over,
+  };
+}
 
 describe('RollingBuildPanel', () => {
   it('出错只显示错误与重试，不显示过期看板', () => {
@@ -101,6 +132,81 @@ describe('RollingBuildPanel', () => {
     expect(container.textContent).toContain('靠前');
     expect(container.textContent).toContain('居中');
     expect(container.textContent).not.toMatch(/买入|卖出|BUY|SELL/);
+  });
+
+  it('退出盈亏红涨绿跌，并展示窗口整体涨跌统计', () => {
+    const data = rolling();
+    data.summary.performance = performance();
+    data.columns[1].exit_rows = [
+      {
+        symbol: 'SH600009', name: '丙', entry_date: '2026-10-19', exit_date: '2026-10-20',
+        entry_price: 10, exit_price: 11, return_pct: 10, held_days: 1,
+        entry_from_window_start: true,
+      },
+      {
+        symbol: 'SH600008', name: '丁', entry_date: '2026-10-19', exit_date: '2026-10-20',
+        entry_price: 10, exit_price: 9, return_pct: -10, held_days: 1,
+        entry_from_window_start: true,
+      },
+    ];
+    render(<RollingBuildPanel {...baseProps} rolling={data} />);
+
+    const win = screen.getByTestId('combo-rolling-exit-2026-10-20-SH600009');
+    const loss = screen.getByTestId('combo-rolling-exit-2026-10-20-SH600008');
+    expect(win.textContent).toContain('丙');
+    expect(win.textContent).toContain('+10.00%');
+    expect(win.innerHTML).toContain('text-red-600');
+    expect(loss.textContent).toContain('-10.00%');
+    expect(loss.innerHTML).toContain('text-green-600');
+
+    const cycle = screen.getByTestId('combo-rolling-cycle-return');
+    expect(cycle.textContent).toBe('+4.50%');
+    expect(cycle.className).toContain('text-red-600');
+    expect(screen.getByTestId('combo-rolling-performance').textContent).toContain('胜率');
+    expect(screen.getByTestId('combo-rolling-performance').textContent).toContain('50.0%');
+  });
+
+  it('缺行情时收益显示 —，不写成 0', () => {
+    const data = rolling();
+    data.summary.performance = performance({
+      priced_trades: 0,
+      unpriced_trades: 2,
+      win_rate_pct: null,
+      avg_return_pct: null,
+      cycle_return_pct: null,
+      open_avg_return_pct: null,
+    });
+    data.columns[1].exit_rows = [
+      {
+        symbol: 'SH600009', name: '丙', entry_date: '2026-10-19', exit_date: '2026-10-20',
+        entry_price: null, exit_price: null, return_pct: null, held_days: 1,
+        entry_from_window_start: true,
+      },
+    ];
+    render(<RollingBuildPanel {...baseProps} rolling={data} />);
+    const row = screen.getByTestId('combo-rolling-exit-2026-10-20-SH600009');
+    expect(row.textContent).toContain('—');
+    expect(row.textContent).not.toContain('0.00%');
+    expect(screen.getByTestId('combo-rolling-cycle-return').textContent).toBe('—');
+  });
+
+  it('横向溢出时渲染常驻滚动条（覆盖式原生滚动条不可见）', async () => {
+    render(<RollingBuildPanel {...baseProps} rolling={rolling()} />);
+    expect(screen.queryByTestId('combo-rolling-scrollbar')).not.toBeInTheDocument();
+
+    const board = screen.getByTestId('combo-rolling-board');
+    Object.defineProperty(board, 'clientWidth', { value: 500, configurable: true });
+    Object.defineProperty(board, 'scrollWidth', { value: 900, configurable: true });
+    fireEvent.scroll(board);
+
+    const bar = await screen.findByTestId('combo-rolling-scrollbar');
+    expect(bar).toHaveAttribute('role', 'scrollbar');
+    expect(bar).toHaveAttribute('aria-orientation', 'horizontal');
+    expect(bar).toHaveAttribute('aria-valuemin', '0');
+    expect(bar).toHaveAttribute('aria-valuemax', '100');
+    await waitFor(() =>
+      expect(screen.getByTestId('combo-rolling-scroll-thumb')).toBeInTheDocument(),
+    );
   });
 
   it('滚动告警抬头展示', () => {

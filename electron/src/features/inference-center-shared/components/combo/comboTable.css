@@ -1,0 +1,15 @@
+/**
+ * 组合选股表格的宽度口径（当日榜单 / 调仓计划共用）。
+ *
+ * rc-table 给内层 `<table>` 写内联 `width: max-content; min-width: 100%`：
+ * `min-width: 100%` 会在宽屏把表格撑满容器，`table-layout: fixed` 再把多出的
+ * 宽度按比例摊给每一列——1920 实测列宽被放大到 1.68 倍（名称 110 → 185，
+ * 历史标注 180 → 302），正是「表格太宽」的来源；窄屏反而只剩一条横滚。
+ *
+ * 把 `min-width` 抬成 `max-content` 后，表格宽度恒等于列宽之和：宽屏不再拉伸，
+ * 窄屏由 `.ant-table-body` 自身横向滚动。表头与表体两张表都要改，否则头身错位。
+ */
+[data-testid='combo-ranking-table'] table,
+[data-testid='combo-plan-table'] table {
+  min-width: max-content !important;
+}
