@@ -37,7 +37,7 @@ export interface RebalancePlanPanelProps {
   onRetry: () => void;
   onGenerate: (overrides: BlendPlanOverrides) => Promise<void>;
   onConfirm: () => Promise<void>;
-  /** `/dates` 返回的降序可用日；用于「计划是否过期」判定 */
+  /** `/dates` 返回的降序可用日；仅在 can_confirm 缺失时兜底判过期 */
   dates: string[];
   isTemplate: boolean;
   onSaveTemplate?: () => void;
@@ -136,9 +136,16 @@ export const RebalancePlanPanel: React.FC<RebalancePlanPanelProps> = ({
     );
   }
 
-  const stale = isPlanStale(plan.data_trade_date, dates);
   const persisted = Boolean(plan.plan_id);
   const confirmed = Boolean(plan.confirmed_at);
+  // 确认窗口以服务端 can_confirm 为准（容器时钟+交易日历单一口径）；
+  // 旧后端缺字段时才退回 /dates 序位判断
+  const confirmable = confirmed
+    ? false
+    : plan.can_confirm != null
+      ? plan.can_confirm
+      : !isPlanStale(plan.data_trade_date, dates);
+  const stale = persisted && !confirmed && !confirmable;
   const rows = planDisplayRows(plan);
 
   const columns: ColumnsType<PlanDisplayRow> = [

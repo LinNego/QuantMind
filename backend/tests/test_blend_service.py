@@ -542,6 +542,71 @@ async def test_update_blend_recomputes_membership_and_validates_merged_gates():
         )
 
 
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_blend_rejects_weights_without_members():
+    """只改权重不带成员时不能静默成功（否则写入被丢弃、返回 200）。"""
+    persistence = _FakePersistence()
+    svc = _service([_model("a"), _model("b")], persistence)
+    base = {
+        "blend_id": "bl_x",
+        "tenant_id": "t",
+        "user_id": "u",
+        "market": "CN",
+        "purpose": "rebalance",
+        "members": [{"model_id": "a"}, {"model_id": "b"}],
+    }
+    with pytest.raises(BlendError) as exc:
+        await svc.update_blend(
+            base,
+            tenant_id="t",
+            user_id="u",
+            fields={},
+            model_ids=None,
+            weights={"a": 2.0},
+        )
+    assert exc.value.code == "weights_require_members"
+    assert persistence.updated is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_blend_rechecks_horizon_when_purpose_becomes_rebalance():
+    """改用途也必须过 T+10 闸门——否则存量成员绕过 _resolve_members 的校验。"""
+    persistence = _FakePersistence()
+    svc = _service([_model("a"), _model("a5", horizon=5)], persistence)
+    base = {
+        "blend_id": "bl_x",
+        "tenant_id": "t",
+        "user_id": "u",
+        "market": "CN",
+        "purpose": "next_day",
+        "members": [{"model_id": "a"}, {"model_id": "a5"}],
+    }
+    with pytest.raises(BlendError) as exc:
+        await svc.update_blend(
+            base,
+            tenant_id="t",
+            user_id="u",
+            fields={"purpose": "rebalance"},
+            model_ids=None,
+            weights=None,
+        )
+    assert exc.value.code == "horizon_not_supported"
+    assert persistence.updated is None
+
+    # 改回 next_day 不需要 T+10 校验，正常落库
+    await svc.update_blend(
+        base,
+        tenant_id="t",
+        user_id="u",
+        fields={"purpose": "next_day"},
+        model_ids=None,
+        weights=None,
+    )
+    assert persistence.updated["fields"]["purpose"] == "next_day"
+
+
 # ── 预览 ─────────────────────────────────────────────────────────────────
 
 
@@ -704,6 +769,36 @@ def _plan(day: str = "2026-10-19", **overrides) -> dict:
     }
     payload.update(overrides)
     return payload
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_annotate_confirmable_marks_window_and_rejects_terminal_plans():
+    svc = _service([])
+
+    async def recent():
+        return {date(2026, 10, 20), date(2026, 10, 19)}
+
+    svc._recent_trading_days = recent
+    plans = [
+        {"plan_id": "p1", "data_trade_date": "2026-10-20", "confirmed_at": None},
+        {"plan_id": "p2", "data_trade_date": "2026-10-16", "confirmed_at": None},
+        {"plan_id": None, "data_trade_date": "2026-10-20", "confirmed_at": None},
+        {
+            "plan_id": "p3",
+            "data_trade_date": "2026-10-19",
+            "confirmed_at": "2026-10-19T08:00:00Z",
+        },
+        None,
+    ]
+    await svc.annotate_confirmable(plans)
+    assert [p and p.get("can_confirm") for p in plans] == [
+        True,
+        False,
+        False,
+        False,
+        None,
+    ]
 
 
 @pytest.mark.unit

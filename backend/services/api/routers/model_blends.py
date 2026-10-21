@@ -11,7 +11,7 @@ JWT 鉴权（``get_current_user``），所有读写按 ``(tenant_id, user_id)`` 
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 from collections.abc import Mapping
 
@@ -51,6 +51,25 @@ async def _run(awaitable):
             status_code=exc.status_code,
             detail={"code": exc.code, "message": exc.message},
         ) from exc
+
+
+def _is_unique_conflict(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "unique" in text or "duplicate" in text
+
+
+async def _annotate_confirmable(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """补 ``can_confirm``（最近 2 个交易日窗口）。
+
+    日历不可用时只降级按钮态（置 None，前端退回本地序位判断），不让读接口 500。
+    """
+    try:
+        await _service().annotate_confirmable(items)
+    except Exception as exc:  # noqa: BLE001 - 仅影响确认按钮可用性
+        logger.warning("annotate_confirmable failed: %s", exc)
+        for item in items:
+            item.setdefault("can_confirm", None)
+    return items
 
 
 def _service() -> ModelBlendService:
@@ -189,15 +208,25 @@ async def preview_blend(
     )
 
 
+_MIN_TRADE_DATE = date(2000, 1, 1)
+_MAX_DATE_AHEAD_DAYS = 3650  # 10 年，足够覆盖任何在研模型的前瞻日期
+
+
 def _parse_date(value: str | None) -> date | None:
     if value is None:
         return None
     try:
-        return date.fromisoformat(value)
+        parsed = date.fromisoformat(value)
     except ValueError as exc:
         raise HTTPException(
             status_code=400, detail="日期格式必须是 YYYY-MM-DD"
         ) from exc
+    # date.max 附近的日期会让交易日历兜底 day + 1 溢出成 500；在入参处拦成 400
+    if parsed < _MIN_TRADE_DATE or parsed > date.today() + timedelta(
+        days=_MAX_DATE_AHEAD_DAYS
+    ):
+        raise HTTPException(status_code=400, detail="日期超出可查询范围")
+    return parsed
 
 
 # ── 组合 CRUD ───────────────────────────────────────────────────────────
@@ -246,7 +275,7 @@ async def create_blend(
             detail={"code": exc.code, "message": exc.message},
         ) from exc
     except Exception as exc:  # noqa: BLE001 - 名称唯一等约束冲突
-        if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
+        if _is_unique_conflict(exc):
             raise HTTPException(status_code=409, detail="组合名称已存在") from exc
         raise
     return blend
@@ -261,16 +290,23 @@ async def patch_blend(
     tenant_id, user_id = _owner(current_user)
     blend = await _get_blend_or_404(blend_id, tenant_id=tenant_id, user_id=user_id)
     fields = body.model_dump(exclude_unset=True, exclude={"model_ids", "weights"})
-    await _run(
-        ModelBlendService().update_blend(
-            blend,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            fields=fields,
-            model_ids=body.model_ids,
-            weights=body.weights,
+    try:
+        await _run(
+            ModelBlendService().update_blend(
+                blend,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                fields=fields,
+                model_ids=body.model_ids,
+                weights=body.weights,
+            )
         )
-    )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 改名撞唯一约束与新建同口径
+        if _is_unique_conflict(exc):
+            raise HTTPException(status_code=409, detail="组合名称已存在") from exc
+        raise
     return await _get_blend_or_404(blend_id, tenant_id=tenant_id, user_id=user_id)
 
 
@@ -397,6 +433,7 @@ async def create_plan(
             persist=body.persist,
         )
     )
+    await _annotate_confirmable([payload])
     return payload
 
 
@@ -453,7 +490,7 @@ async def list_plans(
     if target is not None:
         existing = await persistence.get_plan_by_date(blend_id, data_trade_date=target)
         if existing is not None:
-            return {"items": [existing]}
+            return {"items": await _annotate_confirmable([existing])}
         # 无持久化计划 → 即时重算（只读，不写台账；前视防护靠 as_of 台账）
         recomputed = await _run(
             ModelBlendService().plan(
@@ -464,9 +501,9 @@ async def list_plans(
                 persist=False,
             )
         )
-        return {"items": [recomputed], "recomputed": True}
+        return {"items": await _annotate_confirmable([recomputed]), "recomputed": True}
     items = await persistence.list_plans(blend_id, limit=limit)
-    return {"items": items}
+    return {"items": await _annotate_confirmable(items)}
 
 
 @router.get("/{blend_id}/plans/{plan_id}", summary="计划详情")
@@ -482,7 +519,7 @@ async def get_plan(
     )
     if plan is None or plan.get("blend_id") != blend_id:
         raise HTTPException(status_code=404, detail="计划不存在")
-    return plan
+    return (await _annotate_confirmable([plan]))[0]
 
 
 @router.post("/{blend_id}/plans/{plan_id}/confirm", summary="确认纸面调仓")
@@ -497,8 +534,11 @@ async def confirm_plan(
     plan = await persistence.get_plan(plan_id, tenant_id=tenant_id, user_id=user_id)
     if plan is None or plan.get("blend_id") != blend_id:
         raise HTTPException(status_code=404, detail="计划不存在")
-    return await _run(
+    confirmed = await _run(
         ModelBlendService().confirm_plan(
             blend, plan, tenant_id=tenant_id, user_id=user_id
         )
     )
+    if isinstance(confirmed, dict):
+        confirmed["can_confirm"] = False  # 刚确认的计划不再可确认
+    return confirmed

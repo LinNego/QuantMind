@@ -355,14 +355,22 @@ class ModelBlendService:
                     "feature_count/market 必须一致）",
                     code="signature_mismatch",
                 )
-        if purpose == "rebalance":
-            bad = [m["model_id"] for m in members if m["target_horizon_days"] != 10]
-            if bad:
-                raise BlendError(
-                    "调仓组合仅支持 T+10 模型：" + "、".join(bad[:5]),
-                    code="horizon_not_supported",
-                )
+        ModelBlendService._ensure_purpose_supported(members, purpose)
         return members
+
+    @staticmethod
+    def _ensure_purpose_supported(
+        members: Sequence[Mapping[str, Any]], purpose: str
+    ) -> None:
+        """调仓组合只接受 T+10 成员；新建、换成员、改用途三处共用同一口径。"""
+        if purpose != "rebalance":
+            return
+        bad = [m["model_id"] for m in members if m["target_horizon_days"] != 10]
+        if bad:
+            raise BlendError(
+                "调仓组合仅支持 T+10 模型：" + "、".join(bad[:5]),
+                code="horizon_not_supported",
+            )
 
     @staticmethod
     def _validate_params(
@@ -920,6 +928,12 @@ class ModelBlendService:
         ):
             if key in fields and fields[key] is not None:
                 clean[key] = fields[key]
+        if weights is not None and model_ids is None:
+            # 权重只在重算成员时落库；不拦就会静默丢弃并返回 200
+            raise BlendError(
+                "修改权重必须同时提交 model_ids",
+                code="weights_require_members",
+            )
         members_payload = None
         resolved_members: list[dict[str, Any]] | None = None
         if model_ids is not None:
@@ -947,6 +961,11 @@ class ModelBlendService:
             clean["feature_signature"] = str(signature["factor_schema_hash"])
             clean["data_source"] = str(signature["data_source"])
             clean["horizon_days"] = int(signature["target_horizon_days"] or 10)
+        elif clean.get("purpose") == "rebalance":
+            # 只改用途不换成员：存量成员同样要过 T+10 闸门
+            self._ensure_purpose_supported(
+                await self.members_from_blend(blend), "rebalance"
+            )
         merged_min = int(clean.get("min_coverage", blend.get("min_coverage") or 2))
         merged_consensus = int(
             clean.get("consensus_min_count", blend.get("consensus_min_count") or 0)
@@ -1521,7 +1540,7 @@ class ModelBlendService:
                 code="stale_positions",
             )
         try:
-            await self.persistence.confirm_plan(
+            confirmed = await self.persistence.confirm_plan(
                 plan=plan,
                 target_date=date.fromisoformat(str(plan["target_date"])),
             )
@@ -1531,10 +1550,32 @@ class ModelBlendService:
                     "同一数据日已有确认计划", status_code=409, code="plan_confirmed"
                 ) from exc
             raise
+        if confirmed is False:
+            # 并发确认：另一请求先抢到了 plan 行（rowcount 0）
+            raise BlendError("计划已确认", status_code=409, code="plan_confirmed")
         refreshed = await self.persistence.get_plan(
             str(plan["plan_id"]), tenant_id=tenant_id, user_id=user_id
         )
         return refreshed or {}
+
+    async def annotate_confirmable(
+        self, plans: Sequence[dict[str, Any] | None]
+    ) -> None:
+        """给计划响应补 ``can_confirm``，与 confirm_plan 共用同一份日历口径。
+
+        前端原先按 ``/dates`` 序位判断过期；缺评分日时会与后端「最近 2 个交易日」
+        错位，且浏览器时钟（宿主 JST）与容器时钟不一致。时间判定统一放服务端。
+        """
+        allowed = {day.isoformat() for day in await self._recent_trading_days()}
+        for plan in plans:
+            if plan is None:
+                continue
+            plan_date = str(plan.get("data_trade_date") or "")[:10]
+            plan["can_confirm"] = (
+                bool(plan.get("plan_id"))
+                and not plan.get("confirmed_at")
+                and plan_date in allowed
+            )
 
     @staticmethod
     async def _recent_trading_days() -> set[date]:

@@ -531,10 +531,9 @@ async def _run_job(
     job = await persistence.get_job(job_id, tenant_id=tenant_id, user_id=user_id)
     if job is None or job.get("status") != "queued":
         return
-    now = utc_now()
-    await persistence.update_job(
-        job_id, status="running", started_at=now, heartbeat_at=now
-    )
+    # 条件迁移：读与写之间用户可能已取消（queued → cancelled 是终态）
+    if not await persistence.claim_running(job_id):
+        return
     redis_client = None
     heartbeat_task: asyncio.Task | None = None
     writer: _ProgressWriter | None = None
@@ -611,7 +610,9 @@ async def _run_job(
             )
             return bool(current and current.get("cancel_requested"))
 
-        def _should_skip_model(model_id: str) -> bool:
+        async def _should_skip_model(model_id: str) -> bool:
+            # run_serial 按 Awaitable[bool] 调用（model_backfill.py 里 await）；
+            # 这里必须是 async，写成同步函数会在第一天开跑前抛 await TypeError。
             return batch_inference_orchestrator.is_running(
                 tenant_id, user_id, model_id
             )

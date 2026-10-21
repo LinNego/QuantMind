@@ -219,6 +219,8 @@ export interface BlendPlan {
   config_hash?: string;
   positions_hash?: string;
   confirmed_at?: string | null;
+  /** 后端标注的确认窗口（最近 2 个交易日）；null=日历不可用，前端退回 /dates 序位判断 */
+  can_confirm?: boolean | null;
   created_at?: string | null;
   blend?: { blend_id: string; name?: string; method?: string; horizon_days?: number };
 }

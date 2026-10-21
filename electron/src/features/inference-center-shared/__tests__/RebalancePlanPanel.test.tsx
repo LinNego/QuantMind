@@ -133,6 +133,31 @@ describe('RebalancePlanPanel', () => {
     expect(screen.getByText(/已确认/)).toBeInTheDocument();
   });
 
+  it('后端 can_confirm=true：日期不在 /dates 前两位也允许确认', () => {
+    // 确认窗口以服务端日历为准（评分日缺口时 /dates 序位会误判）
+    render(
+      <RebalancePlanPanel
+        {...baseProps}
+        plan={makePlan({ data_trade_date: '2026-10-01', can_confirm: true })}
+        isTemplate={false}
+      />,
+    );
+    expect(screen.getByTestId('combo-plan-confirm')).not.toBeDisabled();
+    expect(screen.queryByText(/计划已过期/)).not.toBeInTheDocument();
+  });
+
+  it('后端 can_confirm=false：日期看似在窗口内也禁用确认', () => {
+    render(
+      <RebalancePlanPanel
+        {...baseProps}
+        plan={makePlan({ can_confirm: false })}
+        isTemplate={false}
+      />,
+    );
+    expect(screen.getByTestId('combo-plan-confirm')).toBeDisabled();
+    expect(screen.getByText(/计划已过期/)).toBeInTheDocument();
+  });
+
   it('新鲜且已落库的计划：二次确认后才写入台账', async () => {
     const onConfirm = vi.fn().mockResolvedValue(undefined);
     render(

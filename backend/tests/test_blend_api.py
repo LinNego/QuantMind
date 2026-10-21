@@ -27,6 +27,11 @@ BASE = "/api/v1/models/blends"
 USER = {"tenant_id": "default", "user_id": "10000001", "sub": "10000001"}
 
 
+def _last_plan_call(service: _FakeService) -> dict:
+    """计划端点之后还会调 annotate_confirmable，取最后一次 plan 调用的参数。"""
+    return [kwargs for name, kwargs in service.calls if name == "plan"][-1]
+
+
 class _FakeService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
@@ -89,6 +94,15 @@ class _FakeService:
     async def plan(self, blend, **kwargs):
         self._record("plan", blend=blend, **kwargs)
         return dict(self.plan_payload)
+
+    async def annotate_confirmable(self, plans):
+        self._record("annotate_confirmable")
+        for plan in plans:
+            if plan is None:
+                continue
+            plan["can_confirm"] = bool(plan.get("plan_id")) and not plan.get(
+                "confirmed_at"
+            )
 
     async def confirm_plan(self, blend, plan, **kwargs):
         self._record("confirm_plan", blend=blend, plan=plan, **kwargs)
@@ -230,6 +244,13 @@ def test_preview_rejects_bad_date_and_single_member(api):
         json={"model_ids": ["m1", "m2"], "data_trade_date": "2026/10/19"},
     )
     assert bad_date.status_code == 400
+    # 极端年份会让交易日历兜底 day+1 溢出成 500，必须在入参处拦成 400
+    for extreme in ("9999-12-31", "0001-01-01"):
+        resp = client.post(
+            f"{BASE}/preview",
+            json={"model_ids": ["m1", "m2"], "data_trade_date": extreme},
+        )
+        assert resp.status_code == 400, extreme
     too_few = client.post(f"{BASE}/preview", json={"model_ids": ["m1"]})
     assert too_few.status_code == 422
 
@@ -266,6 +287,14 @@ def test_patch_returns_refreshed_and_404s_unknown(api):
 
     missing = client.patch(f"{BASE}/bl_missing", json={"name": "y"})
     assert missing.status_code == 404
+
+    # 改名撞唯一约束与新建同口径 → 409，而不是未处理的 500
+    service.errors["update_blend"] = Exception(
+        'duplicate key value violates unique constraint "uq_blend_name"'
+    )
+    conflict = client.patch(f"{BASE}/bl_x", json={"name": "重复"})
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == "组合名称已存在"
 
 
 def test_delete_archives_and_404s_unknown(api):
@@ -365,7 +394,7 @@ def test_create_plan_without_overrides_leaves_config_to_service(api):
     persistence.blends["bl_x"] = _blend()
     resp = client.post(f"{BASE}/bl_x/plans", json={})
     assert resp.status_code == 200
-    assert service.calls[-1][1]["plan_config"] is None
+    assert _last_plan_call(service)["plan_config"] is None
 
 
 def test_create_plan_overrides_merge_with_blend_defaults(api):
@@ -378,7 +407,7 @@ def test_create_plan_overrides_merge_with_blend_defaults(api):
         json={"capital": 20000000.0, "top_k": 30},
     )
     assert resp.status_code == 200
-    cfg = service.calls[-1][1]["plan_config"]
+    cfg = _last_plan_call(service)["plan_config"]
     assert cfg.capital == 20_000_000.0
     assert cfg.top_k == 30
     # 未显式给的字段沿用组合自身配置，不静默回默认
@@ -407,10 +436,10 @@ def test_create_plan_passes_persist_flag(api):
         json={"data_trade_date": "2026-10-19", "persist": False},
     )
     assert resp.status_code == 200
-    name, kwargs = service.calls[-1]
-    assert name == "plan"
-    assert kwargs["persist"] is False
-    assert kwargs["data_trade_date"].isoformat() == "2026-10-19"
+    plan_calls = [(name, kwargs) for name, kwargs in service.calls if name == "plan"]
+    assert plan_calls
+    assert plan_calls[-1][1]["persist"] is False
+    assert plan_calls[-1][1]["data_trade_date"].isoformat() == "2026-10-19"
 
 
 def test_list_plans_returns_stored_or_recomputes(api):
@@ -424,15 +453,23 @@ def test_list_plans_returns_stored_or_recomputes(api):
     persistence.plans_by_date["bl_x"] = persistence.plans["bp_1"]
     stored = client.get(f"{BASE}/bl_x/plans", params={"date": "2026-10-19"})
     assert stored.status_code == 200
-    assert stored.json() == {"items": [persistence.plans["bp_1"]]}
+    stored_item = stored.json()["items"][0]
+    assert stored_item["plan_id"] == "bp_1"
+    # 确认窗口由服务端标注（前端不再自行比日期）
+    assert stored_item["can_confirm"] is True
     assert all(name != "plan" for name, _ in service.calls)
 
     persistence.plans_by_date.clear()
     recomputed = client.get(f"{BASE}/bl_x/plans", params={"date": "2026-10-18"})
     assert recomputed.status_code == 200
     assert recomputed.json()["recomputed"] is True
-    assert recomputed.json()["items"][0] == service.plan_payload
-    assert service.calls[-1][1]["persist"] is False
+    recomputed_item = recomputed.json()["items"][0]
+    assert {k: v for k, v in recomputed_item.items() if k != "can_confirm"} == (
+        service.plan_payload
+    )
+    # 未落台账的预览计划不可确认
+    assert recomputed_item["can_confirm"] is False
+    assert _last_plan_call(service)["persist"] is False
 
 
 def test_get_plan_checks_blend_membership(api):
@@ -455,6 +492,7 @@ def test_confirm_plan_calls_service(api):
     resp = client.post(f"{BASE}/bl_x/plans/bp_1/confirm")
     assert resp.status_code == 200
     assert resp.json()["confirmed_at"]
+    assert resp.json()["can_confirm"] is False
     name, kwargs = service.calls[-1]
     assert name == "confirm_plan"
     assert kwargs["plan"]["plan_id"] == "bp_1"

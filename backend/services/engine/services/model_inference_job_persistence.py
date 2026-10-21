@@ -248,6 +248,26 @@ class ModelInferenceJobPersistence:
             raise RuntimeError("创建补推任务后无法读回")
         return created
 
+    async def claim_running(self, job_id: str) -> bool:
+        """queued → running 条件迁移。
+
+        取消 queued 任务会直接落 cancelled；无条件改 running 会把终态盖回去。
+        返回 False 表示已被取消或被别处领走，调用方应直接退出。
+        """
+        now = utc_now()
+        async with get_session() as session:
+            result = await session.execute(
+                text(
+                    """
+                    UPDATE qm_model_inference_jobs
+                    SET status = 'running', started_at = :now, heartbeat_at = :now
+                    WHERE job_id = :job_id AND status = 'queued'
+                    """
+                ),
+                {"job_id": str(job_id), "now": now},
+            )
+            return result.rowcount > 0
+
     async def update_job(self, job_id: str, **fields: Any) -> None:
         clean = {key: value for key, value in fields.items() if key in _UPDATABLE}
         if not clean:

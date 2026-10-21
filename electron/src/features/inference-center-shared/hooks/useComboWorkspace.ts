@@ -283,6 +283,7 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
     if (dates.length === 0) {
       setRolling(null);
       setRollingError('该组合暂无完整评分的交易日');
+      setRollingLoading(false); // 上一轮请求的 finally 已随 cleanup 失效，不补就永远转圈
       return;
     }
     let alive = true;
@@ -304,6 +305,7 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
     if (dates.length === 0) {
       setPlan(null);
       setPlanError('该组合暂无完整评分的交易日');
+      setPlanLoading(false); // 同 rolling：cleanup 后旧请求的 finally 不会落地
       return;
     }
     let alive = true;

@@ -9,7 +9,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import React from 'react';
 
@@ -246,5 +246,66 @@ describe('BackfillJobModal 执行', () => {
     expect(await screen.findByRole('button', { name: '已请求取消' })).toBeDisabled();
     // 任务未终结：恢复键仍保留，重开弹窗还能接着看
     expect(localStorage.getItem(STORAGE_KEY)).toBe('job-9');
+  });
+
+  it('迟到的旧轮询响应不得把已终结任务拉回运行态', async () => {
+    localStorage.setItem(STORAGE_KEY, 'job-9');
+    const pending: Array<(job: BackfillJob) => void> = [];
+    let call = 0;
+    getBackfillJob.mockImplementation(() => {
+      call += 1;
+      if (call === 1) return Promise.resolve(makeJob({ job_id: 'job-9' }));
+      return new Promise<BackfillJob>((resolve) => pending.push(resolve));
+    });
+
+    renderModal();
+    await screen.findByTestId('backfill-running');
+
+    // 至少发出两轮轮询；在 act 回调内同步取「此刻最新」的一条来终结，
+    // 否则选取与 resolve 之间又会插进新轮次，旧序号的响应会被（正确地）丢弃
+    await waitFor(() => expect(pending.length).toBeGreaterThanOrEqual(2), { timeout: 1000 });
+    await act(async () => {
+      pending[pending.length - 1](makeJob({ job_id: 'job-9', status: 'completed', progress: 1 }));
+    });
+    expect(await screen.findByTestId('backfill-done')).toBeTruthy();
+
+    // 旧请求后到：若被应用会把界面拉回运行态，而轮询已停、再也纠不回来
+    await act(async () => {
+      pending[0](makeJob({ job_id: 'job-9' }));
+    });
+    expect(screen.queryByTestId('backfill-running')).toBeNull();
+    expect(screen.getByTestId('backfill-done')).toBeTruthy();
+
+    // 终态后确实停表
+    const callsAtDone = getBackfillJob.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(getBackfillJob.mock.calls.length).toBe(callsAtDone);
+  });
+
+  it('起任务响应晚于关窗：不再起轮询，恢复键照写', async () => {
+    let resolveCreate: (job: BackfillJob) => void = () => {};
+    createBackfillJob.mockImplementation(
+      () =>
+        new Promise<BackfillJob>((resolve) => {
+          resolveCreate = resolve;
+        }),
+    );
+    const { rerender } = render(
+      <BackfillJobModal open modelIds={['m1', 'm2']} onClose={vi.fn()} pollIntervalMs={10} />,
+    );
+    await screen.findByText('模型一');
+    await userEvent.click(screen.getByRole('button', { name: /开始串行补推/ }));
+
+    rerender(
+      <BackfillJobModal open={false} modelIds={['m1', 'm2']} onClose={vi.fn()} pollIntervalMs={10} />,
+    );
+    await act(async () => {
+      resolveCreate(makeJob({ job_id: 'job-3' }));
+    });
+
+    // 任务照跑：恢复键必须落下；但轮询不得在关窗状态下启动
+    await waitFor(() => expect(localStorage.getItem(STORAGE_KEY)).toBe('job-3'));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(getBackfillJob).not.toHaveBeenCalled();
   });
 });

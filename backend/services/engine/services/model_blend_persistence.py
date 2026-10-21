@@ -59,6 +59,11 @@ def _iso(value: Any) -> str | None:
     return str(value)
 
 
+def _is_unique_violation(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "unique" in text or "duplicate" in text
+
+
 class ModelBlendPersistence:
     """组合定义 / 计划 / 持仓的读写。"""
 
@@ -212,47 +217,84 @@ class ModelBlendPersistence:
         members: Sequence[tuple[str, str, float]],
     ) -> dict[str, Any]:
         blend_id = new_blend_id()
-        async with get_session() as session:
-            await session.execute(
-                text(
-                    """
-                    INSERT INTO qm_model_blends (
-                      blend_id, tenant_id, user_id, name, market, purpose, source,
-                      template_id, horizon_days, weighting, method, trim_count,
-                      min_coverage, consensus_min_count, entry_per_day, rolling_window,
-                      target_positions, feature_signature, data_source, status
-                    ) VALUES (
-                      :blend_id, :tenant_id, :user_id, :name, :market, :purpose, :source,
-                      :template_id, :horizon_days, :weighting, :method, :trim_count,
-                      :min_coverage,
-                      :consensus_min_count, :entry_per_day, :rolling_window,
-                      :target_positions, :feature_signature, :data_source, 'active'
-                    )
-                    """
-                ),
-                {
-                    "blend_id": blend_id,
-                    "tenant_id": tenant_id,
-                    "user_id": user_id,
-                    "name": name,
-                    "market": market,
-                    "purpose": purpose,
-                    "source": source,
-                    "template_id": template_id,
-                    "horizon_days": horizon_days,
-                    "weighting": weighting,
-                    "method": method,
-                    "trim_count": trim_count,
-                    "min_coverage": min_coverage,
-                    "consensus_min_count": consensus_min_count,
-                    "entry_per_day": entry_per_day,
-                    "rolling_window": rolling_window,
-                    "target_positions": target_positions,
-                    "feature_signature": feature_signature,
-                    "data_source": data_source,
-                },
+        params = {
+            "blend_id": blend_id,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "name": name,
+            "market": market,
+            "purpose": purpose,
+            "source": source,
+            "template_id": template_id,
+            "horizon_days": horizon_days,
+            "weighting": weighting,
+            "method": method,
+            "trim_count": trim_count,
+            "min_coverage": min_coverage,
+            "consensus_min_count": consensus_min_count,
+            "entry_per_day": entry_per_day,
+            "rolling_window": rolling_window,
+            "target_positions": target_positions,
+            "feature_signature": feature_signature,
+            "data_source": data_source,
+        }
+        try:
+            async with get_session() as session:
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO qm_model_blends (
+                          blend_id, tenant_id, user_id, name, market, purpose, source,
+                          template_id, horizon_days, weighting, method, trim_count,
+                          min_coverage, consensus_min_count, entry_per_day, rolling_window,
+                          target_positions, feature_signature, data_source, status
+                        ) VALUES (
+                          :blend_id, :tenant_id, :user_id, :name, :market, :purpose, :source,
+                          :template_id, :horizon_days, :weighting, :method, :trim_count,
+                          :min_coverage,
+                          :consensus_min_count, :entry_per_day, :rolling_window,
+                          :target_positions, :feature_signature, :data_source, 'active'
+                        )
+                        """
+                    ),
+                    params,
+                )
+                await self._replace_members(session, blend_id, members)
+        except Exception as exc:  # noqa: BLE001 - 只有唯一键冲突才走重激活
+            if not _is_unique_violation(exc):
+                raise
+            existing = await self._find_by_name(
+                tenant_id=tenant_id, user_id=user_id, name=name
             )
-            await self._replace_members(session, blend_id, members)
+            if existing is None or str(existing.get("status") or "") != "archived":
+                raise
+            # 归档组合仍占 (tenant,user,name) 唯一键。默认组合被归档后再次自动创建
+            # 若直接 409 就永久失败（列表又不展示归档行）；这里原地重激活并覆盖配置。
+            blend_id = str(existing["blend_id"])
+            params["blend_id"] = blend_id
+            async with get_session() as session:
+                await session.execute(
+                    text(
+                        """
+                        UPDATE qm_model_blends SET
+                          market = :market, purpose = :purpose, source = :source,
+                          template_id = :template_id, horizon_days = :horizon_days,
+                          weighting = :weighting, method = :method,
+                          trim_count = :trim_count, min_coverage = :min_coverage,
+                          consensus_min_count = :consensus_min_count,
+                          entry_per_day = :entry_per_day,
+                          rolling_window = :rolling_window,
+                          target_positions = :target_positions,
+                          feature_signature = :feature_signature,
+                          data_source = :data_source,
+                          status = 'active', updated_at = NOW()
+                        WHERE blend_id = :blend_id
+                          AND tenant_id = :tenant_id AND user_id = :user_id
+                        """
+                    ),
+                    params,
+                )
+                await self._replace_members(session, blend_id, members)
         blend = await self.get_blend(blend_id, tenant_id=tenant_id, user_id=user_id)
         if blend is None:  # pragma: no cover - 插入后同事务必可见
             raise RuntimeError("组合创建后读取失败")
@@ -282,6 +324,28 @@ class ModelBlendPersistence:
                     "weight": float(weight),
                 },
             )
+
+    async def _find_by_name(
+        self, *, tenant_id: str, user_id: str, name: str
+    ) -> dict[str, Any] | None:
+        async with get_session(read_only=True) as session:
+            row = (
+                (
+                    await session.execute(
+                        text(
+                            """
+                            SELECT blend_id, status FROM qm_model_blends
+                            WHERE tenant_id = :tenant_id AND user_id = :user_id
+                              AND name = :name
+                            """
+                        ),
+                        {"tenant_id": tenant_id, "user_id": user_id, "name": name},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        return dict(row) if row is not None else None
 
     async def get_blend(
         self, blend_id: str, *, tenant_id: str, user_id: str
@@ -648,9 +712,25 @@ class ModelBlendPersistence:
         *,
         plan: Mapping[str, Any],
         target_date: date,
-    ) -> None:
-        """确认计划：关 exits、开 entries、写 confirmed_at（单事务）。"""
+    ) -> bool:
+        """确认计划：先抢占 confirmed_at，再关 exits、开 entries（单事务）。
+
+        返回 False = 计划已被并发确认（rowcount 0），调用方映射 409；
+        先抢计划行再做台账写入，避免「没确认成功却写入了持仓」。
+        """
         async with get_session() as session:
+            claimed = await session.execute(
+                text(
+                    """
+                    UPDATE qm_model_blend_plans
+                    SET confirmed_at = NOW()
+                    WHERE plan_id = :plan_id AND confirmed_at IS NULL
+                    """
+                ),
+                {"plan_id": plan["plan_id"]},
+            )
+            if claimed.rowcount == 0:
+                return False
             for row in plan.get("exits") or []:
                 await session.execute(
                     text(
@@ -693,16 +773,7 @@ class ModelBlendPersistence:
                         "target_value": row.get("target_value"),
                     },
                 )
-            await session.execute(
-                text(
-                    """
-                    UPDATE qm_model_blend_plans
-                    SET confirmed_at = NOW()
-                    WHERE plan_id = :plan_id AND confirmed_at IS NULL
-                    """
-                ),
-                {"plan_id": plan["plan_id"]},
-            )
+        return True
 
     # ── 持仓 ────────────────────────────────────────────────────────────
 

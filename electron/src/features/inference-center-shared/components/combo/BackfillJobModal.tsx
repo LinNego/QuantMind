@@ -85,18 +85,40 @@ export const BackfillJobModal: React.FC<BackfillJobModalProps> = ({
   const [pollError, setPollError] = useState<string | null>(null);
 
   const timerRef = useRef<number | null>(null);
+  // 每发一次轮询就自增；晚到的旧响应不得覆盖新状态（终态后尤其致命）
+  const requestSeqRef = useRef(0);
+  const openRef = useRef(open);
+  openRef.current = open;
+  const mountedRef = useRef(true);
   const modelIdsRef = useRef<string[]>(modelIds);
   modelIdsRef.current = modelIds;
 
   const stopPolling = useCallback(() => {
+    requestSeqRef.current += 1; // 在途响应一并作废
     if (timerRef.current != null) {
       window.clearInterval(timerRef.current);
       timerRef.current = null;
     }
   }, []);
 
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      stopPolling();
+    };
+    // stopPolling 恒定；卸载后异步 continuation 不得再起定时器
+  }, [stopPolling]);
+
   const applyJob = useCallback(
-    (next: BackfillJob) => {
+    (next: BackfillJob, seq?: number) => {
+      if (!mountedRef.current) return;
+      if (seq == null) {
+        // 起任务/取消的直接响应：同样作废在途轮询，避免旧快照把按钮态盖回去
+        requestSeqRef.current += 1;
+      } else if (seq < requestSeqRef.current) {
+        return; // 旧响应晚到：丢弃
+      }
       setJob(next);
       setPollError(null);
       if (ACTIVE_JOB_STATUSES.has(next.status)) {
@@ -114,12 +136,15 @@ export const BackfillJobModal: React.FC<BackfillJobModalProps> = ({
   const startPolling = useCallback(
     (jobId: string, intervalMs: number) => {
       stopPolling();
+      // 关窗/卸载后不再起轮询：任务照跑，重开弹窗凭 localStorage 恢复
+      if (!openRef.current || !mountedRef.current) return;
       timerRef.current = window.setInterval(() => {
         // 页面隐藏时暂停：后台标签页不烧请求，回到前台立即补一次
         if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+        const seq = (requestSeqRef.current += 1);
         void modelTrainingService
           .getBackfillJob(jobId)
-          .then(applyJob)
+          .then((next) => applyJob(next, seq))
           .catch((err: unknown) => setPollError(errorMessage(err)));
       }, intervalMs);
     },

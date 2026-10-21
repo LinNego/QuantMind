@@ -634,6 +634,14 @@ class _FakeRunnerPersistence:
     async def get_job(self, job_id, **_kwargs):
         return dict(self.job)
 
+    async def claim_running(self, job_id):
+        # 真实实现是 queued → running 的条件迁移；已终结（如取消）时不得覆盖
+        if self.job.get("status") != "queued":
+            return False
+        self.updates.append((job_id, {"status": "running"}))
+        self.job["status"] = "running"
+        return True
+
     async def update_job(self, job_id, **fields):
         self.updates.append((job_id, fields))
         self.job.update(fields)
@@ -671,6 +679,14 @@ def _patch_run_job_deps(monkeypatch, tmp_path, *, result=None, raise_error=None)
     async def fake_run_serial(*_args, **kwargs):
         if raise_error is not None:
             raise raise_error
+        # 钉住回调契约：真实 run_serial 会 await 两个回调，同步实现会在这里抛
+        # TypeError（曾导致所有补推任务在第一日前直接失败）
+        skip = kwargs.get("should_skip_model")
+        assert skip is not None
+        assert await skip("m1") is False
+        cancel = kwargs.get("should_cancel")
+        assert cancel is not None
+        assert await cancel() is False
         return result
 
     monkeypatch.setattr(js, "resolve_backfill_model", fake_resolve)
@@ -699,6 +715,22 @@ def test_run_job_completes_and_writes_terminal_state(monkeypatch, tmp_path):
     final = persistence.updates[-1][1]
     assert final["completed_days"] == 2
     assert final["model_results"][0]["model_id"] == "m1"
+
+
+def test_run_job_stops_when_cancel_wins_the_queued_race(monkeypatch, tmp_path):
+    persistence = _FakeRunnerPersistence(
+        _row(job_id="job_1", status="queued", model_ids=["m1"])
+    )
+    _patch_run_job_deps(monkeypatch, tmp_path, result=_serial_result())
+
+    async def cancel_won(_job_id):
+        return False  # 读到 queued 后、写 running 前被取消
+
+    monkeypatch.setattr(persistence, "claim_running", cancel_won)
+    _run(js._run_job("job_1", tenant_id="default", user_id="u1", persistence=persistence))
+
+    # 不得再写 running/终态：cancel 落下的 cancelled 是最终结论
+    assert persistence.updates == []
 
 
 def test_run_job_returns_when_not_queued(monkeypatch, tmp_path):
