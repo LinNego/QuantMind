@@ -47,6 +47,9 @@ from backend.services.trade.services.decision_round_core import (
     RoundResult,
     due_slots,
 )
+from backend.services.trade.services.decision_round_bridge_recovery import (
+    bridge_recovery_tick,
+)
 from backend.services.trade.services.decision_round_tick import round_tick, wake_tick
 
 logger = logging.getLogger(__name__)
@@ -256,6 +259,9 @@ async def run_decision_round_worker() -> None:
         # 丙1 触发唤醒评估（Stage 2 第二批）：与正点轮同任务串行，天然无并发下单项。
         # 契约「绝不抛」在 wake_tick 内部兜底（runner 只给一行，循环不许因它出事）。
         await wake_tick()
+        # 桥断 ≥30 分钟后恢复：全名册每家至少补跑一次（2026-10-21 用户要求）。
+        # 与正点轮/唤醒轮串行；义务与证据面见 decision_round_bridge_recovery。
+        await bridge_recovery_tick()
         # 「活着但整天不出活」的可见性：判据在 alerts，本层只负责「什么时候问」。
         # 与 tick 分开 try：可见性问题绝不许影响下一轮决策。
         try:

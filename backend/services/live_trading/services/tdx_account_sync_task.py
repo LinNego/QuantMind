@@ -10,10 +10,18 @@ TDX Account Sync Task - 定期把通达信桥账户/持仓落库到 real_account
 
 import asyncio
 import logging
+import time
 
+from backend.shared.bridge_outage import (
+    build_marker,
+    qualifies,
+    record_probe,
+    write_marker,
+)
 from backend.shared.simulation_account_keys import resolve_db_account_user
 from backend.services.live_trading.services.bridge_health_watch import (
     VERDICT_HARD,
+    VERDICT_OK,
     BridgeHealthTracker,
     classify_sync_result,
     notify_bridge_event,
@@ -21,6 +29,38 @@ from backend.services.live_trading.services.bridge_health_watch import (
 from backend.services.live_trading.services.tdx_push_service import tdx_pusher
 
 logger = logging.getLogger(__name__)
+
+
+def _track_outage(verdict: str, *, now: float | None = None) -> None:
+    """把一次账户探测喂给「桥掉线窗口」；够格恢复则登记全名册补跑义务。
+
+    与告警状态机（``BridgeHealthTracker``）分工：那边管**人**（边沿告警），这里管
+    **决策轮**（恢复后补跑）。窗口写 Redis（交易库 db2），进程重启不丢掉线起点；
+    任何失败只记日志——观测面不许影响账户同步本身。
+    """
+    try:
+        from backend.services.trade_shared.redis_client import get_redis as _get_redis
+
+        wrapper = _get_redis()
+        if getattr(wrapper, "client", None) is None:
+            wrapper.connect()
+        client = getattr(wrapper, "client", None)
+        if client is None:
+            logger.warning("[TdxSync] Redis 不可用，桥掉线窗口本轮不记")
+            return
+        outage = record_probe(client, ok=(verdict == VERDICT_OK), now=now)
+        if outage is None or not qualifies(outage):
+            return
+        marker = build_marker(outage)
+        write_marker(client, marker)
+        logger.warning(
+            "[TdxSync] 桥掉线 %.0f 分钟已恢复（%s）：已登记恢复补跑义务（%s）",
+            outage.down_for_s / 60.0,
+            "跨重启合成" if outage.synthesized else "在线探测",
+            marker.day,
+        )
+    except Exception as exc:  # noqa: BLE001 状态面坏掉不许影响同步循环
+        logger.warning("[TdxSync] 桥掉线窗口记录失败: %s", exc)
 
 
 async def run_tdx_account_sync_task(interval_seconds: int = 30):
@@ -36,6 +76,7 @@ async def run_tdx_account_sync_task(interval_seconds: int = 30):
     )
     tracker = BridgeHealthTracker()
     while True:
+        now_ts = time.time()
         verdict, detail = VERDICT_HARD, ""
         try:
             result = await tdx_pusher.sync_account_to_pg(
@@ -50,7 +91,8 @@ async def run_tdx_account_sync_task(interval_seconds: int = 30):
         except Exception as exc:
             detail = f"账户通道异常: {exc}"
             logger.warning("[TdxSync] 通达信账户同步失败: %s", exc)
-        event = tracker.record(verdict, detail=detail)
+        _track_outage(verdict, now=now_ts)
+        event = tracker.record(verdict, detail=detail, now=now_ts)
         if event is not None:
             await notify_bridge_event(
                 event,
