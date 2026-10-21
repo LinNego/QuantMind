@@ -14,11 +14,13 @@ import { Typography, Spin } from 'antd';
 import { clsx } from 'clsx';
 import { ChevronRight, TrendingUp } from 'lucide-react';
 import type { InferenceRankingItem } from '../../../services/modelTrainingService';
+import { signalPositionLabel } from '../../shared/signalVocabulary';
+import { positionTagClass } from '../positionLabels';
 
 const { Text } = Typography;
 
 /** 表格列宽：与表头共用一份，避免表体表头错位 */
-const GRID_COLS = 'grid-cols-[30px_62px_minmax(0,1fr)_74px_70px_14px]';
+const GRID_COLS = 'grid-cols-[30px_62px_minmax(0,1fr)_74px_96px_14px]';
 
 interface RankingListProps {
   rankings: InferenceRankingItem[];
@@ -69,13 +71,14 @@ export const RankingList: React.FC<RankingListProps> = ({
         <span>代码</span>
         <span>名称</span>
         <span className="truncate">行业</span>
-        <span className="text-right">信号分</span>
+        <span className="text-right">分数 / 位置</span>
         <span />
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar overscroll-contain">
         {rankings.map((r) => {
           const isActive = Boolean(activeCode && activeCode === r.code);
+          const position = signalPositionLabel(r.signal);
           return (
             <button
               key={r.code}
@@ -112,11 +115,14 @@ export const RankingList: React.FC<RankingListProps> = ({
                 >
                   {r.score.toFixed(4)}
                 </Text>
-                {r.signal === 'buy' ? (
-                  <Text className="text-[11px] font-bold text-rose-500 leading-none">↑</Text>
-                ) : r.signal === 'sell' ? (
-                  <Text className="text-[11px] font-bold text-emerald-500 leading-none">↓</Text>
-                ) : null}
+                <span
+                  className={clsx(
+                    'px-1 py-[1px] rounded border text-[9px] font-bold leading-none',
+                    positionTagClass(position),
+                  )}
+                >
+                  {position}
+                </span>
               </span>
               {/* 联动入口：箭头常驻（不挤压列宽），hover / 选中时点亮 */}
               <ChevronRight

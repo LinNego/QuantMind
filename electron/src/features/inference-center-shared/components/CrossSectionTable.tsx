@@ -2,8 +2,8 @@
  * 截面选股工作区：全市场打分榜（全宽表格）。
  *
  * 与左栏「截面轨」的分工：轨是常驻的窄条，用来盯住最近一批的 Top 名单；
- * 这里是把整批明细摊开做**检索**——按信号/行业/板块/分数区间过滤，按任意数值列排序，
- * 导出名单交给下游（组合构建、风控、报单）。
+ * 这里是把整批明细摊开做**检索**——按位置/行业/板块/分数区间过滤，按任意数值列排序，
+ * 导出名单交给下游研究（组合构建、风控复核）。
  *
  * 口径提示：分数是模型原始输出，**未经横截面标准化时不同批次不可直接比大小**，
  * 因此本期/上期的对比只在本批内部有效，导出文件名带上 run_id 以便追溯。
@@ -15,6 +15,8 @@ import type { ColumnsType } from 'antd/es/table';
 import { clsx } from 'clsx';
 import { Download, Filter, Search, X } from 'lucide-react';
 import type { InferenceRankingItem, InferenceRankingResult } from '../../../services/modelTrainingService';
+import { signalPositionLabel } from '../../shared/signalVocabulary';
+import { positionTagClass } from '../positionLabels';
 
 /** 分数变化超过该值才标出方向，避免把浮点噪声渲染成「变动」 */
 const DELTA_EPSILON = 1e-6;
@@ -23,11 +25,14 @@ const EXPORT_LIMIT = 20000;
 
 type SignalKey = 'buy' | 'sell' | 'hold';
 
+/**
+ * 展示面只用位置词（靠前/居中/靠后），不出现方向性字眼。
+ * 内部筛选 key 仍是 buy/sell/hold，保持与后端契约一一对应。
+ */
 const SIGNAL_META: Record<SignalKey, { label: string; cls: string }> = {
-  // 全站「涨红跌绿」：多头用红、空头用绿
-  buy: { label: '买', cls: 'text-rose-700 bg-rose-50 border-rose-200' },
-  sell: { label: '卖', cls: 'text-emerald-700 bg-emerald-50 border-emerald-200' },
-  hold: { label: '持', cls: 'text-slate-600 bg-slate-100 border-slate-200' },
+  buy: { label: signalPositionLabel('BUY'), cls: positionTagClass('靠前') },
+  sell: { label: signalPositionLabel('SELL'), cls: positionTagClass('靠后') },
+  hold: { label: signalPositionLabel('HOLD'), cls: positionTagClass('居中') },
 };
 
 function signalKeyOf(v: string | undefined): SignalKey {
@@ -47,6 +52,41 @@ const fmt = (v: number | null | undefined, digits = 4): string =>
 function csvCell(v: unknown): string {
   const s = v == null ? '' : String(v);
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+export interface CrossSectionCsvMeta {
+  runId?: string;
+  inferenceDate?: string;
+  targetDate?: string;
+  modelId?: string;
+  /** 筛选前的总行数，用于元信息行 */
+  total: number;
+}
+
+/**
+ * 截面名单 CSV（纯函数，便于单测）。
+ * 表头与单元格一律用位置词；内部 key（buy/sell/hold）不出现在导出文件里。
+ */
+export function buildCrossSectionCsv(rows: InferenceRankingItem[], meta: CrossSectionCsvMeta): string {
+  const head = [
+    '排名', '代码', '名称', '分数', '位置', '行业', '板块', '趋势',
+    '市值(亿)', '市值分层', '上期分数', '分数变化', '负向标签',
+  ];
+  const body = rows.map((r) => {
+    const delta = r.prev_score == null ? null : r.score - r.prev_score;
+    return [
+      r.rank, r.code, r.name, r.score, SIGNAL_META[signalKeyOf(r.signal)].label,
+      r.industry ?? '', r.board ?? '', r.trend ?? '',
+      r.market_cap_yi ?? '', r.market_cap_tier ?? '',
+      r.prev_score ?? '', delta == null ? '' : delta.toFixed(6),
+      r.negative_tag ?? '',
+    ];
+  });
+  const metaLines = [
+    `# 批次 run_id=${meta.runId ?? ''} 数据日=${meta.inferenceDate ?? ''} 目标日=${meta.targetDate ?? ''} 模型=${meta.modelId ?? ''}`,
+    `# 导出 ${body.length} / ${meta.total} 行（已应用筛选）`,
+  ];
+  return [...metaLines, head.map(csvCell).join(','), ...body.map((r) => r.map(csvCell).join(','))].join('\r\n');
 }
 
 interface CrossSectionTableProps {
@@ -117,25 +157,13 @@ export const CrossSectionTable: React.FC<CrossSectionTableProps> = ({
   }, []);
 
   const exportCsv = useCallback(() => {
-    const head = [
-      '排名', '代码', '名称', '分数', '信号', '行业', '板块', '趋势',
-      '市值(亿)', '市值分层', '上期分数', '分数变化', '负向标签',
-    ];
-    const body = filtered.slice(0, EXPORT_LIMIT).map((r) => {
-      const delta = r.prev_score == null ? null : r.score - r.prev_score;
-      return [
-        r.rank, r.code, r.name, r.score, signalKeyOf(r.signal),
-        r.industry ?? '', r.board ?? '', r.trend ?? '',
-        r.market_cap_yi ?? '', r.market_cap_tier ?? '',
-        r.prev_score ?? '', delta == null ? '' : delta.toFixed(6),
-        r.negative_tag ?? '',
-      ];
+    const csv = buildCrossSectionCsv(filtered.slice(0, EXPORT_LIMIT), {
+      runId: ranking?.run_id,
+      inferenceDate: ranking?.inference_date,
+      targetDate: ranking?.target_date,
+      modelId: ranking?.model_id,
+      total: rows.length,
     });
-    const meta = [
-      `# 批次 run_id=${ranking?.run_id ?? ''} 数据日=${ranking?.inference_date ?? ''} 目标日=${ranking?.target_date ?? ''} 模型=${ranking?.model_id ?? ''}`,
-      `# 导出 ${body.length} / ${rows.length} 行（已应用筛选）`,
-    ];
-    const csv = [...meta, head.map(csvCell).join(','), ...body.map((r) => r.map(csvCell).join(','))].join('\r\n');
     // BOM：Excel 打开 UTF-8 CSV 不加 BOM 会把中文渲染成乱码
     const blob = new Blob([`﻿${csv}`], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -173,7 +201,7 @@ export const CrossSectionTable: React.FC<CrossSectionTableProps> = ({
       render: (v: number) => <span className={clsx('font-mono text-xs font-black', scoreClass(v))}>{fmt(v)}</span>,
     },
     {
-      title: '信号', dataIndex: 'signal', width: 66, align: 'center',
+      title: '位置', dataIndex: 'signal', width: 72, align: 'center',
       filters: (Object.keys(SIGNAL_META) as SignalKey[]).map((k) => ({ text: SIGNAL_META[k].label, value: k })),
       onFilter: (val, r) => signalKeyOf(r.signal) === val,
       render: (v: string) => {
@@ -247,7 +275,7 @@ export const CrossSectionTable: React.FC<CrossSectionTableProps> = ({
           mode="multiple"
           allowClear
           size="small"
-          placeholder="信号"
+          placeholder="位置"
           maxTagCount={2}
           value={signals}
           onChange={(v) => setSignals(v as SignalKey[])}

@@ -2,8 +2,10 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { Pagination } from 'antd';
 import { Layers } from 'lucide-react';
 import { AlertTriangle } from 'lucide-react';
+import { clsx } from 'clsx';
 import { ModelConsensusItem, SingleStockPredictionResponse } from '../../../services/inferenceCenterService';
 import { InferenceScoreChart } from '../../stock-terminal/components/InferenceScoreChart';
+import { positionTagClass, ratingPositionLabel } from '../positionLabels';
 import {
   EXEC_FAIL_LABEL,
   SKIP_REASON_EXCLUDED_FROM_BANNER,
@@ -208,8 +210,8 @@ export const ModelScoreCurveGrid: React.FC<ModelScoreCurveGridProps> = ({
                     <span className="px-1.5 py-0.5 rounded bg-white border border-slate-200 font-mono text-[10px]">{item.model_type || '—'}</span>
                     <span className="font-mono">T+{item.horizon || 5}</span>
                   </span>
-                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${item.rating === 'STRONG_BUY' ? 'bg-rose-50 text-rose-700 border-rose-200' : item.rating === 'BUY' ? 'bg-red-50 text-red-600 border-red-200' : item.rating === 'SELL' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-slate-100 text-slate-600 border-slate-200'}`}>
-                    {item.rating}
+                  <span className={clsx('px-2 py-0.5 rounded-full text-[10px] font-bold border', positionTagClass(ratingPositionLabel(item.rating)))}>
+                    {ratingPositionLabel(item.rating)}
                   </span>
                 </div>
               </div>
