@@ -35,6 +35,7 @@ import { CrossSectionTable } from '../components/CrossSectionTable';
 import { MarketStatusBar } from '../components/MarketStatusBar';
 import { ModelGovernancePanel } from '../components/ModelGovernancePanel';
 import { RolloutGovernancePanel } from '../components/RolloutGovernancePanel';
+import { ComboWorkspace } from '../components/combo/ComboWorkspace';
 import { WorkspaceTabs, type WorkspaceKey } from '../components/WorkspaceTabs';
 import { StockPoolPickerModal } from '../../../components/backtest/StockPoolPickerModal';
 import type { StockPoolOption } from '../../../services/stockPoolOptionService';
@@ -75,6 +76,8 @@ export const InferenceCenterShell: React.FC = () => {
   const [workspace, setWorkspace] = useState<WorkspaceKey>('single');
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [poolPickerOpen, setPoolPickerOpen] = useState(false);
+  /** 治理面板「组合选股」→ 组合工作区：带过去的模型选择（nonce 触发构建器预填） */
+  const [comboSeed, setComboSeed] = useState<{ modelIds: string[]; nonce: number } | null>(null);
   // 晋升台账「进行中」角标：由面板在加载/操作后回报（面板未挂载过则无角标——
   // 与其在壳里再拉一份容易过期的列表，不如等首次进入后面板自己报数）
   const [rolloutActiveCount, setRolloutActiveCount] = useState(0);
@@ -171,6 +174,12 @@ export const InferenceCenterShell: React.FC = () => {
     [availableSingleModels, ip],
   );
 
+  /** 治理面板多选 → 组合选股：切工作区并把已选模型交给构建器预填 */
+  const handleOpenCombo = useCallback((modelIds: string[]) => {
+    setComboSeed({ modelIds, nonce: Date.now() });
+    setWorkspace('combo');
+  }, []);
+
   // ── 顶栏状态带数据 ──────────────────────────────────────────
   const precheckFailDetail = useMemo(() => {
     const failed = cs.precheck?.items?.find((i) => !i.passed && i.severity !== 'soft');
@@ -255,6 +264,7 @@ export const InferenceCenterShell: React.FC = () => {
           <WorkspaceTabs
             active={workspace}
             onChange={setWorkspace}
+            supportsCombo={Boolean(adapter.supportsCombo)}
             badges={{
               cross: rankingCount > 0 ? String(rankingCount) : undefined,
               governance: cs.registeredModels.length > 0 ? String(cs.registeredModels.length) : undefined,
@@ -265,7 +275,10 @@ export const InferenceCenterShell: React.FC = () => {
 
         {/* 截面模型选型只对「单票研判 / 截面选股」有意义：两个工作区共用这一份上下文
             （治理/晋升是资产审视面，不随截面选型走） */}
-        {cs.selectedModel && workspace !== 'governance' && workspace !== 'rollout' && (
+        {cs.selectedModel &&
+          workspace !== 'combo' &&
+          workspace !== 'governance' &&
+          workspace !== 'rollout' && (
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-[11px] font-bold text-slate-500 flex items-center gap-1.5 whitespace-nowrap">
               <Database size={13} className="text-slate-400" />
@@ -402,6 +415,15 @@ export const InferenceCenterShell: React.FC = () => {
         </div>
       )}
 
+      {workspace === 'combo' && adapter.supportsCombo && (
+        <ComboWorkspace
+          market={market}
+          marketLabel={marketLabel}
+          seedModelIds={comboSeed?.modelIds}
+          seedNonce={comboSeed?.nonce}
+        />
+      )}
+
       {workspace === 'governance' && (
         <div className="flex-1 min-h-0 flex flex-col">
           <ModelGovernancePanel
@@ -409,6 +431,8 @@ export const InferenceCenterShell: React.FC = () => {
             loading={cs.modelsLoading}
             marketLabel={marketLabel}
             onInspect={handleInspectModel}
+            onOpenCombo={handleOpenCombo}
+            onBackfillFinished={cs.reloadModels}
           />
         </div>
       )}

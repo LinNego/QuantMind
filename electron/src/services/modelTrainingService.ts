@@ -5,6 +5,11 @@ import {
   AdminModelFeatureCatalog,
   QuantDBTrainingSourcesResult,
 } from '../features/admin/types';
+import type {
+  BackfillJob,
+  BackfillJobList,
+  BackfillPreview,
+} from './modelInferenceJobTypes';
 
 export interface ModelTrainingRunResponse {
   runId: string;
@@ -803,6 +808,45 @@ class ModelTrainingService {
 
   async getBackfillStatus(modelId: string, taskId: string): Promise<any> {
     const resp = await this.client.get<any>(`/models/${encodeURIComponent(modelId)}/inference/backfill/${encodeURIComponent(taskId)}`);
+    return resp.data;
+  }
+
+  // ── 多模型串行补推（/models/inference/backfill-jobs） ──────────────
+
+  async previewBackfillJobs(modelIds: string[]): Promise<BackfillPreview> {
+    const resp = await this.client.post<BackfillPreview>(
+      '/models/inference/backfill-jobs/preview',
+      { model_ids: modelIds },
+    );
+    return resp.data;
+  }
+
+  async createBackfillJob(modelIds: string[], mode: 'gaps' | 'range' = 'gaps'): Promise<BackfillJob> {
+    const resp = await this.client.post<BackfillJob>('/models/inference/backfill-jobs', {
+      model_ids: modelIds,
+      mode,
+    });
+    return resp.data;
+  }
+
+  async listBackfillJobs(limit = 20): Promise<BackfillJobList> {
+    const resp = await this.client.get<BackfillJobList>('/models/inference/backfill-jobs', {
+      params: { limit },
+    });
+    return resp.data;
+  }
+
+  async getBackfillJob(jobId: string): Promise<BackfillJob> {
+    const resp = await this.client.get<BackfillJob>(
+      `/models/inference/backfill-jobs/${encodeURIComponent(jobId)}`,
+    );
+    return resp.data;
+  }
+
+  async cancelBackfillJob(jobId: string): Promise<BackfillJob> {
+    const resp = await this.client.post<BackfillJob>(
+      `/models/inference/backfill-jobs/${encodeURIComponent(jobId)}/cancel`,
+    );
     return resp.data;
   }
 

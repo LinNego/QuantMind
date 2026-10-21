@@ -33,6 +33,8 @@ export interface CrossSectionInference {
   // 模型
   registeredModels: UserModelRecord[];
   modelsLoading: boolean;
+  /** 外部动作（如批量补推完成）后重拉注册表 */
+  reloadModels: () => Promise<void>;
   selectedModelId: string;
   setSelectedModelId: (id: string) => void;
   selectedModel: UserModelRecord | null;
@@ -412,6 +414,8 @@ export function useCrossSectionInference(
   return {
     registeredModels,
     modelsLoading,
+    /** 外部动作（如批量补推完成）后重拉注册表；壳层把它接到治理面板回调 */
+    reloadModels: loadRegisteredModels,
     selectedModelId,
     setSelectedModelId,
     selectedModel,

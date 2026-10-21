@@ -25,6 +25,7 @@ const CN_ADAPTER: InferenceCenterAdapter = {
   currencySymbol: '¥',
   defaultSymbol: 'SH600519',
   searchPlaceholder: '输入代码/名称搜索 (如 600519 或 茅台)',
+  supportsCombo: true,
 
   preload: () => stockListService.load(),
   search: async (kw) => {

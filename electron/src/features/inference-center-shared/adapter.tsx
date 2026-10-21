@@ -34,6 +34,12 @@ export interface InferenceCenterAdapter {
   /** 个股预测输入框的占位提示（各市场举例不同） */
   searchPlaceholder: string;
 
+  /**
+   * 是否支持「组合选股」工作区（能力位，组件里不写 `market === 'CN'`）。
+   * 后端组合候选目前只接受 CN 签名；HK/US/FUTURES 缺省关闭，避免出现必空的面板。
+   */
+  supportsCombo?: boolean;
+
   /** 预加载联想数据源（CN 读本地静态表、HK 拉名称表、US 拉标的池、FUTURES 拉品种热力图）；失败应静默降级 */
   preload(): Promise<void>;
   /** 内存/远端搜索联想项 */

@@ -12,9 +12,9 @@
 
 import React from 'react';
 import { clsx } from 'clsx';
-import { Target, Table2, ShieldCheck, GitBranch } from 'lucide-react';
+import { Target, Table2, Layers, ShieldCheck, GitBranch } from 'lucide-react';
 
-export type WorkspaceKey = 'single' | 'cross' | 'governance' | 'rollout';
+export type WorkspaceKey = 'single' | 'cross' | 'combo' | 'governance' | 'rollout';
 
 interface WorkspaceMeta {
   key: WorkspaceKey;
@@ -37,6 +37,12 @@ export const WORKSPACES: WorkspaceMeta[] = [
     icon: Table2,
   },
   {
+    key: 'combo',
+    label: '组合选股',
+    hint: '同特征多模型组合的截面榜单与纸面调仓计划',
+    icon: Layers,
+  },
+  {
     key: 'governance',
     label: '模型治理',
     hint: '模型资产盘点：周期口径、区间能力、归因可用性、批次健康度',
@@ -55,14 +61,21 @@ interface WorkspaceTabsProps {
   onChange: (key: WorkspaceKey) => void;
   /** 每个工作区右上角的小角标（如截面行数、模型数）；缺省不显示 */
   badges?: Partial<Record<WorkspaceKey, string>>;
+  /** 组合选股能力位：未开通的市场不渲染该 Tab */
+  supportsCombo?: boolean;
 }
 
-export const WorkspaceTabs: React.FC<WorkspaceTabsProps> = ({ active, onChange, badges }) => (
+export const WorkspaceTabs: React.FC<WorkspaceTabsProps> = ({
+  active,
+  onChange,
+  badges,
+  supportsCombo = false,
+}) => (
   <nav
     aria-label="推理中心工作区"
     className="flex items-center gap-1 bg-slate-100/80 border border-slate-200 rounded-lg p-0.5 shrink-0"
   >
-    {WORKSPACES.map((w) => {
+    {WORKSPACES.filter((w) => w.key !== 'combo' || supportsCombo).map((w) => {
       const Icon = w.icon;
       const isActive = active === w.key;
       return (

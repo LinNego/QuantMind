@@ -80,7 +80,22 @@ if (typeof window !== 'undefined') {
 
   // rc-table 会调用带 pseudoElt 参数的 getComputedStyle，jsdom 默认会抛 not implemented
   const originalGetComputedStyle = window.getComputedStyle.bind(window);
-  window.getComputedStyle = ((elt: Element) => originalGetComputedStyle(elt)) as typeof window.getComputedStyle;
+
+  // jsdom 用 nwsapi 的 :has() 支持来测量样式，而 nwsapi 拼 `:scope` 时用已废弃的全局 escape()：
+  // 祖先元素类名含 . 或 []（Tailwind 的 space-y-1.5 / w-[268px]）会变成非法选择器。
+  // 真实浏览器可解析；测试里测量值只影响动效，退回内联样式即可，不必为它改生产类名。
+  const isInvalidSelectorError = (err: unknown) =>
+    typeof (err as { message?: unknown })?.message === 'string' &&
+    (err as { message: string }).message.includes('is not a valid selector');
+
+  window.getComputedStyle = ((elt: Element) => {
+    try {
+      return originalGetComputedStyle(elt);
+    } catch (err) {
+      if (!isInvalidSelectorError(err)) throw err;
+      return (elt as HTMLElement).style;
+    }
+  }) as typeof window.getComputedStyle;
 }
 
 // Mock ResizeObserver (must be constructable with `new`)

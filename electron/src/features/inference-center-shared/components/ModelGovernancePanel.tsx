@@ -6,11 +6,11 @@
  * 那类模型在研判页会表现为「功能莫名不可用」，根因却藏在模型产物里。
  */
 
-import React, { useMemo, useState } from 'react';
-import { Input, Select, Table, Tag, Tooltip } from 'antd';
+import React, { useEffect, useMemo, useState } from 'react';
+import { Button, Input, Select, Table, Tag, Tooltip } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { clsx } from 'clsx';
-import { AlertTriangle, PackageCheck, Search, ShieldCheck } from 'lucide-react';
+import { AlertTriangle, Layers, PackageCheck, Search, ShieldCheck, X, Zap } from 'lucide-react';
 import type { UserModelRecord } from '../../../services/modelTrainingService';
 import {
   extractModelTypeShort,
@@ -19,6 +19,7 @@ import {
   modelDisplayName,
   resolveMetricNumber,
 } from '../../../pages/modelRegistryUtils';
+import { BackfillJobModal } from './combo/BackfillJobModal';
 
 /** 与后端 `_SHAP_TREE_FRAMEWORKS` 保持一致：只有这三个框架有原生 SHAP 通道 */
 const TREE_FRAMEWORKS = new Set(['lightgbm', 'xgboost', 'catboost']);
@@ -129,6 +130,10 @@ interface ModelGovernancePanelProps {
   marketLabel: string;
   /** 点行 → 跳到单票研判并预选该模型 */
   onInspect?: (model: UserModelRecord) => void;
+  /** 勾选模型 → 带种子跳到组合选股工作区（P5 接入） */
+  onOpenCombo?: (modelIds: string[]) => void;
+  /** 补推任务终结后通知父级刷新模型列表 */
+  onBackfillFinished?: () => void;
 }
 
 export const ModelGovernancePanel: React.FC<ModelGovernancePanelProps> = ({
@@ -136,11 +141,21 @@ export const ModelGovernancePanel: React.FC<ModelGovernancePanelProps> = ({
   loading,
   marketLabel,
   onInspect,
+  onOpenCombo,
+  onBackfillFinished,
 }) => {
   const [keyword, setKeyword] = useState('');
   const [algo, setAlgo] = useState<string | null>(null);
   const [horizon, setHorizon] = useState<number | null>(null);
   const [onlyProblems, setOnlyProblems] = useState(false);
+  const [selectedKeys, setSelectedKeys] = useState<React.Key[]>([]);
+  const [backfillOpen, setBackfillOpen] = useState(false);
+
+  // 切市场后旧选择没有意义（预览会报跨市场），直接清空
+  useEffect(() => {
+    setSelectedKeys([]);
+    setBackfillOpen(false);
+  }, [marketLabel]);
 
   const rows = useMemo(() => models.map(buildRow), [models]);
 
@@ -379,6 +394,55 @@ export const ModelGovernancePanel: React.FC<ModelGovernancePanelProps> = ({
         </div>
       </div>
 
+      {/* ── 多选工具条：仅在勾选后出现，避免空占一行 ─────────── */}
+      {selectedKeys.length > 0 && (
+        <div
+          data-testid="governance-selection-bar"
+          className="shrink-0 px-3 py-1.5 border-b border-blue-200 bg-blue-50/70 flex items-center gap-2 flex-wrap"
+        >
+          <span className="text-[11px] font-black text-blue-900 whitespace-nowrap">
+            已选 <span className="font-mono">{selectedKeys.length}</span> 个模型
+          </span>
+          <span className="text-[10px] text-slate-500 whitespace-nowrap">
+            串行按缺口从小到大执行 · 同一时间仅一个补推任务
+          </span>
+          <div className="ml-auto flex items-center gap-2">
+            <Tooltip title={selectedKeys.length < 2 ? '至少选择 2 个模型' : '逐模型逐日补到最新交易日'}>
+              <Button
+                size="small"
+                type="primary"
+                icon={<Zap size={12} />}
+                disabled={selectedKeys.length < 2}
+                onClick={() => setBackfillOpen(true)}
+              >
+                一键推理至最新
+              </Button>
+            </Tooltip>
+            {onOpenCombo && (
+              <Tooltip
+                title={
+                  selectedKeys.length < 2
+                    ? '至少选择 2 个模型'
+                    : '带所选模型跳到组合选股（同特征多模型融合）'
+                }
+              >
+                <Button
+                  size="small"
+                  icon={<Layers size={12} />}
+                  disabled={selectedKeys.length < 2}
+                  onClick={() => onOpenCombo(selectedKeys.map(String))}
+                >
+                  组合选股
+                </Button>
+              </Tooltip>
+            )}
+            <Button size="small" type="text" icon={<X size={12} />} onClick={() => setSelectedKeys([])}>
+              清除
+            </Button>
+          </div>
+        </div>
+      )}
+
       <div className="flex-1 min-h-0" data-testid="governance-table">
         <Table<GovernanceRow>
           rowKey="key"
@@ -386,7 +450,14 @@ export const ModelGovernancePanel: React.FC<ModelGovernancePanelProps> = ({
           loading={loading}
           dataSource={filtered}
           columns={columns}
-          scroll={{ x: 1180, y: 'calc(100vh - 300px)' }}
+          rowSelection={{
+            selectedRowKeys: selectedKeys,
+            onChange: (keys) => setSelectedKeys(keys),
+            // 翻页/筛选后保留选择：跨页勾选是这条链路的常态
+            preserveSelectedRowKeys: true,
+            columnWidth: 36,
+          }}
+          scroll={{ x: 1220, y: 'calc(100vh - 300px)' }}
           pagination={{ pageSize: 50, size: 'small', showSizeChanger: true, pageSizeOptions: ['50', '100', '200'] }}
           onRow={(r) => ({
             onClick: () => onInspect?.(r.model),
@@ -395,6 +466,13 @@ export const ModelGovernancePanel: React.FC<ModelGovernancePanelProps> = ({
           locale={{ emptyText: loading ? ' ' : '该市场没有已注册模型' }}
         />
       </div>
+
+      <BackfillJobModal
+        open={backfillOpen}
+        modelIds={selectedKeys.map(String)}
+        onClose={() => setBackfillOpen(false)}
+        onFinished={onBackfillFinished}
+      />
     </div>
   );
 };
