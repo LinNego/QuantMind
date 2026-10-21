@@ -629,6 +629,47 @@ class QuantDBDataHub:
 
         return self._normalize_kline(df)
 
+    def fetch_daily_close_batch(
+        self,
+        symbols: list[str],
+        start: date,
+        end: date,
+        *,
+        adjust: str = "qfq",
+    ) -> pd.DataFrame:
+        """批量读取收盘价（列裁剪，返回 symbol/trade_date/close）。
+
+        与 ``fetch_daily_kline_batch`` 同源同分区口径，只是不取 OHLCV。
+        全市场 TopK 历史统计一次要读数千只标的，列裁剪可省约 2/3 内存。
+        """
+        view_map = {
+            "qfq": "daily_forward",
+            "hfq": "daily_backward",
+            "none": "daily_unadjusted",
+        }
+        subdir = view_map.get(adjust, "daily_forward")
+
+        if not symbols:
+            return pd.DataFrame()
+
+        dates = self._partition_dates(f"1_kline_data/{subdir}", start, end)
+        if not dates:
+            return pd.DataFrame()
+
+        placeholders = ", ".join("?" for _ in symbols)
+        df = self._read_partitioned(
+            f"1_kline_data/{subdir}",
+            dates,
+            cols="symbol, time, close",
+            where_sql=f"symbol IN ({placeholders})",
+            order_by="symbol, dt",
+            bind=symbols,
+        )
+        if df.empty:
+            return df
+
+        return self._normalize_kline(df)
+
     def fetch_index_kline(
         self,
         symbol: str,

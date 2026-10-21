@@ -49,6 +49,9 @@ from backend.services.api.routers.model_blends import router as model_blends_rou
 from backend.services.api.routers.model_inference_jobs import (
     router as model_inference_jobs_router,
 )
+from backend.services.api.routers.model_selection_stats import (
+    router as model_selection_stats_router,
+)
 from backend.services.api.routers.model_training import router as model_training_router
 from backend.services.api.routers.model_rollouts import router as model_rollouts_router
 from backend.services.api.routers.model_rolling import router as model_rolling_router
@@ -519,6 +522,9 @@ app.include_router(
 app.include_router(
     model_inference_jobs_router
 )  # 串行补推（/api/v1/models/inference/backfill-jobs/*，P3；必须先于 model_training 兜底）
+app.include_router(
+    model_selection_stats_router
+)  # 截面选股 TopK 历史统计（/api/v1/models/{model_id}/selection-stats）
 app.include_router(
     model_training_router, prefix="/api/v1/models", tags=["ModelTraining"]
 )

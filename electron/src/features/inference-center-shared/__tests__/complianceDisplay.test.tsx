@@ -173,6 +173,10 @@ describe('源码扫描：展示组件不得写回买卖字眼', () => {
     'components/ModelConsensusPanel.tsx',
     'components/IndividualWorkbench.tsx',
     'positionLabels.ts',
+    // 截面选股「历史统计」：单模型 TopK 统计面板与口径纯函数
+    'components/crossstats/CrossSectionWorkspace.tsx',
+    'components/crossstats/SelectionStatsPanel.tsx',
+    'components/crossstats/selectionStatsModel.ts',
   ];
 
   it('固定文件清单非空且存在', () => {

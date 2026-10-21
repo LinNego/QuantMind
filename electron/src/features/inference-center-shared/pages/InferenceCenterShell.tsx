@@ -31,7 +31,7 @@ import {
 import { useIndividualPrediction } from '../hooks/useIndividualPrediction';
 import { CrossSectionRail } from '../components/CrossSectionRail';
 import { IndividualWorkbench } from '../components/IndividualWorkbench';
-import { CrossSectionTable } from '../components/CrossSectionTable';
+import { CrossSectionWorkspace } from '../components/crossstats/CrossSectionWorkspace';
 import { MarketStatusBar } from '../components/MarketStatusBar';
 import { ModelGovernancePanel } from '../components/ModelGovernancePanel';
 import { RolloutGovernancePanel } from '../components/RolloutGovernancePanel';
@@ -404,15 +404,18 @@ export const InferenceCenterShell: React.FC = () => {
       )}
 
       {workspace === 'cross' && (
-        <div className="flex-1 min-h-0 flex flex-col">
-          <CrossSectionTable
-            ranking={cs.ranking}
-            loading={cs.rankingLoading}
-            fallbackFrom={cs.rankingFallbackFrom}
-            onSelect={handleSelectRanking}
-            activeCode={ip.symbol}
-          />
-        </div>
+        <CrossSectionWorkspace
+          ranking={cs.ranking}
+          loading={cs.rankingLoading}
+          fallbackFrom={cs.rankingFallbackFrom}
+          onSelect={handleSelectRanking}
+          activeCode={ip.symbol}
+          modelId={crossSelectedModel?.model_id ?? null}
+          modelName={crossSelectedModel ? modelDisplayName(crossSelectedModel) : '未选择模型'}
+          horizonDays={cs.horizonDays}
+          market={market}
+          marketLabel={marketLabel}
+        />
       )}
 
       {workspace === 'combo' && adapter.supportsCombo && (

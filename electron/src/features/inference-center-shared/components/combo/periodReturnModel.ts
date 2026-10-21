@@ -8,7 +8,6 @@
  */
 
 import type {
-  BlendPeriodDaily,
   BlendPeriodQuery,
   BlendPeriodResponse,
 } from '../../../../services/blendTypes';
@@ -112,6 +111,12 @@ export interface EquityGeometry {
   maxEquity: number;
 }
 
+/** 权益曲线的最小结构（组合周期收益与单模型历史统计共用） */
+export interface EquitySeriesPoint {
+  date: string;
+  equity: number;
+}
+
 /**
  * 权益曲线几何（纯函数，供 SVG 直接渲染）。
  *
@@ -119,7 +124,7 @@ export interface EquityGeometry {
  * 单点/全等值时画水平中线，不做除零。
  */
 export function buildEquityGeometry(
-  daily: readonly BlendPeriodDaily[],
+  daily: readonly EquitySeriesPoint[],
   initialCapital: number,
   width: number,
   height: number,
