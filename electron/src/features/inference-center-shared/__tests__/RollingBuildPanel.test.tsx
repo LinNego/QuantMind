@@ -72,6 +72,19 @@ describe('RollingBuildPanel', () => {
     expect(screen.getByText(/持有天数 = 本窗口内连续在榜天数/)).toBeInTheDocument();
   });
 
+  it('卡片显示行业与市值；缺失显示 — 而不是 0', () => {
+    const data = rolling();
+    data.columns[1].picks[0].industry = '银行';
+    data.columns[1].picks[0].market_cap_yi = 2431.6;
+    render(<RollingBuildPanel {...baseProps} rolling={data} />);
+    const withProfile = screen.getByTestId('combo-rolling-pick-2026-10-20-SH600001');
+    expect(withProfile.textContent).toContain('银行');
+    expect(withProfile.textContent).toContain('2432 亿');
+    const missing = screen.getByTestId('combo-rolling-pick-2026-10-20-SH600002');
+    expect(missing.textContent).toContain('行业—');
+    expect(missing.textContent).toContain('市值—');
+  });
+
   it('新进与留存用不同色块，且都不含红绿', () => {
     render(<RollingBuildPanel {...baseProps} rolling={rolling()} />);
     const fresh = screen.getByTestId('combo-rolling-pick-2026-10-20-SH600002');

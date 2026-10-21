@@ -92,27 +92,27 @@ async def _get_blend_or_404(
 
 class PreviewBody(BaseModel):
     market: str = Field(default="CN", max_length=16)
-    model_ids: list[str] = Field(min_length=2, max_length=20)
+    model_ids: list[str] = Field(min_length=2, max_length=30)
     data_trade_date: str | None = None
     purpose: str = Field(default="rebalance", pattern=r"^(rebalance|next_day)$")
     method: str = Field(default="mean", pattern=r"^(mean|median|trimmed)$")
     trim_count: int = Field(default=2, ge=0, le=10)
     top_k: int = Field(default=50, ge=1, le=2000)
     top: int = Field(default=200, ge=1, le=2000)
-    min_coverage: int = Field(default=2, ge=1, le=20)
-    consensus_min_count: int = Field(default=0, ge=0, le=20)
+    min_coverage: int = Field(default=2, ge=1, le=30)
+    consensus_min_count: int = Field(default=0, ge=0, le=30)
     weights: dict[str, float] | None = None
 
 
 class BlendCreateBody(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     market: str = Field(default="CN", max_length=16)
-    model_ids: list[str] = Field(min_length=2, max_length=20)
+    model_ids: list[str] = Field(min_length=2, max_length=30)
     purpose: str = Field(default="rebalance", pattern=r"^(rebalance|next_day)$")
     method: str = Field(default="mean", pattern=r"^(mean|median|trimmed)$")
     trim_count: int = Field(default=2, ge=0, le=10)
-    min_coverage: int = Field(default=8, ge=1, le=20)
-    consensus_min_count: int = Field(default=0, ge=0, le=20)
+    min_coverage: int = Field(default=8, ge=1, le=30)
+    consensus_min_count: int = Field(default=0, ge=0, le=30)
     entry_per_day: int = Field(default=5, ge=1, le=50)
     rolling_window: int = Field(default=10, ge=1, le=60)
     target_positions: int = Field(default=50, ge=1, le=500)
@@ -126,12 +126,12 @@ class BlendPatchBody(BaseModel):
     purpose: str | None = Field(default=None, pattern=r"^(rebalance|next_day)$")
     method: str | None = Field(default=None, pattern=r"^(mean|median|trimmed)$")
     trim_count: int | None = Field(default=None, ge=0, le=10)
-    min_coverage: int | None = Field(default=None, ge=1, le=20)
-    consensus_min_count: int | None = Field(default=None, ge=0, le=20)
+    min_coverage: int | None = Field(default=None, ge=1, le=30)
+    consensus_min_count: int | None = Field(default=None, ge=0, le=30)
     entry_per_day: int | None = Field(default=None, ge=1, le=50)
     rolling_window: int | None = Field(default=None, ge=1, le=60)
     target_positions: int | None = Field(default=None, ge=1, le=500)
-    model_ids: list[str] | None = Field(default=None, min_length=2, max_length=20)
+    model_ids: list[str] | None = Field(default=None, min_length=2, max_length=30)
     weights: dict[str, float] | None = None
 
 
@@ -144,6 +144,9 @@ class PlanBody(BaseModel):
     hold_days: int | None = Field(default=None, ge=1, le=60)
     entry_per_day: int | None = Field(default=None, ge=1, le=50)
     target_positions: int | None = Field(default=None, ge=1, le=500)
+    # 机构级硬条件：最低 ADV20（亿元）与 ST/退市剔除
+    min_adv_yi: float | None = Field(default=None, ge=0, le=1000)
+    exclude_st: bool | None = None
 
 
 # ── 模型识别 ────────────────────────────────────────────────────────────
@@ -378,10 +381,16 @@ async def get_blend_ranking(
     if data_trade_date is None:
         model_ids = [str(m["model_id"]) for m in blend.get("members") or []]
         data_trade_date = await service.latest_common_date(
-            tenant_id=tenant_id, user_id=user_id, model_ids=model_ids
+            tenant_id=tenant_id,
+            user_id=user_id,
+            model_ids=model_ids,
+            required=int(blend.get("min_coverage") or 2),
         )
         if data_trade_date is None:
-            raise HTTPException(status_code=404, detail="组合没有可用数据日")
+            raise HTTPException(
+                status_code=404,
+                detail="组合没有可用数据日：请先对成员做串行补推，或调低最低覆盖数",
+            )
     weights = (
         None
         if str(blend.get("weighting") or "equal") == "equal"
@@ -447,6 +456,8 @@ def _plan_config(blend: Mapping[str, Any], body: PlanBody) -> PlanConfig | None:
             body.hold_days,
             body.entry_per_day,
             body.target_positions,
+            body.min_adv_yi,
+            body.exclude_st,
         )
     ):
         return None
@@ -472,6 +483,12 @@ def _plan_config(blend: Mapping[str, Any], body: PlanBody) -> PlanConfig | None:
             body.target_positions
             if body.target_positions is not None
             else int(blend.get("target_positions") or defaults.target_positions)
+        ),
+        min_adv_yi=(
+            body.min_adv_yi if body.min_adv_yi is not None else defaults.min_adv_yi
+        ),
+        exclude_st=(
+            body.exclude_st if body.exclude_st is not None else defaults.exclude_st
         ),
     )
 

@@ -34,7 +34,7 @@ import type {
 } from '../../../../services/blendTypes';
 import { formatResearchScore } from '../../../shared/researchScore';
 import { positionTagClass } from '../../positionLabels';
-import { dispersionLabel, positionLabel } from './comboRankingModel';
+import { dispersionLabel, positionLabel, templateRollingDefaults } from './comboRankingModel';
 
 export interface ComboBuilderModalProps {
   open: boolean;
@@ -102,6 +102,8 @@ export const ComboBuilderModal: React.FC<ComboBuilderModalProps> = ({
   const [saving, setSaving] = useState(false);
   // 读取失败后的手动重试序号：只用于重跑资格请求，不动已填参数
   const [reloadNonce, setReloadNonce] = useState(0);
+  // 用户手改过滚动参数后，不再随所选组周期自动覆盖
+  const rollingTouched = useRef(false);
   // 打开瞬间捕获预填参数：拉取过程中父级重渲染不应改变本次预填
   const initialRef = useRef({ template: initialTemplate, modelIds: initialModelIds });
   initialRef.current = { template: initialTemplate, modelIds: initialModelIds };
@@ -112,6 +114,7 @@ export const ComboBuilderModal: React.FC<ComboBuilderModalProps> = ({
     setExcluded([]);
     setSelected([]);
     setParams(DEFAULT_PARAMS);
+    rollingTouched.current = false;
     setError(null);
     setPreview(null);
   }, []);
@@ -133,6 +136,7 @@ export const ComboBuilderModal: React.FC<ComboBuilderModalProps> = ({
         const { template, modelIds } = initialRef.current;
         const allIds = new Set(nextGroups.flatMap((g) => g.models.map((m) => m.model_id)));
         if (template) {
+          const rolling = templateRollingDefaults(template.horizon_days);
           setSelected(template.members.map((m) => m.model_id).filter((id) => allIds.has(id)));
           setParams({
             name: template.name,
@@ -140,9 +144,9 @@ export const ComboBuilderModal: React.FC<ComboBuilderModalProps> = ({
             trim_count: template.trim_count,
             min_coverage: template.min_coverage,
             consensus_min_count: template.consensus_min_count,
-            entry_per_day: DEFAULT_PARAMS.entry_per_day,
-            rolling_window: DEFAULT_PARAMS.rolling_window,
-            target_positions: DEFAULT_PARAMS.target_positions,
+            entry_per_day: template.entry_per_day ?? rolling.entry_per_day,
+            rolling_window: template.rolling_window ?? rolling.rolling_window,
+            target_positions: template.target_positions ?? rolling.target_positions,
           });
         } else if (modelIds?.length) {
           setSelected(modelIds.filter((id) => allIds.has(id)));
@@ -168,6 +172,26 @@ export const ComboBuilderModal: React.FC<ComboBuilderModalProps> = ({
     if (!singleGroup) return null;
     return groupOf(selected[0])?.signature ?? null;
   }, [singleGroup, selected, groupOf]);
+  const selectedHorizon = useMemo(() => {
+    const raw = selectedSignature?.target_horizon_days;
+    return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : null;
+  }, [selectedSignature]);
+
+  // 手工勾选成员时：滚动默认值随该组周期派生（模板预填优先，手改后不再覆盖）
+  useEffect(() => {
+    if (initialRef.current.template || rollingTouched.current || selectedHorizon === null) return;
+    const rolling = templateRollingDefaults(selectedHorizon);
+    setParams((prev) => {
+      if (
+        prev.entry_per_day === rolling.entry_per_day &&
+        prev.rolling_window === rolling.rolling_window &&
+        prev.target_positions === rolling.target_positions
+      ) {
+        return prev;
+      }
+      return { ...prev, ...rolling };
+    });
+  }, [selectedHorizon]);
 
   const toggle = (groupId: string, modelId: string, checked: boolean) => {
     setSelected((prev) => {
@@ -191,6 +215,7 @@ export const ComboBuilderModal: React.FC<ComboBuilderModalProps> = ({
       const resp = await blendService.preview({
         market,
         model_ids: selected,
+        purpose: 'rebalance',
         method: params.method,
         trim_count: params.trim_count,
         min_coverage: params.min_coverage,
@@ -218,6 +243,7 @@ export const ComboBuilderModal: React.FC<ComboBuilderModalProps> = ({
         name: params.name.trim(),
         market,
         model_ids: selected,
+        purpose: 'rebalance',
         method: params.method,
         trim_count: params.trim_count,
         min_coverage: params.min_coverage,
@@ -439,20 +465,31 @@ export const ComboBuilderModal: React.FC<ComboBuilderModalProps> = ({
             <label className="space-y-1 text-[11px] text-slate-600">
               <span className="font-bold">每日新进上限</span>
               <InputNumber className="w-full" min={1} max={50} value={params.entry_per_day}
-                onChange={(v) => setParams({ ...params, entry_per_day: Number(v ?? 5) })} />
+                onChange={(v) => {
+                  rollingTouched.current = true;
+                  setParams({ ...params, entry_per_day: Number(v ?? 5) });
+                }} />
             </label>
             <label className="space-y-1 text-[11px] text-slate-600">
               <span className="font-bold">滚动窗口（交易日）</span>
               <InputNumber className="w-full" min={1} max={60} value={params.rolling_window}
-                onChange={(v) => setParams({ ...params, rolling_window: Number(v ?? 10) })} />
+                onChange={(v) => {
+                  rollingTouched.current = true;
+                  setParams({ ...params, rolling_window: Number(v ?? 10) });
+                }} />
             </label>
             <label className="space-y-1 text-[11px] text-slate-600">
               <span className="font-bold">目标持仓数</span>
               <InputNumber className="w-full" min={1} max={500} value={params.target_positions}
-                onChange={(v) => setParams({ ...params, target_positions: Number(v ?? 50) })} />
+                onChange={(v) => {
+                  rollingTouched.current = true;
+                  setParams({ ...params, target_positions: Number(v ?? 50) });
+                }} />
             </label>
             <div className="col-span-2 text-[10px] text-slate-400">
-              默认窗口 10 日 × 每日 5 只 = 50 只；参数只影响滚动展示与纸面计划，不改变榜单排序口径。
+              默认随预测周期派生：{selectedHorizon === null ? 'T+10' : `T+${selectedHorizon}`} → 每日 5 只 × {params.rolling_window} 个交易日
+              ≈ {params.entry_per_day * params.rolling_window} 只（目标持仓 {params.target_positions}）。
+              参数只影响滚动展示与纸面计划，不改变榜单排序口径。
             </div>
           </div>
         )}

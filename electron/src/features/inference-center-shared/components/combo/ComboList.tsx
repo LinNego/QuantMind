@@ -160,6 +160,14 @@ export const ComboList: React.FC<ComboListProps> = ({
                       <span>{template.members.length} 只</span>
                       <span>·</span>
                       <span>{blendMethodLabel(template.method)}</span>
+                      {(template.missing_members ?? 0) > 0 && (
+                        <span
+                          className="text-amber-600"
+                          title="这些成员从未有过有效推理，未纳入模板"
+                        >
+                          {template.missing_members} 只无推理
+                        </span>
+                      )}
                     </div>
                   </button>
                 );

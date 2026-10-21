@@ -8,8 +8,9 @@
   ``lookback`` 个交易日，有效日不足 ``min_lookback_days`` 视为「数据不足」；
 - 新进每日最多 ``entry_per_day`` 只、总持仓不超过 ``target_positions``，
   **不为了凑数降低门槛**；
-- 单票目标金额 = ``min(资金上限, T 日成交额 × 参与率)``，缺成交额只标注
-  「容量未校验」，不静默放行；
+- 机构级硬条件：ADV20 最低日均成交额、ST/退市剔除、当日剩余资金逐笔扣减；
+  成交额不可校验时**不新进**（不再按「容量未校验」放行）；
+- 单票目标金额 = ``min(单票预算, ADV20 × 参与率, 当日剩余资金)``；
 - 输出只有纸面台账字段，**不产生任何订单/委托/成交语义**。
 
 纯函数、无 IO；持仓与行情由 service 层查库后传入。
@@ -38,6 +39,11 @@ DEFAULT_EXIT_DELTA = 0.03
 DEFAULT_LOOKBACK = 20
 DEFAULT_MIN_LOOKBACK_DAYS = 15
 DEFAULT_CAPITAL = 10_000_000.0
+#: 新进最低 20 日均成交额（亿元）。低于该值视为机构容量不足，不新进。
+DEFAULT_MIN_ADV_YI = 1.0
+DEFAULT_ADV_LOOKBACK_DAYS = 20
+DEFAULT_MIN_ADV_DAYS = 15
+YI = 100_000_000.0
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,10 @@ class PlanConfig:
     exit_delta: float = DEFAULT_EXIT_DELTA
     lookback: int = DEFAULT_LOOKBACK
     min_lookback_days: int = DEFAULT_MIN_LOOKBACK_DAYS
+    min_adv_yi: float = DEFAULT_MIN_ADV_YI
+    exclude_st: bool = True
+    adv_lookback_days: int = DEFAULT_ADV_LOOKBACK_DAYS
+    min_adv_days: int = DEFAULT_MIN_ADV_DAYS
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,6 +77,10 @@ class PlanConfig:
             "exit_delta": self.exit_delta,
             "lookback": self.lookback,
             "min_lookback_days": self.min_lookback_days,
+            "min_adv_yi": self.min_adv_yi,
+            "exclude_st": self.exclude_st,
+            "adv_lookback_days": self.adv_lookback_days,
+            "min_adv_days": self.min_adv_days,
         }
 
 
@@ -182,16 +196,23 @@ def build_rebalance_plan(
     config: PlanConfig | None = None,
     prices: Mapping[str, float] | None = None,
     amounts: Mapping[str, float] | None = None,
+    avg_amounts: Mapping[str, float] | None = None,
+    risk_flags: Mapping[str, str] | None = None,
 ) -> RebalancePlan:
     """生成单日纸面调仓计划。
 
     ``history`` 是 ``date → symbol → S``（不含 T）；``trading_days`` 升序，
-    必须包含 T 之前与 T 当天的真实交易日；``prices/amounts`` 来自
-    QuantDB 不复权日线（amount 单位为元）。
+    必须包含 T 之前与 T 当天的真实交易日；``prices/avg_amounts`` 来自
+    QuantDB 不复权日线（amount 单位为元）。``avg_amounts`` 是 ADV20；
+    未提供时退回 ``amounts``（仅兼容旧调用，生产必须传 ADV）。
+    ``risk_flags`` 为 ``symbol → "ST"/"退市"`` 的当前截面风险标记。
     """
     cfg = config or PlanConfig()
     prices = prices or {}
     amounts = amounts or {}
+    adv_map = avg_amounts if avg_amounts is not None else amounts
+    risk_flags = risk_flags or {}
+    min_adv = max(0.0, float(cfg.min_adv_yi) * YI)
     ranking_by_symbol = {row.symbol: row for row in ranking}
     held = {position.symbol: position for position in positions}
     warnings: list[str] = []
@@ -209,6 +230,21 @@ def build_rebalance_plan(
             )
         return mean_cache[symbol]
 
+    def adv_fields(symbol: str) -> dict[str, Any]:
+        adv = adv_map.get(symbol)
+        return {"adv_yi": float(adv) / YI if _finite(adv) else None}
+
+    def liquidity_note(symbol: str) -> str:
+        adv = adv_map.get(symbol)
+        if not _finite(adv):
+            return "成交额缺失，需人工复核"
+        if min_adv > 0 and float(adv) < min_adv:
+            return "流动性不足，需人工复核"
+        return ""
+
+    def merge_note(note: str, extra: str) -> str:
+        return "；".join(part for part in (note, extra) if part)
+
     holds: list[dict[str, Any]] = []
     exits: list[dict[str, Any]] = []
     for symbol, position in sorted(held.items()):
@@ -219,7 +255,31 @@ def build_rebalance_plan(
             "symbol": symbol,
             "first_entry_date": position.entry_date.isoformat(),
             "held_days": held_days,
+            **adv_fields(symbol),
         }
+        flag = risk_flags.get(symbol) if cfg.exclude_st else None
+        if flag:
+            exits.append(
+                {
+                    **base,
+                    **(
+                        _row_payload(row)
+                        if row is not None
+                        else {
+                            "score": None,
+                            "pct": None,
+                            "research_score": None,
+                            "position": None,
+                        }
+                    ),
+                    "mean20": mean20,
+                    "exit_line": (mean20 - cfg.exit_delta)
+                    if mean20 is not None
+                    else None,
+                    "exit_reason": f"风险警示({flag})",
+                }
+            )
+            continue
         if row is None:
             holds.append(
                 {
@@ -232,7 +292,7 @@ def build_rebalance_plan(
                     "exit_line": (mean20 - cfg.exit_delta)
                     if mean20 is not None
                     else None,
-                    "note": "数据不足，需人工复核",
+                    "note": merge_note("数据不足，需人工复核", liquidity_note(symbol)),
                 }
             )
             continue
@@ -256,7 +316,7 @@ def build_rebalance_plan(
                     **_row_payload(row),
                     "mean20": None,
                     "exit_line": None,
-                    "note": "历史不足，需人工复核",
+                    "note": merge_note("历史不足，需人工复核", liquidity_note(symbol)),
                 }
             )
             continue
@@ -278,14 +338,22 @@ def build_rebalance_plan(
                 **_row_payload(row),
                 "mean20": mean20,
                 "exit_line": exit_line,
-                "note": "",
+                "note": liquidity_note(symbol),
             }
         )
 
     slots = max(0, cfg.target_positions - len(holds))
-    budget_per_position = (
-        cfg.capital * (1.0 - cfg.cash_buffer) / max(1, cfg.target_positions)
-    )
+    available = max(0.0, cfg.capital * (1.0 - cfg.cash_buffer))
+    budget_per_position = available / max(1, cfg.target_positions)
+    # 持仓（含当日待退出）仍占用资金：A 股卖出资金当日不可再用于买入
+    held_value = 0.0
+    for position in positions:
+        price = prices.get(position.symbol)
+        if _finite(price) and position.shares > 0:
+            held_value += float(price) * position.shares
+        elif _finite(position.target_value):
+            held_value += float(position.target_value)
+    remaining = max(0.0, available - held_value)
     entries: list[dict[str, Any]] = []
     for row in ranking:
         if len(entries) >= min(cfg.entry_per_day, slots):
@@ -293,6 +361,10 @@ def build_rebalance_plan(
         if row.symbol in held:
             continue
         if row.rank > cfg.top_k:
+            continue
+        flag = risk_flags.get(row.symbol) if cfg.exclude_st else None
+        if flag:
+            warnings.append(f"风险警示:{row.symbol}:{flag}")
             continue
         mean20 = mean_of(row.symbol)
         if mean20 is None:
@@ -304,16 +376,22 @@ def build_rebalance_plan(
         if not _finite(price):
             warnings.append(f"无参考价:{row.symbol}")
             continue
-        amount = amounts.get(row.symbol)
-        if _finite(amount):
-            target_value = min(
-                budget_per_position, float(amount) * cfg.adv_participation
-            )
-            note = ""
-        else:
-            target_value = budget_per_position
-            note = "容量未校验"
-            warnings.append(f"容量未校验:{row.symbol}")
+        adv = adv_map.get(row.symbol)
+        if not _finite(adv):
+            # 机构口径：无法校验容量就不新进，不按「未校验」放行
+            warnings.append(f"成交额缺失:{row.symbol}")
+            continue
+        if float(adv) <= 0 or (min_adv > 0 and float(adv) < min_adv):
+            warnings.append(f"成交额不足:{row.symbol}:{float(adv) / YI:.2f}亿")
+            continue
+        if remaining <= 0:
+            warnings.append("资金用尽")
+            break
+        target_value = min(
+            budget_per_position,
+            float(adv) * cfg.adv_participation,
+            remaining,
+        )
         shares = _lot_shares(target_value, float(price))
         if shares <= 0:
             warnings.append(f"资金不足一手:{row.symbol}")
@@ -323,13 +401,18 @@ def build_rebalance_plan(
                 **_row_payload(row),
                 "mean20": mean20,
                 "exit_line": mean20 - cfg.exit_delta,
-                "target_value": target_value,
+                "target_value": shares * float(price),
                 "ref_price": float(price),
                 "shares": shares,
-                "note": note,
+                "adv_yi": float(adv) / YI,
+                "note": "",
             }
         )
+        remaining -= shares * float(price)
 
+    capital_used = held_value + sum(
+        float(row["shares"]) * float(row["ref_price"]) for row in entries
+    )
     summary = {
         "capital": cfg.capital,
         "target_positions": cfg.target_positions,
@@ -337,6 +420,12 @@ def build_rebalance_plan(
         "hold_days": cfg.hold_days,
         "top_k": cfg.top_k,
         "cash_buffer": cfg.cash_buffer,
+        "capital_available": round(available, 2),
+        "capital_used": round(capital_used, 2),
+        "capital_remaining": round(max(0.0, available - capital_used), 2),
+        "min_adv_yi": cfg.min_adv_yi,
+        "exclude_st": cfg.exclude_st,
+        "adv_lookback_days": cfg.adv_lookback_days,
         "n_entries": len(entries),
         "n_holds": len(holds),
         "n_exits": len(exits),
@@ -397,6 +486,10 @@ def config_hash(
     lookback: int = DEFAULT_LOOKBACK,
     min_lookback_days: int = DEFAULT_MIN_LOOKBACK_DAYS,
     capital: float = DEFAULT_CAPITAL,
+    min_adv_yi: float = DEFAULT_MIN_ADV_YI,
+    exclude_st: bool = True,
+    adv_lookback_days: int = DEFAULT_ADV_LOOKBACK_DAYS,
+    min_adv_days: int = DEFAULT_MIN_ADV_DAYS,
     consensus_threshold: float = 0.70,
 ) -> str:
     """组合配置指纹：成员/权重/门槛/调仓参数任一变化 → 新计划。"""
@@ -419,6 +512,10 @@ def config_hash(
         "lookback": int(lookback),
         "min_lookback_days": int(min_lookback_days),
         "capital": float(capital),
+        "min_adv_yi": float(min_adv_yi),
+        "exclude_st": bool(exclude_st),
+        "adv_lookback_days": int(adv_lookback_days),
+        "min_adv_days": int(min_adv_days),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

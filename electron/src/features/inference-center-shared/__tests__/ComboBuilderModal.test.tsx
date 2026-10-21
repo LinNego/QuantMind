@@ -34,7 +34,7 @@ const GROUP_SIG = { target_horizon_days: 10, feature_count: 300, data_source: 'q
 function eligible(): ComboEligibleResponse {
   return {
     market: 'CN',
-    total_eligible: 4,
+    total_eligible: 5,
     groups: [
       {
         key: 'g1',
@@ -50,6 +50,7 @@ function eligible(): ComboEligibleResponse {
         signature: { ...GROUP_SIG, target_horizon_days: 5 },
         models: [
           { model_id: 'm4', display_name: 'LGB-5', model_type: 'lightgbm', model_source: 'manual', horizon_days: 5, feature_count: 300, status: 'ready' },
+          { model_id: 'm5', display_name: 'XGB-5', model_type: 'xgboost', model_source: 'manual', horizon_days: 5, feature_count: 300, status: 'ready' },
         ],
       },
     ],
@@ -158,6 +159,7 @@ describe('ComboBuilderModal', () => {
     expect(mocks.preview).toHaveBeenCalledWith({
       market: 'CN',
       model_ids: ['m1', 'm2'],
+      purpose: 'rebalance',
       method: 'mean',
       trim_count: 2,
       min_coverage: 2,
@@ -171,6 +173,7 @@ describe('ComboBuilderModal', () => {
       name: '我的组合',
       market: 'CN',
       model_ids: ['m1', 'm2'],
+      purpose: 'rebalance',
       entry_per_day: 5,
       rolling_window: 10,
       target_positions: 50,
@@ -213,6 +216,41 @@ describe('ComboBuilderModal', () => {
       template_id: 'sys:abc:10:baseline',
     });
     expect(props.onCreated).toHaveBeenCalled();
+  });
+
+  it('T+5 模板：滚动默认值按周期派生为 5 只 × 5 日 = 25', async () => {
+    const template5 = {
+      template_id: 'sys:abc:5:full_equal',
+      kind: 'full_equal',
+      name: '全5·T+5 等权',
+      market: 'CN',
+      horizon_days: 5,
+      method: 'mean' as const,
+      trim_count: 2,
+      min_coverage: 2,
+      consensus_min_count: 0,
+      members: [
+        { model_id: 'm4', model_source: 'manual', weight: 1, model_type: 'lightgbm', display_name: 'LGB-5' },
+        { model_id: 'm5', model_source: 'manual', weight: 1, model_type: 'xgboost', display_name: 'XGB-5' },
+      ],
+      evidence: { grade: 'watch', candidate_id: null },
+      baseline: false,
+    };
+    renderModal({ initialTemplate: template5 });
+    await screen.findByText(/2 只成员/);
+    fireEvent.click(screen.getByRole('button', { name: '下一步' }));
+    await screen.findByDisplayValue('全5·T+5 等权');
+    fireEvent.click(screen.getByRole('button', { name: '预览榜单' }));
+    await screen.findByText('浦发银行');
+    fireEvent.click(screen.getByRole('button', { name: '保存组合' }));
+    await waitFor(() => expect(mocks.createBlend).toHaveBeenCalledTimes(1));
+    expect(mocks.createBlend.mock.calls[0][0]).toMatchObject({
+      purpose: 'rebalance',
+      entry_per_day: 5,
+      rolling_window: 5,
+      target_positions: 25,
+      template_id: 'sys:abc:5:full_equal',
+    });
   });
 
   it('读取失败时显示错误而不是空列表', async () => {

@@ -32,6 +32,7 @@ import {
   rollingStatus,
   scoreLabel,
   templateGradeLabel,
+  templateRollingDefaults,
   templateToCreateRequest,
 } from '../components/combo/comboRankingModel';
 
@@ -285,6 +286,49 @@ describe('模板 → 保存请求', () => {
     expect(body.source).toBe('system');
     expect(body.template_id).toBe('sys:abc:10:baseline');
     expect(body.name).toBe('全13·T+10 等权');
+    // T+10 → 5 只/日 × 10 日 = 50
+    expect(body.purpose).toBe('rebalance');
+    expect(body.entry_per_day).toBe(5);
+    expect(body.rolling_window).toBe(10);
+    expect(body.target_positions).toBe(50);
+  });
+
+  it('滚动默认值随周期派生：T+5 → 25，T+20 → 100（上限 100）', () => {
+    expect(templateRollingDefaults(5)).toMatchObject({
+      entry_per_day: 5,
+      rolling_window: 5,
+      target_positions: 25,
+    });
+    expect(templateRollingDefaults(20)).toMatchObject({
+      entry_per_day: 5,
+      rolling_window: 20,
+      target_positions: 100,
+    });
+    expect(templateRollingDefaults(null)).toMatchObject({
+      rolling_window: 10,
+      target_positions: 50,
+    });
+  });
+
+  it('模板显式给出的滚动参数优先于派生值', () => {
+    const explicit = { ...template, horizon_days: 5, entry_per_day: 3, rolling_window: 8, target_positions: 24 };
+    const body = templateToCreateRequest(explicit);
+    expect(body.entry_per_day).toBe(3);
+    expect(body.rolling_window).toBe(8);
+    expect(body.target_positions).toBe(24);
+  });
+
+  it('模板值超服务端上限时夹到 le 上限（entry 50 / window 60 / target 500）', () => {
+    const body = templateToCreateRequest({
+      ...template,
+      horizon_days: 90,
+      entry_per_day: 80,
+      rolling_window: 90,
+      target_positions: 900,
+    });
+    expect(body.entry_per_day).toBe(50);
+    expect(body.rolling_window).toBe(60);
+    expect(body.target_positions).toBe(500);
   });
 
   it('非等权 → 原样映射权重；名称可覆盖', () => {

@@ -164,7 +164,7 @@ export const ComboWorkspace: React.FC<ComboWorkspaceProps> = ({
               label: '滚动建仓',
               children: isTemplate ? (
                 <div className="h-full flex items-center justify-center bg-white border border-slate-200 rounded-xl">
-                  <Empty description="保存为组合后可查看滚动建仓（每天 5 只 × 10 日）">
+                  <Empty description="保存为组合后可查看滚动建仓（每日新进 × 滚动窗口）">
                     <Button type="primary" onClick={() => openBuilder([], true)}>
                       保存当前模板为组合
                     </Button>
@@ -185,6 +185,7 @@ export const ComboWorkspace: React.FC<ComboWorkspaceProps> = ({
               children: (
                 <RebalancePlanPanel
                   plan={state.plan}
+                  blend={state.selectedBlend}
                   loading={state.planLoading}
                   error={state.planError}
                   onRetry={state.reloadPlan}

@@ -113,6 +113,62 @@ try {
     const planText = ((await ws.innerText().catch(() => '')) || '').replace(/\n+/g, ' | ');
     if (/调仓计划|纸面|暂无|生成|—/.test(planText)) ok('调仓计划区渲染', planText.slice(0, 160));
     else bad('调仓计划区渲染', planText.slice(0, 240));
+    if (/最低成交额|剔除 ST/.test(planText)) ok('计划参数含机构硬条件（最低成交额 / 剔除 ST）');
+    else bad('计划参数含机构硬条件', planText.slice(0, 200));
+
+    // 7.5) 计划表横向可滚（列多时不硬挤）
+    const planTable = page.locator('[data-testid="combo-plan-table"]');
+    if (await planTable.count()) {
+      const body = planTable.locator('.ant-table-body, .ant-table-content').first();
+      const m = await body.evaluate((el) => ({ sw: el.scrollWidth, cw: el.clientWidth })).catch(() => null);
+      if (!m) bad('计划表横向滚动', '表格容器未找到');
+      else if (m.sw > m.cw) ok('计划表可横向滚动', `${m.sw}>${m.cw}`);
+      else ok('计划表列宽未溢出当前视口', `${m.sw}<=${m.cw}`);
+    }
+
+    // 7.6) 两档视口：滚动看板可横/纵滚动，且内容不被裁剪
+    for (const vp of [{ width: 1366, height: 768 }, { width: 1680, height: 980 }]) {
+      await page.setViewportSize(vp);
+      await rollingTab.click().catch(() => {});
+      await page.waitForTimeout(1800);
+      const board = page.locator('[data-testid="combo-rolling-board"]');
+      if (!(await board.count())) {
+        bad(`滚动看板存在@${vp.width}`, '未渲染');
+        continue;
+      }
+      const met = await board.evaluate((el) => {
+        el.scrollLeft = el.scrollWidth;
+        el.scrollTop = el.scrollHeight;
+        return {
+          sw: el.scrollWidth, cw: el.clientWidth, sh: el.scrollHeight, ch: el.clientHeight,
+          left: el.scrollLeft, top: el.scrollTop,
+        };
+      });
+      if (met.sw > met.cw && met.left > 0) ok(`滚动看板横向可滚@${vp.width}`, `${met.left}/${met.sw - met.cw}`);
+      else bad(`滚动看板横向可滚@${vp.width}`, JSON.stringify(met));
+      if (met.sh <= met.ch || met.top > 0) ok(`滚动看板纵向不裁剪@${vp.width}`, `${met.sh}/${met.ch}`);
+      else bad(`滚动看板纵向不裁剪@${vp.width}`, JSON.stringify(met));
+      await page.screenshot({ path: `/tmp/qm_probe_combo_rolling_${vp.width}.png` });
+    }
+    await page.setViewportSize({ width: 1680, height: 980 });
+
+    // 7.7) K2：T+5 模板标注无推理成员，且预览无报错
+    const t5Template = page.locator('[data-testid^="combo-item-template-"]', { hasText: 'T+5' }).first();
+    if (await t5Template.count()) {
+      const t5Text = ((await t5Template.innerText().catch(() => '')) || '').replace(/\n+/g, ' ');
+      if (/\d+\s*只无推理/.test(t5Text)) ok('T+5 模板标注无推理成员', t5Text.slice(0, 120));
+      else bad('T+5 模板标注无推理成员', t5Text.slice(0, 160));
+      await t5Template.click();
+      await page.waitForTimeout(4000);
+      const t5Body = ((await ws.innerText().catch(() => '')) || '').replace(/\n+/g, ' | ');
+      if (/读取失败|请求失败|Model not found|组合没有可用数据日/.test(t5Body)) {
+        bad('T+5 模板预览', t5Body.slice(0, 240));
+      } else {
+        ok('T+5 模板预览', t5Body.slice(0, 140));
+      }
+    } else {
+      bad('T+5 模板存在', '模板列表未找到 T+5');
+    }
   }
 
   // 8) 模型治理：多选 → 一键推理入口出现（只开预览，不起任务）

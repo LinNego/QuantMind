@@ -4,7 +4,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import type { BlendPlan } from '../../../services/blendTypes';
+import type { BlendPlan, BlendRecord } from '../../../services/blendTypes';
 import { RebalancePlanPanel } from '../components/combo/RebalancePlanPanel';
 
 function makePlan(over: Partial<BlendPlan> = {}): BlendPlan {
@@ -24,6 +24,10 @@ function makePlan(over: Partial<BlendPlan> = {}): BlendPlan {
       exit_delta: 0.05,
       lookback: 20,
       min_lookback_days: 10,
+      min_adv_yi: 1,
+      exclude_st: true,
+      adv_lookback_days: 20,
+      min_adv_days: 15,
     },
     summary: {
       capital: 10_000_000,
@@ -41,6 +45,34 @@ function makePlan(over: Partial<BlendPlan> = {}): BlendPlan {
     holds: [{ symbol: 'SH600002', mean20: 0.5, exit_line: 0.45, held_days: 3 }],
     exits: [{ symbol: 'SH600003', mean20: 0.3, exit_line: 0.4, exit_reason: '评分跌破退出线' }],
     warnings: [],
+    ...over,
+  };
+}
+
+function makeBlend(over: Partial<BlendRecord> = {}): BlendRecord {
+  return {
+    blend_id: 'blend-20',
+    tenant_id: 't',
+    user_id: 'u',
+    name: 'T+20 组合',
+    market: 'CN',
+    purpose: 'rebalance',
+    source: 'system',
+    template_id: null,
+    horizon_days: 20,
+    weighting: 'equal',
+    method: 'mean',
+    trim_count: 2,
+    min_coverage: 3,
+    consensus_min_count: 0,
+    entry_per_day: 5,
+    rolling_window: 20,
+    target_positions: 100,
+    feature_signature: 'sig',
+    data_source: 'quantdb_factors',
+    status: 'active',
+    created_at: null,
+    updated_at: null,
     ...over,
   };
 }
@@ -77,8 +109,53 @@ describe('RebalancePlanPanel', () => {
     render(<RebalancePlanPanel {...baseProps} plan={null} onGenerate={onGenerate} isTemplate={false} />);
     fireEvent.click(screen.getByRole('button', { name: '生成今日计划' }));
     await waitFor(() =>
-      expect(onGenerate).toHaveBeenCalledWith({ capital: 10_000_000, top_k: 50, hold_days: 10 }),
+      expect(onGenerate).toHaveBeenCalledWith({
+        capital: 10_000_000,
+        top_k: 50,
+        hold_days: 10,
+        entry_per_day: 5,
+        min_adv_yi: 1,
+        exclude_st: true,
+      }),
     );
+  });
+
+  it('无计划时按组合周期回填：T+20 不会被写死成 10 日/50 只', async () => {
+    const onGenerate = vi.fn().mockResolvedValue(undefined);
+    render(
+      <RebalancePlanPanel
+        {...baseProps}
+        plan={null}
+        blend={makeBlend()}
+        onGenerate={onGenerate}
+        isTemplate={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: '生成今日计划' }));
+    await waitFor(() =>
+      expect(onGenerate).toHaveBeenCalledWith({
+        capital: 10_000_000,
+        top_k: 100,
+        hold_days: 20,
+        entry_per_day: 5,
+        min_adv_yi: 1,
+        exclude_st: true,
+      }),
+    );
+  });
+
+  it('行情/风险标记缺失的计划只可预览，不能确认', () => {
+    render(
+      <RebalancePlanPanel
+        {...baseProps}
+        plan={makePlan({ data_ok: false, can_confirm: true })}
+        isTemplate={false}
+      />,
+    );
+    expect(screen.getByTestId('combo-plan-data-degraded')).toBeInTheDocument();
+    expect(screen.getByTestId('combo-plan-confirm')).toBeDisabled();
+    // 不是过期，不能误报「计划已过期」
+    expect(screen.queryByText(/计划已过期/)).not.toBeInTheDocument();
   });
 
   it('三类行按新进/留存/退出渲染，退出原因单独成文', () => {
@@ -156,6 +233,66 @@ describe('RebalancePlanPanel', () => {
     );
     expect(screen.getByTestId('combo-plan-confirm')).toBeDisabled();
     expect(screen.getByText(/计划已过期/)).toBeInTheDocument();
+  });
+
+  it('计划行展示行业/市值/ADV20，缺失显示 — 而不是 0', () => {
+    const plan = makePlan({
+      entries: [
+        {
+          symbol: 'SH600001',
+          name: '浦发银行',
+          industry: '银行',
+          market_cap_yi: 2431.6,
+          adv_yi: 12.34,
+          mean20: 0.6,
+          exit_line: 0.55,
+          research_score: 88.2,
+          target_value: 200_000,
+          shares: 1000,
+        },
+      ],
+      holds: [{ symbol: 'SH600002', mean20: 0.5, exit_line: 0.45, held_days: 3 }],
+      exits: [],
+    });
+    render(<RebalancePlanPanel {...baseProps} plan={plan} isTemplate={false} />);
+    expect(screen.getByText('浦发银行')).toBeInTheDocument();
+    expect(screen.getAllByText('银行').length).toBeGreaterThan(0);
+    expect(screen.getByText('2432')).toBeInTheDocument();
+    expect(screen.getByText('12.34')).toBeInTheDocument();
+    // 缺失的 ADV/市值：该行渲染 —（不写成 0）
+    const missingRow = screen.getByText('SH600002').closest('tr');
+    expect(missingRow?.textContent).toContain('—');
+    expect(missingRow?.textContent).not.toMatch(/\b0\.00\b/);
+  });
+
+  it('计划提示默认折叠，展开后列出全部条目', () => {
+    const plan = makePlan({
+      warnings: ['成交额不足:SH600009:0.50亿', '成交额缺失:SH600010', '资金用尽'],
+    });
+    render(<RebalancePlanPanel {...baseProps} plan={plan} isTemplate={false} />);
+    expect(screen.getByText(/计划提示 3 条/)).toBeInTheDocument();
+    expect(screen.queryByText('资金用尽')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText(/计划提示 3 条/));
+    expect(screen.getByText('资金用尽')).toBeInTheDocument();
+  });
+
+  it('勾选/取消「剔除 ST / 退市」会带进下一次生成', async () => {
+    const onGenerate = vi.fn().mockResolvedValue(undefined);
+    render(
+      <RebalancePlanPanel
+        {...baseProps}
+        plan={makePlan()}
+        onGenerate={onGenerate}
+        isTemplate={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole('checkbox', { name: /剔除 ST/ }));
+    fireEvent.click(screen.getByTestId('combo-plan-generate'));
+    await waitFor(() =>
+      expect(onGenerate).toHaveBeenCalledWith(
+        expect.objectContaining({ exclude_st: false, min_adv_yi: 1 }),
+      ),
+    );
   });
 
   it('新鲜且已落库的计划：二次确认后才写入台账', async () => {

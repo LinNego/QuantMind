@@ -230,7 +230,7 @@ export const ComboRankingTable: React.FC<ComboRankingTableProps> = ({
   ];
 
   return (
-    <div className="flex-1 min-h-0 flex flex-col bg-white border border-slate-200 rounded-xl overflow-hidden">
+    <div className="h-full min-h-0 min-w-0 flex flex-col bg-white border border-slate-200 rounded-xl overflow-hidden">
       <div className="shrink-0 flex items-center gap-3 px-3 py-2 border-b border-slate-100">
         <div className="flex items-center gap-2 text-[11px] text-slate-500">
           <span>
@@ -295,7 +295,7 @@ export const ComboRankingTable: React.FC<ComboRankingTableProps> = ({
           dataSource={rows}
           columns={columns}
           pagination={{ defaultPageSize: 50, pageSizeOptions: [50, 100, 200], showSizeChanger: true }}
-          scroll={{ y: 520 }}
+          scroll={{ x: 980, y: 'calc(100vh - 300px)' }}
           expandable={{
             expandedRowRender: (row) => <ContributionTable row={row} members={members} />,
             rowExpandable: () => true,

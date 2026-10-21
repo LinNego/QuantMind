@@ -22,6 +22,13 @@ import {
   rollingStatus,
 } from './comboRankingModel';
 
+/** 市值（亿元）→ 展示值；缺失返回 null（渲染 `—`，不写 0） */
+function capLabel(marketCapYi: number | null | undefined): string | null {
+  if (typeof marketCapYi !== 'number' || !Number.isFinite(marketCapYi)) return null;
+  if (marketCapYi >= 10000) return `${(marketCapYi / 10000).toFixed(2)} 万亿`;
+  return `${marketCapYi.toFixed(0)} 亿`;
+}
+
 export interface RollingBuildPanelProps {
   rolling: BlendRollingResponse | null;
   loading: boolean;
@@ -54,7 +61,7 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
 
   if (loading && !rolling) {
     return (
-      <div className="flex-1 min-h-0 flex items-center justify-center bg-white border border-slate-200 rounded-xl">
+      <div className="h-full min-h-0 min-w-0 flex items-center justify-center bg-white border border-slate-200 rounded-xl">
         <Spin tip="读取滚动窗口…" />
       </div>
     );
@@ -62,7 +69,7 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
 
   if (!rolling || rolling.columns.length === 0) {
     return (
-      <div className="flex-1 min-h-0 flex items-center justify-center bg-white border border-slate-200 rounded-xl">
+      <div className="h-full min-h-0 min-w-0 flex items-center justify-center bg-white border border-slate-200 rounded-xl">
         <Empty description="该组合暂无滚动窗口数据" />
       </div>
     );
@@ -72,7 +79,10 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
   const latest = rolling.data_trade_date;
 
   return (
-    <div className="flex-1 min-h-0 flex flex-col bg-white border border-slate-200 rounded-xl overflow-hidden">
+    <div
+      className="h-full min-h-0 min-w-0 flex flex-col bg-white border border-slate-200 rounded-xl overflow-hidden"
+      data-testid="combo-rolling-root"
+    >
       <div className="shrink-0 flex items-center gap-3 px-3 py-2 border-b border-slate-100">
         <div className="flex items-center gap-2 text-[11px] text-slate-500">
           <span>
@@ -110,7 +120,10 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
         </div>
       )}
 
-      <div className="flex-1 min-h-0 overflow-auto p-2" data-testid="combo-rolling-board">
+      <div
+        className="flex-1 min-h-0 overflow-auto overscroll-contain p-2"
+        data-testid="combo-rolling-board"
+      >
         <div className="flex gap-1.5 min-w-max items-stretch">
           {rolling.columns.map((column, index) => {
             const isLatest = column.date === latest;
@@ -118,7 +131,7 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
             return (
               <div
                 key={column.date}
-                className="w-[148px] shrink-0 flex flex-col rounded-lg border border-slate-200 bg-slate-50/60"
+                className="w-[160px] shrink-0 flex flex-col rounded-lg border border-slate-200 bg-slate-50/60"
                 data-testid={`combo-rolling-col-${column.date}`}
               >
                 <div
@@ -142,10 +155,12 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
                     const status = rollingStatus(pick);
                     const label = positionLabel(pick);
                     const composite = formatResearchScore(researchScore(pick.pct));
+                    const cap = capLabel(pick.market_cap_yi);
+                    const profileLine = [pick.industry || '行业—', cap ?? '市值—'].join(' · ');
                     return (
                       <Tooltip
                         key={pick.symbol}
-                        title={`排名 ${pick.rank} · 覆盖 ${pick.coverage}/${memberCount} · 综合分 ${composite} · ${positionLabel(pick)}`}
+                        title={`${pick.name || pick.symbol} · 排名 ${pick.rank} · 覆盖 ${pick.coverage}/${memberCount} · 综合分 ${composite} · ${positionLabel(pick)} · ${profileLine}`}
                       >
                         <div
                           className={`rounded-md border px-1.5 py-1 ${ROLLING_TONE[status]}`}
@@ -158,6 +173,7 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
                             <span className="font-mono text-[10px] shrink-0">{composite}</span>
                           </div>
                           <div className="text-[10px] truncate opacity-80">{pick.name || '—'}</div>
+                          <div className="text-[9px] truncate opacity-60">{profileLine}</div>
                           <div className="flex items-center justify-between gap-1 mt-0.5">
                             <span
                               className={`rounded border px-1 text-[9px] font-bold ${positionTagClass(label)}`}

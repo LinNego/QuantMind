@@ -217,7 +217,8 @@ def test_target_value_capped_by_adv_and_capital():
         history=_history(days[:-1], "A", 0.5),
         trading_days=days,
         positions=[],
-        config=_config(target_positions=1, capital=1_000_000.0),
+        # 本例只验「容量上限」与「资金上限」的取小，不验最低成交额门槛
+        config=_config(target_positions=1, capital=1_000_000.0, min_adv_yi=0.0),
         prices={"A": 10.0},
         amounts={"A": 500_000.0},
     )
@@ -225,9 +226,10 @@ def test_target_value_capped_by_adv_and_capital():
     # 资金上限 98 万，但 ADV 1% × 50 万 = 5000 元
     assert row["target_value"] == pytest.approx(5_000.0)
     assert row["shares"] == 500  # 100 股整手
+    assert row["adv_yi"] == pytest.approx(0.005)
 
 
-def test_missing_amount_marks_capacity_unchecked():
+def test_missing_adv_blocks_entry_instead_of_passing_unchecked():
     days, today, target = _plan_days()
     plan = build_rebalance_plan(
         data_trade_date=today,
@@ -238,9 +240,75 @@ def test_missing_amount_marks_capacity_unchecked():
         positions=[],
         config=_config(),
         prices={"A": 10.0},
-        amounts={},
+        avg_amounts={},
     )
-    assert plan.entries and "容量未校验" in plan.entries[0]["note"]
+    assert plan.entries == []
+    assert any("成交额缺失" in warning for warning in plan.warnings)
+
+
+def test_low_adv_blocks_entry():
+    days, today, target = _plan_days()
+    plan = build_rebalance_plan(
+        data_trade_date=today,
+        target_date=target,
+        ranking=[_row("A", 0.9, rank=1)],
+        history=_history(days[:-1], "A", 0.5),
+        trading_days=days,
+        positions=[],
+        config=_config(),
+        prices={"A": 10.0},
+        avg_amounts={"A": 5e7},  # 0.5 亿 < 1 亿门槛
+    )
+    assert plan.entries == []
+    assert any("成交额不足" in warning for warning in plan.warnings)
+
+
+def test_st_blocks_entry_and_forces_existing_position_exit():
+    days, today, target = _plan_days()
+    plan = build_rebalance_plan(
+        data_trade_date=today,
+        target_date=target,
+        ranking=[_row("A", 0.9, rank=1), _row("B", 0.8, rank=2)],
+        history={day: {"A": 0.5, "B": 0.5} for day in days[:-1]},
+        trading_days=days,
+        positions=[PaperPosition(symbol="B", entry_date=days[-3], shares=100)],
+        config=_config(),
+        prices={"A": 10.0, "B": 10.0},
+        avg_amounts={"A": 2e8, "B": 2e8},
+        risk_flags={"A": "ST", "B": "退市"},
+    )
+    assert plan.entries == []
+    assert [row["symbol"] for row in plan.exits] == ["B"]
+    assert plan.exits[0]["exit_reason"] == "风险警示(退市)"
+    assert any("风险警示:A:ST" in warning for warning in plan.warnings)
+
+
+def test_remaining_capital_caps_entries_and_stops_when_exhausted():
+    days, today, target = _plan_days()
+    held = PaperPosition(symbol="H", entry_date=days[-2], shares=90_000)
+    plan = build_rebalance_plan(
+        data_trade_date=today,
+        target_date=target,
+        ranking=[_row("A", 0.9, rank=1), _row("B", 0.8, rank=2)],
+        history={day: {"A": 0.5, "B": 0.5, "H": 0.5} for day in days[:-1]},
+        trading_days=days,
+        positions=[held],
+        config=_config(
+            capital=1_000_000.0,
+            cash_buffer=0.0,
+            target_positions=3,
+            entry_per_day=2,
+            min_adv_yi=0.0,
+        ),
+        prices={"A": 10.0, "B": 10.0, "H": 10.0},
+        avg_amounts={"A": 1e10, "B": 1e10, "H": 1e10},
+    )
+    # 持仓现值 90 万，只剩 10 万：首笔吃满剩余，第二笔资金用尽
+    assert [row["symbol"] for row in plan.entries] == ["A"]
+    assert plan.entries[0]["shares"] == 10_000
+    assert plan.summary["capital_used"] == pytest.approx(1_000_000.0)
+    assert plan.summary["capital_remaining"] == pytest.approx(0.0)
+    assert any("资金用尽" in warning for warning in plan.warnings)
 
 
 def test_positions_hash_is_order_insensitive_and_value_sensitive():
@@ -270,6 +338,9 @@ def test_config_hash_covers_members_weights_and_params():
     )
     assert config_hash(**base) != config_hash(**{**base, "min_coverage": 9})
     assert config_hash(**base) != config_hash(**{**base, "entry_per_day": 4})
+    assert config_hash(**base) != config_hash(**{**base, "min_adv_yi": 2.0})
+    assert config_hash(**base) != config_hash(**{**base, "exclude_st": False})
+    assert config_hash(**base) != config_hash(**{**base, "adv_lookback_days": 10})
 
 
 def test_consecutive_days_in_topk_counts_backwards_until_gap():

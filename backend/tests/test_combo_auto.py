@@ -159,6 +159,11 @@ def test_auto_candidates_make_baseline_first_and_cover_families():
     full = items[0]
     assert len(full["members"]) == 13
     assert full["min_coverage"] == 8  # ceil(13*0.6)
+    # 滚动参数随周期派生：T+10 → 5 只/日、滚动 10 日、目标 50 只
+    assert full["purpose"] == "rebalance"
+    assert full["entry_per_day"] == 5
+    assert full["rolling_window"] == 10
+    assert full["target_positions"] == 50
     consensus = next(i for i in items if i["kind"] == "consensus_high")
     assert consensus["min_coverage"] == 10  # ceil(13*0.75)
     trimmed = next(i for i in items if i["kind"] == "trimmed")
@@ -166,11 +171,58 @@ def test_auto_candidates_make_baseline_first_and_cover_families():
     assert trimmed["trim_count"] == 2
 
 
+def test_template_rolling_defaults_follow_horizon():
+    for horizon, target in ((5, 25), (20, 100)):
+        models = [
+            normalize_model(
+                _model(f"m{i}", model_type="lightgbm", horizon=horizon),
+                source="user",
+            )
+            for i in range(4)
+        ]
+        result = build_auto_candidates(models)
+        full = result["items"][0]
+        assert full["rolling_window"] == horizon
+        assert full["entry_per_day"] == 5
+        assert full["target_positions"] == target
+
+
 def test_small_group_does_not_generate_templates():
     models = [normalize_model(m, source="user") for m in _thirteen()[:2]]
     result = build_auto_candidates(models)
     assert result["items"] == []
     assert result["baseline_template_id"] is None
+
+
+def test_auto_candidates_filter_members_without_runs():
+    """K2：T+5 全组只有部分成员有 run 时，模板只保留有 run 的成员并标注缺失数。
+
+    不把覆盖门槛降到 2 来硬凑全组——模板成员缩减后 min_coverage 按新成员数
+    重算，缺失成员数在模板上明示（前端显示「N 只成员暂无推理」）。
+    """
+    models = [normalize_model(m, source="user") for m in _thirteen()[:4]]
+    runnable = {models[0]["model_id"], models[1]["model_id"], models[2]["model_id"]}
+
+    result = build_auto_candidates(models, runnable_ids=runnable)
+    full = result["items"][0]
+    assert full["kind"] == "full_equal"
+    assert len(full["members"]) == 3
+    assert full["missing_members"] == 1
+    assert full["min_coverage"] == 2  # ceil(3*0.6)
+
+    # 有 run 的成员不足 3 只：不生成模板（不伪造成员）
+    result = build_auto_candidates(
+        models, runnable_ids=runnable - {models[0]["model_id"]}
+    )
+    assert result["items"] == []
+    assert result["baseline_template_id"] is None
+
+
+def test_auto_candidates_without_run_filter_keeps_all_members():
+    models = [normalize_model(m, source="user") for m in _thirteen()]
+    result = build_auto_candidates(models)
+    assert result["items"][0]["missing_members"] == 0
+    assert len(result["items"][0]["members"]) == 13
 
 
 def test_template_ids_are_stable_when_evidence_changes():

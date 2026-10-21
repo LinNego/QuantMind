@@ -131,6 +131,8 @@ export interface BlendRollingPick {
   /** 本窗口内连续在榜天数（断榜后重新计数，不伪造跨窗连续） */
   held_days: number;
   is_new: boolean;
+  industry?: string | null;
+  market_cap_yi?: number | null;
 }
 
 export interface BlendRollingColumn {
@@ -169,6 +171,12 @@ export interface BlendPlanConfig {
   exit_delta: number;
   lookback: number;
   min_lookback_days: number;
+  /** 新进最低 ADV20（亿元）；0 表示不设门槛 */
+  min_adv_yi: number;
+  /** 是否剔除 ST/退市（硬条件） */
+  exclude_st: boolean;
+  adv_lookback_days: number;
+  min_adv_days: number;
 }
 
 export interface BlendPlanSummary {
@@ -178,6 +186,17 @@ export interface BlendPlanSummary {
   hold_days: number;
   top_k: number;
   cash_buffer: number;
+  /** 扣除现金缓冲后的可用资金（元） */
+  capital_available?: number;
+  /** 已占用资金（持仓现值 + 新进目标金额，元） */
+  capital_used?: number;
+  /** 剩余资金（元） */
+  capital_remaining?: number;
+  min_adv_yi?: number;
+  exclude_st?: boolean;
+  adv_lookback_days?: number;
+  /** false=行情或风险标记缺失；此类计划只能预览，不能确认 */
+  data_ok?: boolean;
   n_entries: number;
   n_holds: number;
   n_exits: number;
@@ -187,6 +206,8 @@ export interface BlendPlanSummary {
 /** 计划行：新进(entries)/留存(holds)/退出(exits) 共用形状，字段按类别可缺 */
 export interface BlendPlanRow {
   symbol: string;
+  /** 简称/行业/市值（当前截面；缺失为 null → 渲染 `—`） */
+  name?: string | null;
   /** 仅 holds/exits：纸面台账首入日期 */
   first_entry_date?: string;
   /** 仅 holds/exits：已持有交易日数 */
@@ -203,6 +224,10 @@ export interface BlendPlanRow {
   target_value?: number;
   ref_price?: number;
   shares?: number;
+  /** ADV20（亿元）；缺失为 null → 渲染 `—` */
+  adv_yi?: number | null;
+  industry?: string | null;
+  market_cap_yi?: number | null;
 }
 
 export interface BlendPlan {
@@ -216,6 +241,8 @@ export interface BlendPlan {
   holds: BlendPlanRow[];
   exits: BlendPlanRow[];
   warnings: string[];
+  /** false=行情或 ST/退市标记缺失；后端 confirm_plan 会拒绝确认 */
+  data_ok?: boolean;
   config_hash?: string;
   positions_hash?: string;
   confirmed_at?: string | null;
@@ -232,6 +259,8 @@ export interface BlendPlanOverrides {
   hold_days?: number;
   entry_per_day?: number;
   target_positions?: number;
+  min_adv_yi?: number;
+  exclude_st?: boolean;
 }
 
 export interface BlendPlanRequest extends BlendPlanOverrides {
@@ -257,11 +286,18 @@ export interface ComboTemplate {
   name: string;
   market: string;
   horizon_days: number | null;
+  /** 默认调仓用途与滚动建仓参数（后端按周期派生，旧模板可能缺省） */
+  purpose?: BlendPurpose;
+  entry_per_day?: number;
+  rolling_window?: number;
+  target_positions?: number;
   method: BlendMethod;
   trim_count: number;
   min_coverage: number;
   consensus_min_count: number;
   members: ComboTemplateMember[];
+  /** 因「从未有过有效推理」被排除的成员数；0/缺省表示成员齐全 */
+  missing_members?: number;
   evidence: { grade: EvidenceGrade; candidate_id: string | null };
   /** 基线模板恒排第一（C0 = 全 13 · T+10 等权） */
   baseline: boolean;

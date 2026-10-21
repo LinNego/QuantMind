@@ -223,6 +223,16 @@ describe('ComboWorkspace', () => {
     expect(mocks.getRolling).not.toHaveBeenCalled();
   });
 
+  it('模板标注无推理成员数（K2：只列有 run 的成员）', async () => {
+    mocks.getAutoCandidates.mockResolvedValue({
+      ...autoCandidates(),
+      items: [template({ missing_members: 11 })],
+    });
+    renderWorkspace();
+    await screen.findByText('浦发银行');
+    expect(screen.getByText('11 只无推理')).toBeInTheDocument();
+  });
+
   it('已保存组合进入滚动 Tab 才请求，渲染新进色块', async () => {
     renderWorkspace();
     await screen.findByText('浦发银行');
@@ -256,6 +266,7 @@ describe('ComboWorkspace', () => {
       params: {
         capital: 10_000_000, top_k: 50, hold_days: 10, entry_per_day: 5, target_positions: 50,
         cash_buffer: 0.02, adv_participation: 0.05, exit_delta: 0.05, lookback: 20, min_lookback_days: 10,
+        min_adv_yi: 1, exclude_st: true, adv_lookback_days: 20, min_adv_days: 15,
       },
       summary: {
         capital: 10_000_000, target_positions: 50, entry_per_day: 5, hold_days: 10, top_k: 50,
@@ -290,6 +301,9 @@ describe('ComboWorkspace', () => {
         capital: 10_000_000,
         top_k: 50,
         hold_days: 10,
+        entry_per_day: 5,
+        min_adv_yi: 1,
+        exclude_st: true,
       }),
     );
   });

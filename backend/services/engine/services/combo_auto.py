@@ -21,7 +21,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 
 SIGNATURE_KEYS = (
     "market",
@@ -217,20 +217,32 @@ def _template(
     trim_count: int = 2,
     min_coverage: int | None = None,
     consensus_min_count: int = 0,
+    missing_members: int = 0,
 ) -> dict[str, Any]:
     horizon = sig.get("target_horizon_days")
+    # 滚动建仓默认值随周期派生：T+10 → 5 只/日 × 10 日 = 50 只；
+    # T+5 → 25；T+20 → 100（上限 100，避免长周期默认持仓失控）。
+    entry_per_day = 5
+    rolling_window = int(horizon or 10)
+    target_positions = min(100, entry_per_day * rolling_window)
     return {
         "template_id": f"sys:{_signature_short(sig)}:{horizon}:{kind}",
         "kind": kind,
         "name": name,
         "market": sig.get("market") or "CN",
         "horizon_days": horizon,
+        "purpose": "rebalance",
+        "entry_per_day": entry_per_day,
+        "rolling_window": rolling_window,
+        "target_positions": target_positions,
         "method": method,
         "trim_count": trim_count,
         "min_coverage": min_coverage
         if min_coverage is not None
         else max(2, math.ceil(len(members) * 0.6)),
         "consensus_min_count": consensus_min_count,
+        # 因「从未有过有效推理」被排除的成员数（K2）；0 表示模板成员齐全
+        "missing_members": max(0, int(missing_members)),
         "members": [
             {
                 "model_id": str(m.get("model_id")),
@@ -247,8 +259,14 @@ def _template(
 def build_auto_candidates(
     models: Sequence[Mapping[str, Any]],
     evidence: Mapping[str, Any] | None = None,
+    runnable_ids: Collection[str] | None = None,
 ) -> dict[str, Any]:
-    """生成系统模板 + 证据等级；C0（13 个 T+10）恒第一。"""
+    """生成系统模板 + 证据等级；C0（13 个 T+10）恒第一。
+
+    ``runnable_ids`` 非 None 时**只保留至少有过一次有效推理 run 的成员**
+    （K2：T+5 全组只有 13/24 有 run 时，不把覆盖门槛降到 2 硬凑全组，
+    而是缩减模板成员并在模板上标注 ``missing_members``）。
+    """
     eligible, excluded = eligible_models(models)
     groups = group_models(eligible)
     evidence = evidence or {}
@@ -256,65 +274,85 @@ def build_auto_candidates(
         evidence.get("candidates") if isinstance(evidence, dict) else None
     )
     by_alias = _evidence_index(evidence_candidates or [])
+    runnable = None if runnable_ids is None else {str(i) for i in runnable_ids}
+
+    def _keep(rows: Sequence[Mapping[str, Any]]) -> tuple[list, int]:
+        """按 run 可用性过滤成员；返回 (保留成员, 被过滤数)。"""
+        if runnable is None:
+            return list(rows), 0
+        kept = [m for m in rows if str(m.get("model_id")) in runnable]
+        return kept, len(rows) - len(kept)
 
     items: list[dict[str, Any]] = []
     for group in groups:
         sig = group["signature"]
-        members = group["models"]
-        if len(members) < 3:
-            continue
-        full = [m for m in members if m.get("target_horizon_days") is not None]
+        all_full = [
+            m for m in group["models"] if m.get("target_horizon_days") is not None
+        ]
+        full, missing_full = _keep(all_full)
         if len(full) < 3:
             continue
+        horizon = sig.get("target_horizon_days")
         items.append(
             _template(
                 sig=sig,
                 kind="full_equal",
-                name=f"全{len(full)}·T+{sig.get('target_horizon_days')} 等权",
+                name=f"全{len(full)}·T+{horizon} 等权",
                 members=full,
                 min_coverage=max(2, math.ceil(len(full) * 0.6)),
+                missing_members=missing_full,
             )
         )
-        trees = [m for m in full if m.get("model_type") in TREE_TYPES]
+        trees, missing_trees = _keep(
+            [m for m in all_full if m.get("model_type") in TREE_TYPES]
+        )
         if len(trees) >= 2:
             items.append(
                 _template(
                     sig=sig,
                     kind="family_tree",
-                    name=f"树族{len(trees)}·T+{sig.get('target_horizon_days')}",
+                    name=f"树族{len(trees)}·T+{horizon}",
                     members=trees,
                     min_coverage=max(2, math.ceil(len(trees) * 0.6)),
+                    missing_members=missing_trees,
                 )
             )
-        linear = [m for m in full if m.get("model_type") in LINEAR_TYPES]
+        linear, missing_linear = _keep(
+            [m for m in all_full if m.get("model_type") in LINEAR_TYPES]
+        )
         if len(linear) >= 2:
             items.append(
                 _template(
                     sig=sig,
                     kind="family_linear",
-                    name=f"线性族{len(linear)}·T+{sig.get('target_horizon_days')}",
+                    name=f"线性族{len(linear)}·T+{horizon}",
                     members=linear,
                     min_coverage=2,
+                    missing_members=missing_linear,
                 )
             )
-        deep = [m for m in full if m.get("model_type") in DL_TYPES]
+        deep, missing_deep = _keep(
+            [m for m in all_full if m.get("model_type") in DL_TYPES]
+        )
         if len(deep) >= 2:
             items.append(
                 _template(
                     sig=sig,
                     kind="family_dl",
-                    name=f"深度族{len(deep)}·T+{sig.get('target_horizon_days')}",
+                    name=f"深度族{len(deep)}·T+{horizon}",
                     members=deep,
                     min_coverage=max(2, math.ceil(len(deep) * 0.6)),
+                    missing_members=missing_deep,
                 )
             )
         items.append(
             _template(
                 sig=sig,
                 kind="consensus_high",
-                name=f"全{len(full)}·高共识·T+{sig.get('target_horizon_days')}",
+                name=f"全{len(full)}·高共识·T+{horizon}",
                 members=full,
                 min_coverage=math.ceil(len(full) * 0.75),
+                missing_members=missing_full,
             )
         )
         if len(full) >= 5:
@@ -322,11 +360,12 @@ def build_auto_candidates(
                 _template(
                     sig=sig,
                     kind="trimmed",
-                    name=f"全{len(full)}·截尾·T+{sig.get('target_horizon_days')}",
+                    name=f"全{len(full)}·截尾·T+{horizon}",
                     members=full,
                     method="trimmed",
                     trim_count=2,
                     min_coverage=max(5, math.ceil(len(full) * 0.6)),
+                    missing_members=missing_full,
                 )
             )
 

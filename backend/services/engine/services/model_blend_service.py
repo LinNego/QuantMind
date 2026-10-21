@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -54,8 +55,14 @@ from backend.shared.stock_utils import StockCodeUtil
 logger = logging.getLogger(__name__)
 
 MIN_MEMBERS = 2
-MAX_MEMBERS = 20
+#: T+5 全组模板实有 24 个同签名模型，上限必须容得下整组模板
+MAX_MEMBERS = 30
 CN_MARKET = "CN"
+#: 行业/市值快照缓存（秒）：快照是最新截面，不按日分区
+PROFILE_CACHE_TTL_SECONDS = 300.0
+_PROFILE_CACHE: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
+#: ST/退市风险标记缓存：``market → (ts, flags, error)``；失败也缓存，避免读盘风暴
+_RISK_CACHE: dict[str, tuple[float, dict[str, str], str | None]] = {}
 
 
 def _prefix_symbol_sql(source: str = "symbol") -> str:
@@ -144,6 +151,15 @@ def _finite(value: Any) -> bool:
         return value is not None and math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
+
+
+def _required_coverage(model_ids: Sequence[str], required: int | None) -> int:
+    """共同数据日要求的最少成员数：``min(成员数, 指定门槛)``，至少 1。"""
+    total = len({str(model_id) for model_id in model_ids})
+    if total <= 0:
+        return 1
+    wanted = total if required is None else int(required)
+    return max(1, min(total, wanted))
 
 
 #: 窗口统计缓存：历史日的组合分与 TopK 在推理结果落定后不再变化，
@@ -295,8 +311,49 @@ class ModelBlendService:
         models = await self._normalized_models(
             tenant_id=tenant_id, user_id=user_id, market=market
         )
+        runnable = await self._runnable_model_ids(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            model_ids=[str(m["model_id"]) for m in models],
+        )
         evidence = combo_auto.load_evidence()
-        return combo_auto.build_auto_candidates(models, evidence)
+        return combo_auto.build_auto_candidates(models, evidence, runnable_ids=runnable)
+
+    async def _runnable_model_ids(
+        self, *, tenant_id: str, user_id: str, model_ids: Sequence[str]
+    ) -> set[str] | None:
+        """至少有过一次有效推理 run（completed / signals>0 / 非 fallback）的模型。
+
+        模板只列「能产出信号」的成员：从未推理过的模型放进模板，榜单永远
+        缺成员且日期被拖旧（K2）。查询失败不阻断清单（返回空集会让模板
+        全部消失，反而更糟），降级为不过滤。
+        """
+        if not model_ids:
+            return set()
+        try:
+            async with get_session(read_only=True) as session:
+                rows = (
+                    await session.execute(
+                        text(
+                            """
+                            SELECT DISTINCT model_id FROM qm_model_inference_runs
+                            WHERE tenant_id = :tenant_id AND user_id = :user_id
+                              AND model_id = ANY(:model_ids)
+                              AND status = 'completed' AND signals_count > 0
+                              AND fallback_used = FALSE
+                            """
+                        ),
+                        {
+                            "tenant_id": tenant_id,
+                            "user_id": user_id,
+                            "model_ids": list(model_ids),
+                        },
+                    )
+                ).all()
+            return {str(row[0]) for row in rows}
+        except Exception as exc:  # pragma: no cover - 查询失败降级为不过滤
+            logger.warning("读取模型推理可用性失败，模板不做 run 过滤: %s", exc)
+            return None
 
     # ── 成员解析与校验 ──────────────────────────────────────────────────
 
@@ -344,7 +401,7 @@ class ModelBlendService:
         for member in members[1:]:
             other = combo_auto.signature_of(member)
             # 周期不参与「同特征」判定：next_day 允许跨周期（附 mixed_horizon
-            # 警告），rebalance 由下面的 T+10 闸门单独拦。
+            # 警告），rebalance 由下面的同周期校验单独拦。
             if any(
                 other[key] != signature[key]
                 for key in combo_auto.SIGNATURE_KEYS
@@ -355,21 +412,34 @@ class ModelBlendService:
                     "feature_count/market 必须一致）",
                     code="signature_mismatch",
                 )
-        ModelBlendService._ensure_purpose_supported(members, purpose)
+        ModelBlendService._ensure_rebalance_horizon(members, purpose)
         return members
 
     @staticmethod
-    def _ensure_purpose_supported(
+    def _ensure_rebalance_horizon(
         members: Sequence[Mapping[str, Any]], purpose: str
     ) -> None:
-        """调仓组合只接受 T+10 成员；新建、换成员、改用途三处共用同一口径。"""
+        """调仓组合允许任意周期（T+1…T+20），但成员必须同周期。
+
+        新建、换成员、改用途三处共用同一口径；跨周期组合只允许
+        ``next_day``（由 ``preview`` 附 ``mixed_horizon`` 警告）。
+        """
         if purpose != "rebalance":
             return
-        bad = [m["model_id"] for m in members if m["target_horizon_days"] != 10]
-        if bad:
+        unknown = [
+            str(m["model_id"]) for m in members if m.get("target_horizon_days") is None
+        ]
+        if unknown:
             raise BlendError(
-                "调仓组合仅支持 T+10 模型：" + "、".join(bad[:5]),
-                code="horizon_not_supported",
+                "调仓组合成员缺少预测周期：" + "、".join(unknown[:5]),
+                code="horizon_unknown",
+            )
+        horizons = {int(m["target_horizon_days"]) for m in members}
+        if len(horizons) > 1:
+            raise BlendError(
+                "调仓组合成员必须同预测周期："
+                + "、".join(f"T+{h}" for h in sorted(horizons)),
+                code="mixed_horizon",
             )
 
     @staticmethod
@@ -388,8 +458,20 @@ class ModelBlendService:
     # ── 取数 ────────────────────────────────────────────────────────────
 
     async def latest_common_date(
-        self, *, tenant_id: str, user_id: str, model_ids: Sequence[str]
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        model_ids: Sequence[str],
+        required: int | None = None,
     ) -> date | None:
+        """最近一个「至少 ``required`` 个成员有可用 run」的交易日。
+
+        缺省 ``required = len(model_ids)``（全员）；调仓组合按
+        ``min_coverage`` 传入，避免 24 成员 T+5 全组因个别模型没补推而永远无日期。
+        缺成员由 ``_combine_runs`` 继续产出 ``缺少当日推理`` 警告。
+        """
+        required = _required_coverage(model_ids, required)
         async with get_session(read_only=True) as session:
             row = (
                 await session.execute(
@@ -411,7 +493,7 @@ class ModelBlendService:
                         "model_ids": list(model_ids),
                         "start": date(2000, 1, 1),
                         "end": date(2100, 1, 1),
-                        "required": len(set(model_ids)),
+                        "required": required,
                     },
                 )
             ).first()
@@ -533,11 +615,20 @@ class ModelBlendService:
 
     # ── 榜单 ────────────────────────────────────────────────────────────
 
-    def _row_payload(self, row: BlendRow, names: Mapping[str, str]) -> dict[str, Any]:
+    def _row_payload(
+        self,
+        row: BlendRow,
+        names: Mapping[str, str],
+        profiles: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        profile = (profiles or {}).get(row.symbol) or {}
         return {
             "code": row.symbol,
             "symbol": row.symbol,
             "name": names.get(row.symbol) or "",
+            # 缺失一律 None（前端显示 —），绝不把未知市值写成 0
+            "industry": profile.get("industry"),
+            "market_cap_yi": profile.get("market_cap_yi"),
             "S": row.score,
             "S_pct": row.pct,
             "score": row.score,
@@ -601,7 +692,12 @@ class ModelBlendService:
             consensus_min_count=consensus_min_count,
         )
         names = await self._stock_names()
-        rows = [self._row_payload(row, names) for row in result.rows[: max(1, top)]]
+        market = str(members[0].get("market") or CN_MARKET) if members else CN_MARKET
+        profiles = await self._stock_profiles(market)
+        rows = [
+            self._row_payload(row, names, profiles)
+            for row in result.rows[: max(1, top)]
+        ]
         if annotate:
             window = await self._window_stats(
                 tenant_id=tenant_id,
@@ -667,9 +763,13 @@ class ModelBlendService:
             tenant_id=tenant_id,
             user_id=user_id,
             model_ids=[str(m["model_id"]) for m in members],
+            required=min_coverage,
         )
         if target is None:
-            raise BlendError("所选模型没有共同数据日", code="no_common_date")
+            raise BlendError(
+                "所选模型没有共同数据日：请先对成员做串行补推，或调低最低覆盖数",
+                code="no_common_date",
+            )
         payload = await self.ranking(
             tenant_id=tenant_id,
             user_id=user_id,
@@ -704,6 +804,7 @@ class ModelBlendService:
     ) -> list[str]:
         members = await self.members_from_blend(blend)
         model_ids = [str(m["model_id"]) for m in members]
+        required = _required_coverage(model_ids, int(blend.get("min_coverage") or 2))
         async with get_session(read_only=True) as session:
             rows = (
                 await session.execute(
@@ -724,7 +825,7 @@ class ModelBlendService:
                         "model_ids": model_ids,
                         "start": date(2000, 1, 1),
                         "end": date(2100, 1, 1),
-                        "required": len(model_ids),
+                        "required": required,
                         "limit": max(1, min(365, limit)),
                     },
                 )
@@ -756,11 +857,18 @@ class ModelBlendService:
             raise BlendError(f"组合至少需要 {MIN_MEMBERS} 个模型")
         weights = _weights_from_members(blend, members)
         member_ids = [str(m["model_id"]) for m in members]
+        min_coverage = int(blend.get("min_coverage") or 2)
         target = end_date or await self.latest_common_date(
-            tenant_id=tenant_id, user_id=user_id, model_ids=member_ids
+            tenant_id=tenant_id,
+            user_id=user_id,
+            model_ids=member_ids,
+            required=min_coverage,
         )
         if target is None:
-            raise BlendError("所选模型没有共同数据日", code="no_common_date")
+            raise BlendError(
+                "所选模型没有共同数据日：请先对成员做串行补推，或调低最低覆盖数",
+                code="no_common_date",
+            )
 
         stats = await self._window_stats(
             tenant_id=tenant_id,
@@ -769,7 +877,7 @@ class ModelBlendService:
             weights=weights,
             method=str(blend.get("method") or "mean"),
             trim_count=int(blend.get("trim_count") or 2),
-            min_coverage=int(blend.get("min_coverage") or 2),
+            min_coverage=min_coverage,
             consensus_min_count=int(blend.get("consensus_min_count") or 0),
             end_date=target,
             lookback=int(window),
@@ -777,6 +885,7 @@ class ModelBlendService:
             symbols=[],
         )
         names = await self._stock_names()
+        profiles = await self._stock_profiles(str(blend.get("market") or CN_MARKET))
         rows_by_day = stats.get("top_rows") or {}
         days = sorted(day for day in rows_by_day if day <= target)[-(int(window) + 1) :]
 
@@ -791,11 +900,14 @@ class ModelBlendService:
                 today.add(symbol)
                 held = streak.get(symbol, 0) + 1
                 streak[symbol] = held
+                profile = profiles.get(symbol) or {}
                 picks.append(
                     {
                         **row,
                         "code": symbol,
                         "name": names.get(symbol) or "",
+                        "industry": profile.get("industry"),
+                        "market_cap_yi": profile.get("market_cap_yi"),
                         "held_days": held,
                         "is_new": held == 1,
                     }
@@ -962,8 +1074,8 @@ class ModelBlendService:
             clean["data_source"] = str(signature["data_source"])
             clean["horizon_days"] = int(signature["target_horizon_days"] or 10)
         elif clean.get("purpose") == "rebalance":
-            # 只改用途不换成员：存量成员同样要过 T+10 闸门
-            self._ensure_purpose_supported(
+            # 只改用途不换成员：存量成员同样要过「同周期」校验
+            self._ensure_rebalance_horizon(
                 await self.members_from_blend(blend), "rebalance"
             )
         merged_min = int(clean.get("min_coverage", blend.get("min_coverage") or 2))
@@ -1007,6 +1119,52 @@ class ModelBlendService:
         except Exception as exc:  # pragma: no cover - 名称缺失不影响主流程
             logger.warning("组合榜单读取股票简称失败: %s", exc)
             return {}
+
+    @staticmethod
+    async def _stock_profiles(
+        market: str = CN_MARKET,
+    ) -> dict[str, dict[str, Any]]:
+        """``前缀式 symbol → {industry, market_cap_yi}``（5 分钟进程内缓存）。
+
+        口径：``stock_snapshot`` 是**当前截面**，不是按日快照；历史日期榜单的
+        行业/市值只能标「当前」，不得用于回测归因。缺失/NaN 一律 None。
+        """
+        key = str(market or CN_MARKET).upper()
+        now = time.monotonic()
+        cached = _PROFILE_CACHE.get(key)
+        if cached is not None and now - cached[0] < PROFILE_CACHE_TTL_SECONDS:
+            return cached[1]
+        try:
+            from backend.services.engine.factor_research import store
+
+            # parquet 读取是阻塞 IO：放到线程池，避免卡住 API/engine 事件循环
+            frame = await asyncio.to_thread(store.stock_snapshot, key)
+        except Exception as exc:  # pragma: no cover - 缺失不影响榜单主流程
+            logger.warning("组合榜单读取行业/市值失败(%s): %s", key, exc)
+            # 失败也缓存，短暂窗口内不再反复读盘/刷日志
+            _PROFILE_CACHE[key] = (now, {})
+            return {}
+        profiles: dict[str, dict[str, Any]] = {}
+        if frame is not None and not getattr(frame, "empty", True):
+            has_industry = "industry" in frame.columns
+            has_mv = "total_mv_yi" in frame.columns
+            for _, row in frame.iterrows():
+                prefix = StockCodeUtil.to_prefix(str(row.get("symbol") or ""))
+                if not prefix:
+                    continue
+                industry = row.get("industry") if has_industry else None
+                market_cap = row.get("total_mv_yi") if has_mv else None
+                profiles[prefix] = {
+                    "industry": industry.strip()
+                    if isinstance(industry, str) and industry.strip()
+                    else None,
+                    "market_cap_yi": float(market_cap) if _finite(market_cap) else None,
+                }
+        _PROFILE_CACHE[key] = (now, profiles)
+        if len(_PROFILE_CACHE) > 8:  # 市场数量有限；防御性上限
+            oldest = min(_PROFILE_CACHE.items(), key=lambda item: item[1][0])[0]
+            _PROFILE_CACHE.pop(oldest, None)
+        return profiles
 
     # ── 历史标注 ────────────────────────────────────────────────────────
 
@@ -1316,8 +1474,18 @@ class ModelBlendService:
 
     @staticmethod
     async def _quotes(
-        symbols: Sequence[str], data_trade_date: date
+        symbols: Sequence[str],
+        data_trade_date: date,
+        *,
+        lookback_days: int = 20,
+        min_adv_days: int = 15,
     ) -> tuple[dict[str, float], dict[str, float], list[str]]:
+        """T 日参考价 + ADV20（元）。
+
+        返回 ``(prices, avg_amounts, warnings)``：``prices`` 只取 T 日收盘价；
+        ``avg_amounts`` 是最近 ``lookback_days`` 个**有成交额**交易日的均值，
+        有效日不足 ``min_adv_days`` 的标的不进映射（计划层会按「成交额缺失」拦截）。
+        """
         suffix_to_prefix = {}
         for symbol in symbols:
             suffix = StockCodeUtil.to_suffix(symbol)
@@ -1325,6 +1493,7 @@ class ModelBlendService:
                 suffix_to_prefix[suffix] = symbol
         if not suffix_to_prefix:
             return {}, {}, []
+        start = data_trade_date - timedelta(days=max(45, int(lookback_days) * 3))
         try:
             from backend.services.engine.data_platform.quantdb_hub import (
                 QuantDBDataHub,
@@ -1335,29 +1504,135 @@ class ModelBlendService:
                 return {}, {}, ["行情源不可用，计划未校验价格与容量"]
             frame = hub.fetch_daily_kline_batch(
                 list(suffix_to_prefix),
-                data_trade_date,
+                start,
                 data_trade_date,
                 adjust="none",
             )
         except Exception as exc:  # pragma: no cover - 行情缺失按警告处理
             logger.warning("组合计划读取行情失败: %s", exc)
             return {}, {}, [f"行情读取失败：{exc}"]
-        prices: dict[str, float] = {}
-        amounts: dict[str, float] = {}
         if frame is None or frame.empty:
             return {}, {}, ["当日行情缺失，计划未校验价格与容量"]
+        history: dict[str, list[tuple[date, float, float]]] = {}
         for _, row in frame.iterrows():
             prefix = suffix_to_prefix.get(str(row.get("symbol")))
             if not prefix:
                 continue
             close = row.get("close")
             amount = row.get("amount")
-            if _finite(close) and float(close) > 0:
-                prices[prefix] = float(close)
-            if _finite(amount) and float(amount) > 0:
-                # QuantDB daily_unadjusted.amount 单位为万元（实测 2026-10-20）。
-                amounts[prefix] = float(amount) * 10_000.0
-        return prices, amounts, []
+            # QuantDB daily_unadjusted.amount 单位为万元（实测 2026-10-20）。
+            if not (_finite(amount) and float(amount) > 0):
+                continue
+            raw_day = row.get("trade_date")
+            day = raw_day.date() if hasattr(raw_day, "date") else _parse_date(raw_day)
+            if day is None or day > data_trade_date:
+                continue
+            history.setdefault(prefix, []).append(
+                (
+                    day,
+                    float(close) if _finite(close) and float(close) > 0 else 0.0,
+                    float(amount) * 10_000.0,
+                )
+            )
+        prices: dict[str, float] = {}
+        avg_amounts: dict[str, float] = {}
+        for prefix, rows in history.items():
+            rows.sort(key=lambda item: item[0])
+            window = rows[-max(1, int(lookback_days)) :]
+            if len(window) >= max(1, int(min_adv_days)):
+                avg_amounts[prefix] = sum(item[2] for item in window) / len(window)
+            today = next(
+                (item for item in reversed(rows) if item[0] == data_trade_date),
+                None,
+            )
+            if today is not None and today[1] > 0:
+                prices[prefix] = today[1]
+        return prices, avg_amounts, []
+
+    @staticmethod
+    async def _risk_flags(
+        symbols: Sequence[str], market: str = CN_MARKET
+    ) -> tuple[dict[str, str], str | None]:
+        """``前缀式 symbol → "ST" / "退市"``（当前截面）+ 数据源错误原因。
+
+        数据源 ``factor_research.data.load_instrument("CN")``（``is_st`` /
+        ``is_quit``，名称含 ST 兜底）。截面无时点性：历史重算时只能说明
+        「按当前截面判定」，这一点由计划层 warnings 明示。
+
+        **失败不再静默放行**：返回 ``(flags, reason)``，``reason`` 非 None 时
+        计划层必须告警并标记 ``data_ok=False``（不可确认），否则「已剔除 ST」
+        的硬条件会在数据源故障时悄悄失效。
+        """
+        if not symbols:
+            return {}, None
+        key = str(market or CN_MARKET).upper()
+        now = time.monotonic()
+        cached = _RISK_CACHE.get(key)
+        if cached is not None and now - cached[0] < PROFILE_CACHE_TTL_SECONDS:
+            all_flags, reason = cached[1], cached[2]
+        else:
+            all_flags, reason = {}, None
+            if key != "CN":
+                reason = f"暂不支持 {key} 的风险标记"
+            else:
+                try:
+                    from backend.services.engine.factor_research.data import (
+                        load_instrument,
+                    )
+
+                    # 全表 parquet 读取是阻塞 IO：放线程池，避免卡事件循环
+                    frame = await asyncio.to_thread(load_instrument, "CN")
+                except Exception as exc:  # pragma: no cover - 数据源故障路径
+                    logger.warning("组合计划读取风险标记失败: %s", exc)
+                    frame, reason = None, str(exc) or type(exc).__name__
+                if reason is None and (frame is None or getattr(frame, "empty", True)):
+                    reason = "风险标记源为空"
+                if reason is None:
+                    all_flags = ModelBlendService._flags_from_instruments(frame)
+            _RISK_CACHE[key] = (now, all_flags, reason)
+            if len(_RISK_CACHE) > 8:  # 市场数量有限；防御性上限
+                oldest = min(_RISK_CACHE.items(), key=lambda item: item[1][0])[0]
+                _RISK_CACHE.pop(oldest, None)
+        wanted = {
+            StockCodeUtil.to_prefix(str(symbol)) or str(symbol) for symbol in symbols
+        }
+        return {sym: flag for sym, flag in all_flags.items() if sym in wanted}, reason
+
+    @staticmethod
+    def _flags_from_instruments(frame: Any) -> dict[str, str]:
+        """从全量证券主表提取 ST/退市标记（纯函数，便于单测）。"""
+        has_st = "is_st" in frame.columns
+        has_quit = "is_quit" in frame.columns
+        flags: dict[str, str] = {}
+
+        def truthy(value: Any) -> bool:
+            if value is True:
+                return True
+            if value is False or value is None:
+                return False
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return False
+            # NaN 必须视为「未知」：bool(float('nan')) 是 True，
+            # 不拦会把整个候选池误标成 ST/退市，计划直接清空。
+            if math.isnan(number):
+                return False
+            return bool(number)
+
+        for _, row in frame.iterrows():
+            prefix = StockCodeUtil.to_prefix(str(row.get("symbol") or ""))
+            if not prefix:
+                continue
+            name = str(row.get("name") or "")
+            is_st = truthy(row.get("is_st")) if has_st else False
+            if not is_st and "ST" in name.upper():
+                is_st = True
+            if has_quit and truthy(row.get("is_quit")):
+                flags[prefix] = "退市"
+            elif is_st:
+                flags[prefix] = "ST"
+        return flags
 
     async def plan(
         self,
@@ -1378,11 +1653,18 @@ class ModelBlendService:
         blend_id = str(blend["blend_id"])
         members = await self.members_from_blend(blend)
         member_ids = [str(m["model_id"]) for m in members]
+        min_coverage = int(blend.get("min_coverage") or 2)
         target = data_trade_date or await self.latest_common_date(
-            tenant_id=tenant_id, user_id=user_id, model_ids=member_ids
+            tenant_id=tenant_id,
+            user_id=user_id,
+            model_ids=member_ids,
+            required=min_coverage,
         )
         if target is None:
-            raise BlendError("所选模型没有共同数据日", code="no_common_date")
+            raise BlendError(
+                "所选模型没有共同数据日：请先对成员做串行补推，或调低最低覆盖数",
+                code="no_common_date",
+            )
 
         weights = _weights_from_members(blend, members)
         ranking = await self.ranking(
@@ -1392,7 +1674,7 @@ class ModelBlendService:
             data_trade_date=target,
             method=str(blend.get("method") or "mean"),
             weights=weights,
-            min_coverage=int(blend.get("min_coverage") or 2),
+            min_coverage=min_coverage,
             trim_count=int(blend.get("trim_count") or 2),
             consensus_min_count=int(blend.get("consensus_min_count") or 0),
             top=max(cfg.top_k, cfg.target_positions),
@@ -1418,14 +1700,25 @@ class ModelBlendService:
             weights=weights,
             method=str(blend.get("method") or "mean"),
             trim_count=int(blend.get("trim_count") or 2),
-            min_coverage=int(blend.get("min_coverage") or 2),
+            min_coverage=min_coverage,
             consensus_min_count=int(blend.get("consensus_min_count") or 0),
             end_date=target,
             lookback=cfg.lookback,
             top_k=max(cfg.top_k, cfg.target_positions),
             symbols=candidate_symbols,
         )
-        prices, amounts, quote_warnings = await self._quotes(candidate_symbols, target)
+        prices, avg_amounts, quote_warnings = await self._quotes(
+            candidate_symbols,
+            target,
+            lookback_days=cfg.adv_lookback_days,
+            min_adv_days=cfg.min_adv_days,
+        )
+        risk_flags: dict[str, str] = {}
+        risk_error: str | None = None
+        if cfg.exclude_st:
+            risk_flags, risk_error = await self._risk_flags(
+                candidate_symbols, market=str(blend.get("market") or CN_MARKET)
+            )
         target_date = await self._next_trading_day(target)
         paper = build_rebalance_plan(
             data_trade_date=target,
@@ -1436,7 +1729,8 @@ class ModelBlendService:
             positions=positions,
             config=cfg,
             prices=prices,
-            amounts=amounts,
+            avg_amounts=avg_amounts,
+            risk_flags=risk_flags,
         )
         weight_map = weights or {}
         config_digest = config_hash(
@@ -1444,7 +1738,7 @@ class ModelBlendService:
                 (str(m["model_id"]), float(weight_map.get(m["model_id"], 1.0)))
                 for m in members
             ],
-            min_coverage=int(blend.get("min_coverage") or 2),
+            min_coverage=min_coverage,
             method=str(blend.get("method") or "mean"),
             trim_count=int(blend.get("trim_count") or 2),
             consensus_min_count=int(blend.get("consensus_min_count") or 0),
@@ -1458,10 +1752,36 @@ class ModelBlendService:
             lookback=cfg.lookback,
             min_lookback_days=cfg.min_lookback_days,
             capital=cfg.capital,
+            min_adv_yi=cfg.min_adv_yi,
+            exclude_st=cfg.exclude_st,
+            adv_lookback_days=cfg.adv_lookback_days,
+            min_adv_days=cfg.min_adv_days,
         )
         digest_positions = positions_hash(positions)
         payload = paper.to_dict()
-        payload["warnings"] = list(payload.get("warnings") or []) + quote_warnings
+        warnings = list(payload.get("warnings") or []) + quote_warnings
+        # data_ok=False 表示行情/风险标记缺失：计划可以看，但**不可确认**，
+        # 否则「已剔除 ST / 已按成交额匹配」的硬条件会在故障时静默失效。
+        data_ok = not quote_warnings
+        if cfg.exclude_st:
+            if risk_error:
+                warnings.append(f"风险标记不可用，未剔除 ST/退市：{risk_error}")
+                data_ok = False
+            else:
+                warnings.append("ST/退市按当前截面判定，历史重算无时点性")
+        payload["warnings"] = warnings
+        payload["data_ok"] = data_ok
+        payload["summary"]["data_ok"] = data_ok
+        # 名称/行业/市值与榜单同源；计划行缺失时仍保持 None（前端显示 —）
+        names = await self._stock_names()
+        profiles = await self._stock_profiles(str(blend.get("market") or CN_MARKET))
+        for section in ("entries", "holds", "exits"):
+            for row in payload.get(section) or []:
+                symbol = str(row.get("symbol"))
+                profile = profiles.get(symbol) or {}
+                row.setdefault("name", names.get(symbol) or None)
+                row.setdefault("industry", profile.get("industry"))
+                row.setdefault("market_cap_yi", profile.get("market_cap_yi"))
         if not persist:
             payload.update(
                 {
@@ -1495,6 +1815,7 @@ class ModelBlendService:
             exits=payload["exits"],
         )
         stored["warnings"] = payload["warnings"]
+        stored["data_ok"] = data_ok
         stored["blend"] = {
             "blend_id": blend_id,
             "name": blend.get("name"),
@@ -1513,6 +1834,15 @@ class ModelBlendService:
     ) -> dict[str, Any]:
         if plan.get("confirmed_at"):
             raise BlendError("计划已确认", status_code=409, code="plan_confirmed")
+        summary = (
+            plan.get("summary") if isinstance(plan.get("summary"), Mapping) else {}
+        )
+        if plan.get("data_ok") is False or summary.get("data_ok") is False:
+            raise BlendError(
+                "计划数据不完整（行情或 ST/退市标记缺失），请重新生成后再确认",
+                status_code=409,
+                code="plan_data_degraded",
+            )
         plan_date = date.fromisoformat(str(plan["data_trade_date"]))
         allowed = await self._recent_trading_days()
         if plan_date not in allowed:
@@ -1571,10 +1901,15 @@ class ModelBlendService:
             if plan is None:
                 continue
             plan_date = str(plan.get("data_trade_date") or "")[:10]
+            summary = (
+                plan.get("summary") if isinstance(plan.get("summary"), Mapping) else {}
+            )
             plan["can_confirm"] = (
                 bool(plan.get("plan_id"))
                 and not plan.get("confirmed_at")
                 and plan_date in allowed
+                and plan.get("data_ok") is not False
+                and summary.get("data_ok") is not False
             )
 
     @staticmethod

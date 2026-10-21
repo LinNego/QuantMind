@@ -533,6 +533,7 @@ class ModelBlendPersistence:
 
     @staticmethod
     def _row_to_plan(row: Mapping[str, Any]) -> dict[str, Any]:
+        summary = _loads(row.get("summary"), {})
         return {
             "plan_id": str(row["plan_id"]),
             "blend_id": str(row["blend_id"]),
@@ -541,7 +542,11 @@ class ModelBlendPersistence:
             "config_hash": str(row["config_hash"]),
             "positions_hash": str(row["positions_hash"]),
             "params": _loads(row.get("params"), {}),
-            "summary": _loads(row.get("summary"), {}),
+            "summary": summary,
+            # 提升到顶层，读接口与即时生成返回同一形状；旧计划无此键为 None
+            "data_ok": (
+                summary.get("data_ok") if isinstance(summary, Mapping) else None
+            ),
             "entries": _loads(row.get("entries"), []),
             "holds": _loads(row.get("holds"), []),
             "exits": _loads(row.get("exits"), []),

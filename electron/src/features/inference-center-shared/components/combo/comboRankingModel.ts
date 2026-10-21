@@ -13,6 +13,7 @@ import type {
   BlendHistory,
   BlendPlan,
   BlendPlanRow,
+  BlendPurpose,
   BlendRankingRow,
   BlendRollingColumn,
   BlendRollingPick,
@@ -206,6 +207,30 @@ export function rankingCsvFilename(blendName: string, dataTradeDate: string): st
 
 // ── 模板 ───────────────────────────────────────────────────────────────
 
+export interface TemplateRollingDefaults {
+  purpose: 'rebalance';
+  entry_per_day: number;
+  rolling_window: number;
+  target_positions: number;
+}
+
+/**
+ * 滚动建仓默认值随预测周期派生（与后端 `combo_auto._template` 同口径）：
+ * T+10 → 5 只/日 × 10 日 = 50；T+5 → 25；T+20 → 100（上限 100）。
+ */
+export function templateRollingDefaults(horizonDays?: number | null): TemplateRollingDefaults {
+  const horizon = Number(horizonDays);
+  const window =
+    Number.isFinite(horizon) && horizon >= 1 ? Math.min(60, Math.round(horizon)) : 10;
+  const entryPerDay = 5;
+  return {
+    purpose: 'rebalance',
+    entry_per_day: entryPerDay,
+    rolling_window: window,
+    target_positions: Math.min(100, entryPerDay * window),
+  };
+}
+
 /** 模板 → 保存请求（成员按模板顺序，权重原样；source 固定 system） */
 export function templateToCreateRequest(
   template: ComboTemplate,
@@ -214,6 +239,10 @@ export function templateToCreateRequest(
   name: string;
   market: string;
   model_ids: string[];
+  purpose: BlendPurpose;
+  entry_per_day: number;
+  rolling_window: number;
+  target_positions: number;
   method: ComboTemplate['method'];
   trim_count: number;
   min_coverage: number;
@@ -226,10 +255,24 @@ export function templateToCreateRequest(
     template.members.map((member) => [member.model_id, Number(member.weight) || 1]),
   );
   const equal = template.members.every((member) => Math.abs((Number(member.weight) || 1) - 1) < 1e-9);
+  const defaults = templateRollingDefaults(template.horizon_days);
+  const pick = (value: number | undefined, fallback: number): number =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 1 ? value : fallback;
   return {
     name: (name ?? template.name).trim(),
     market: template.market || 'CN',
     model_ids: template.members.map((member) => member.model_id),
+    purpose: template.purpose ?? defaults.purpose,
+    // 与服务端 BlendCreateBody 的 le 上限对齐：超上限的模板值不得原样下发
+    entry_per_day: Math.min(50, pick(template.entry_per_day, defaults.entry_per_day)),
+    rolling_window: Math.min(
+      60,
+      pick(template.rolling_window, defaults.rolling_window),
+    ),
+    target_positions: Math.min(
+      500,
+      pick(template.target_positions, defaults.target_positions),
+    ),
     method: template.method,
     trim_count: template.trim_count,
     min_coverage: template.min_coverage,

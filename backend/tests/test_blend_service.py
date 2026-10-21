@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 from sqlalchemy import text
@@ -351,15 +351,24 @@ async def test_resolve_members_rejects_below_min_and_above_max():
             market="CN",
             purpose="rebalance",
         )
-    many = _service([_model(f"m{i}") for i in range(21)])
+    # 上限 30：T+5 全组模板实有 24 个成员，旧上限 20 会把整组模板挡在 422
+    many = _service([_model(f"m{i}") for i in range(31)])
     with pytest.raises(BlendError):
         await many._resolve_members(
             tenant_id="t",
             user_id="u",
-            model_ids=[f"m{i}" for i in range(21)],
+            model_ids=[f"m{i}" for i in range(31)],
             market="CN",
             purpose="rebalance",
         )
+    ok = await _service([_model(f"m{i}") for i in range(24)])._resolve_members(
+        tenant_id="t",
+        user_id="u",
+        model_ids=[f"m{i}" for i in range(24)],
+        market="CN",
+        purpose="rebalance",
+    )
+    assert len(ok) == 24
 
 
 @pytest.mark.unit
@@ -418,7 +427,35 @@ async def test_resolve_members_rejects_signature_mismatch_but_ignores_horizon():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_resolve_members_rebalance_requires_t10():
+async def test_resolve_members_rebalance_accepts_any_uniform_horizon():
+    svc = _service(
+        [
+            _model("a10", horizon=10),
+            _model("b10", horizon=10),
+            _model("a5", horizon=5),
+            _model("b5", horizon=5),
+            _model("a20", horizon=20),
+            _model("b20", horizon=20),
+        ]
+    )
+    for pair, horizon in (
+        (["a10", "b10"], 10),
+        (["a5", "b5"], 5),
+        (["a20", "b20"], 20),
+    ):
+        members = await svc._resolve_members(
+            tenant_id="t",
+            user_id="u",
+            model_ids=pair,
+            market="CN",
+            purpose="rebalance",
+        )
+        assert {m["target_horizon_days"] for m in members} == {horizon}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_resolve_members_rebalance_rejects_mixed_horizon():
     svc = _service([_model("a"), _model("b", horizon=5)])
     with pytest.raises(BlendError) as exc:
         await svc._resolve_members(
@@ -428,7 +465,7 @@ async def test_resolve_members_rebalance_requires_t10():
             market="CN",
             purpose="rebalance",
         )
-    assert exc.value.code == "horizon_not_supported"
+    assert exc.value.code == "mixed_horizon"
 
 
 @pytest.mark.unit
@@ -446,6 +483,225 @@ async def test_resolve_members_rejects_ensemble_member():
             purpose="rebalance",
         )
     assert exc.value.code == "model_not_eligible"
+
+
+# ── 行业 / 市值 ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_row_payload_carries_industry_and_market_cap_or_none():
+    svc = ModelBlendService()
+    row = BlendRow(
+        symbol="SZ000001",
+        score=0.8,
+        rank=1,
+        coverage=8,
+        dispersion=None,
+        pct=0.9,
+        research_score=90.0,
+        position="HOLD",
+        contributions={},
+        missing_members=(),
+    )
+    payload = svc._row_payload(
+        row,
+        {"SZ000001": "平安银行"},
+        {"SZ000001": {"industry": "银行", "market_cap_yi": 1234.5}},
+    )
+    assert payload["industry"] == "银行"
+    assert payload["market_cap_yi"] == pytest.approx(1234.5)
+    # 缺档案 → None（前端显示 —），绝不落成 0
+    missing = svc._row_payload(row, {}, {})
+    assert missing["industry"] is None
+    assert missing["market_cap_yi"] is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_stock_profiles_maps_suffix_to_prefix_and_drops_nan(monkeypatch):
+    import pandas as pd
+
+    from backend.services.engine.factor_research import store
+
+    fake = pd.DataFrame(
+        {
+            "symbol": ["000001.SZ", "600000.SH", "000002.SZ"],
+            "industry": ["银行", "银行", None],
+            "total_mv_yi": [1000.0, 2000.0, float("nan")],
+        }
+    )
+    monkeypatch.setattr(store, "stock_snapshot", lambda market="CN": fake)
+    blend_service_module._PROFILE_CACHE.clear()
+    profiles = await ModelBlendService._stock_profiles("CN")
+    assert profiles["SZ000001"]["industry"] == "银行"
+    assert profiles["SZ000001"]["market_cap_yi"] == pytest.approx(1000.0)
+    assert profiles["SH600000"]["market_cap_yi"] == pytest.approx(2000.0)
+    assert profiles["SZ000002"] == {"industry": None, "market_cap_yi": None}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_stock_profiles_returns_empty_on_source_failure(monkeypatch):
+    from backend.services.engine.factor_research import store
+
+    def boom(market="CN"):
+        raise RuntimeError("parquet missing")
+
+    monkeypatch.setattr(store, "stock_snapshot", boom)
+    blend_service_module._PROFILE_CACHE.clear()
+    assert await ModelBlendService._stock_profiles("CN") == {}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_risk_flags_maps_st_delisted_and_ignores_nan(monkeypatch):
+    import pandas as pd
+
+    from backend.services.engine.factor_research import data as factor_data
+
+    fake = pd.DataFrame(
+        {
+            "symbol": ["000001.SZ", "600000.SH", "000002.SZ", "000003.SZ"],
+            "name": ["平安银行", "*ST某某", "退市某某", "正常股份"],
+            # NaN 必须是「未知」而不是 True：否则整池都会被误标 ST
+            "is_st": [0.0, 1.0, float("nan"), float("nan")],
+            "is_quit": [0.0, float("nan"), 1.0, float("nan")],
+        }
+    )
+    monkeypatch.setattr(factor_data, "load_instrument", lambda market="CN": fake)
+    blend_service_module._RISK_CACHE.clear()
+    flags, reason = await ModelBlendService._risk_flags(
+        ["SZ000001", "SH600000", "SZ000002", "SZ000003"], "CN"
+    )
+    assert reason is None
+    assert flags == {"SH600000": "ST", "SZ000002": "退市"}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_risk_flags_reports_source_failure_instead_of_failing_open(monkeypatch):
+    from backend.services.engine.factor_research import data as factor_data
+
+    def boom(market="CN"):
+        raise RuntimeError("parquet missing")
+
+    monkeypatch.setattr(factor_data, "load_instrument", boom)
+    blend_service_module._RISK_CACHE.clear()
+    flags, reason = await ModelBlendService._risk_flags(["SZ000001"], "CN")
+    assert flags == {}
+    assert reason and "parquet missing" in reason
+
+    # 非 CN 市场：明确返回「不支持」，不得伪装成「无风险标的」
+    flags, reason = await ModelBlendService._risk_flags(["00700.HK"], "HK")
+    assert flags == {}
+    assert reason and "HK" in reason
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_latest_common_date_uses_min_coverage_as_required(monkeypatch):
+    captured: dict = {}
+
+    class _Result:
+        def first(self):
+            return (SAMPLE_DATE,)
+
+    class _Session:
+        async def execute(self, statement, params):
+            captured.update(params)
+            return _Result()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        blend_service_module, "get_session", lambda **kwargs: _Session()
+    )
+    found = await ModelBlendService().latest_common_date(
+        tenant_id="t",
+        user_id="u",
+        model_ids=["a", "b", "c", "d"],
+        required=2,
+    )
+    assert found == SAMPLE_DATE
+    # 不做「全员有 run」：24 成员 T+5 组只要求 min_coverage 个
+    assert captured["required"] == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_auto_candidates_filters_templates_to_runnable_models():
+    """模板只列有 run 的成员（K2），缺失数原样带到模板上。"""
+    models = [_model(f"m{i}", horizon=5) for i in range(4)]
+    svc = _service(models)
+
+    async def fake_runnable(*, tenant_id, user_id, model_ids):
+        assert set(model_ids) == {"m0", "m1", "m2", "m3"}
+        return {"m0", "m1", "m2"}
+
+    svc._runnable_model_ids = fake_runnable
+    payload = await svc.auto_candidates(tenant_id="t", user_id="u")
+    full = next(i for i in payload["items"] if i["kind"] == "full_equal")
+    assert [m["model_id"] for m in full["members"]] == ["m0", "m1", "m2"]
+    assert full["missing_members"] == 1
+    assert full["min_coverage"] == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_runnable_model_ids_reads_completed_runs(monkeypatch):
+    captured: dict = {}
+
+    class _Result:
+        def all(self):
+            return [("m1",), ("m2",)]
+
+    class _Session:
+        async def execute(self, statement, params):
+            captured.update(params)
+            return _Result()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        blend_service_module, "get_session", lambda **kwargs: _Session()
+    )
+    ids = await ModelBlendService()._runnable_model_ids(
+        tenant_id="t", user_id="u", model_ids=["m1", "m2", "m3"]
+    )
+    assert ids == {"m1", "m2"}
+    assert captured["model_ids"] == ["m1", "m2", "m3"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_runnable_model_ids_degrades_to_none_on_query_failure(monkeypatch):
+    """查询失败 → None（模板不过滤），而不是空集（模板全消失）。"""
+
+    class _Session:
+        async def execute(self, statement, params):
+            raise RuntimeError("db down")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        blend_service_module, "get_session", lambda **kwargs: _Session()
+    )
+    ids = await ModelBlendService()._runnable_model_ids(
+        tenant_id="t", user_id="u", model_ids=["m1"]
+    )
+    assert ids is None
 
 
 # ── 创建 / 修改 ──────────────────────────────────────────────────────────
@@ -572,7 +828,7 @@ async def test_update_blend_rejects_weights_without_members():
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_update_blend_rechecks_horizon_when_purpose_becomes_rebalance():
-    """改用途也必须过 T+10 闸门——否则存量成员绕过 _resolve_members 的校验。"""
+    """改用途也要过「同周期」校验——否则存量混周期成员绕过 _resolve_members。"""
     persistence = _FakePersistence()
     svc = _service([_model("a"), _model("a5", horizon=5)], persistence)
     base = {
@@ -592,10 +848,10 @@ async def test_update_blend_rechecks_horizon_when_purpose_becomes_rebalance():
             model_ids=None,
             weights=None,
         )
-    assert exc.value.code == "horizon_not_supported"
+    assert exc.value.code == "mixed_horizon"
     assert persistence.updated is None
 
-    # 改回 next_day 不需要 T+10 校验，正常落库
+    # 改回 next_day 允许跨周期，正常落库
     await svc.update_blend(
         base,
         tenant_id="t",
@@ -605,6 +861,30 @@ async def test_update_blend_rechecks_horizon_when_purpose_becomes_rebalance():
         weights=None,
     )
     assert persistence.updated["fields"]["purpose"] == "next_day"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_blend_allows_uniform_t5_purpose():
+    persistence = _FakePersistence()
+    svc = _service([_model("a5", horizon=5), _model("b5", horizon=5)], persistence)
+    base = {
+        "blend_id": "bl_5",
+        "tenant_id": "t",
+        "user_id": "u",
+        "market": "CN",
+        "purpose": "next_day",
+        "members": [{"model_id": "a5"}, {"model_id": "b5"}],
+    }
+    await svc.update_blend(
+        base,
+        tenant_id="t",
+        user_id="u",
+        fields={"purpose": "rebalance"},
+        model_ids=None,
+        weights=None,
+    )
+    assert persistence.updated["fields"]["purpose"] == "rebalance"
 
 
 # ── 预览 ─────────────────────────────────────────────────────────────────
@@ -799,6 +1079,48 @@ async def test_annotate_confirmable_marks_window_and_rejects_terminal_plans():
         False,
         None,
     ]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_annotate_confirmable_blocks_data_degraded_plans():
+    svc = _service([])
+
+    async def recent():
+        return {date(2026, 10, 19)}
+
+    svc._recent_trading_days = recent
+    plans = [
+        {"plan_id": "p1", "data_trade_date": "2026-10-19", "data_ok": False},
+        {
+            "plan_id": "p2",
+            "data_trade_date": "2026-10-19",
+            "summary": {"data_ok": False},
+        },
+        {"plan_id": "p3", "data_trade_date": "2026-10-19", "summary": {}},
+    ]
+    await svc.annotate_confirmable(plans)
+    assert [p.get("can_confirm") for p in plans] == [False, False, True]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_confirm_plan_rejects_data_degraded_plan():
+    svc = _service([_model("a"), _model("b")])
+    with pytest.raises(BlendError) as exc:
+        await svc.confirm_plan(
+            {"blend_id": "bl_x"},
+            {
+                "plan_id": "p1",
+                "data_trade_date": SAMPLE_DATE.isoformat(),
+                "target_date": "2026-10-20",
+                "confirmed_at": None,
+                "summary": {"data_ok": False},
+            },
+            tenant_id="t",
+            user_id="u",
+        )
+    assert exc.value.code == "plan_data_degraded"
 
 
 @pytest.mark.unit
@@ -1310,7 +1632,58 @@ async def test_plan_readonly_real_data_has_no_order_semantics_and_budget():
         assert entry["ref_price"] > 0
         assert entry["target_value"] > 0
         assert "side" not in entry and "order_id" not in entry
+        # 机构口径：能新进就必然校验过 ADV20（缺失/不足会被拦下）
+        assert entry["adv_yi"] is not None and entry["adv_yi"] > 0
+        # 展示面字段随行下发（缺失允许 None，但键必须存在）
+        assert "name" in entry and "industry" in entry and "market_cap_yi" in entry
     assert isinstance(plan["warnings"], list)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_quotes_adv_requires_min_valid_days(monkeypatch):
+    """ADV20 只算最近 20 个有成交额的交易日；有效日不足 min_adv_days 不进映射。"""
+    import pandas as pd
+
+    from backend.services.engine.data_platform import quantdb_hub
+
+    rows = []
+    # 600000.SH：14 个有效日（<15）→ 不产出 ADV，但当日参考价仍可用
+    for i in range(14):
+        rows.append(
+            {
+                "symbol": "600000.SH",
+                "trade_date": SAMPLE_DATE - timedelta(days=13 - i),
+                "close": 10.0,
+                "amount": 10_000.0,  # 万元
+            }
+        )
+    # 000001.SZ：15 个有效日 → 产出 ADV（×10000 转元）
+    for i in range(15):
+        rows.append(
+            {
+                "symbol": "000001.SZ",
+                "trade_date": SAMPLE_DATE - timedelta(days=14 - i),
+                "close": 12.0,
+                "amount": 20_000.0,
+            }
+        )
+    fake = pd.DataFrame(rows)
+
+    def fake_fetch(self, symbols, start, end, adjust="none"):
+        return fake
+
+    monkeypatch.setattr(
+        quantdb_hub.QuantDBDataHub, "fetch_daily_kline_batch", fake_fetch
+    )
+    prices, amounts, warnings = await ModelBlendService._quotes(
+        ["SH600000", "SZ000001"], SAMPLE_DATE, lookback_days=20, min_adv_days=15
+    )
+    assert warnings == []
+    assert prices["SH600000"] == pytest.approx(10.0)
+    assert prices["SZ000001"] == pytest.approx(12.0)
+    assert "SH600000" not in amounts
+    assert amounts["SZ000001"] == pytest.approx(20_000.0 * 10_000.0)
 
 
 @pytest.mark.integration
