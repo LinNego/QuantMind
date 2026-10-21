@@ -100,6 +100,8 @@ export const ComboBuilderModal: React.FC<ComboBuilderModalProps> = ({
   const [preview, setPreview] = useState<BlendRankingResponse | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const [saving, setSaving] = useState(false);
+  // 读取失败后的手动重试序号：只用于重跑资格请求，不动已填参数
+  const [reloadNonce, setReloadNonce] = useState(0);
   // 打开瞬间捕获预填参数：拉取过程中父级重渲染不应改变本次预填
   const initialRef = useRef({ template: initialTemplate, modelIds: initialModelIds });
   initialRef.current = { template: initialTemplate, modelIds: initialModelIds };
@@ -151,7 +153,7 @@ export const ComboBuilderModal: React.FC<ComboBuilderModalProps> = ({
     return () => {
       alive = false;
     };
-  }, [open, market, reset]);
+  }, [open, market, reset, reloadNonce]);
 
   const groupOf = useCallback(
     (modelId: string) => groups.find((g) => g.models.some((m) => m.model_id === modelId)),
@@ -318,7 +320,19 @@ export const ComboBuilderModal: React.FC<ComboBuilderModalProps> = ({
           current={step}
           items={[{ title: '选成员' }, { title: '参数' }, { title: '预览保存' }]}
         />
-        {error && <Alert type="error" showIcon message={error} />}
+        {error && (
+          <Alert
+            type="error"
+            showIcon
+            message="可参与模型读取失败"
+            description={error}
+            action={
+              <Button size="small" onClick={() => setReloadNonce((n) => n + 1)}>
+                重试
+              </Button>
+            }
+          />
+        )}
         {selectedGroupKeys.length > 1 && (
           <Alert
             type="warning"
@@ -331,7 +345,7 @@ export const ComboBuilderModal: React.FC<ComboBuilderModalProps> = ({
         {step === 0 && (
           <div className="max-h-[420px] overflow-auto space-y-2" data-testid="combo-builder-members">
             {loading && <div className="text-xs text-slate-500">读取可参与模型…</div>}
-            {!loading && groups.length === 0 && (
+            {!loading && !error && groups.length === 0 && (
               <Alert type="info" showIcon message="没有可参与组合的模型" description="模型需就绪、非融合模型，且具备完整特征签名。" />
             )}
             {groups.map((group) => {

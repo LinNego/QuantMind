@@ -211,11 +211,23 @@ class BlendService {
  */
 export function blendErrorMessage(error: unknown): string {
   const err = error as {
-    response?: { data?: { detail?: unknown } };
+    response?: { status?: number; data?: { detail?: unknown } };
     message?: string;
   };
   const detail = err?.response?.data?.detail;
-  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (typeof detail === 'string' && detail.trim()) {
+    const text = detail.trim();
+    // 旧后端没挂组合路由时，/models/blends/* 会被 model_training 的
+    // `GET /{model_id}` 兜底捕获并回英文 `Model not found`。
+    // 这不是「模型不存在」，而是「后端版本落后」——必须给能动手的文案。
+    if (
+      err?.response?.status === 404 &&
+      text.toLowerCase() === 'model not found'
+    ) {
+      return '组合选股接口未就绪：当前后端为旧版本，请更新后端后重试';
+    }
+    return text;
+  }
   if (detail && typeof detail === 'object') {
     const obj = detail as { message?: unknown; code?: unknown };
     if (typeof obj.message === 'string' && obj.message.trim()) return obj.message;

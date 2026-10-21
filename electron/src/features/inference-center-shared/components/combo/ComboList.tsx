@@ -23,6 +23,8 @@ export interface ComboListProps {
   selection: ComboSelection | null;
   baselineTemplateId: string | null;
   loading: boolean;
+  /** 清单/模板读取失败：空态文案要说「读取失败」，不能谎称「暂无」 */
+  error?: string | null;
   onSelect: (selection: ComboSelection) => void;
   onNew: () => void;
 }
@@ -42,6 +44,7 @@ export const ComboList: React.FC<ComboListProps> = ({
   selection,
   baselineTemplateId,
   loading,
+  error = null,
   onSelect,
   onNew,
 }) => {
@@ -66,6 +69,8 @@ export const ComboList: React.FC<ComboListProps> = ({
           </div>
           {loading && blends.length === 0 ? (
             <Skeleton active paragraph={{ rows: 3 }} title={false} />
+          ) : error && blends.length === 0 ? (
+            <div className="px-1 py-3 text-[11px] text-rose-500">组合清单读取失败</div>
           ) : blends.length === 0 ? (
             <div className="px-1 py-3 text-[11px] text-slate-400">
               暂无已保存组合；选中下方模板后保存即可启用滚动与纸面计划。
@@ -115,6 +120,8 @@ export const ComboList: React.FC<ComboListProps> = ({
           {templates.length === 0 ? (
             loading ? (
               <Skeleton active paragraph={{ rows: 2 }} title={false} />
+            ) : error ? (
+              <div className="px-1 py-2 text-[11px] text-rose-500">模板读取失败</div>
             ) : (
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可用模板" />
             )

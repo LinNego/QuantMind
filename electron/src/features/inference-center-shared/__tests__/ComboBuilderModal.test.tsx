@@ -219,5 +219,19 @@ describe('ComboBuilderModal', () => {
     mocks.getEligible.mockRejectedValueOnce(new Error('网关超时'));
     renderModal();
     expect(await screen.findByText('网关超时')).toBeInTheDocument();
+    // 失败与「确实没有可参与模型」是两件事，不能同时给出误导性空态
+    expect(screen.queryByText('没有可参与组合的模型')).toBeNull();
+  });
+
+  it('读取失败后可重试，重试成功恢复模型清单', async () => {
+    mocks.getEligible
+      .mockRejectedValueOnce(new Error('Model not found'))
+      .mockResolvedValueOnce(eligible());
+    renderModal();
+    expect(await screen.findByText('Model not found')).toBeInTheDocument();
+    // antd 对两字按钮自动插入空格（渲染成「重 试」）
+    fireEvent.click(screen.getByRole('button', { name: /重\s*试/ }));
+    expect(await screen.findByText('LGB')).toBeInTheDocument();
+    expect(mocks.getEligible).toHaveBeenCalledTimes(2);
   });
 });

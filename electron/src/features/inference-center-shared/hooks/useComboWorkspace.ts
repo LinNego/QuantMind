@@ -76,6 +76,8 @@ export interface ComboWorkspaceState {
   reloadEvidence: () => void;
 
   refreshBlends: () => Promise<void>;
+  /** 重载组合清单 + 模板（失败重试入口）；同时复位默认组合的「只建一次」守卫 */
+  reloadSnapshot: () => Promise<void>;
 }
 
 export function useComboWorkspace(market: string): ComboWorkspaceState {
@@ -380,6 +382,13 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
     }
   }, [selectedBlend, plan]);
 
+  const reloadSnapshot = useCallback(async () => {
+    // 手动重试视为一次新的首启：后端更新/网络恢复后仍应能补建默认组合，
+    // 否则一次失败会让 autoCreateRef 永久锁死，直到整页刷新。
+    autoCreateRef.current = false;
+    await loadSnapshot();
+  }, [loadSnapshot]);
+
   const refreshBlends = useCallback(async () => {
     setSnapshotLoading(true);
     try {
@@ -430,5 +439,6 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
       setEvidenceNonce((n) => n + 1);
     },
     refreshBlends,
+    reloadSnapshot,
   };
 }

@@ -77,6 +77,7 @@ export const ComboWorkspace: React.FC<ComboWorkspaceProps> = ({
         selection={state.selection}
         baselineTemplateId={state.baselineTemplateId}
         loading={state.snapshotLoading}
+        error={state.snapshotError}
         onSelect={state.select}
         onNew={() => openBuilder([], false)}
       />
@@ -123,7 +124,18 @@ export const ComboWorkspace: React.FC<ComboWorkspaceProps> = ({
         </div>
 
         {state.snapshotError && (
-          <div className="shrink-0 px-3 pt-2 text-[11px] text-rose-600">{state.snapshotError}</div>
+          <div className="shrink-0 flex items-center gap-2 px-3 pt-2 text-[11px] text-rose-600">
+            <span className="min-w-0 break-all">{state.snapshotError}</span>
+            <Button
+              size="small"
+              type="link"
+              className="!h-auto !px-1 text-[11px]"
+              loading={state.snapshotLoading}
+              onClick={() => void state.reloadSnapshot()}
+            >
+              重新加载
+            </Button>
+          </div>
         )}
 
         <Tabs

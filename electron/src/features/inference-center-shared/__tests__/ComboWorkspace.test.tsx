@@ -182,6 +182,22 @@ describe('ComboWorkspace', () => {
     );
   });
 
+  it('清单读取失败：展示原因与重试入口，重试后自动补建默认组合', async () => {
+    mocks.listBlends.mockRejectedValueOnce(new Error('Model not found')).mockResolvedValueOnce([]);
+    mocks.getAutoCandidates.mockResolvedValue(autoCandidates());
+    renderWorkspace();
+
+    expect(await screen.findByText('Model not found')).toBeInTheDocument();
+    // 失败态不得再渲染「加载中」骨架，也不得谎称「暂无已保存组合」
+    expect(screen.queryByText(/暂无已保存组合/)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /重新加载/ }));
+    await waitFor(() => expect(mocks.listBlends).toHaveBeenCalledTimes(2));
+    // 重试成功后 autoCreate 守卫必须已复位，否则默认组合永远建不出来
+    await waitFor(() => expect(mocks.createBlend).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText('浦发银行')).toBeInTheDocument();
+  });
+
   it('已有组合时不再建 C0，榜单带数据日', async () => {
     renderWorkspace();
     await screen.findByText('浦发银行');
