@@ -47,7 +47,18 @@ from backend.services.engine.inference.fusion_orchestrator import (
     create_fusion_model,
 )
 from backend.services.engine.inference.router_service import InferenceRouterService
+from backend.services.engine.inference.model_backfill import (
+    MAX_GAP_DAYS_PER_MODEL,
+    compute_coverage,
+    resolve_backfill_model,
+    resolve_pred_candidates,
+)
 from backend.services.engine.inference.script_runner import InferenceScriptRunner
+from backend.services.engine.services.model_inference_job_service import (
+    JobValidationError,
+    create_job,
+    model_inference_job_persistence,
+)
 from backend.services.engine.services.model_inference_batch_persistence import (
     model_inference_batch_persistence,
 )
@@ -56,7 +67,6 @@ from backend.services.engine.services.model_inference_persistence import (
 )
 from backend.shared.database_manager_v2 import get_session
 from backend.shared.inference_stats import compute_score_distribution
-from backend.shared.inference_coverage import find_inference_gap_dates
 from backend.shared.model_assets import model_asset_gaps
 from backend.shared.model_registry import (
     MAX_DISPLAY_NAME_LENGTH,
@@ -1245,126 +1255,9 @@ async def get_model_market_regime(
 
 
 # ── 推理覆盖与一键补全（追加至 pred.parquet） ──────────────────────────────
-_backfill_tasks: dict[str, dict[str, Any]] = {}
-
-
-def _resolve_pred_candidates(storage_path: str) -> list[Path]:
-    base = Path(storage_path)
-    return [
-        base / "pred.parquet",
-        base / "pred" / "pred.parquet",
-        base / "pred.parquet",
-    ]
-
-
-def _read_pred_dates(parquet_file: Path) -> list[str]:
-    import duckdb
-
-    con = duckdb.connect()
-    try:
-        cols = [
-            r[0]
-            for r in con.execute(
-                f"SELECT * FROM read_parquet('{str(parquet_file)}') LIMIT 0"
-            ).description
-        ]
-        date_col = (
-            "trade_date" if "trade_date" in cols else "date" if "date" in cols else None
-        )
-        if not date_col:
-            return []
-        rows = con.execute(
-            f"SELECT DISTINCT CAST({date_col} AS DATE) AS d FROM read_parquet('{str(parquet_file)}') ORDER BY d"
-        ).fetchall()
-        return [str(r[0])[:10] for r in rows if r[0] is not None]
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-
-def _quantdb_latest_factor_date(market: str = "CN") -> date | None:
-    """QuantDB 因子数据最新可用交易日；失败返回 None。
-
-    用于把 coverage 缺口的上限从「最新交易日」收敛到「数据已产出日」，
-    避免把因子尚未产出（T+1 更新）的当日误判为缺口并触发注定失败的补全。
-    """
-    try:
-        from backend.services.engine.data_platform.quantdb_factor_reader import (
-            QuantDBFactorReader,
-            market_data_dir,
-        )
-
-        qdir = market_data_dir(market)
-        if not qdir.is_dir():
-            return None
-        reader = QuantDBFactorReader(qdir, market=market)
-        dates = reader.available_dates("l1_factors")
-        if not dates:
-            return None
-        return date.fromisoformat(str(dates[-1])[:10])
-    except Exception:
-        return None
-
-
-def _merge_runner_signals_into_pred(
-    parquet_file: Path, signals_by_date: list[tuple[str, list[dict]]]
-) -> int:
-    """把 runner 真实推理分数合并进 pred.parquet（coverage/分数曲线的数据源）。
-
-    实现移至共享模块 backend.services.engine.inference.pred_merge，
-    供一键补全（API 层）与每日自动推理（engine 层）两条链路共用，
-    保持两套推理数据一致。
-    """
-    from backend.services.engine.inference.pred_merge import merge_signals_into_pred
-
-    # 补全场景允许在 pred.parquet 缺失时以真实分数创建（多日连续补全
-    # 可形成完整序列）
-    return merge_signals_into_pred(
-        Path(parquet_file), signals_by_date, create_if_missing=True
-    )
-
-
-def _latest_trading_date() -> date:
-    try:
-        import exchange_calendars as xcals
-        import pandas as pd
-        from datetime import timedelta
-
-        cal = xcals.get_calendar("XSHG")
-        today = date.today()
-        # 逐日回退至最近交易日，避免 is_session/previous_session 异常时回退到 date.today()（周末会误显示为交易日）
-        for i in range(10):
-            cur = today - timedelta(days=i)
-            ts = pd.Timestamp(cur)
-            try:
-                if cal.is_session(ts):
-                    return cur
-            except Exception:
-                continue
-        # 兜底：previous_session
-        try:
-            prev = cal.previous_session(pd.Timestamp(today))
-            return (
-                prev.date()
-                if hasattr(prev, "date")
-                else date.fromisoformat(str(prev)[:10])
-            )
-        except Exception:
-            pass
-        # 仍失败则按周末回退
-        cur = today
-        while cur.weekday() >= 5:
-            cur -= timedelta(days=1)
-        return cur
-    except Exception:
-        cur = date.today()
-        from datetime import timedelta
-
-        while cur.weekday() >= 5:
-            cur -= timedelta(days=1)
-        return cur
+# 缺口计算/单日执行/串行编排已收敛到 model_backfill（P3）；
+# 旧端点保留，内部改为创建 qm_model_inference_jobs 任务。
+_resolve_pred_candidates = resolve_pred_candidates
 
 
 @router.get("/{model_id}/inference/coverage", summary="获取推理覆盖（用户态）")
@@ -1374,371 +1267,93 @@ async def get_inference_coverage(
 ):
     tenant_id = str(current_user.get("tenant_id") or "default")
     user_id = str(current_user.get("user_id") or current_user.get("sub") or "")
-    model = await model_registry_service.get_model(
-        tenant_id=tenant_id, user_id=user_id, model_id=model_id
-    )
-    if not model:
-        async with get_session(read_only=True) as session:
-            row = (
-                (
-                    await session.execute(
-                        text(
-                            "SELECT tenant_id, user_id, model_id, storage_path FROM qm_user_models WHERE tenant_id=:t AND model_id=:m LIMIT 1"
-                        ),
-                        {"t": tenant_id, "m": model_id},
-                    )
-                )
-                .mappings()
-                .first()
-            )
-            if row:
-                model = {
-                    "storage_path": row["storage_path"],
-                    "model_id": row["model_id"],
-                }
+    model = await resolve_backfill_model(tenant_id, user_id, model_id)
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
-    storage_path = str(model.get("storage_path") or "").strip()
-    if not storage_path:
-        return {
-            "model_id": model_id,
-            "min_date": None,
-            "max_date": None,
-            "count": 0,
-            "gap_dates": [],
-            "latest_trade_date": str(_latest_trading_date()),
-            "is_up_to_date": False,
-        }
-    parquet_file = next(
-        (p for p in _resolve_pred_candidates(storage_path) if p.is_file()), None
-    )
-    # Ubuntu 容器：storage_path 为 /app/models/...；若本地 pred 缺失则用 QuantDB 因子可覆盖日期兜底
-    quantdb_fallback_dates: list[str] | None = None
-    if not parquet_file:
-        try:
-            meta = (
-                model.get("metadata_json")
-                if isinstance(model.get("metadata_json"), dict)
-                else {}
-            )
-            ctx = meta.get("context") if isinstance(meta.get("context"), dict) else {}
-            factor_source = str(
-                meta.get("factor_source") or ctx.get("factor_source") or "l1_factors"
-            )
-            market = str(ctx.get("market") or meta.get("market") or "CN")
-            from backend.services.engine.data_platform.quantdb_factor_reader import (
-                QuantDBFactorReader,
-                market_data_dir,
-            )
-
-            qdir = market_data_dir(market)
-            if qdir.is_dir():
-                reader = QuantDBFactorReader(qdir, market=market)
-                quantdb_fallback_dates = reader.available_dates(factor_source)
-        except Exception:
-            quantdb_fallback_dates = None
-        if quantdb_fallback_dates:
-            min_date, max_date = quantdb_fallback_dates[0], quantdb_fallback_dates[-1]
-            latest = _latest_trading_date()
-            # 缺口上限截至 QuantDB 数据已产出日，而非最新交易日：
-            # 因子 T+1 更新，数据未产出的日子不算缺口，避免补全注定失败
-            gap_end = min(latest, _quantdb_latest_factor_date(market) or latest)
-            try:
-                import exchange_calendars as xcals
-                import pandas as pd
-
-                cal = xcals.get_calendar("XSHG")
-                start = pd.Timestamp(max_date) + pd.Timedelta(days=1)
-                end = pd.Timestamp(gap_end)
-                gap = (
-                    [d.strftime("%Y-%m-%d") for d in cal.sessions_in_range(start, end)]
-                    if start <= end
-                    else []
-                )
-            except Exception:
-                gap = []
-            return {
-                "model_id": model_id,
-                "min_date": min_date,
-                "max_date": max_date,
-                "count": len(quantdb_fallback_dates),
-                "gap_dates": gap,
-                "latest_trade_date": str(latest),
-                "data_cutoff_date": str(gap_end),
-                # 非真实推理记录：min/max/count 是 QuantDB 因子可支持范围，
-                # 不是该模型已推理的覆盖；estimated=True 供前端区分展示
-                "estimated": True,
-                "is_up_to_date": False,
-                "source": "quantdb_fallback",
-            }
-        return {
-            "model_id": model_id,
-            "min_date": None,
-            "max_date": None,
-            "count": 0,
-            "gap_dates": [],
-            "latest_trade_date": str(_latest_trading_date()),
-            "is_up_to_date": False,
-            "reason": "pred.parquet not found and quantdb unavailable",
-        }
     try:
-        dates = _read_pred_dates(parquet_file)
-        if not dates:
-            return {
-                "model_id": model_id,
-                "min_date": None,
-                "max_date": None,
-                "count": 0,
-                "gap_dates": [],
-                "latest_trade_date": str(_latest_trading_date()),
-                "is_up_to_date": False,
-            }
-        min_date, max_date = dates[0], dates[-1]
-        latest = _latest_trading_date()
-        # 生成交易日缺口；上限截至 QuantDB 因子数据已产出日（因子 T+1 更新，
-        # 当日数据未产出不算缺口），避免一键补全对无数据日做注定失败的推理。
-        # 必须扫描 [min_date, gap_end] 全区间，不能只从 max_date 向后补；
-        # 否则中间某日推理失败后，即使后续日期已存在也会永久漏补。
-        gap_end = min(latest, _quantdb_latest_factor_date() or latest)
-        gap = find_inference_gap_dates(dates, gap_end)
-        return {
-            "model_id": model_id,
-            "min_date": min_date,
-            "max_date": max_date,
-            "count": len(dates),
-            "gap_dates": gap,
-            "latest_trade_date": str(latest),
-            "data_cutoff_date": str(gap_end),
-            "is_up_to_date": len(gap) == 0,
-        }
-    except Exception as exc:
+        coverage = await asyncio.to_thread(compute_coverage, model)
+    except Exception as exc:  # noqa: BLE001 - 覆盖读取失败映射 500
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    payload: dict[str, Any] = {
+        "model_id": model_id,
+        "min_date": coverage.min_date,
+        "max_date": coverage.max_date,
+        "count": coverage.count,
+        "gap_dates": list(coverage.gap_dates),
+        "latest_trade_date": coverage.latest_trade_date,
+        "is_up_to_date": bool(
+            not coverage.gap_dates
+            and coverage.reason is None
+            and not coverage.estimated
+        ),
+    }
+    if coverage.data_cutoff_date:
+        payload["data_cutoff_date"] = coverage.data_cutoff_date
+    if coverage.estimated:
+        # 非真实推理记录：min/max/count 是 QuantDB 因子可支持范围，
+        # 不是该模型已推理的覆盖；estimated=True 供前端区分展示
+        payload["estimated"] = True
+        payload["source"] = coverage.source
+    if coverage.reason:
+        payload["reason"] = coverage.reason
+    return payload
 
 
 @router.post("/{model_id}/inference/backfill", summary="一键补全至最新交易日（用户态）")
 async def trigger_backfill(
     model_id: str,
-    background_tasks: BackgroundTasks,
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     tenant_id = str(current_user.get("tenant_id") or "default")
     user_id = str(current_user.get("user_id") or current_user.get("sub") or "")
-    model = await model_registry_service.get_model(
-        tenant_id=tenant_id, user_id=user_id, model_id=model_id
-    )
-    if not model:
-        async with get_session(read_only=True) as session:
-            row = (
-                (
-                    await session.execute(
-                        text(
-                            "SELECT storage_path FROM qm_user_models WHERE tenant_id=:t AND model_id=:m LIMIT 1"
-                        ),
-                        {"t": tenant_id, "m": model_id},
-                    )
-                )
-                .mappings()
-                .first()
-            )
-            if row:
-                model = {
-                    "storage_path": row["storage_path"],
-                    "model_id": row["model_id"],
-                }
+    model = await resolve_backfill_model(tenant_id, user_id, model_id)
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
-    cov = await get_inference_coverage(model_id, current_user)
-    gaps: list[str] = list(cov.get("gap_dates") or [])
+    try:
+        coverage = await asyncio.to_thread(compute_coverage, model)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    gaps = list(coverage.gap_dates)
     if not gaps:
+        return {
+            "task_id": None,
+            "status": "completed",
+            "message": "已是最新",
+            "gap": 0,
+        }
+    if len(gaps) > MAX_GAP_DAYS_PER_MODEL:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "gap_too_large",
+                "message": (
+                    f"缺口 {len(gaps)} 天超过上限 {MAX_GAP_DAYS_PER_MODEL} 天，"
+                    "请稍后拆分补推"
+                ),
+            },
+        )
+    try:
+        job = await create_job(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            model_ids=[model_id],
+            persistence=model_inference_job_persistence,
+            min_models=1,
+        )
+    except JobValidationError as exc:
+        status = 409 if exc.code == "active_job_exists" else 400
+        raise HTTPException(
+            status_code=status,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    job_id = str(job.get("job_id") or "")
+    if str(job.get("status")) == "completed":
         return {"task_id": None, "status": "completed", "message": "已是最新", "gap": 0}
-    task_id = f"backfill_{uuid.uuid4().hex[:8]}"
-    _backfill_tasks[task_id] = {
-        "task_id": task_id,
-        "model_id": model_id,
-        "status": "running",
-        "progress": 0,
-        "gap": len(gaps),
-        "logs": "",
-        "appended": 0,
-    }
-
-    async def _run():
-        appended = 0
-        failed = 0
-        logs: list[str] = []
-        # runner 成功日的真实分数：**逐日**合并进 pred.parquet（同日幂等 upsert）。
-        #
-        # 原实现把各日分数累积在内存、循环结束后才一次性合并——中途重启/杀进程
-        # 则已算完的天数全部丢失（pred.parquet 不动，coverage 缺口仍在，前端表现
-        # 为「跑了很久，缺口没变」）。逐日落盘后，重跑只补剩余缺口。
-        merged_days = 0
-        try:
-            storage_path = str(model.get("storage_path") or "")
-            parquet_file = next(
-                (p for p in _resolve_pred_candidates(storage_path) if p.is_file()), None
-            )
-            if not parquet_file:
-                parquet_file = Path(storage_path) / "pred.parquet"
-
-            def _merge_day(day: str, signals: list[dict]) -> int:
-                """把单日真实分数合并进 pred.parquet（线程池内同步执行）。"""
-                if parquet_file is None or not signals:
-                    return 0
-                return _merge_runner_signals_into_pred(parquet_file, [(day, signals)])
-
-            for idx, d in enumerate(gaps):
-                try:
-                    _backfill_tasks[task_id]["progress"] = int(
-                        (idx + 1) / len(gaps) * 100
-                    )
-                    _backfill_tasks[task_id]["logs"] = "\n".join(logs[-50:])
-                    # 只走 InferenceScriptRunner 真实推理（Ubuntu /data/quantdb）。
-                    # 曾经的「runner 失败 → 复制上一日 parquet 行、只改 trade_date
-                    # 重标」兜底已删除：那是拿旧分数冒充新日分数，属数据完整性问题，
-                    # 且会让 coverage 缺口假性消除。失败日如实记 failed。
-                    result = None
-                    try:
-                        runner = InferenceScriptRunner(
-                            primary_model_dir=str(Path(storage_path)),
-                            primary_model_id=model_id,
-                        )
-                        # 同步推理较慢，放线程池避免阻塞事件循环
-                        import concurrent.futures
-
-                        _d, _runner = d, runner
-
-                        def _sync_run(
-                            _d=_d, _runner=_runner, _tenant=tenant_id, _user=user_id
-                        ):
-                            return _runner.execute(
-                                date=_d, tenant_id=_tenant, user_id=_user
-                            )
-
-                        loop = asyncio.get_running_loop()
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=1
-                        ) as pool:
-                            result = await loop.run_in_executor(pool, _sync_run)
-                        if getattr(result, "success", False):
-                            appended += 1
-                            _day_signals = list(getattr(result, "signals", None) or [])
-                            try:
-                                with concurrent.futures.ThreadPoolExecutor(
-                                    max_workers=1
-                                ) as pool:
-                                    merged_rows = await loop.run_in_executor(
-                                        pool, _merge_day, d, _day_signals
-                                    )
-                                merged_days += 1
-                                logs.append(
-                                    f"{d} 推理完成（runner {result.signals_count} 行，"
-                                    f"已合并 pred {merged_rows} 行）"
-                                )
-                            except Exception as merge_exc:  # noqa: BLE001
-                                logs.append(f"{d} 推理完成但 pred 合并失败: {merge_exc}")
-                                logger.warning(
-                                    "backfill %s %s merge pred failed: %s",
-                                    model_id,
-                                    d,
-                                    merge_exc,
-                                )
-                        else:
-                            failed += 1
-                            logs.append(
-                                f"{d} runner 失败: {getattr(result, 'error', '')}"
-                            )
-                    except Exception as exc:
-                        failed += 1
-                        logs.append(f"{d} runner 异常: {exc}")
-                        result = None
-                    # runner 失败时落 run 终态，避免 run 记录悬空（此前失败日
-                    # 在 qm_model_inference_runs 无任何痕迹，排查无从下手）
-                    if result is not None and not getattr(result, "success", False):
-                        try:
-                            _rid = str(result.run_id or "")
-                            if _rid:
-                                _now = datetime.now(ZoneInfo("Asia/Shanghai"))
-                                await model_inference_persistence.create_run(
-                                    run_id=_rid,
-                                    tenant_id=tenant_id,
-                                    user_id=user_id,
-                                    model_id=model_id,
-                                    data_trade_date=date.fromisoformat(d),
-                                    prediction_trade_date=date.fromisoformat(d),
-                                    status="failed",
-                                    request_payload={
-                                        "source": "backfill",
-                                        "task_id": task_id,
-                                        "date": d,
-                                    },
-                                    created_at=_now,
-                                )
-                                await model_inference_persistence.update_run(
-                                    run_id=_rid,
-                                    status="failed",
-                                    updated_at=_now,
-                                    failure_stage=str(
-                                        getattr(result, "failure_stage", "") or ""
-                                    ),
-                                    error_message=str(
-                                        getattr(result, "error", "") or "backfill 推理失败"
-                                    )[:2000],
-                                )
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.05)
-                except Exception as exc:
-                    failed += 1
-                    logs.append(f"{d} 失败: {exc}")
-                    logger.warning("backfill %s %s failed: %s", model_id, d, exc)
-                _backfill_tasks[task_id].update(
-                    {
-                        "progress": int((idx + 1) / len(gaps) * 100),
-                        "logs": "\n".join(logs[-100:]),
-                        "appended": appended,
-                        "failed": failed,
-                    }
-                )
-            if failed:
-                # 部分成功标 partial（非笼统 failed）：成功日已可用，
-                # 失败明细（多为数据未产出）附在 error 供前端展示
-                _backfill_tasks[task_id].update(
-                    {
-                        "status": "partial" if appended > 0 else "failed",
-                        "progress": 100,
-                        "logs": "\n".join(logs[-200:]),
-                        "appended": appended,
-                        "merged_days": merged_days,
-                        "failed": failed,
-                        "error": (
-                            f"{appended}/{len(gaps)} 日补全成功，{failed} 日失败："
-                            + "; ".join(
-                                ln for ln in logs[-failed:] if "失败" in ln
-                            )[:500]
-                        ),
-                    }
-                )
-            else:
-                _backfill_tasks[task_id].update(
-                    {
-                        "status": "completed",
-                        "progress": 100,
-                        "logs": "\n".join(logs[-200:]),
-                        "appended": appended,
-                        "merged_days": merged_days,
-                        "failed": 0,
-                    }
-                )
-        except Exception as exc:
-            _backfill_tasks[task_id].update(
-                {"status": "failed", "error": str(exc), "logs": "\n".join(logs[-200:])}
-            )
-
-    background_tasks.add_task(_run)
     return {
-        "task_id": task_id,
+        "task_id": job_id,
+        "job_id": job_id,
         "status": "running",
-        "gap": len(gaps),
+        "gap": int(job.get("total_days") or len(gaps)),
         "target_dates": gaps,
     }
 
@@ -1751,11 +1366,50 @@ async def get_backfill_status(
     task_id: str,
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    _ = current_user
-    task = _backfill_tasks.get(task_id)
-    if not task or task.get("model_id") != model_id:
+    tenant_id = str(current_user.get("tenant_id") or "default")
+    user_id = str(current_user.get("user_id") or current_user.get("sub") or "")
+    job = await model_inference_job_persistence.get_job(
+        task_id, tenant_id=tenant_id, user_id=user_id
+    )
+    job_models = [str(mid) for mid in (job or {}).get("model_ids") or []]
+    if job is None or model_id not in job_models:
         raise HTTPException(status_code=404, detail="任务不存在")
-    return task
+    total_days = int(job.get("total_days") or 0)
+    completed = int(job.get("completed_days") or 0)
+    failed = int(job.get("failed_days") or 0)
+    skipped = int(job.get("skipped_days") or 0)
+    terminal = str(job.get("status")) in {
+        "completed",
+        "partial",
+        "failed",
+        "cancelled",
+    }
+    progress = (
+        100
+        if terminal
+        else int(round(100 * (completed + failed + skipped) / total_days))
+        if total_days
+        else 0
+    )
+    model_results = job.get("model_results") or []
+    merged_days = sum(int(item.get("days_merged") or 0) for item in model_results)
+    # 旧面板只认识 running/completed/partial/failed；排队与取消中按 running 呈现。
+    status = {"queued": "running", "cancelling": "running"}.get(
+        str(job.get("status")), str(job.get("status"))
+    )
+    return {
+        "task_id": task_id,
+        "model_id": model_id,
+        "status": status,
+        "progress": progress,
+        "gap": total_days,
+        "logs": "\n".join(str(line) for line in (job.get("logs") or [])[-200:]),
+        "appended": completed,
+        "merged_days": merged_days,
+        "failed": failed,
+        "skipped": skipped,
+        "error": job.get("error"),
+    }
 
 
 @router.get("/{model_id}", summary="获取单个用户模型（用户态）")

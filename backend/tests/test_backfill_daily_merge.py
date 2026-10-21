@@ -16,6 +16,7 @@ import pandas as pd
 import pytest
 
 _BACKEND = Path(__file__).resolve().parents[1]
+_CORE = _BACKEND / "services/engine/inference/model_backfill.py"
 _ROUTER = _BACKEND / "services/api/routers/model_training.py"
 
 
@@ -66,10 +67,14 @@ def test_daily_merge_accumulates_across_days(tmp_path):
 
 @pytest.mark.unit
 def test_backfill_merges_per_day_and_drops_template_copy():
-    """接线断言：循环内逐日合并已接上，模板复制兜底已删。"""
-    src = _ROUTER.read_text(encoding="utf-8")
-    assert "_merge_day" in src, "必须有单日合并入口"
-    assert "merged_days" in src, "任务状态应暴露已合并天数"
-    assert "模板复制" not in src, (
+    """接线断言：单日执行内逐日合并（P3 起在 model_backfill），模板复制兜底已删。"""
+    core = _CORE.read_text(encoding="utf-8")
+    router = _ROUTER.read_text(encoding="utf-8")
+    assert "def _execute_sync" in core, "必须有单日执行入口"
+    assert "merge_signals_into_pred" in core, "单日执行必须把分数合并进 pred"
+    assert "create_if_missing=True" in core, "补全允许在 pred 缺失时创建"
+    assert "_backfill_tasks" not in router, "进程内任务字典必须删除（改落 job 表）"
+    assert "merged_days" in router, "旧状态端点应继续暴露已合并天数"
+    assert "模板复制" not in core and "模板复制" not in router, (
         "「复制上一日行、只改 trade_date」的模板复制兜底必须删除（假数据）"
     )

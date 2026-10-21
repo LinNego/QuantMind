@@ -45,6 +45,10 @@ from backend.services.api.market_analysis_futures.router import (
 )
 from backend.services.api.routers.market_kline import router as market_kline_router
 from backend.services.api.routers.market_minute import router as market_minute_router
+from backend.services.api.routers.model_blends import router as model_blends_router
+from backend.services.api.routers.model_inference_jobs import (
+    router as model_inference_jobs_router,
+)
 from backend.services.api.routers.model_training import router as model_training_router
 from backend.services.api.routers.model_rollouts import router as model_rollouts_router
 from backend.services.api.routers.model_rolling import router as model_rolling_router
@@ -141,6 +145,16 @@ async def lifespan(app: FastAPI):
         )
 
         await model_inference_batch_persistence.ensure_tables()
+        from backend.services.engine.services.model_inference_job_persistence import (
+            ModelInferenceJobPersistence,
+        )
+
+        await ModelInferenceJobPersistence().ensure_tables()
+        from backend.services.engine.services.model_blend_persistence import (
+            ModelBlendPersistence,
+        )
+
+        await ModelBlendPersistence().ensure_tables()
         from backend.shared.rolling_campaigns import (
             ensure_tables as ensure_rolling_campaign_tables,
         )
@@ -499,6 +513,12 @@ app.include_router(model_rollouts_router)  # 晋升流程（/api/v1/models/rollo
 app.include_router(
     model_rolling_router
 )  # 滚动训练用户态（/api/v1/models/rolling/*，P1）
+app.include_router(
+    model_blends_router
+)  # 组合选股（/api/v1/models/blends/*，P2；必须先于 model_training 兜底）
+app.include_router(
+    model_inference_jobs_router
+)  # 串行补推（/api/v1/models/inference/backfill-jobs/*，P3；必须先于 model_training 兜底）
 app.include_router(
     model_training_router, prefix="/api/v1/models", tags=["ModelTraining"]
 )
