@@ -370,6 +370,84 @@ def test_init_rejects_unknown_dataset(tmp_path, monkeypatch):
         ms.init_from_modelscope(["not_a_dataset"])
 
 
+def test_init_aborts_on_empty_remote_manifest_without_touching_local(
+    tmp_path, monkeypatch
+):
+    """远端清单为空 → 直接中止；本地文件一个字节都不动。
+
+    用户红线（2026-10-21）：数据集初始化**绝不能**「先清空再拉」，
+    无论远端枚举失败、仓库下线还是 API 返回空清单，都不得删除本地数据。
+    """
+    import pytest
+
+    root = tmp_path / "quantdb"
+    monkeypatch.setenv("QM_QUANTDB_DATA_DIR", str(root))
+    monkeypatch.setenv("QUANTDB_STATE_DIR", str(tmp_path / "state"))
+    sentinel = root / "1_kline_data/daily_forward/dt=20260101/data.parquet"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_bytes(b"local-only")
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [])
+
+    with pytest.raises(RuntimeError, match="远端清单为空"):
+        ms.init_from_modelscope(None)
+
+    assert sentinel.read_bytes() == b"local-only"
+
+
+def test_init_never_deletes_local_only_files_or_state(tmp_path, monkeypatch):
+    """只覆盖远端清单内的文件：远端没有的本地文件与未涉及的数据集原样保留。
+
+    远端「有明细」才允许动——而且是逐文件原子覆盖；远端没有的路径（本地独有
+    分区、其它数据集）与本函数无关，一条都不许删，状态库也不许清。
+    """
+    root = tmp_path / "quantdb"
+    monkeypatch.setenv("QM_QUANTDB_DATA_DIR", str(root))
+    monkeypatch.setenv("QUANTDB_STATE_DIR", str(tmp_path / "state"))
+
+    c1, c2, remote = _make_remote()
+    # 本地独有文件（远端清单里没有）——必须存活
+    local_only = root / "1_kline_data/daily_forward/dt=20250101/data.parquet"
+    local_only.parent.mkdir(parents=True)
+    local_only.write_bytes(b"local-only")
+    # 另一个数据集的本地文件 + 状态登记——不能被本次初始化波及
+    other = root / "3_financial_data/income/000001.SZ.parquet"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"income-local")
+    ms._upsert_state_rows(
+        root,
+        [
+            (
+                "3_financial_data/income/000001.SZ.parquet",
+                "a" * 64,
+                "a" * 64,
+                12,
+                str(other),
+                "v1_symbol",
+                "income",
+            )
+        ],
+    )
+
+    _FakeClient.payloads = {remote[0].path: c1, remote[1].path: c2}
+    _FakeClient.stream_calls = 0
+    monkeypatch.setattr(ms.httpx, "Client", _FakeClient)
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: remote)
+
+    summary = ms.init_from_modelscope(["daily_forward"])
+
+    assert summary["downloaded"] == 2
+    assert local_only.read_bytes() == b"local-only"
+    assert other.read_bytes() == b"income-local"
+    from backend.scripts.quantdb_daily_sync import _state_path
+
+    conn = sqlite3.connect(str(_state_path(root)))
+    income_rows = conn.execute(
+        "SELECT key FROM objects WHERE dataset='income'"
+    ).fetchall()
+    conn.close()
+    assert income_rows == [("3_financial_data/income/000001.SZ.parquet",)]
+
+
 def test_classify_per_share():
     assert ms._classify("3_financial_data/per_share/000001.SZ.parquet") == (
         "per_share",

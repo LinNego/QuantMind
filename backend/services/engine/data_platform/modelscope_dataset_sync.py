@@ -444,6 +444,12 @@ def init_from_modelscope(
     目标是与魔搭社区数据集完全对齐：不比对、不增量，逐文件下载并覆盖
     已存在的文件；完成后用远端 sha256 重建同步状态库。
     datasets: 数据集名列表（DATASETS 规格）；None=仓库内可识别的全部。
+
+    **安全不变量（2026-10-21 用户红线，改动前先读）**：
+    - 本函数**从不删除**本地文件或目录，也不清空数据根；
+    - 只覆盖**远端清单列出**的路径（.part → sha256 校验 → ``os.replace`` 原子替换）；
+    - 远端没有的本地文件、未选中的数据集、以及它们的同步状态登记，一律原样保留；
+    - 远端清单为空/不可识别 → 在任何本地写入之前直接中止（RuntimeError）。
     """
     from backend.shared.quantdb_datasets import DATASETS
 
@@ -476,6 +482,14 @@ def init_from_modelscope(
 
     total_files = sum(len(v) for v in grouped.values())
     total_bytes = sum(f.size for v in grouped.values() for f in v)
+    if total_files == 0:
+        # 空清单绝不能往下走：那意味着「远端什么都没枚举到」，
+        # 继续执行只会把状态库按空集重建/写出一份误导性的完成回执。
+        # 本地数据本来就不会被删，这里再在**任何本地写入之前**显式中止。
+        raise RuntimeError(
+            "魔搭远端清单为空（未枚举到任何可识别的 parquet 数据集）；"
+            "已中止，未改动本地数据"
+        )
     _progress(
         progress_cb,
         "enumerate_done",

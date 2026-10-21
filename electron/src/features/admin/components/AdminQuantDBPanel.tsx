@@ -126,7 +126,7 @@ export const AdminQuantDBPanel: React.FC = () => {
                 }
                 extra={
                     <Space size="middle">
-                        <Tooltip title="从魔搭（ModelScope）公开数据集一键拉取 QuantDB 全量数据并覆盖本地数据目录，无需 QuantDB API Key / 流量；全量约 56GB，预计 1-3 小时，可稍后回来查看进度。仓库：https://www.modelscope.cn/datasets/qusong0627/LightGBM_Alpha300">
+                        <Tooltip title="从魔搭（ModelScope）公开数据集一键拉取 QuantDB 全量数据并覆盖本地数据目录，无需 QuantDB API Key / 流量；不会清空本地目录——只覆盖远端清单内的文件，远端没有的本地文件原样保留。全量约 56GB，预计 1-3 小时，可稍后回来查看进度。仓库：https://www.modelscope.cn/datasets/qusong0627/LightGBM_Alpha300">
                             <Button
                                 type="primary"
                                 size="large"
@@ -759,7 +759,7 @@ export const ModelScopeInitModal: React.FC<ModelScopeInitModalProps> = ({ open, 
 
     return (
         <Modal
-            title="初始化数据 — 从魔搭覆盖本地 QuantDB 数据目录"
+            title="初始化数据 — 从魔搭拉取并覆盖远端清单内文件"
             open={open}
             onCancel={onClose}
             width={880}
@@ -799,7 +799,10 @@ export const ModelScopeInitModal: React.FC<ModelScopeInitModalProps> = ({ open, 
                     showIcon
                     message={
                         <span>
-                            从魔搭公开数据集仓库拉取 QuantDB A股数据并覆盖本地数据目录（免 QuantDB API Key / 流量）。逐文件校验 sha256 后原地覆盖；已完整下载的文件自动跳过，支持断点续传。仓库：
+                            从魔搭公开数据集仓库拉取 QuantDB A股数据（免 QuantDB API Key / 流量）。
+                            <strong>不会清空本地数据目录</strong>：只覆盖远端清单内的文件（逐文件校验 sha256 后原子替换），
+                            远端没有的本地文件与未勾选的数据集原样保留；远端清单为空会直接中止，不做任何本地改动。
+                            已完整下载的文件自动跳过，支持断点续传。仓库：
                             <a href={repoUrl} target="_blank" rel="noreferrer">{repoUrl}</a>
                         </span>
                     }
