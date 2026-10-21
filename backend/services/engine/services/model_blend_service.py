@@ -37,9 +37,12 @@ from backend.services.engine.inference.blend_engine import (
     position_of,
     rank_pct_from_rank,
 )
+from backend.services.engine.inference import portfolio_metrics as metrics
 from backend.services.engine.inference.period_performance import simulate_period
 from backend.services.engine.inference.rolling_performance import (
+    cell_stats,
     compute_rolling_performance,
+    simulate_daily_rotation,
 )
 from backend.services.engine.inference.blend_plan import (
     DEFAULT_LOOKBACK,
@@ -52,11 +55,12 @@ from backend.services.engine.inference.blend_plan import (
     positions_hash,
 )
 from backend.services.engine.services import combo_auto
+from backend.services.engine.services.blend_pred_source import BlendPredSource
 from backend.services.engine.services.model_blend_persistence import (
     ModelBlendPersistence,
 )
 from backend.shared.database_manager_v2 import get_session
-from backend.shared.stock_utils import StockCodeUtil
+from backend.shared.stock_utils import StockCodeUtil, build_prefix_symbol_sql
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +70,15 @@ MAX_MEMBERS = 30
 CN_MARKET = "CN"
 #: 周期收益：区间上限（交易日）。300 ≈ 14 个月，覆盖「最近半年/近一年」。
 MAX_PERIOD_TRADING_DAYS = 300
+#: pred 测试集路径的上限：覆盖 414 天全量测试集
+MAX_PRED_PERIOD_TRADING_DAYS = 420
 #: median/trimmed 走慢路（逐行折叠符号），区间收紧，避免同步接口超时。
 MAX_NON_MEAN_PERIOD_DAYS = 120
+#: pred 路径的 median/trimmed 在 DuckDB 内聚合，可放宽到全测试集
+MAX_PRED_NON_MEAN_PERIOD_DAYS = 420
+#: 基准指数与 MA20 需要的回看自然日
+BENCHMARK_SYMBOL = "000300.SH"
+BENCHMARK_LOOKBACK_DAYS = 40
 #: 评分覆盖率下限：低于 30% 拒绝计算，30~80% 标 partial。
 MIN_PERIOD_COVERAGE = 0.30
 PARTIAL_PERIOD_COVERAGE = 0.80
@@ -82,31 +93,8 @@ _PROFILE_CACHE: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
 _RISK_CACHE: dict[str, tuple[float, dict[str, str], str | None]] = {}
 
 
-def _prefix_symbol_sql(source: str = "symbol") -> str:
-    """生成「任意写入形态 → 前缀式」的 SQL 表达式。
-
-    与 ``StockCodeUtil.to_prefix`` 逐条对齐：先 ``upper(btrim(...))``（Python 侧
-    同样先 ``upper().strip()``），再按后缀式 / 反向后缀 / 前缀式 / 纯 6 位识别。
-    ``source`` 只在测试里换成 ``VALUES`` 列名，生产恒为 ``symbol``。
-    """
-    value = f"upper(btrim({source}))"
-    return f"""
-CASE
-  WHEN {value} ~ '^[0-9]{{6}}\\.(SH|SZ|BJ)$' THEN
-    substr({value}, 8, 2) || substr({value}, 1, 6)
-  WHEN {value} ~ '^(SH|SZ|BJ)\\.[0-9]{{6}}$' THEN
-    substr({value}, 1, 2) || substr({value}, 4, 6)
-  WHEN {value} ~ '^(SH|SZ|BJ)[0-9]{{6}}$' THEN {value}
-  WHEN {value} ~ '^[0-9]{{6}}$' THEN
-    CASE
-      WHEN substr({value}, 1, 2) IN ('60', '68', '90') THEN 'SH' || {value}
-      WHEN substr({value}, 1, 2) IN ('00', '30', '20') THEN 'SZ' || {value}
-      WHEN substr({value}, 1, 2) IN ('83', '43', '87', '88', '92') THEN 'BJ' || {value}
-      ELSE {value}
-    END
-  ELSE {value}
-END
-""".strip()
+#: 与 ``StockCodeUtil.to_prefix`` 对齐的 SQL 折叠表达式（唯一实现在 shared）。
+_prefix_symbol_sql = build_prefix_symbol_sql
 
 
 #: 把任意写入形态折叠成前缀式（与 StockCodeUtil.to_prefix 对齐）。
@@ -336,8 +324,10 @@ class ModelBlendService:
     def __init__(
         self,
         persistence: ModelBlendPersistence | None = None,
+        pred_source: BlendPredSource | None = None,
     ) -> None:
         self.persistence = persistence or ModelBlendPersistence()
+        self._pred_source = pred_source or BlendPredSource()
 
     # ── 模型清单 ────────────────────────────────────────────────────────
 
@@ -918,6 +908,235 @@ class ModelBlendService:
             ).all()
         return [str(row[0]) for row in rows]
 
+    # ── 历史数据源（pred 优先，整组合选源）────────────────────────────
+    @staticmethod
+    def _pred_inputs(
+        members: Sequence[Mapping[str, Any]],
+        weights: Mapping[str, float] | None,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "model_id": str(member["model_id"]),
+                "weight": float((weights or {}).get(str(member["model_id"]), 1.0)),
+            }
+            for member in members
+        ]
+
+    async def _readiness_for(
+        self,
+        *,
+        members: Sequence[Mapping[str, Any]],
+        weights: Mapping[str, float] | None,
+        tenant_id: str,
+        user_id: str,
+        market: str,
+    ):
+        return await self._pred_source.readiness(
+            self._pred_inputs(members, weights),
+            tenant_id=tenant_id,
+            user_id=user_id,
+            market=market,
+        )
+
+    async def _runs_bounds(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        model_ids: Sequence[str],
+        required: int,
+    ) -> dict[str, Any]:
+        """推理运行记录（runs）的可用区间与共同数据日数。"""
+        sql = f"""
+            WITH {_RUNS_CTE}
+            SELECT MIN(day) AS first_day, MAX(day) AS last_day, COUNT(*) AS day_count
+            FROM (
+              SELECT data_trade_date AS day FROM runs
+              GROUP BY data_trade_date
+              HAVING COUNT(DISTINCT model_id) >= :required
+            ) x
+        """
+        async with get_session(read_only=True) as session:
+            row = (
+                await session.execute(
+                    text(sql),
+                    {
+                        "tenant_id": tenant_id,
+                        "user_id": user_id,
+                        "model_ids": list(model_ids),
+                        "start": date(2000, 1, 1),
+                        "end": date(2100, 1, 1),
+                        "required": _required_coverage(model_ids, required),
+                    },
+                )
+            ).first()
+        if not row or row[0] is None:
+            return {"start": None, "end": None, "trading_days": 0}
+        first_day = row[0] if isinstance(row[0], date) else _parse_date(row[0])
+        last_day = row[1] if isinstance(row[1], date) else _parse_date(row[1])
+        return {
+            "start": first_day.isoformat() if first_day else None,
+            "end": last_day.isoformat() if last_day else None,
+            "trading_days": int(row[2] or 0),
+        }
+
+    @staticmethod
+    def _bounds_payload(
+        readiness: Any,
+        runs: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        pred = None
+        if readiness.ready_members:
+            pred = {
+                "start": readiness.start.isoformat() if readiness.start else None,
+                "end": readiness.end.isoformat() if readiness.end else None,
+                "trading_days": int(readiness.trading_days),
+                "members_ready": readiness.ready_members,
+                "members_total": readiness.members_total,
+            }
+        source = (
+            "pred" if readiness.all_ready and readiness.trading_days > 0 else "runs"
+        )
+        effective = pred if source == "pred" else runs
+        return {
+            "source": source,
+            "pred": pred,
+            "runs": dict(runs),
+            "effective": {
+                "start": (effective or {}).get("start"),
+                "end": (effective or {}).get("end"),
+                "trading_days": int((effective or {}).get("trading_days") or 0),
+            },
+            "warnings": list(readiness.warnings),
+        }
+
+    @staticmethod
+    def _benchmark_payload(
+        closes: Mapping[date, float], *, market: str = CN_MARKET
+    ) -> dict[str, Any]:
+        """基准徽标的元信息：只描述数据是否可用，不重复行情序列。"""
+        enabled = market == CN_MARKET
+        return {
+            "symbol": BENCHMARK_SYMBOL if enabled else None,
+            "name": "沪深300" if enabled else None,
+            "available": bool(closes),
+            "days": len(closes),
+        }
+
+    async def _history_rows(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        members: Sequence[Mapping[str, Any]],
+        weights: Mapping[str, float] | None,
+        method: str,
+        trim_count: int,
+        min_coverage: int,
+        consensus_min_count: int,
+        start_date: date,
+        end_date: date,
+        top_k: int,
+        market: str = CN_MARKET,
+        readiness: Any | None = None,
+    ) -> tuple[dict[date, list[dict[str, Any]]], str, Any]:
+        """区间内每日组合分 TopK：pred 全成员可用才走 pred，否则整体回退 runs。"""
+        ready = readiness or await self._readiness_for(
+            members=members,
+            weights=weights,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            market=market,
+        )
+        if ready.all_ready and ready.trading_days > 0:
+            rows = await self._pred_source.load_top_rows(
+                ready.members,
+                method=method,
+                trim_count=trim_count,
+                min_coverage=min_coverage,
+                consensus_min_count=consensus_min_count,
+                start=start_date,
+                end=end_date,
+                top_k=top_k,
+            )
+            return rows, "pred", ready
+        rows = await self._range_stats(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            members=members,
+            weights=weights,
+            method=method,
+            trim_count=trim_count,
+            min_coverage=min_coverage,
+            consensus_min_count=consensus_min_count,
+            start_date=start_date,
+            end_date=end_date,
+            top_k=top_k,
+        )
+        return rows, "runs", ready
+
+    async def data_bounds(
+        self,
+        blend: Mapping[str, Any],
+        *,
+        tenant_id: str,
+        user_id: str,
+    ) -> dict[str, Any]:
+        """组合历史的统一数据端口：pred / runs 覆盖范围与生效区间。"""
+        members = await self.members_from_blend(blend)
+        weights = _weights_from_members(blend, members)
+        market = str(blend.get("market") or CN_MARKET)
+        readiness = await self._readiness_for(
+            members=members,
+            weights=weights,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            market=market,
+        )
+        runs = await self._runs_bounds(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            model_ids=[str(m["model_id"]) for m in members],
+            required=int(blend.get("min_coverage") or 2),
+        )
+        return self._bounds_payload(readiness, runs)
+
+    @staticmethod
+    async def _benchmark_closes(
+        start: date, end: date, *, market: str = CN_MARKET
+    ) -> dict[date, float]:
+        """沪深 300 指数收盘（MA20 需要向前多取一段）。失败返回空映射。"""
+        if market != CN_MARKET or end < start:
+            return {}
+        try:
+            from backend.services.engine.data_platform.quantdb_hub import (
+                QuantDBDataHub,
+            )
+
+            hub = QuantDBDataHub.get_instance()
+            if hub is None or not hub.available:
+                return {}
+            frame = await asyncio.to_thread(
+                hub.fetch_index_kline,
+                BENCHMARK_SYMBOL,
+                start - timedelta(days=BENCHMARK_LOOKBACK_DAYS),
+                end,
+            )
+        except Exception as exc:  # noqa: BLE001 - 基准缺失只降级，不阻断
+            logger.warning("读取基准 %s 失败: %s", BENCHMARK_SYMBOL, exc)
+            return {}
+        if frame is None or getattr(frame, "empty", True):
+            return {}
+        out: dict[date, float] = {}
+        for _, row in frame.iterrows():
+            raw_day = row.get("trade_date")
+            day = raw_day.date() if hasattr(raw_day, "date") else _parse_date(raw_day)
+            close = row.get("close")
+            if day is None or not _finite(close) or float(close) <= 0:
+                continue
+            out[day] = float(close)
+        return out
+
     async def rolling(
         self,
         blend: Mapping[str, Any],
@@ -927,28 +1146,56 @@ class ModelBlendService:
         end_date: date | None = None,
         window: int = 10,
         per_day: int = 5,
+        capital: float = DEFAULT_PERIOD_CAPITAL,
     ) -> dict[str, Any]:
         """滚动建仓视图：最近 ``window+1`` 个交易日，每日 Top ``per_day``。
 
-        选中口径与榜单完全同源（组合分排序），不另算一套；
-        ``held_days`` 只统计**本窗口内**连续在榜天数（超出窗口的历史见榜单
-        ``history``/纸面台账，不在这里猜）。
+        选中口径与榜单完全同源（组合分排序），历史数据源与 ``period()``
+        共用 ``_history_rows``（pred 测试集优先、整组合降级 runs）。
+
+        统计口径是**每日批次**：入选日收盘按全部权益等权建仓，次一交易日
+        收盘结算；最后一批只估值不结算（计入浮动）。``realized + unrealized
+        == final_equity - initial_capital``。名单侧的连续在榜只服务列展示，
+        不参与组合胜率。
         """
         if not 1 <= int(window) <= 60:
             raise BlendError("滚窗必须在 [1, 60]")
         if not 1 <= int(per_day) <= 50:
             raise BlendError("每日只数必须在 [1, 50]")
+        if not _finite(capital) or float(capital) <= 0:
+            raise BlendError("初始资金必须是正数")
+        capital = float(capital)
         members = await self.members_from_blend(blend)
         if len(members) < MIN_MEMBERS:
             raise BlendError(f"组合至少需要 {MIN_MEMBERS} 个模型")
         weights = _weights_from_members(blend, members)
         member_ids = [str(m["model_id"]) for m in members]
         min_coverage = int(blend.get("min_coverage") or 2)
-        target = end_date or await self.latest_common_date(
+        market = str(blend.get("market") or CN_MARKET)
+
+        readiness = await self._readiness_for(
+            members=members,
+            weights=weights,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            market=market,
+        )
+        runs = await self._runs_bounds(
             tenant_id=tenant_id,
             user_id=user_id,
             model_ids=member_ids,
             required=min_coverage,
+        )
+        bounds = self._bounds_payload(readiness, runs)
+        target = (
+            end_date
+            or _parse_date((bounds.get("effective") or {}).get("end"))
+            or await self.latest_common_date(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                model_ids=member_ids,
+                required=min_coverage,
+            )
         )
         if target is None:
             raise BlendError(
@@ -956,26 +1203,31 @@ class ModelBlendService:
                 code="no_common_date",
             )
 
-        stats = await self._window_stats(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            members=members,
-            weights=weights,
-            method=str(blend.get("method") or "mean"),
-            trim_count=int(blend.get("trim_count") or 2),
-            min_coverage=min_coverage,
-            consensus_min_count=int(blend.get("consensus_min_count") or 0),
-            end_date=target,
-            lookback=int(window),
-            top_k=int(per_day),
-            symbols=[],
-        )
-        names = await self._stock_names()
-        profiles = await self._stock_profiles(str(blend.get("market") or CN_MARKET))
-        rows_by_day = stats.get("top_rows") or {}
-        days = sorted(day for day in rows_by_day if day <= target)[-(int(window) + 1) :]
+        window_days = int(window) + 1
+        trading_days = await self._trading_days(target, need=window_days)
+        days = trading_days[-window_days:]
+        rows_by_day: dict[date, list[dict[str, Any]]] = {}
+        source = bounds.get("source") or "runs"
+        if days:
+            rows_by_day, source, readiness = await self._history_rows(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                members=members,
+                weights=weights,
+                method=str(blend.get("method") or "mean"),
+                trim_count=int(blend.get("trim_count") or 2),
+                min_coverage=min_coverage,
+                consensus_min_count=int(blend.get("consensus_min_count") or 0),
+                start_date=days[0],
+                end_date=days[-1],
+                top_k=int(per_day),
+                market=market,
+                readiness=readiness,
+            )
+            bounds = self._bounds_payload(readiness, runs)
 
-        # ── 收盘价损益（尾盘买入口径，2026-10-21）─────────────────────────
+        names = await self._stock_names()
+        profiles = await self._stock_profiles(market)
         picks_by_day = {
             day: [
                 str(row["symbol"])
@@ -986,7 +1238,40 @@ class ModelBlendService:
         symbols = sorted(
             {symbol for picked in picks_by_day.values() for symbol in picked}
         )
-        closes = await self._close_history(symbols, days[0], days[-1]) if days else {}
+        # 首日涨跌幅需要前一交易日收盘：起点向前多取 10 个自然日
+        closes = (
+            await self._close_history(symbols, days[0] - timedelta(days=10), days[-1])
+            if days and symbols
+            else {}
+        )
+        benchmark_closes: dict[date, float] = {}
+        rotation: dict[str, Any] = {
+            "batches": [],
+            "daily": [],
+            "equity_by_day": {},
+            "summary": {},
+        }
+        cells: dict[str, Any] = {"by_symbol": {}, "by_day": {}}
+        market_by_day: dict[date, dict[str, Any]] = {}
+        if days:
+            benchmark_closes = await self._benchmark_closes(
+                days[0], days[-1], market=market
+            )
+            rotation = simulate_daily_rotation(
+                days=days,
+                picks_by_day=picks_by_day,
+                closes=closes,
+                capital=capital,
+                benchmark_closes=benchmark_closes,
+            )
+            cells = cell_stats(
+                days,
+                picks_by_day,
+                closes,
+                equity_by_day=rotation["equity_by_day"],
+            )
+            market_by_day = metrics.market_day_stats(days, benchmark_closes)
+
         performance = compute_rolling_performance(days, picks_by_day, closes)
 
         def exit_payload(trade: Mapping[str, Any]) -> dict[str, Any]:
@@ -1018,12 +1303,15 @@ class ModelBlendService:
         for day in days:
             picks: list[dict[str, Any]] = []
             today: set[str] = set()
+            day_cells = cells["by_day"].get(day) or {}
             for row in (rows_by_day.get(day) or [])[: int(per_day)]:
                 symbol = str(row["symbol"])
                 today.add(symbol)
                 held = streak.get(symbol, 0) + 1
                 streak[symbol] = held
                 profile = profiles.get(symbol) or {}
+                cell = day_cells.get(symbol) or {}
+                stats = cells["by_symbol"].get(symbol) or {}
                 picks.append(
                     {
                         **row,
@@ -1033,11 +1321,39 @@ class ModelBlendService:
                         "market_cap_yi": profile.get("market_cap_yi"),
                         "held_days": held,
                         "is_new": held == 1,
+                        # 当日格子：涨跌幅 / 持仓权重 / 当日盈亏（仅当日实际持有）
+                        "change_pct": cell.get("change_pct"),
+                        "weight_pct": cell.get("weight_pct"),
+                        "day_pnl_amount": cell.get("pnl_amount"),
+                        "stats": {
+                            "appearances": stats.get("appearances"),
+                            "streak_days": stats.get("streak_days", held),
+                            "first_seen": (
+                                stats["first_seen"].isoformat()
+                                if stats.get("first_seen")
+                                else None
+                            ),
+                            "since_first_pct": stats.get("since_first_pct"),
+                            "next_day_avg_pct": stats.get("next_day_avg_pct"),
+                            "next_day_win_rate_pct": stats.get("next_day_win_rate_pct"),
+                            "next_day_samples": stats.get("next_day_samples"),
+                            "next_day_std_pct": stats.get("next_day_std_pct"),
+                            "latest_close": stats.get("latest_close"),
+                            "change_pct": stats.get("change_pct"),
+                        },
                     }
                 )
+            market_row = market_by_day.get(day) or {
+                "change_pct": None,
+                "close": None,
+                "ma20_deviation_pct": None,
+                "position": "unknown",
+                "tone": "unknown",
+            }
             columns.append(
                 {
                     "date": day.isoformat(),
+                    "market": market_row,
                     "picks": picks,
                     "exits": sorted(previous - today),
                     "exit_rows": exit_rows_by_day.get(day, []),
@@ -1050,14 +1366,39 @@ class ModelBlendService:
             previous = today
 
         latest = columns[-1] if columns else {"picks": [], "exits": []}
+        batch_rows = [
+            {
+                **batch,
+                "entry_date": batch["entry_date"].isoformat(),
+                "exit_date": batch["exit_date"].isoformat(),
+            }
+            for batch in rotation["batches"]
+        ]
+        daily_rows = [
+            {
+                **row,
+                "date": row["date"].isoformat(),
+                "exit_date": row["exit_date"].isoformat(),
+            }
+            for row in rotation["daily"]
+        ]
+        warnings = list(readiness.warnings)
+        if days and market == CN_MARKET and not benchmark_closes:
+            warnings.append("benchmark_unavailable")
         return {
             "blend_id": str(blend["blend_id"]),
             "data_trade_date": target.isoformat(),
             "target_date": (await self._next_trading_day(target)).isoformat(),
             "window": int(window),
             "per_day": int(per_day),
+            "capital": capital,
+            "source": source,
+            "bounds": bounds,
+            "benchmark": self._benchmark_payload(benchmark_closes, market=market),
             "days": [day.isoformat() for day in days],
             "columns": columns,
+            "batches": batch_rows,
+            "daily": daily_rows,
             "members": self._member_payload(members, {}, weights),
             "summary": {
                 "unique_symbols": len(
@@ -1065,13 +1406,10 @@ class ModelBlendService:
                 ),
                 "new_today": sum(1 for pick in latest["picks"] if pick["is_new"]),
                 "exited_today": len(latest["exits"]),
-                # 收盘价口径：买入=入选日收盘，卖出=退出日收盘（未计费用）
-                "performance": {
-                    **performance["stats"],
-                    "entry_convention": "close",
-                },
+                # 每日批次口径：收盘建仓/次日收盘结算，未计费用
+                "performance": rotation["summary"],
             },
-            "warnings": [],
+            "warnings": warnings,
         }
 
     async def period(
@@ -1116,11 +1454,31 @@ class ModelBlendService:
             raise BlendError("初始资金必须是正数")
         capital = float(capital)
 
-        target_end = end_date or await self.latest_common_date(
+        market = str(blend.get("market") or CN_MARKET)
+        readiness = await self._readiness_for(
+            members=members,
+            weights=weights,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            market=market,
+        )
+        runs = await self._runs_bounds(
             tenant_id=tenant_id,
             user_id=user_id,
             model_ids=member_ids,
             required=min_coverage,
+        )
+        bounds = self._bounds_payload(readiness, runs)
+
+        target_end = (
+            end_date
+            or _parse_date((bounds.get("effective") or {}).get("end"))
+            or await self.latest_common_date(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                model_ids=member_ids,
+                required=min_coverage,
+            )
         )
         if target_end is None:
             raise BlendError(
@@ -1133,22 +1491,32 @@ class ModelBlendService:
         calendar_days = await self._calendar_days(target_start, target_end)
         if not calendar_days:
             raise BlendError("所选区间内没有交易日")
-        if len(calendar_days) > MAX_PERIOD_TRADING_DAYS:
+        max_days = (
+            MAX_PRED_PERIOD_TRADING_DAYS
+            if bounds["source"] == "pred"
+            else MAX_PERIOD_TRADING_DAYS
+        )
+        max_non_mean_days = (
+            MAX_PRED_NON_MEAN_PERIOD_DAYS
+            if bounds["source"] == "pred"
+            else MAX_NON_MEAN_PERIOD_DAYS
+        )
+        if len(calendar_days) > max_days:
             raise BlendError(
-                f"区间最多 {MAX_PERIOD_TRADING_DAYS} 个交易日（约 14 个月），"
+                f"区间最多 {max_days} 个交易日，"
                 f"请把建仓日推后（当前 {len(calendar_days)} 个交易日）",
                 status_code=422,
                 code="range_too_long",
             )
-        if method != "mean" and len(calendar_days) > MAX_NON_MEAN_PERIOD_DAYS:
+        if method != "mean" and len(calendar_days) > max_non_mean_days:
             raise BlendError(
-                f"{method} 方法最多支持 {MAX_NON_MEAN_PERIOD_DAYS} 个交易日，"
+                f"{method} 方法最多支持 {max_non_mean_days} 个交易日，"
                 "请缩短区间或改用均值组合",
                 status_code=422,
                 code="range_too_long",
             )
 
-        rows_by_day = await self._range_stats(
+        rows_by_day, source, readiness = await self._history_rows(
             tenant_id=tenant_id,
             user_id=user_id,
             members=members,
@@ -1160,7 +1528,10 @@ class ModelBlendService:
             start_date=target_start,
             end_date=target_end,
             top_k=target_positions,
+            market=market,
+            readiness=readiness,
         )
+        bounds = self._bounds_payload(readiness, runs)
         day_set = set(calendar_days)
         scoring_days = sorted(day for day in rows_by_day if day in day_set)
         if len(scoring_days) < 2:
@@ -1202,6 +1573,10 @@ class ModelBlendService:
                 code="quote_source_unavailable",
             )
 
+        # 基准（沪深 300）：覆盖率不足 95% 时引擎侧把基准/超额一律置 None
+        benchmark_closes = await self._benchmark_closes(
+            effective_start, effective_end, market=market
+        )
         result = simulate_period(
             days=sim_days,
             picks_by_day=picks_by_day,
@@ -1210,9 +1585,12 @@ class ModelBlendService:
             positions=target_positions,
             entry_per_day=entry_per_day,
             hold_days=hold_days,
+            benchmark_closes=benchmark_closes,
         )
         names = await self._stock_names()
-        warnings: list[str] = []
+        warnings: list[str] = list(readiness.warnings)
+        if market == CN_MARKET and not benchmark_closes:
+            warnings.append("benchmark_unavailable")
         if target_start < effective_start:
             warnings.append("effective_start_clamped")
         if coverage_ratio < 1.0:
@@ -1261,6 +1639,9 @@ class ModelBlendService:
         ]
         return {
             "blend_id": str(blend["blend_id"]),
+            "source": source,
+            "bounds": bounds,
+            "benchmark": self._benchmark_payload(benchmark_closes, market=market),
             "requested": {
                 "start": target_start.isoformat(),
                 "end": target_end.isoformat(),

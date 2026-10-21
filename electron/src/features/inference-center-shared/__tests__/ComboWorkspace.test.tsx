@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   getAutoCandidates: vi.fn(),
   preview: vi.fn(),
   getDates: vi.fn(),
+  getBounds: vi.fn(),
   getRanking: vi.fn(),
   getRolling: vi.fn(),
   getPeriod: vi.fn(),
@@ -226,6 +227,20 @@ beforeEach(() => {
   mocks.getAutoCandidates.mockResolvedValue(autoCandidates());
   mocks.createBlend.mockResolvedValue(blend({ blend_id: 'blend-new' }));
   mocks.getDates.mockResolvedValue({ blend_id: 'blend-1', dates: ['2026-10-20', '2026-10-19'] });
+  mocks.getBounds.mockResolvedValue({
+    blend_id: 'blend-1',
+    source: 'pred',
+    pred: {
+      start: '2025-01-02',
+      end: '2026-10-19',
+      trading_days: 430,
+      members_ready: 2,
+      members_total: 2,
+    },
+    runs: { start: '2026-08-27', end: '2026-10-20', trading_days: 33 },
+    effective: { start: '2025-01-02', end: '2026-10-19', trading_days: 430 },
+    warnings: [],
+  });
   mocks.getRanking.mockResolvedValue(ranking());
   mocks.preview.mockResolvedValue(ranking());
   mocks.getRolling.mockResolvedValue(rolling());

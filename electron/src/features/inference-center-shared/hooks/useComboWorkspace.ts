@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { message } from 'antd';
 import { blendService, blendErrorMessage } from '../../../services/blendService';
 import type {
+  BlendBounds,
   BlendDatesResponse,
   BlendEvidenceResponse,
   BlendPeriodQuery,
@@ -28,6 +29,9 @@ import type {
 import { templateToCreateRequest } from '../components/combo/comboRankingModel';
 
 export type ComboTab = 'ranking' | 'rolling' | 'period' | 'plan' | 'evidence';
+
+/** 滚动建仓默认批次本金（元） */
+export const DEFAULT_ROLLING_CAPITAL = 10_000_000;
 
 export interface ComboSelection {
   kind: 'blend' | 'template';
@@ -51,6 +55,15 @@ export interface ComboWorkspaceState {
   datesLoading: boolean;
   date: string | null;
   setDate: (date: string | null) => void;
+
+  /** 组合历史可用区间（pred 测试集 / 推理台账），周期收益的快捷区间锚点 */
+  bounds: BlendBounds | null;
+  boundsLoading: boolean;
+  boundsError: string | null;
+
+  /** 滚动建仓批次本金（元）：改变后重算批次与机构指标 */
+  rollingCapital: number;
+  setRollingCapital: (capital: number) => void;
 
   tab: ComboTab;
   setTab: (tab: ComboTab) => void;
@@ -102,6 +115,11 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
   /** 日期请求已结束（成功或失败）：榜单/滚动/计划都要等它，避免先按 null 日发一次再重发 */
   const [datesReady, setDatesReady] = useState(false);
   const [date, setDate] = useState<string | null>(null);
+
+  const [bounds, setBounds] = useState<BlendBounds | null>(null);
+  const [boundsLoading, setBoundsLoading] = useState(false);
+  const [boundsError, setBoundsError] = useState<string | null>(null);
+  const [rollingCapital, setRollingCapital] = useState(DEFAULT_ROLLING_CAPITAL);
 
   const [tab, setTab] = useState<ComboTab>('ranking');
 
@@ -252,6 +270,29 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
     if (templates.length > 0) setSelection({ kind: 'template', id: templates[0].template_id });
   }, [selection, snapshotLoading, blends, templates, baselineTemplateId]);
 
+  // ── 可用区间（pred 测试集 / 推理台账）──────────────────────────────
+  // 周期收益的快捷区间以它为准（pred 可回看到 2025）；失败不阻塞页面，
+  // 面板退化为按 `/dates`（仅推理台账）锚定。
+  useEffect(() => {
+    if (selection?.kind !== 'blend') {
+      setBounds(null);
+      setBoundsError(null);
+      setBoundsLoading(false);
+      return;
+    }
+    let alive = true;
+    setBoundsLoading(true);
+    setBoundsError(null);
+    blendService
+      .getBounds(selection.id)
+      .then((resp) => alive && setBounds(resp))
+      .catch((err) => alive && setBoundsError(blendErrorMessage(err)))
+      .finally(() => alive && setBoundsLoading(false));
+    return () => {
+      alive = false;
+    };
+  }, [selection]);
+
   // ── 可用日期（仅已保存组合）────────────────────────────────────────
   useEffect(() => {
     if (selection?.kind !== 'blend') {
@@ -355,14 +396,17 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
     setRollingLoading(true);
     setRollingError(null);
     blendService
-      .getRolling(selection.id, { date: date ?? undefined })
+      .getRolling(selection.id, {
+        date: date ?? undefined,
+        capital: rollingCapital,
+      })
       .then((resp) => alive && setRolling(resp))
       .catch((err) => alive && setRollingError(blendErrorMessage(err)))
       .finally(() => alive && setRollingLoading(false));
     return () => {
       alive = false;
     };
-  }, [selection, tab, date, datesReady, dates.length, rollingNonce]);
+  }, [selection, tab, date, datesReady, dates.length, rollingNonce, rollingCapital]);
 
   // ── 纸面计划 ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -478,6 +522,11 @@ export function useComboWorkspace(market: string): ComboWorkspaceState {
     datesLoading,
     date,
     setDate,
+    bounds,
+    boundsLoading,
+    boundsError,
+    rollingCapital,
+    setRollingCapital,
     tab,
     setTab,
     ranking,

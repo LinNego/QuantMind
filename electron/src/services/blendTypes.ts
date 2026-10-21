@@ -117,6 +117,82 @@ export interface BlendDatesResponse {
   dates: string[];
 }
 
+/**
+ * 历史数据端口：`pred` = 成员模型 `pred.parquet` 测试集（可回到 2025），
+ * `runs` = `engine_signal_scores` 推理台账（通常只到最近一次串行补推）。
+ * 整组合成员齐全才走 pred，否则整体降级 runs，**绝不混源**。
+ */
+export type BlendDataSource = 'pred' | 'runs';
+
+export interface BlendBoundsSpan {
+  start: string | null;
+  end: string | null;
+  trading_days: number;
+}
+
+export interface BlendPredBounds extends BlendBoundsSpan {
+  members_ready: number;
+  members_total: number;
+}
+
+/** 组合历史可用区间（`/bounds` 与 rolling/period 响应内嵌同形） */
+export interface BlendBounds {
+  source: BlendDataSource;
+  pred: BlendPredBounds | null;
+  runs: BlendBoundsSpan;
+  effective: BlendBoundsSpan;
+  /** 成员级降级码：`member_unavailable:<id>` / `member_pred_unavailable:<id>` … */
+  warnings: string[];
+}
+
+export interface BlendBoundsResponse extends BlendBounds {
+  blend_id: string;
+}
+
+/** 基准徽标：只描述数据可用性，不重复行情序列 */
+export interface BlendBenchmark {
+  symbol: string | null;
+  name: string | null;
+  available: boolean;
+  days: number;
+}
+
+export type BlendMarketTone = 'up' | 'down' | 'flat' | 'unknown';
+export type BlendMarketPosition = 'above_ma20' | 'below_ma20' | 'unknown';
+
+/** 当日大盘（沪深 300）：涨跌幅、收盘、相对 20 日均线位置 */
+export interface BlendMarketDay {
+  change_pct: number | null;
+  close: number | null;
+  ma20_deviation_pct: number | null;
+  position: BlendMarketPosition;
+  tone: BlendMarketTone;
+}
+
+/** 单只标的在窗口内的统计（按窗口内出现过的每个标的给一份） */
+export interface BlendRollingCellStats {
+  /** 窗口内在榜天数 */
+  appearances: number | null;
+  /** 当前连续在榜天数（断榜重计） */
+  streak_days: number | null;
+  /** 窗口内首次入选日 */
+  first_seen: string | null;
+  /** 首次入选日收盘 → 末日收盘的涨跌（%） */
+  since_first_pct: number | null;
+  /** 在榜日次日收益均值（%） */
+  next_day_avg_pct: number | null;
+  /** 在榜日次日上涨占比（%） */
+  next_day_win_rate_pct: number | null;
+  /** 次日收益样本数 */
+  next_day_samples: number | null;
+  /** 次日收益标准差（样本 <3 时为 null，不硬凑） */
+  next_day_std_pct: number | null;
+  /** 末日收盘价 */
+  latest_close: number | null;
+  /** 末日当日涨跌幅（%） */
+  change_pct: number | null;
+}
+
 /** 滚动建仓：每列一日、每列 Top `per_day`；`exits` 只在「昨列→今日」标注 */
 export interface BlendRollingPick {
   symbol: string;
@@ -133,6 +209,14 @@ export interface BlendRollingPick {
   is_new: boolean;
   industry?: string | null;
   market_cap_yi?: number | null;
+  /** 当日涨跌幅（%）；缺行情为 null → `—` */
+  change_pct?: number | null;
+  /** 当日持仓权重（%）：仅前一交易日已在榜（当日实际持有）才有值 */
+  weight_pct?: number | null;
+  /** 当日盈亏金额（元）：仅当日实际持有的标的才有值 */
+  day_pnl_amount?: number | null;
+  /** 窗口内表现统计（在榜天数 / 首次至今 / 次日收益等） */
+  stats?: BlendRollingCellStats | null;
 }
 
 /** 一笔已了结的滚动持仓（收盘价买入 → 退出日收盘价卖出） */
@@ -156,6 +240,8 @@ export interface BlendRollingExit {
 
 export interface BlendRollingColumn {
   date: string;
+  /** 当日大盘（沪深 300）；缺数据时各字段为 null / unknown */
+  market?: BlendMarketDay;
   picks: BlendRollingPick[];
   /** 兼容旧字段：退出代码列表 */
   exits: string[];
@@ -163,31 +249,99 @@ export interface BlendRollingColumn {
   exit_rows?: BlendRollingExit[];
 }
 
-/** 滚动窗口整体涨跌统计（收盘价、等权、未计费用） */
+/** 一个每日批次：入选日收盘按全部权益等权建仓 → 次一交易日收盘结算 */
+export interface BlendRollingBatch {
+  entry_date: string;
+  exit_date: string;
+  positions: number;
+  priced: number;
+  return_pct: number | null;
+  notional_amount: number;
+  pnl_amount: number | null;
+  equity: number;
+  /** false = 最后一批，仅末日估值（计入浮动），不结算 */
+  settled: boolean;
+  holding_days: number;
+}
+
+/** 逐日净值（组合与基准同日对照） */
+export interface BlendRollingDaily {
+  date: string;
+  exit_date: string;
+  return_pct: number | null;
+  equity: number;
+  market_value: number;
+  cash: number;
+  exposure_pct: number | null;
+  benchmark_return_pct: number | null;
+  excess_return_pct: number | null;
+  settled: boolean;
+}
+
+/**
+ * 滚动窗口的每日批次口径绩效（收盘价、等权、未计费用）。
+ *
+ * 恒等式：`realized + unrealized == final_equity − initial_capital`。
+ * 最后一批只估值不结算，所以「已实现」= 倒数第二个交易日结算后的权益差，
+ * 「浮动」= 末日估值 − 倒数第二个交易日权益。
+ */
 export interface BlendRollingPerformance {
-  entry_convention?: string;
-  closed_trades: number;
-  priced_trades: number;
-  unpriced_trades: number;
+  initial_capital: number;
+  final_equity: number;
+  profit_amount: number;
+  total_return_pct: number | null;
+  /** 与 total_return_pct 同值，保留旧字段名 */
+  cycle_return_pct: number | null;
+  realized_pnl_amount: number;
+  realized_return_pct: number | null;
+  unrealized_pnl_amount: number;
+  unrealized_return_pct: number | null;
+  /** 基准覆盖率不足 95% 时基准/超额/IR 一律 null（不写 0） */
+  benchmark_return_pct: number | null;
+  benchmark_coverage_pct: number | null;
+  excess_return_pct: number | null;
+  annualized_return_pct: number | null;
+  volatility_pct: number | null;
+  sharpe_ratio: number | null;
+  sortino_ratio: number | null;
+  calmar_ratio: number | null;
+  max_drawdown_pct: number | null;
+  drawdown_peak_date: string | null;
+  drawdown_trough_date: string | null;
+  drawdown_recovery_date: string | null;
+  drawdown_recovery_days: number | null;
+  tracking_error_pct: number | null;
+  information_ratio: number | null;
+  avg_daily_excess_pct: number | null;
+  /** 已结算批次（笔） */
+  trades: number;
   wins: number;
   losses: number;
   flats: number;
   win_rate_pct: number | null;
   avg_return_pct: number | null;
-  median_return_pct: number | null;
-  best_symbol: string | null;
-  best_return_pct: number | null;
-  worst_symbol: string | null;
-  worst_return_pct: number | null;
-  open_positions: number;
-  open_priced: number;
-  open_avg_return_pct: number | null;
-  /** 每日等权持有当日 TopK、次日收盘换仓的累计收益（%） */
-  cycle_return_pct: number | null;
+  avg_win_pct: number | null;
+  avg_loss_pct: number | null;
+  payoff_ratio: number | null;
+  profit_factor: number | null;
+  gross_profit_amount: number | null;
+  gross_loss_amount: number | null;
+  avg_holding_days: number | null;
+  turnover_x: number | null;
+  avg_exposure_pct: number | null;
+  final_cash_pct: number | null;
+  trading_days: number;
+  batches: number;
+  settled_batches: number;
+  open_batches: number;
+  priced_batches: number;
+  unpriced_batches: number;
+  partial_batches: number;
   cycle_days: number;
   cycle_priced_days: number;
   cycle_win_days: number;
   cycle_loss_days: number;
+  entry_convention: string;
 }
 
 export interface BlendRollingSummary {
@@ -204,8 +358,17 @@ export interface BlendRollingResponse {
   target_date: string;
   window: number;
   per_day: number;
+  /** 批次本金（元）；旧后端缺失时按默认 1000 万理解 */
+  capital?: number;
+  source?: BlendDataSource;
+  bounds?: BlendBounds;
+  benchmark?: BlendBenchmark;
   days: string[];
   columns: BlendRollingColumn[];
+  /** 每日批次（含未结算批） */
+  batches?: BlendRollingBatch[];
+  /** 逐日净值与基准对照 */
+  daily?: BlendRollingDaily[];
   members: BlendRankingMember[];
   summary: BlendRollingSummary;
   warnings: string[];
@@ -242,9 +405,41 @@ export interface BlendPeriodSummary {
   final_equity: number;
   total_return_pct: number | null;
   profit_amount: number;
+  /** 已了结交易累计损益（元） */
   realized_pnl_amount: number;
+  /** 已实现收益率（% = 已实现损益 ÷ 初始资金） */
+  realized_return_pct: number | null;
+  /** 期末在场浮动损益（元） */
   unrealized_pnl_amount: number;
+  /** 浮动收益率（% = 浮动损益 ÷ 初始资金） */
+  unrealized_return_pct: number | null;
   max_drawdown_pct: number | null;
+  drawdown_peak_date: string | null;
+  drawdown_trough_date: string | null;
+  drawdown_recovery_date: string | null;
+  drawdown_recovery_days: number | null;
+  /** 基准（沪深 300）；覆盖率不足 95% 时为 null，绝不写 0 */
+  benchmark_return_pct: number | null;
+  benchmark_coverage_pct: number | null;
+  excess_return_pct: number | null;
+  annualized_return_pct: number | null;
+  volatility_pct: number | null;
+  sharpe_ratio: number | null;
+  sortino_ratio: number | null;
+  calmar_ratio: number | null;
+  tracking_error_pct: number | null;
+  information_ratio: number | null;
+  profit_factor: number | null;
+  payoff_ratio: number | null;
+  avg_win_pct: number | null;
+  avg_loss_pct: number | null;
+  gross_profit_amount: number | null;
+  gross_loss_amount: number | null;
+  avg_holding_days: number | null;
+  /** 建仓名义金额合计 ÷ 初始资金（倍） */
+  turnover_x: number | null;
+  avg_exposure_pct: number | null;
+  final_cash_pct: number | null;
   trading_days: number;
   scoring_days: number;
   entries: number;
@@ -273,6 +468,12 @@ export interface BlendPeriodMonth {
   end_equity: number;
   return_pct: number | null;
   profit_amount: number;
+  /** 本月新增已实现损益（元） */
+  realized_pnl_amount: number;
+  /** 月末浮动损益存量（元） */
+  unrealized_pnl_amount: number;
+  benchmark_return_pct: number | null;
+  excess_return_pct: number | null;
   entries: number;
   exits: number;
   closed_trades: number;
@@ -286,10 +487,17 @@ export interface BlendPeriodDaily {
   date: string;
   equity: number;
   cash: number;
+  market_value: number;
+  /** 仓位（市值 ÷ 权益，%）；权益非正时为 null */
+  exposure_pct: number | null;
   positions: number;
   entries: number;
   exits: number;
+  realized_pnl_amount: number;
+  unrealized_pnl_amount: number;
   return_pct: number | null;
+  benchmark_return_pct: number | null;
+  excess_return_pct: number | null;
 }
 
 export interface BlendPeriodTrade {
@@ -329,6 +537,10 @@ export interface BlendPeriodOpen {
 
 export interface BlendPeriodResponse {
   blend_id: string;
+  /** 本次计算实际使用的数据端口（pred 测试集 / runs 推理台账） */
+  source?: BlendDataSource;
+  bounds?: BlendBounds;
+  benchmark?: BlendBenchmark;
   requested: BlendPeriodRequested;
   effective: BlendPeriodEffective;
   template: BlendPeriodTemplate;

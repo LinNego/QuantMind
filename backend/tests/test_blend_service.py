@@ -19,12 +19,17 @@ from __future__ import annotations
 import time
 import uuid
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
 
 from backend.services.engine.inference.blend_engine import BlendRow
 from backend.services.engine.inference.blend_plan import positions_hash
+from backend.services.engine.services.blend_pred_source import (
+    PredMember,
+    PredReadiness,
+)
 from backend.services.engine.services.model_blend_persistence import (
     ModelBlendPersistence,
 )
@@ -1258,15 +1263,78 @@ def _roll_row(symbol: str, rank: int) -> dict:
     }
 
 
-def _rolling_service(rows_by_day, *, models=None, closes=None, profiles=None):
+def _fake_readiness(models, start, end, *, ready=True, warnings=()):
+    """构造一个 PredReadiness：``ready=True`` 时全部成员可用（pred 源）。"""
+    ready_members = (
+        tuple(
+            PredMember(
+                model_id=str(model["model_id"]),
+                weight=1.0,
+                path=Path("/tmp/pred.parquet"),
+                mtime_ns=0,
+                size=0,
+                start=start,
+                end=end,
+            )
+            for model in models
+        )
+        if ready
+        else ()
+    )
+    return PredReadiness(
+        members=ready_members,
+        members_total=len(models),
+        start=start if ready else None,
+        end=end if ready else None,
+        trading_days=max(1, (end - start).days + 1) if ready else 0,
+        warnings=tuple(warnings),
+    )
+
+
+def _rolling_service(
+    rows_by_day,
+    *,
+    models=None,
+    closes=None,
+    profiles=None,
+    benchmark=None,
+    source="pred",
+    readiness=None,
+    runs=None,
+):
     """替身窗口：只喂表头三列（符号/分数/名次），其余口径由真库用例覆盖。"""
     members = models or [_model("a"), _model("b")]
     svc = _service(members)
     calls: dict = {}
+    ordered_days = sorted(rows_by_day)
+    first = ordered_days[0] if ordered_days else D_ROLL
+    last = ordered_days[-1] if ordered_days else D_ROLL
+    ready = (
+        readiness if readiness is not None else _fake_readiness(members, first, last)
+    )
+    runs_bounds = runs or {
+        "start": first.isoformat(),
+        "end": last.isoformat(),
+        "trading_days": len(ordered_days),
+    }
 
-    async def fake_window_stats(**kwargs):
-        calls["window_stats"] = kwargs
-        return {"scores": {}, "top": {}, "top_rows": rows_by_day, "days": []}
+    async def fake_readiness_for(**_kwargs):
+        return ready
+
+    async def fake_runs_bounds(**_kwargs):
+        return dict(runs_bounds)
+
+    async def fake_history(**kwargs):
+        calls["history_rows"] = kwargs
+        return rows_by_day, source, ready
+
+    async def fake_trading_days(_end, *, need):
+        calls["trading_days"] = {"end": _end, "need": int(need)}
+        return ordered_days[-int(need) :]
+
+    async def fake_benchmark(start, end, *, market="CN"):
+        calls["benchmark"] = {"start": start, "end": end, "market": market}
+        return dict(benchmark or {})
 
     async def fake_names():
         return {"SH600000": "浦发银行", "SZ000001": "平安银行"}
@@ -1288,7 +1356,11 @@ def _rolling_service(rows_by_day, *, models=None, closes=None, profiles=None):
     async def fake_members(_blend):
         return list(members)
 
-    svc._window_stats = fake_window_stats
+    svc._readiness_for = fake_readiness_for
+    svc._runs_bounds = fake_runs_bounds
+    svc._history_rows = fake_history
+    svc._trading_days = fake_trading_days
+    svc._benchmark_closes = fake_benchmark
     svc._stock_names = fake_names
     svc._stock_profiles = fake_profiles
     svc._close_history = fake_closes
@@ -1361,11 +1433,26 @@ async def test_rolling_builds_streaks_new_flags_and_exits():
     assert summary["unique_symbols"] == 5
     assert summary["new_today"] == 3
     assert summary["exited_today"] == 1
-    # 无行情时损益如实缺失（不写 0），但笔数按退出事件计数
-    assert summary["performance"]["entry_convention"] == "close"
-    assert summary["performance"]["closed_trades"] == 2
-    assert summary["performance"]["priced_trades"] == 0
-    assert summary["performance"]["win_rate_pct"] is None
+    # 无行情时批次不计价：交易统计如实缺失（不写 0），权益保持不变
+    performance = summary["performance"]
+    assert performance["entry_convention"] == "close"
+    assert performance["trades"] == 0
+    assert performance["win_rate_pct"] is None
+    assert performance["realized_pnl_amount"] == pytest.approx(0.0)
+    assert performance["unrealized_pnl_amount"] == pytest.approx(0.0)
+    assert performance["total_return_pct"] == pytest.approx(0.0)
+    assert payload["source"] == "pred"
+    assert payload["bounds"]["source"] == "pred"
+    assert payload["capital"] == pytest.approx(10_000_000.0)
+    assert [row["entry_date"] for row in payload["batches"]] == [
+        d0.isoformat(),
+        d1.isoformat(),
+    ]
+    assert [row["settled"] for row in payload["batches"]] == [True, False]
+    assert [row["date"] for row in payload["daily"]] == [
+        d0.isoformat(),
+        d1.isoformat(),
+    ]
     assert by_day[d1.isoformat()]["exit_rows"] == [
         {
             "symbol": "SH600000",
@@ -1386,24 +1473,25 @@ async def test_rolling_builds_streaks_new_flags_and_exits():
     assert (
         payload["target_date"] == date.fromordinal(D_ROLL.toordinal() + 1).isoformat()
     )
-    assert calls["window_stats"]["end_date"] == D_ROLL
-    assert calls["window_stats"]["lookback"] == 10
-    assert calls["window_stats"]["top_k"] == 5
-    assert calls["window_stats"]["symbols"] == []
+    assert calls["history_rows"]["start_date"] == d0
+    assert calls["history_rows"]["end_date"] == d2
+    assert calls["history_rows"]["top_k"] == 5
+    assert calls["trading_days"] == {"end": D_ROLL, "need": 11}
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_rolling_exit_rows_carry_close_based_pnl_and_profile():
     """退出行 = 收盘价买入/卖出损益 + 名称/行业/市值，供前端弹窗直接展示。"""
-    d0, d1 = _roll_days(1, 0)
+    d0, d1, d2 = _roll_days(2, 1, 0)
     rows = {
-        d0: [_roll_row("SH600000", 1), _roll_row("SZ000001", 2)],
+        d0: [_roll_row("SZ000001", 1)],
         d1: [_roll_row("SH600000", 1)],
+        d2: [_roll_row("SH600000", 1)],
     }
     closes = {
-        "SH600000": {d0: 10.0, d1: 11.0},
-        "SZ000001": {d0: 20.0, d1: 18.0},
+        "SH600000": {d0: 10.0, d1: 11.0, d2: 12.1},
+        "SZ000001": {d0: 20.0, d1: 18.0, d2: 18.0},
     }
     profiles = {"SZ000001": {"industry": "银行", "market_cap_yi": 2200.0}}
     svc, calls = _rolling_service(rows, closes=closes, profiles=profiles)
@@ -1412,7 +1500,7 @@ async def test_rolling_exit_rows_carry_close_based_pnl_and_profile():
         {"blend_id": "bl_x"}, tenant_id="t", user_id="u", window=10, per_day=5
     )
 
-    column = payload["columns"][-1]
+    column = payload["columns"][1]
     assert column["exits"] == ["SZ000001"]
     assert len(column["exit_rows"]) == 1
     exit_row = column["exit_rows"][0]
@@ -1426,17 +1514,24 @@ async def test_rolling_exit_rows_carry_close_based_pnl_and_profile():
     assert exit_row["held_days"] == 1
     assert exit_row["entry_from_window_start"] is True
 
+    # 批次口径：d0 批次已结算（-10%），d1 批次未结算（+10% 计浮动）
     perf = payload["summary"]["performance"]
-    assert perf["closed_trades"] == 1
+    assert perf["realized_pnl_amount"] == pytest.approx(-1_000_000.0)
+    assert perf["realized_return_pct"] == pytest.approx(-10.0)
+    # 第二批以结算后权益 900 万建仓，+10% → 浮动 90 万
+    assert perf["unrealized_pnl_amount"] == pytest.approx(900_000.0)
+    assert perf["unrealized_return_pct"] == pytest.approx(9.0)
+    assert perf["total_return_pct"] == pytest.approx(-1.0)
+    assert perf["trades"] == 1
     assert perf["wins"] == 0
     assert perf["losses"] == 1
     assert perf["win_rate_pct"] == pytest.approx(0.0)
     assert perf["avg_return_pct"] == pytest.approx(-10.0)
-    assert perf["open_positions"] == 1
-    assert perf["open_avg_return_pct"] == pytest.approx(10.0)
+    assert perf["settled_batches"] == 1
+    assert perf["open_batches"] == 1
     assert calls["close_history"]["symbols"] == ["SH600000", "SZ000001"]
-    assert calls["close_history"]["start"] == d0
-    assert calls["close_history"]["end"] == d1
+    assert calls["close_history"]["start"] == d0 - timedelta(days=10)
+    assert calls["close_history"]["end"] == d2
 
 
 @pytest.mark.unit
@@ -1514,7 +1609,14 @@ async def test_rolling_rejects_out_of_range_window(window, per_day):
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_rolling_without_common_date_raises_business_code():
-    svc, _rolling_calls = _rolling_service({})
+    empty_runs = {"start": None, "end": None, "trading_days": 0}
+    svc, _rolling_calls = _rolling_service(
+        {},
+        readiness=_fake_readiness(
+            [_model("a"), _model("b")], D_ROLL, D_ROLL, ready=False
+        ),
+        runs=empty_runs,
+    )
 
     async def no_date(**_kwargs):
         return None
@@ -1523,6 +1625,245 @@ async def test_rolling_without_common_date_raises_business_code():
     with pytest.raises(BlendError) as exc:
         await svc.rolling({"blend_id": "bl_x"}, tenant_id="t", user_id="u")
     assert exc.value.code == "no_common_date"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_uses_runs_and_keeps_source_warnings_when_pred_unavailable():
+    d0, d1 = _roll_days(1, 0)
+    rows = {d0: [_roll_row("SH600000", 1)], d1: [_roll_row("SH600000", 1)]}
+    models = [_model("a"), _model("b")]
+    unready = _fake_readiness(
+        models, d0, d1, ready=False, warnings=("member_pred_unavailable:a",)
+    )
+    svc, calls = _rolling_service(rows, models=models, readiness=unready, source="runs")
+
+    payload = await svc.rolling(
+        {"blend_id": "bl_x"}, tenant_id="t", user_id="u", window=3, per_day=5
+    )
+
+    assert payload["source"] == "runs"
+    assert payload["bounds"]["source"] == "runs"
+    assert "member_pred_unavailable:a" in payload["warnings"]
+    assert calls["history_rows"]["readiness"] is unready
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_cells_carry_change_pnl_and_market_row():
+    d_prev = date.fromordinal(D_ROLL.toordinal() - 3)
+    d0, d1, d2 = _roll_days(2, 1, 0)
+    rows = {d0: [_roll_row("SH600000", 1)], d1: [_roll_row("SH600000", 1)]}
+    rows[d2] = [_roll_row("SH600000", 1)]
+    closes = {"SH600000": {d0: 10.0, d1: 11.0, d2: 12.1}}
+    benchmark = {d_prev: 99.0, d0: 100.0, d1: 101.0, d2: 102.2}
+    svc, _ = _rolling_service(rows, closes=closes, benchmark=benchmark)
+
+    payload = await svc.rolling(
+        {"blend_id": "bl_x"}, tenant_id="t", user_id="u", window=3, per_day=5
+    )
+
+    by_day = {column["date"]: column for column in payload["columns"]}
+    assert by_day[d0.isoformat()]["market"] == {
+        "change_pct": 1.01,
+        "close": 100.0,
+        "ma20_deviation_pct": None,
+        "position": "unknown",
+        "tone": "up",
+    }
+    assert by_day[d1.isoformat()]["market"]["change_pct"] == pytest.approx(1.0)
+    first = by_day[d0.isoformat()]["picks"][0]
+    second = by_day[d1.isoformat()]["picks"][0]
+    last = by_day[d2.isoformat()]["picks"][0]
+    assert first["change_pct"] is None  # 窗口首日没有前收
+    assert first["weight_pct"] is None  # 首日尚未持有
+    assert first["day_pnl_amount"] is None
+    assert second["change_pct"] == pytest.approx(10.0)
+    assert second["weight_pct"] == pytest.approx(100.0)
+    assert second["day_pnl_amount"] == pytest.approx(1_000_000.0)
+    # 格子统计块：窗口名单表现，不参与组合胜率
+    assert last["stats"]["appearances"] == 3
+    assert last["stats"]["streak_days"] == 3
+    assert last["stats"]["first_seen"] == d0.isoformat()
+    assert last["stats"]["since_first_pct"] == pytest.approx(21.0)
+    assert last["stats"]["next_day_avg_pct"] == pytest.approx(10.0)
+    assert last["stats"]["next_day_win_rate_pct"] == pytest.approx(100.0)
+    assert last["stats"]["next_day_samples"] == 2
+    assert last["stats"]["next_day_std_pct"] is None
+    assert last["stats"]["latest_close"] == pytest.approx(12.1)
+    assert last["stats"]["change_pct"] == pytest.approx(10.0)
+    assert payload["benchmark"] == {
+        "symbol": "000300.SH",
+        "name": "沪深300",
+        "available": True,
+        "days": 4,
+    }
+    assert "benchmark_unavailable" not in payload["warnings"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_flags_missing_benchmark_instead_of_zero():
+    d0, d1 = _roll_days(1, 0)
+    rows = {d0: [_roll_row("SH600000", 1)], d1: [_roll_row("SH600000", 1)]}
+    closes = {"SH600000": {d0: 10.0, d1: 11.0}}
+    svc, _ = _rolling_service(rows, closes=closes, benchmark={})
+
+    payload = await svc.rolling(
+        {"blend_id": "bl_x"}, tenant_id="t", user_id="u", window=2, per_day=5
+    )
+
+    assert payload["benchmark"]["available"] is False
+    assert "benchmark_unavailable" in payload["warnings"]
+    assert payload["summary"]["performance"]["benchmark_return_pct"] is None
+    assert payload["summary"]["performance"]["excess_return_pct"] is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_rejects_non_positive_capital():
+    svc, _ = _rolling_service({}, closes={})
+    with pytest.raises(BlendError):
+        await svc.rolling({"blend_id": "bl_x"}, tenant_id="t", user_id="u", capital=0)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_data_bounds_prefers_pred_when_all_members_ready():
+    models = [_model("a"), _model("b")]
+    svc = _service(models)
+    start, end = date(2025, 2, 5), date(2026, 10, 19)
+
+    async def fake_members(_blend):
+        return list(models)
+
+    async def fake_readiness(**_kwargs):
+        return _fake_readiness(models, start, end)
+
+    async def fake_runs(**_kwargs):
+        return {"start": "2026-08-27", "end": "2026-10-19", "trading_days": 32}
+
+    svc.members_from_blend = fake_members
+    svc._readiness_for = fake_readiness
+    svc._runs_bounds = fake_runs
+
+    payload = await svc.data_bounds(
+        {"blend_id": "bl_x", "min_coverage": 2}, tenant_id="t", user_id="u"
+    )
+
+    assert payload["source"] == "pred"
+    assert payload["pred"]["start"] == start.isoformat()
+    assert payload["pred"]["end"] == end.isoformat()
+    assert payload["pred"]["members_ready"] == 2
+    assert payload["pred"]["members_total"] == 2
+    assert payload["runs"]["trading_days"] == 32
+    assert payload["effective"]["start"] == start.isoformat()
+    assert payload["effective"]["end"] == end.isoformat()
+    assert payload["warnings"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_data_bounds_falls_back_to_runs_without_mixing_sources():
+    models = [_model("a"), _model("b")]
+    svc = _service(models)
+    start, end = date(2026, 8, 27), date(2026, 10, 19)
+
+    async def fake_members(_blend):
+        return list(models)
+
+    async def fake_readiness(**_kwargs):
+        return _fake_readiness(
+            models, start, end, ready=False, warnings=("member_pred_unavailable:b",)
+        )
+
+    async def fake_runs(**_kwargs):
+        return {"start": start.isoformat(), "end": end.isoformat(), "trading_days": 32}
+
+    svc.members_from_blend = fake_members
+    svc._readiness_for = fake_readiness
+    svc._runs_bounds = fake_runs
+
+    payload = await svc.data_bounds({"blend_id": "bl_x"}, tenant_id="t", user_id="u")
+
+    assert payload["source"] == "runs"
+    assert payload["pred"] is None
+    assert payload["effective"] == {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "trading_days": 32,
+    }
+    assert payload["warnings"] == ["member_pred_unavailable:b"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_history_rows_dispatches_pred_or_runs_without_mixing():
+    models = [_model("a"), _model("b")]
+    svc = _service(models)
+    start, end = date(2026, 9, 1), date(2026, 9, 2)
+    ready = _fake_readiness(models, start, end)
+    unready = _fake_readiness(models, start, end, ready=False)
+    calls: dict = {}
+
+    class FakePredSource:
+        def __init__(self, readiness):
+            self.readiness = readiness
+            self.loaded = False
+
+        async def load_top_rows(self, members, **kwargs):
+            self.loaded = True
+            calls["load"] = kwargs
+            return {end: [{"symbol": "SH600000"}]}
+
+    pred_source = FakePredSource(ready)
+    svc._pred_source = pred_source
+
+    async def fake_range(**kwargs):
+        calls["range"] = kwargs
+        return {end: [{"symbol": "SZ000001"}]}
+
+    svc._range_stats = fake_range
+
+    rows, source, _ = await svc._history_rows(
+        tenant_id="t",
+        user_id="u",
+        members=models,
+        weights=None,
+        method="mean",
+        trim_count=2,
+        min_coverage=2,
+        consensus_min_count=0,
+        start_date=start,
+        end_date=end,
+        top_k=5,
+        readiness=ready,
+    )
+    assert source == "pred"
+    assert rows[end][0]["symbol"] == "SH600000"
+    assert pred_source.loaded is True
+    assert "range" not in calls
+
+    pred_source = FakePredSource(unready)
+    svc._pred_source = pred_source
+    rows, source, _ = await svc._history_rows(
+        tenant_id="t",
+        user_id="u",
+        members=models,
+        weights=None,
+        method="mean",
+        trim_count=2,
+        min_coverage=2,
+        consensus_min_count=0,
+        start_date=start,
+        end_date=end,
+        top_k=5,
+        readiness=unready,
+    )
+    assert source == "runs"
+    assert rows[end][0]["symbol"] == "SZ000001"
+    assert pred_source.loaded is False
+    assert calls["range"]["start_date"] == start
 
 
 # ── 真库：榜单 / 窗口 / 计划 ─────────────────────────────────────────────
@@ -2122,20 +2463,51 @@ def _period_service(
     closes=None,
     common_date=PERIOD_DAYS[-1],
     members=None,
+    benchmark=None,
+    source="runs",
+    runs=None,
+    readiness=None,
 ):
-    svc = _service(members or [_model("a"), _model("b")])
+    members = members or [_model("a"), _model("b")]
+    svc = _service(members)
     calls: dict = {}
+    ready = (
+        readiness
+        if readiness is not None
+        else _fake_readiness(
+            members,
+            PERIOD_DAYS[0],
+            PERIOD_DAYS[-1],
+            ready=(source == "pred"),
+        )
+    )
+    runs_bounds = runs or {
+        "start": PERIOD_DAYS[0].isoformat(),
+        "end": PERIOD_DAYS[-1].isoformat(),
+        "trading_days": len(PERIOD_DAYS),
+    }
 
     async def fake_members(_blend):
-        return list(members or [_model("a"), _model("b")])
+        return list(members)
+
+    async def fake_readiness_for(**_kwargs):
+        return ready
+
+    async def fake_runs_bounds(**_kwargs):
+        calls["runs_bounds"] = True
+        return dict(runs_bounds)
+
+    async def fake_history(**kwargs):
+        calls["history_rows"] = kwargs
+        return rows_by_day, source, ready
 
     async def fake_calendar(start, end):
         calls["calendar"] = {"start": start, "end": end}
         return list(PERIOD_DAYS if days is None else days)
 
-    async def fake_range(**kwargs):
-        calls["range_stats"] = kwargs
-        return rows_by_day
+    async def fake_benchmark(start, end, *, market="CN"):
+        calls["benchmark"] = {"start": start, "end": end, "market": market}
+        return dict(benchmark or {})
 
     async def fake_closes(symbols, start, end):
         calls["close_history"] = {
@@ -2153,8 +2525,11 @@ def _period_service(
         return common_date
 
     svc.members_from_blend = fake_members
+    svc._readiness_for = fake_readiness_for
+    svc._runs_bounds = fake_runs_bounds
+    svc._history_rows = fake_history
     svc._calendar_days = fake_calendar
-    svc._range_stats = fake_range
+    svc._benchmark_closes = fake_benchmark
     svc._close_history = fake_closes
     svc._stock_names = fake_names
     svc.latest_common_date = fake_common_date
@@ -2178,9 +2553,9 @@ async def test_period_builds_fixed_hold_summary_months_and_serializes_dates():
         positions=1,
     )
 
-    assert calls["range_stats"]["start_date"] == PERIOD_DAYS[0]
-    assert calls["range_stats"]["end_date"] == PERIOD_DAYS[-1]
-    assert calls["range_stats"]["top_k"] == 1
+    assert calls["history_rows"]["start_date"] == PERIOD_DAYS[0]
+    assert calls["history_rows"]["end_date"] == PERIOD_DAYS[-1]
+    assert calls["history_rows"]["top_k"] == 1
     assert payload["requested"] == {
         "start": PERIOD_DAYS[0].isoformat(),
         "end": PERIOD_DAYS[-1].isoformat(),
@@ -2206,7 +2581,7 @@ async def test_period_builds_fixed_hold_summary_months_and_serializes_dates():
     assert summary["entry_convention"] == "close"
     assert summary["fee_convention"] == "none"
     # P=1 < E×H=5：稳态桶大于持仓上限，组合会在满仓后暂停建仓
-    assert payload["warnings"] == ["positions_cap"]
+    assert payload["warnings"] == ["benchmark_unavailable", "positions_cap"]
     assert [row["month"] for row in payload["months"]] == ["2026-10"]
     assert payload["months"][0]["start_date"] == PERIOD_DAYS[0].isoformat()
     assert payload["months"][0]["return_pct"] == pytest.approx(40.0)
@@ -2433,11 +2808,125 @@ async def test_period_defaults_positions_from_template_and_end_from_latest():
         start_date=PERIOD_DAYS[0],
     )
 
-    assert calls["common_date"] is True
-    assert calls["range_stats"]["top_k"] == 3
-    assert payload["requested"]["positions"] == 3
+    # 默认截止日取统一数据端口的 effective.end，不再单独查 runs
+    assert "common_date" not in calls
     assert payload["requested"]["end"] == PERIOD_DAYS[-1].isoformat()
+    assert payload["source"] == "runs"
+    assert payload["bounds"]["effective"]["end"] == PERIOD_DAYS[-1].isoformat()
+    assert calls["history_rows"]["top_k"] == 3
+    assert payload["requested"]["positions"] == 3
     assert payload["template"]["target_positions"] == 3
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_falls_back_to_latest_common_date_when_bounds_empty():
+    rows = {day: [_period_row("SH600000")] for day in PERIOD_DAYS}
+    closes = {"SH600000": dict.fromkeys(PERIOD_DAYS, 10.0)}
+    models = [_model("a"), _model("b")]
+    empty_runs = {"start": None, "end": None, "trading_days": 0}
+    svc, calls = _period_service(
+        rows,
+        closes=closes,
+        members=models,
+        readiness=_fake_readiness(models, PERIOD_DAYS[0], PERIOD_DAYS[-1], ready=False),
+        runs=empty_runs,
+    )
+
+    payload = await svc.period(
+        _period_blend(rolling_window=1),
+        tenant_id="t",
+        user_id="u",
+        start_date=PERIOD_DAYS[0],
+    )
+
+    assert calls["common_date"] is True
+    assert payload["requested"]["end"] == PERIOD_DAYS[-1].isoformat()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_pred_source_widens_range_budget_to_full_test_split():
+    days = [
+        date.fromordinal(PERIOD_DAYS[0].toordinal() + offset) for offset in range(421)
+    ]
+    rows = {day: [_period_row("SH600000")] for day in days[:2]}
+    svc, _ = _period_service(rows, days=days, closes={}, source="pred")
+
+    with pytest.raises(BlendError) as exc:
+        await svc.period(
+            _period_blend(),
+            tenant_id="t",
+            user_id="u",
+            start_date=days[0],
+            end_date=days[-1],
+        )
+    assert exc.value.code == "range_too_long"
+
+    # 420 个交易日内允许（不再受 runs 的 300 天上限约束）
+    svc, _ = _period_service(rows, days=days[:420], closes={}, source="pred")
+    with pytest.raises(BlendError) as exc:
+        await svc.period(
+            _period_blend(),
+            tenant_id="t",
+            user_id="u",
+            start_date=days[0],
+            end_date=days[419],
+        )
+    assert exc.value.code == "insufficient_coverage"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_wires_benchmark_closes_into_simulation():
+    rows = {day: [_period_row("SH600000")] for day in PERIOD_DAYS}
+    closes = {"SH600000": dict.fromkeys(PERIOD_DAYS, 10.0)}
+    benchmark = {day: 100.0 + index for index, day in enumerate(PERIOD_DAYS)}
+    svc, calls = _period_service(rows, closes=closes, benchmark=benchmark)
+
+    payload = await svc.period(
+        _period_blend(rolling_window=1),
+        tenant_id="t",
+        user_id="u",
+        start_date=PERIOD_DAYS[0],
+        end_date=PERIOD_DAYS[-1],
+        capital=1000.0,
+        positions=1,
+    )
+
+    assert calls["benchmark"]["start"] == PERIOD_DAYS[0]
+    assert payload["benchmark"] == {
+        "symbol": "000300.SH",
+        "name": "沪深300",
+        "available": True,
+        "days": len(PERIOD_DAYS),
+    }
+    assert payload["summary"]["benchmark_return_pct"] is not None
+    assert payload["summary"]["excess_return_pct"] is not None
+    assert "benchmark_unavailable" not in payload["warnings"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_period_flags_missing_benchmark_as_none_not_zero():
+    rows = {day: [_period_row("SH600000")] for day in PERIOD_DAYS}
+    closes = {"SH600000": dict.fromkeys(PERIOD_DAYS, 10.0)}
+    svc, _ = _period_service(rows, closes=closes, benchmark={})
+
+    payload = await svc.period(
+        _period_blend(rolling_window=1),
+        tenant_id="t",
+        user_id="u",
+        start_date=PERIOD_DAYS[0],
+        end_date=PERIOD_DAYS[-1],
+        capital=1000.0,
+        positions=1,
+    )
+
+    assert payload["benchmark"]["available"] is False
+    assert "benchmark_unavailable" in payload["warnings"]
+    assert payload["summary"]["benchmark_return_pct"] is None
+    assert payload["summary"]["excess_return_pct"] is None
 
 
 @pytest.mark.unit

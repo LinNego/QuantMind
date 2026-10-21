@@ -174,6 +174,8 @@ export const ComboWorkspace: React.FC<ComboWorkspaceProps> = ({
               ) : (
                 <RollingBuildPanel
                   rolling={state.rolling}
+                  capital={state.rollingCapital}
+                  onCapitalCommit={state.setRollingCapital}
                   loading={state.rollingLoading}
                   error={state.rollingError}
                   onRetry={state.reloadRolling}
@@ -198,6 +200,7 @@ export const ComboWorkspace: React.FC<ComboWorkspaceProps> = ({
                   loading={state.periodLoading}
                   error={state.periodError}
                   dates={state.dates}
+                  bounds={state.bounds}
                   onCalculate={(query) => void state.loadPeriod(query)}
                   onRetry={state.reloadPeriod}
                 />

@@ -307,3 +307,119 @@ def test_entry_on_last_day_is_open_with_zero_pnl():
     assert result["summary"]["final_equity"] == pytest.approx(1000.0)
     # 建仓当日收盘建仓：已持有交易日按 0 计（尚无隔夜）
     assert result["open"][0]["held_days"] == 0
+
+
+@pytest.mark.unit
+def test_realized_and_unrealized_sum_to_profit_identity():
+    days = _days(3)
+    closes = {
+        "SH600000": dict(zip(days, [10, 11, 12], strict=True)),
+        "SH600001": dict(zip(days, [10, 10, 10], strict=True)),
+    }
+    result = _run(
+        days=days,
+        picks={days[0]: ["SH600000", "SH600001"]},
+        closes=closes,
+        capital=1000.0,
+        positions=2,
+        entry_per_day=2,
+        hold_days=3,
+    )
+
+    summary = result["summary"]
+    assert summary["closed_trades"] == 0
+    assert summary["open_positions"] == 2
+    assert summary["realized_pnl_amount"] == pytest.approx(0.0)
+    assert summary["unrealized_pnl_amount"] == pytest.approx(100.0)
+    assert summary["profit_amount"] == pytest.approx(100.0)
+    assert summary["realized_return_pct"] == pytest.approx(0.0)
+    assert summary["unrealized_return_pct"] == pytest.approx(10.0)
+    assert summary["realized_pnl_amount"] + summary[
+        "unrealized_pnl_amount"
+    ] == pytest.approx(summary["final_equity"] - summary["initial_capital"])
+
+
+@pytest.mark.unit
+def test_benchmark_excess_on_summary_daily_and_months():
+    days = _days(4)
+    closes = {
+        "SH600000": dict(zip(days, [10, 11, 12, 13], strict=True)),
+        "SH600001": dict(zip(days, [10, 10, 10, 10], strict=True)),
+    }
+    benchmark = dict(zip(days, [100, 100, 101, 102], strict=True))
+    result = simulate_period(
+        days=days,
+        picks_by_day={days[0]: ["SH600000", "SH600001"]},
+        closes=closes,
+        capital=1000.0,
+        positions=2,
+        entry_per_day=2,
+        hold_days=2,
+        benchmark_closes=benchmark,
+    )
+
+    summary = result["summary"]
+    assert summary["benchmark_return_pct"] == pytest.approx(2.0)
+    assert summary["benchmark_coverage_pct"] == pytest.approx(100.0)
+    assert summary["excess_return_pct"] == pytest.approx(8.0)
+    assert summary["realized_pnl_amount"] == pytest.approx(100.0)
+    assert summary["unrealized_pnl_amount"] == pytest.approx(0.0)
+    assert summary["realized_pnl_amount"] + summary[
+        "unrealized_pnl_amount"
+    ] == pytest.approx(summary["final_equity"] - summary["initial_capital"])
+    assert summary["sharpe_ratio"] is not None
+    assert summary["profit_factor"] is None or summary["profit_factor"] >= 0
+
+    assert result["daily"][0]["benchmark_return_pct"] is None
+    assert result["daily"][2]["benchmark_return_pct"] == pytest.approx(1.0)
+    assert result["daily"][2]["excess_return_pct"] == pytest.approx(
+        result["daily"][2]["return_pct"] - 1.0
+    )
+    month = result["months"][0]
+    assert month["benchmark_return_pct"] == pytest.approx(2.0)
+    assert month["excess_return_pct"] == pytest.approx(month["return_pct"] - 2.0)
+
+
+@pytest.mark.unit
+def test_missing_benchmark_is_none_not_zero():
+    days = _days(3)
+    closes = _closes("SH600000", [10, 11, 12], days)
+    result = _run(
+        days=days,
+        picks={days[0]: ["SH600000"]},
+        closes=closes,
+        positions=1,
+        entry_per_day=1,
+        hold_days=2,
+    )
+
+    summary = result["summary"]
+    assert summary["benchmark_return_pct"] is None
+    assert summary["excess_return_pct"] is None
+    assert summary["benchmark_coverage_pct"] is None
+    assert result["daily"][1]["benchmark_return_pct"] is None
+    assert result["months"][0]["benchmark_return_pct"] is None
+
+
+@pytest.mark.unit
+def test_benchmark_below_coverage_threshold_is_reported_as_missing():
+    days = _days(4)
+    closes = {"SH600000": dict(zip(days, [10, 10, 10, 10], strict=True))}
+    # 只在首末两日有指数收盘：区间收益可算，但覆盖率仅 50%
+    benchmark = {days[0]: 100.0, days[3]: 110.0}
+    result = simulate_period(
+        days=days,
+        picks_by_day={days[0]: ["SH600000"]},
+        closes=closes,
+        capital=1000.0,
+        positions=1,
+        entry_per_day=1,
+        hold_days=2,
+        benchmark_closes=benchmark,
+    )
+
+    summary = result["summary"]
+    assert summary["benchmark_coverage_pct"] == pytest.approx(50.0)
+    assert summary["benchmark_return_pct"] is None
+    assert summary["excess_return_pct"] is None
+    assert summary["information_ratio"] is None

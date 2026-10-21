@@ -41,6 +41,18 @@ function blend(over: Partial<BlendRecord> = {}): BlendRecord {
 function period(over: Partial<BlendPeriodResponse> = {}): BlendPeriodResponse {
   const base: BlendPeriodResponse = {
     blend_id: 'blend-1',
+    source: 'pred',
+    bounds: {
+      source: 'pred',
+      pred: {
+        start: '2025-01-02', end: '2026-10-19', trading_days: 430,
+        members_ready: 13, members_total: 13,
+      },
+      runs: { start: '2026-08-27', end: '2026-10-19', trading_days: 33 },
+      effective: { start: '2025-01-02', end: '2026-10-19', trading_days: 430 },
+      warnings: [],
+    },
+    benchmark: { symbol: 'SH000300', name: '沪深300', available: true, days: 430 },
     requested: { start: '2026-04-22', end: '2026-10-19', capital: 10000000, positions: 50 },
     effective: {
       start: '2026-08-27',
@@ -55,8 +67,34 @@ function period(over: Partial<BlendPeriodResponse> = {}): BlendPeriodResponse {
       total_return_pct: -0.65,
       profit_amount: -64938.15,
       realized_pnl_amount: 12000,
+      realized_return_pct: 0.12,
       unrealized_pnl_amount: -76938.15,
+      unrealized_return_pct: -0.77,
       max_drawdown_pct: -6.04,
+      drawdown_peak_date: '2026-09-01',
+      drawdown_trough_date: '2026-10-17',
+      drawdown_recovery_date: null,
+      drawdown_recovery_days: null,
+      benchmark_return_pct: -2.1,
+      benchmark_coverage_pct: 100,
+      excess_return_pct: 1.45,
+      annualized_return_pct: -7.2,
+      volatility_pct: 18.5,
+      sharpe_ratio: -0.35,
+      sortino_ratio: -0.5,
+      calmar_ratio: -1.1,
+      tracking_error_pct: 6.2,
+      information_ratio: 0.23,
+      profit_factor: 0.82,
+      payoff_ratio: 1.1,
+      avg_win_pct: 5.2,
+      avg_loss_pct: -4.7,
+      gross_profit_amount: 220000,
+      gross_loss_amount: -268000,
+      avg_holding_days: 10,
+      turnover_x: 3.2,
+      avg_exposure_pct: 84.5,
+      final_cash_pct: 30.2,
       trading_days: 32,
       scoring_days: 32,
       entries: 160,
@@ -83,6 +121,10 @@ function period(over: Partial<BlendPeriodResponse> = {}): BlendPeriodResponse {
         end_equity: 10031333.15,
         return_pct: 0.31,
         profit_amount: 31333.15,
+        realized_pnl_amount: 0,
+        unrealized_pnl_amount: 31333.15,
+        benchmark_return_pct: -0.2,
+        excess_return_pct: 0.51,
         entries: 15,
         exits: 0,
         closed_trades: 0,
@@ -98,6 +140,10 @@ function period(over: Partial<BlendPeriodResponse> = {}): BlendPeriodResponse {
         end_equity: 9935061.85,
         return_pct: -4.21,
         profit_amount: -438938.15,
+        realized_pnl_amount: -320000,
+        unrealized_pnl_amount: -118938.15,
+        benchmark_return_pct: -1.8,
+        excess_return_pct: -2.41,
         entries: 40,
         exits: 40,
         closed_trades: 40,
@@ -107,9 +153,24 @@ function period(over: Partial<BlendPeriodResponse> = {}): BlendPeriodResponse {
       },
     ],
     daily: [
-      { date: '2026-08-27', equity: 10000000, cash: 9400000, positions: 5, entries: 5, exits: 0, return_pct: null },
-      { date: '2026-09-30', equity: 10374000, cash: 4000000, positions: 50, entries: 5, exits: 5, return_pct: 1.1 },
-      { date: '2026-10-19', equity: 9935061.85, cash: 3000000, positions: 50, entries: 5, exits: 5, return_pct: -0.4 },
+      {
+        date: '2026-08-27', equity: 10000000, cash: 9400000, market_value: 600000,
+        exposure_pct: 6, positions: 5, entries: 5, exits: 0,
+        realized_pnl_amount: 0, unrealized_pnl_amount: 0,
+        return_pct: null, benchmark_return_pct: null, excess_return_pct: null,
+      },
+      {
+        date: '2026-09-30', equity: 10374000, cash: 4000000, market_value: 6374000,
+        exposure_pct: 61.4, positions: 50, entries: 5, exits: 5,
+        realized_pnl_amount: 80000, unrealized_pnl_amount: 294000,
+        return_pct: 1.1, benchmark_return_pct: -0.2, excess_return_pct: 1.3,
+      },
+      {
+        date: '2026-10-19', equity: 9935061.85, cash: 3000000, market_value: 6935061.85,
+        exposure_pct: 69.8, positions: 50, entries: 5, exits: 5,
+        realized_pnl_amount: 12000, unrealized_pnl_amount: -76938.15,
+        return_pct: -0.4, benchmark_return_pct: -1.8, excess_return_pct: 1.4,
+      },
     ],
     trades: [
       {
@@ -163,6 +224,22 @@ describe('PeriodReturnPanel', () => {
     expect(screen.getByTestId('combo-period-total-return').className).toContain('text-green-600');
     expect(screen.getByTestId('combo-period-profit')).toHaveTextContent('-6.49 万');
     expect(screen.getByTestId('combo-period-quality')).toHaveTextContent('数据完整');
+    // 已实现 / 浮动分开；基准 / 超额来自统一数据端口
+    expect(screen.getByTestId('combo-period-realized')).toHaveTextContent('+1.20 万');
+    expect(screen.getByTestId('combo-period-realized')).toHaveTextContent('0.12%');
+    expect(screen.getByTestId('combo-period-unrealized')).toHaveTextContent('-7.69 万');
+    expect(screen.getByTestId('combo-period-benchmark')).toHaveTextContent('-2.10%');
+    expect(screen.getByTestId('combo-period-excess')).toHaveTextContent('+1.45%');
+    expect(screen.getByTestId('combo-period-source')).toHaveTextContent('pred 测试集');
+    expect(screen.getByTestId('combo-period-source')).toHaveTextContent(
+      '2025-01-02 ~ 2026-10-19',
+    );
+    expect(screen.getByTestId('combo-period-source')).toHaveTextContent('沪深300 · 430 日');
+    // 基准按初始资金归一后与组合同轴（橙色虚线）
+    expect(screen.getByTestId('combo-period-chart').innerHTML).toContain('#f59e0b');
+    const months = screen.getByTestId('combo-period-months').textContent ?? '';
+    expect(months).toContain('基准');
+    expect(months).toContain('超额');
     expect(screen.getByTestId('combo-period-chart')).toBeInTheDocument();
     expect(screen.getByText('月度拆解')).toBeInTheDocument();
     // 2026-08 无已了结交易 → 胜率必须是 —，不是 0
@@ -214,6 +291,38 @@ describe('PeriodReturnPanel', () => {
       capital: 10000000,
       positions: 50,
     });
+  });
+
+  it('快捷区间「全部」按 pred 可用区间回看到 2025，而不是只到推理台账', async () => {
+    const onCalculate = vi.fn();
+    render(
+      <PeriodReturnPanel
+        {...baseProps}
+        blend={blend()}
+        period={period()}
+        onCalculate={onCalculate}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('combo-period-quick-all'));
+    await waitFor(() => expect(onCalculate).toHaveBeenCalledTimes(1));
+    expect(onCalculate.mock.calls[0][0]).toMatchObject({
+      start: '2025-01-02',
+      end: '2026-10-19',
+      capital: 10000000,
+      positions: 50,
+    });
+  });
+
+  it('基准覆盖率不足时，基准与超额显示 —（不写 0）', () => {
+    const data = period();
+    data.summary.benchmark_coverage_pct = 40;
+    data.summary.benchmark_return_pct = null;
+    data.summary.excess_return_pct = null;
+    render(
+      <PeriodReturnPanel {...baseProps} blend={blend()} period={data} onCalculate={vi.fn()} />,
+    );
+    expect(screen.getByTestId('combo-period-benchmark').textContent).toBe('—');
+    expect(screen.getByTestId('combo-period-excess').textContent).toBe('—');
   });
 
   it('展开明细：已了结与在场表格都渲染，顺延/沿用标记可见', async () => {

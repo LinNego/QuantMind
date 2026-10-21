@@ -82,6 +82,30 @@ class _FakeService:
         self._record("available_dates", blend=blend, **kwargs)
         return ["2026-10-19", "2026-10-16"]
 
+    async def data_bounds(self, blend, **kwargs):
+        self._record("data_bounds", blend=blend, **kwargs)
+        return {
+            "source": "pred",
+            "pred": {
+                "start": "2025-02-05",
+                "end": "2026-10-19",
+                "trading_days": 414,
+                "members_ready": 2,
+                "members_total": 2,
+            },
+            "runs": {
+                "start": "2026-08-27",
+                "end": "2026-10-19",
+                "trading_days": 32,
+            },
+            "effective": {
+                "start": "2025-02-05",
+                "end": "2026-10-19",
+                "trading_days": 414,
+            },
+            "warnings": [],
+        }
+
     async def rolling(self, blend, **kwargs):
         self._record("rolling", blend=blend, **kwargs)
         return {
@@ -374,6 +398,29 @@ def test_ranking_404_when_no_common_date(api):
     assert resp.status_code == 404
 
 
+def test_bounds_returns_unified_source_envelope(api):
+    client, service, persistence = api
+    persistence.blends["bl_x"] = _blend()
+    resp = client.get(f"{BASE}/bl_x/bounds")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["blend_id"] == "bl_x"
+    assert payload["source"] == "pred"
+    assert payload["pred"]["trading_days"] == 414
+    assert payload["runs"]["trading_days"] == 32
+    assert payload["effective"]["start"] == "2025-02-05"
+    name, kwargs = service.calls[-1]
+    assert name == "data_bounds"
+    assert kwargs["tenant_id"] == "default"
+    assert kwargs["user_id"] == "10000001"
+    assert kwargs["blend"]["blend_id"] == "bl_x"
+
+
+def test_bounds_404s_unknown_blend(api):
+    client, _service, _persistence = api
+    assert client.get(f"{BASE}/bl_missing/bounds").status_code == 404
+
+
 def test_rolling_passes_window_per_day_and_date(api):
     client, service, persistence = api
     persistence.blends["bl_x"] = _blend()
@@ -387,7 +434,17 @@ def test_rolling_passes_window_per_day_and_date(api):
     assert kwargs["end_date"] == date(2026, 10, 19)
     assert kwargs["window"] == 10
     assert kwargs["per_day"] == 5
+    assert kwargs["capital"] == 10_000_000.0
     assert kwargs["blend"]["blend_id"] == "bl_x"
+
+
+def test_rolling_passes_capital(api):
+    client, service, persistence = api
+    persistence.blends["bl_x"] = _blend()
+    resp = client.get(f"{BASE}/bl_x/rolling", params={"capital": 2_000_000})
+    assert resp.status_code == 200
+    assert service.calls[-1][1]["capital"] == 2_000_000.0
+    assert client.get(f"{BASE}/bl_x/rolling", params={"capital": 0}).status_code == 422
 
 
 def test_rolling_defaults_and_bounds(api):

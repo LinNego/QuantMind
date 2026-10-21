@@ -23,6 +23,8 @@ from datetime import date
 from typing import Any
 from collections.abc import Mapping, Sequence
 
+from backend.services.engine.inference import portfolio_metrics as metrics
+
 RETURN_NDIGITS = 4
 AMOUNT_NDIGITS = 2
 PRICE_NDIGITS = 4
@@ -90,12 +92,14 @@ def simulate_period(
     positions: int,
     entry_per_day: int,
     hold_days: int,
+    benchmark_closes: Mapping[date, float] | None = None,
 ) -> dict[str, Any]:
     """模拟固定持有期滚动组合，返回摘要 / 月度 / 日权益 / 交易明细。
 
     ``days`` 是区间内全部交易日（升序）；``picks_by_day`` 只在**评分日**
     有键，值是该日组合榜单前 ``positions`` 名（按榜单顺序）；
-    ``closes`` 是 ``symbol → {date: close}``，未复权收盘价。
+    ``closes`` 是 ``symbol → {date: close}``，前复权收盘价；
+    ``benchmark_closes`` 是基准指数收盘价，缺失时基准/超额一律 ``None``。
     """
     ordered_days = list(days)
     capital = float(capital)
@@ -119,6 +123,8 @@ def simulate_period(
     daily: list[dict[str, Any]] = []
     target_budget = capital / positions
     entries_total = 0
+    entries_notional = 0.0
+    realized_cum = 0.0
     missing_entry_price = 0
     deferred_exit = 0
     peak_equity = capital
@@ -143,6 +149,7 @@ def simulate_period(
             proceeds = float(row["shares"]) * exit_price
             cash += proceeds
             pnl = proceeds - float(row["notional"])
+            realized_cum += pnl
             trades.append(
                 {
                     "symbol": row["symbol"],
@@ -179,6 +186,7 @@ def simulate_period(
                 break
             shares = budget / entry_price
             cash -= budget
+            entries_notional += budget
             open_rows.append(
                 {
                     "symbol": symbol,
@@ -207,9 +215,14 @@ def simulate_period(
                 row["stale"] = False
             else:
                 row["stale"] = True
-        equity = cash + sum(
+        market_value = sum(
             float(row["shares"]) * float(row["mark_price"]) for row in open_rows
         )
+        unrealized = sum(
+            float(row["shares"]) * float(row["mark_price"]) - float(row["notional"])
+            for row in open_rows
+        )
+        equity = cash + market_value
         peak_equity = max(peak_equity, equity)
         if peak_equity > 0:
             max_drawdown = min(max_drawdown, equity / peak_equity - 1.0)
@@ -219,9 +232,15 @@ def simulate_period(
                 "date": day,
                 "equity": round(equity, AMOUNT_NDIGITS),
                 "cash": round(cash, AMOUNT_NDIGITS),
+                "market_value": round(market_value, AMOUNT_NDIGITS),
+                "exposure_pct": round(market_value / equity * 100.0, 2)
+                if equity > 0
+                else None,
                 "positions": len(open_rows),
                 "entries": added_today,
                 "exits": exited_today,
+                "realized_pnl_amount": round(realized_cum, AMOUNT_NDIGITS),
+                "unrealized_pnl_amount": round(unrealized, AMOUNT_NDIGITS),
                 "return_pct": round(
                     (equity / previous_equity - 1.0) * 100.0, RETURN_NDIGITS
                 )
@@ -252,6 +271,20 @@ def simulate_period(
             }
         )
 
+    portfolio_returns = metrics.daily_returns([float(row["equity"]) for row in daily])
+    benchmark = metrics.benchmark_stats(ordered_days, benchmark_closes or {})
+    benchmark_daily = benchmark["daily_returns"]
+    for index, row in enumerate(daily):
+        value = benchmark_daily[index] if index < len(benchmark_daily) else None
+        row["benchmark_return_pct"] = (
+            round(value * 100.0, RETURN_NDIGITS) if value is not None else None
+        )
+        row["excess_return_pct"] = (
+            round(float(row["return_pct"]) - value * 100.0, RETURN_NDIGITS)
+            if row["return_pct"] is not None and value is not None
+            else None
+        )
+
     summary = _summary(
         capital=capital,
         final_equity=final_equity,
@@ -262,7 +295,86 @@ def simulate_period(
         scoring_days=sum(1 for day in ordered_days if day in picks_by_day),
         max_drawdown=max_drawdown,
     )
-    months = _months(capital, daily, trades)
+    drawdown = metrics.drawdown_stats(
+        ordered_days, [float(row["equity"]) for row in daily]
+    )
+    risk = metrics.risk_metrics(portfolio_returns)
+    excess = metrics.excess_metrics(portfolio_returns, benchmark_daily)
+    trades_stats = metrics.trade_stats(
+        [trade["return_pct"] for trade in trades],
+        [trade["pnl_amount"] for trade in trades],
+        [trade["held_days"] for trade in trades],
+    )
+    total_return_pct = summary["total_return_pct"]
+    annualized = metrics.annualized_return_pct(total_return_pct, len(daily))
+    max_drawdown_pct = float(summary["max_drawdown_pct"] or 0.0)
+    exposures = [
+        float(row["exposure_pct"])
+        for row in daily
+        if row.get("exposure_pct") is not None
+    ]
+    benchmark_ok = bool(
+        benchmark["coverage_pct"] is not None
+        and float(benchmark["coverage_pct"]) >= metrics.BENCHMARK_MIN_COVERAGE_PCT
+    )
+    benchmark_total = benchmark["return_pct"] if benchmark_ok else None
+    summary.update(
+        {
+            "realized_return_pct": round(
+                float(summary["realized_pnl_amount"]) / capital * 100.0,
+                RETURN_NDIGITS,
+            )
+            if capital > 0
+            else None,
+            "unrealized_return_pct": round(
+                float(summary["unrealized_pnl_amount"]) / capital * 100.0,
+                RETURN_NDIGITS,
+            )
+            if capital > 0
+            else None,
+            "benchmark_return_pct": benchmark_total,
+            "benchmark_coverage_pct": benchmark["coverage_pct"],
+            "excess_return_pct": round(
+                total_return_pct - benchmark_total, RETURN_NDIGITS
+            )
+            if total_return_pct is not None and benchmark_total is not None
+            else None,
+            "annualized_return_pct": annualized,
+            "volatility_pct": risk["volatility_pct"],
+            "sharpe_ratio": risk["sharpe_ratio"],
+            "sortino_ratio": risk["sortino_ratio"],
+            "calmar_ratio": round(annualized / abs(max_drawdown_pct), 4)
+            if annualized is not None and max_drawdown_pct < 0
+            else None,
+            "tracking_error_pct": excess["tracking_error_pct"]
+            if benchmark_ok
+            else None,
+            "information_ratio": excess["information_ratio"] if benchmark_ok else None,
+            "profit_factor": trades_stats["profit_factor"],
+            "payoff_ratio": trades_stats["payoff_ratio"],
+            "avg_win_pct": trades_stats["avg_win_pct"],
+            "avg_loss_pct": trades_stats["avg_loss_pct"],
+            "gross_profit_amount": trades_stats["gross_profit_amount"],
+            "gross_loss_amount": trades_stats["gross_loss_amount"],
+            "avg_holding_days": trades_stats["avg_holding_days"],
+            "turnover_x": round(entries_notional / capital, 4) if capital > 0 else None,
+            "avg_exposure_pct": round(statistics.fmean(exposures), 2)
+            if exposures
+            else None,
+            "final_cash_pct": round(
+                float(daily[-1]["cash"]) / float(daily[-1]["equity"]) * 100.0, 2
+            )
+            if daily and float(daily[-1]["equity"]) > 0
+            else None,
+            "drawdown_peak_date": drawdown["peak_date"],
+            "drawdown_trough_date": drawdown["trough_date"],
+            "drawdown_recovery_date": drawdown["recovery_date"],
+            "drawdown_recovery_days": drawdown["recovery_days"],
+        }
+    )
+    months = _months(
+        capital, daily, trades, benchmark_monthly=benchmark["monthly_returns"]
+    )
     stale_marks = sum(1 for row in open_payload if row["stale"])
     warnings = {
         "missing_entry_price": missing_entry_price,
@@ -337,6 +449,8 @@ def _months(
     capital: float,
     daily: Sequence[Mapping[str, Any]],
     trades: Sequence[Mapping[str, Any]],
+    *,
+    benchmark_monthly: Mapping[str, float | None] | None = None,
 ) -> list[dict[str, Any]]:
     """按自然月拆解；首月以上一期=初始资金为基准。"""
     grouped: dict[str, list[Mapping[str, Any]]] = {}
@@ -353,6 +467,7 @@ def _months(
 
     out: list[dict[str, Any]] = []
     previous_end = float(capital)
+    previous_realized = 0.0
     for month, rows in grouped.items():
         year, month_number = (int(part) for part in month.split("-"))
         first_day = rows[0]["date"]
@@ -366,6 +481,13 @@ def _months(
         ]
         month_start = date(year, month_number, 1)
         month_end = date(year, month_number, calendar.monthrange(year, month_number)[1])
+        month_return = (
+            round((end_equity / previous_end - 1.0) * 100.0, RETURN_NDIGITS)
+            if previous_end > 0
+            else None
+        )
+        month_realized = float(rows[-1].get("realized_pnl_amount") or 0.0)
+        benchmark_return = (benchmark_monthly or {}).get(month)
         out.append(
             {
                 "month": month,
@@ -373,12 +495,21 @@ def _months(
                 "end_date": last_day,
                 "start_equity": round(previous_end, AMOUNT_NDIGITS),
                 "end_equity": round(end_equity, AMOUNT_NDIGITS),
-                "return_pct": round(
-                    (end_equity / previous_end - 1.0) * 100.0, RETURN_NDIGITS
-                )
-                if previous_end > 0
-                else None,
+                "return_pct": month_return,
                 "profit_amount": round(end_equity - previous_end, AMOUNT_NDIGITS),
+                "realized_pnl_amount": round(
+                    month_realized - previous_realized, AMOUNT_NDIGITS
+                ),
+                "unrealized_pnl_amount": round(
+                    float(rows[-1].get("unrealized_pnl_amount") or 0.0),
+                    AMOUNT_NDIGITS,
+                ),
+                "benchmark_return_pct": benchmark_return,
+                "excess_return_pct": round(
+                    month_return - benchmark_return, RETURN_NDIGITS
+                )
+                if month_return is not None and benchmark_return is not None
+                else None,
                 "entries": sum(int(row["entries"]) for row in rows),
                 "exits": sum(int(row["exits"]) for row in rows),
                 "closed_trades": len(month_trades),
@@ -395,4 +526,5 @@ def _months(
             }
         )
         previous_end = end_equity
+        previous_realized = month_realized
     return out

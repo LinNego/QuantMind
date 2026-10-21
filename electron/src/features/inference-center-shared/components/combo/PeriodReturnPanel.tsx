@@ -8,6 +8,10 @@
  * - 收盘价建仓与退出，**不计手续费、印花税与滑点**；
  * - 输出总收益、月度拆解、权益曲线与交易明细，用于评估组合综合选股能力。
  *
+ * 机构级统计（2026-10-21 追加）：已实现与浮动拆分、基准（沪深300）与超额、
+ * 年化/波动/夏普/索提诺/卡玛、最大回撤窗口、跟踪误差与信息比率、盈利因子与盈亏比、
+ * 换手与平均仓位；数据端口（pred 测试集 / 推理台账）与可用区间常驻展示。
+ *
  * 展示面合规：不出现「买入/卖出」，统一说「建仓/退出/入选」；
  * 红涨绿跌（A 股口径）；缺失值一律 `—`，绝不显示成 0。
  */
@@ -29,6 +33,7 @@ import type { ColumnsType } from 'antd/es/table';
 import dayjs, { type Dayjs } from 'dayjs';
 import { Calculator, RefreshCw } from 'lucide-react';
 import type {
+  BlendBounds,
   BlendPeriodMonth,
   BlendPeriodOpen,
   BlendPeriodQuery,
@@ -44,7 +49,8 @@ import {
 } from './comboRankingModel';
 import {
   PERIOD_QUICK_RANGES,
-  buildEquityGeometry,
+  buildBenchmarkEquitySeries,
+  buildComparisonGeometry,
   formatPct,
   formatSignedAmount,
   formatWinRate,
@@ -53,6 +59,8 @@ import {
   periodWarningLabel,
   type PeriodQuickRange,
 } from './periodReturnModel';
+import { DataSourceBadge, PortfolioMetricsStrip } from './PortfolioMetricsStrip';
+import { buildPeriodMetricSections } from './periodMetricsSections';
 import './comboTable.css';
 
 const { RangePicker } = DatePicker;
@@ -73,8 +81,10 @@ export interface PeriodReturnPanelProps {
   period: BlendPeriodResponse | null;
   loading: boolean;
   error: string | null;
-  /** 可用评分日（降序），用于「全部」快捷区间 */
+  /** 可用评分日（降序），用于「全部」快捷区间兜底 */
   dates: readonly string[];
+  /** 后端 `/bounds`：pred 测试集 / 推理台账的实际可用区间 */
+  bounds?: BlendBounds | null;
   onCalculate: (query: BlendPeriodQuery) => void;
   onRetry: () => void;
 }
@@ -85,6 +95,7 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
   loading,
   error,
   dates,
+  bounds,
   onCalculate,
   onRetry,
 }) => {
@@ -120,8 +131,18 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
 
   const handleCalculate = () => onCalculate(buildQuery());
 
+  // 快捷区间锚点：优先 pred 测试集的实际区间（可回看到 2025），否则退回可用评分日
+  const effectiveBounds = period?.bounds ?? bounds ?? null;
+  const anchor = useMemo(
+    () => ({
+      start: effectiveBounds?.effective.start ?? null,
+      end: effectiveBounds?.effective.end ?? null,
+    }),
+    [effectiveBounds],
+  );
+
   const handleQuick = (kind: PeriodQuickRange) => {
-    const query = periodQuickQuery(kind, dates);
+    const query = periodQuickQuery(kind, dates, anchor);
     if (query.start && query.end) setRange([dayjs(query.start), dayjs(query.end)]);
     else if (query.end) setRange([null, dayjs(query.end)]);
     // 快捷区间只换日期，资金/持仓上限仍取当前表单值
@@ -130,24 +151,37 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
 
   const summary = period?.summary ?? null;
   const template = period?.template ?? null;
+  const benchmarkSeries = useMemo(
+    () =>
+      period && summary
+        ? buildBenchmarkEquitySeries(period.daily, summary.initial_capital)
+        : [],
+    [period, summary],
+  );
   const geometry = useMemo(
     () =>
-      period
-        ? buildEquityGeometry(
+      period && summary
+        ? buildComparisonGeometry(
             period.daily,
-            period.summary.initial_capital,
+            benchmarkSeries,
+            summary.initial_capital,
             EQUITY_WIDTH,
             EQUITY_HEIGHT,
           )
         : null,
-    [period],
+    [period, summary, benchmarkSeries],
+  );
+  const metricSections = useMemo(
+    () => (summary ? buildPeriodMetricSections(summary) : []),
+    [summary],
   );
 
   const monthColumns: ColumnsType<BlendPeriodMonth> = [
     {
       title: '月份',
       dataIndex: 'month',
-      width: 96,
+      width: 92,
+      fixed: 'left',
       render: (value: string, row) => (
         <span className="flex items-center gap-1">
           <span className="font-mono text-[11px]">{value}</span>
@@ -158,7 +192,7 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
     {
       title: '月收益',
       dataIndex: 'return_pct',
-      width: 92,
+      width: 88,
       align: 'right',
       render: (value: number | null) => (
         <span className={`font-mono font-bold ${returnToneClass(value)}`}>
@@ -167,9 +201,31 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
       ),
     },
     {
+      title: '基准',
+      dataIndex: 'benchmark_return_pct',
+      width: 80,
+      align: 'right',
+      render: (value: number | null) => (
+        <span className="font-mono text-[11px] text-slate-600">
+          {formatReturnPct(value)}
+        </span>
+      ),
+    },
+    {
+      title: '超额',
+      dataIndex: 'excess_return_pct',
+      width: 84,
+      align: 'right',
+      render: (value: number | null) => (
+        <span className={`font-mono text-[11px] font-bold ${returnToneClass(value)}`}>
+          {formatReturnPct(value)}
+        </span>
+      ),
+    },
+    {
       title: '收益金额',
       dataIndex: 'profit_amount',
-      width: 110,
+      width: 104,
       align: 'right',
       render: (value: number) => (
         <span className={`font-mono ${returnToneClass(value)}`}>
@@ -178,9 +234,26 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
       ),
     },
     {
+      title: '已实现 / 浮动',
+      key: 'pnl_split',
+      width: 168,
+      align: 'right',
+      render: (_value, row) => (
+        <span className="font-mono text-[10px] whitespace-nowrap">
+          <span className={returnToneClass(row.realized_pnl_amount)}>
+            {formatSignedAmount(row.realized_pnl_amount)}
+          </span>
+          <span className="px-0.5 text-slate-300">/</span>
+          <span className={returnToneClass(row.unrealized_pnl_amount)}>
+            {formatSignedAmount(row.unrealized_pnl_amount)}
+          </span>
+        </span>
+      ),
+    },
+    {
       title: '区间',
       key: 'span',
-      width: 168,
+      width: 160,
       render: (_value, row) => (
         <span className="font-mono text-[10px] text-slate-500">
           {row.start_date} ~ {row.end_date}
@@ -190,7 +263,7 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
     {
       title: '建仓 / 了结',
       key: 'trades',
-      width: 108,
+      width: 100,
       align: 'right',
       render: (_value, row) => (
         <span className="font-mono text-[11px]">
@@ -201,14 +274,14 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
     {
       title: '月末在场',
       dataIndex: 'month_end_positions',
-      width: 88,
+      width: 84,
       align: 'right',
       render: (value: number) => <span className="font-mono text-[11px]">{value}</span>,
     },
     {
       title: '胜率',
       dataIndex: 'win_rate_pct',
-      width: 80,
+      width: 76,
       align: 'right',
       render: (value: number | null) => (
         <span className="font-mono text-[11px] text-slate-600">{formatWinRate(value)}</span>
@@ -462,79 +535,33 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
             </Button>
           ))}
         </div>
+        <span className="ml-auto">
+          <DataSourceBadge
+            source={period?.source ?? effectiveBounds?.source ?? null}
+            bounds={effectiveBounds}
+            benchmark={period?.benchmark ?? null}
+            testId="combo-period-source"
+          />
+        </span>
         <Button
           size="small"
           icon={<RefreshCw size={13} />}
           loading={loading}
           onClick={onRetry}
-          className="ml-auto"
         >
           刷新
         </Button>
       </div>
 
       {period && summary && (
-        <div
-          className="shrink-0 flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2 border-b border-slate-100 bg-slate-50/70 text-[11px] text-slate-500"
-          data-testid="combo-period-summary"
-        >
-          <span className="flex items-baseline gap-1">
-            <span className="font-bold text-slate-600">总收益</span>
-            <span
-              className={`font-mono text-lg font-black ${returnToneClass(summary.total_return_pct)}`}
-              data-testid="combo-period-total-return"
-            >
-              {formatReturnPct(summary.total_return_pct)}
-            </span>
-          </span>
-          <span className="flex items-baseline gap-1">
-            <span>收益金额</span>
-            <strong
-              className={`font-mono text-sm ${returnToneClass(summary.profit_amount)}`}
-              data-testid="combo-period-profit"
-            >
-              {formatSignedAmount(summary.profit_amount)}
-            </strong>
-          </span>
-          <span>
-            期末权益{' '}
-            <strong className="font-mono text-slate-700">
-              {formatAmount(summary.final_equity)}
-            </strong>
-          </span>
-          <span>
-            最大回撤{' '}
-            <strong className={`font-mono ${returnToneClass(summary.max_drawdown_pct)}`}>
-              {formatPct(summary.max_drawdown_pct)}
-            </strong>
-          </span>
-          <span>
-            胜率{' '}
-            <strong className="font-mono text-slate-700">
-              {formatWinRate(summary.win_rate_pct)}
-            </strong>
-          </span>
-          <span>
-            已了结{' '}
-            <strong className="font-mono text-slate-700">{summary.closed_trades}</strong> 笔 ·
-            在场 <strong className="font-mono text-slate-700">{summary.open_positions}</strong> 只
-          </span>
-          <span>
-            已实现{' '}
-            <strong className={`font-mono ${returnToneClass(summary.realized_pnl_amount)}`}>
-              {formatSignedAmount(summary.realized_pnl_amount)}
-            </strong>{' '}
-            / 浮动{' '}
-            <strong className={`font-mono ${returnToneClass(summary.unrealized_pnl_amount)}`}>
-              {formatSignedAmount(summary.unrealized_pnl_amount)}
-            </strong>
-          </span>
-          <span>
-            日均在场{' '}
-            <strong className="font-mono text-slate-700">
-              {summary.avg_positions.toFixed(1)}
-            </strong>{' '}
-            只
+        <PortfolioMetricsStrip sections={metricSections} testId="combo-period-summary" />
+      )}
+
+      {period && summary && (
+        <div className="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-1 border-b border-slate-100 text-[10px] text-slate-400">
+          <span data-testid="combo-period-range">
+            {periodRangeLabel(period)} · 评分日 {summary.scoring_days}/
+            {summary.trading_days} · 收盘价建仓/退出，不计手续费与滑点
           </span>
           <Tag
             color={summary.data_quality === 'complete' ? 'green' : 'orange'}
@@ -547,7 +574,7 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
           </Tag>
           {template && (
             <Tooltip title="每日新进 × 持有天数来自已保存组合模板；每仓目标金额 = 初始资金 ÷ 持仓上限">
-              <span className="ml-auto text-[10px] text-slate-400 cursor-help">
+              <span className="cursor-help">
                 模板：每日新进 {template.entry_per_day} · 持有 {template.hold_days} 日 · 目标{' '}
                 {template.target_positions} 只
               </span>
@@ -573,21 +600,28 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
           </div>
         ) : (
           <>
-            <div className="text-[10px] text-slate-400" data-testid="combo-period-range">
-              {periodRangeLabel(period)} · 评分日 {summary.scoring_days}/{summary.trading_days}
-              {' · '}
-              收盘价建仓/退出，不计手续费与滑点
-            </div>
-
             {geometry && (
               <div
                 className="rounded-lg border border-slate-200 bg-white px-2 py-1"
                 data-testid="combo-period-chart"
               >
                 <div className="flex items-center justify-between px-1 text-[10px] text-slate-400">
-                  <span>区间权益（初始 {formatAmount(summary.initial_capital)}）</span>
+                  <span className="flex items-center gap-2">
+                    <span>区间权益（初始 {formatAmount(summary.initial_capital)}）</span>
+                    <span className="flex items-center gap-1">
+                      <span className="inline-block h-0.5 w-3 bg-blue-600" />
+                      组合
+                    </span>
+                    {geometry.benchmarkPath && (
+                      <span className="flex items-center gap-1">
+                        <span className="inline-block h-0.5 w-3 bg-amber-500" />
+                        {period.benchmark?.name ?? '基准'}
+                      </span>
+                    )}
+                  </span>
                   <span className="font-mono">
-                    {formatAmount(geometry.minEquity)} ~ {formatAmount(geometry.maxEquity)}
+                    {formatAmount(geometry.equity.minEquity)} ~{' '}
+                    {formatAmount(geometry.equity.maxEquity)}
                   </span>
                 </div>
                 <svg
@@ -595,20 +629,30 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
                   preserveAspectRatio="none"
                   className="w-full h-40"
                   role="img"
-                  aria-label="区间权益曲线"
+                  aria-label="区间权益曲线与基准"
                 >
                   <line
                     x1={0}
                     x2={EQUITY_WIDTH}
-                    y1={geometry.baselineY}
-                    y2={geometry.baselineY}
+                    y1={geometry.equity.baselineY}
+                    y2={geometry.equity.baselineY}
                     stroke="#cbd5e1"
                     strokeDasharray="4 4"
                     strokeWidth={1}
                   />
-                  <path d={geometry.areaPath} fill="#dbeafe" opacity={0.6} />
+                  <path d={geometry.equity.areaPath} fill="#dbeafe" opacity={0.6} />
+                  {geometry.benchmarkPath && (
+                    <path
+                      d={geometry.benchmarkPath}
+                      fill="none"
+                      stroke="#f59e0b"
+                      strokeWidth={1.3}
+                      strokeDasharray="3 2"
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  )}
                   <path
-                    d={geometry.linePath}
+                    d={geometry.equity.linePath}
                     fill="none"
                     stroke="#2563eb"
                     strokeWidth={1.6}
@@ -626,7 +670,7 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
                 columns={monthColumns}
                 dataSource={period.months}
                 pagination={false}
-                scroll={{ x: 720 }}
+                scroll={{ x: 1080 }}
               />
             </div>
 
@@ -672,7 +716,8 @@ export const PeriodReturnPanel: React.FC<PeriodReturnPanelProps> = ({
 
       <div className="shrink-0 px-3 py-1.5 border-t border-slate-100 text-[10px] text-slate-400">
         口径：评分日收盘价建仓，固定持有 H 个交易日后收盘价退出（停牌顺延），每仓目标金额 =
-        初始资金 ÷ 持仓上限；期末未到期按最后有效收盘价估值。不计手续费、印花税与滑点。
+        初始资金 ÷ 持仓上限；期末未到期按最后有效收盘价估值。基准为沪深300，按日收益复利并与
+        组合同轴展示；覆盖率不足 95% 时基准与超额一律显示 —。不计手续费、印花税与滑点。
         结果用于评估组合综合选股能力，不构成任何投资建议。
       </div>
     </div>

@@ -3,21 +3,34 @@
  *
  * 横向 N+1 列（D-N … 今日），每列 `per_day` 只，默认 11×5 = 55 格（窗口内去重约 50）。
  * 色块只表达「新进 / 留存 / 退出」，**刻意不用红绿**——红绿在 A 股是涨跌方向，
- * 与「是否新进」无关，混用会把方向暗示从颜色里加回来。
+ * 与「是否新进」无关，混用会把方向暗示从颜色里加回来。涨跌幅与当日盈亏
+ * 只出现在**文字与数字**上（红涨绿跌），不参与卡片底色。
  *
+ * 每个格子（2026-10-21 追加）：当日涨跌幅、当日盈亏（仅当日实际持有）、
+ * 窗口内在榜天数 / 首次入选至今 / 次日收益均值与胜率（hover 给完整统计）。
+ * 每列头部（同日追加）：沪深300 当日涨跌幅、收盘、相对 20 日线位置。
+ *
+ * 口径：入选日收盘按全部权益等权建仓 → 次一交易日收盘结算；最后一批只估值不结算。
  * 退出只在「昨列 → 今日」标注一次（后端已限定），这里不做二次推算。
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Button, Empty, Spin, Tag, Tooltip } from 'antd';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, Button, Collapse, Empty, InputNumber, Spin, Table, Tag, Tooltip } from 'antd';
+import type { ColumnsType } from 'antd/es/table';
 import { RefreshCw } from 'lucide-react';
-import type { BlendRollingResponse } from '../../../../services/blendTypes';
+import type {
+  BlendRollingBatch,
+  BlendRollingDaily,
+  BlendRollingPick,
+  BlendRollingResponse,
+} from '../../../../services/blendTypes';
 import { formatResearchScore, researchScore } from '../../../shared/researchScore';
 import { positionTagClass } from '../../positionLabels';
 import {
   ROLLING_TONE,
   exitLabel,
   exitTradeLabel,
+  formatAmount,
   formatReturnPct,
   positionLabel,
   returnToneClass,
@@ -26,6 +39,15 @@ import {
   scrollGeometry,
   type ScrollGeometry,
 } from './comboRankingModel';
+import { blendWarningLabel } from './portfolioMetricsModel';
+import {
+  marketChangeLabel,
+  marketDayLabel,
+  marketPositionLabel,
+} from './portfolioMetricsModel';
+import { formatSignedAmount, formatWinRate } from './periodReturnModel';
+import { DataSourceBadge, PortfolioMetricsStrip } from './PortfolioMetricsStrip';
+import { buildRollingMetricSections } from './rollingMetricsSections';
 import './rollingBoard.css';
 
 const HIDDEN_SCROLLBAR: ScrollGeometry = {
@@ -35,6 +57,10 @@ const HIDDEN_SCROLLBAR: ScrollGeometry = {
   progress: 0,
 };
 
+const DEFAULT_CAPITAL = 10_000_000;
+const MIN_CAPITAL_WAN = 1;
+const MAX_CAPITAL_WAN = 1_000_000;
+
 /** 市值（亿元）→ 展示值；缺失返回 null（渲染 `—`，不写 0） */
 function capLabel(marketCapYi: number | null | undefined): string | null {
   if (typeof marketCapYi !== 'number' || !Number.isFinite(marketCapYi)) return null;
@@ -42,8 +68,41 @@ function capLabel(marketCapYi: number | null | undefined): string | null {
   return `${marketCapYi.toFixed(0)} 亿`;
 }
 
+/** 格子 hover：窗口内完整统计（缺失一律 `—`） */
+function pickStatsLabel(pick: BlendRollingPick): string {
+  const stats = pick.stats;
+  const parts = [
+    `${pick.name || pick.symbol} · 排名 ${pick.rank}`,
+    `综合分 ${formatResearchScore(researchScore(pick.pct))}`,
+    positionLabel(pick),
+  ];
+  if (stats) {
+    parts.push(`在榜 ${stats.appearances ?? '—'} 日（连续 ${stats.streak_days ?? '—'}）`);
+    if (stats.first_seen) parts.push(`首次 ${stats.first_seen}`);
+    parts.push(`首次至今 ${formatReturnPct(stats.since_first_pct)}`);
+    parts.push(
+      `次日均值 ${formatReturnPct(stats.next_day_avg_pct)}（胜率 ${formatWinRate(
+        stats.next_day_win_rate_pct,
+      )} · ${stats.next_day_samples ?? '—'} 样本）`,
+    );
+    parts.push(`次日波动 ${formatReturnPct(stats.next_day_std_pct)}`);
+    parts.push(`末日收盘 ${stats.latest_close ?? '—'}`);
+  }
+  parts.push(`当日涨跌 ${formatReturnPct(pick.change_pct)}`);
+  if (pick.weight_pct !== null && pick.weight_pct !== undefined) {
+    parts.push(`当日权重 ${pick.weight_pct.toFixed(2)}%`);
+  }
+  if (pick.day_pnl_amount !== null && pick.day_pnl_amount !== undefined) {
+    parts.push(`当日盈亏 ${formatSignedAmount(pick.day_pnl_amount)}`);
+  }
+  return parts.join(' · ');
+}
+
 export interface RollingBuildPanelProps {
   rolling: BlendRollingResponse | null;
+  /** 批次本金（元）；改变后由上层重新请求 */
+  capital: number;
+  onCapitalCommit: (capital: number) => void;
   loading: boolean;
   error: string | null;
   onRetry: () => void;
@@ -51,6 +110,8 @@ export interface RollingBuildPanelProps {
 
 export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
   rolling,
+  capital,
+  onCapitalCommit,
   loading,
   error,
   onRetry,
@@ -60,6 +121,28 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
   const trackRef = useRef<HTMLDivElement | null>(null);
   const [overflowX, setOverflowX] = useState(false);
   const [scrollbar, setScrollbar] = useState<ScrollGeometry>(HIDDEN_SCROLLBAR);
+
+  // 本金输入：本地编辑，失焦/回车才提交（避免逐字符触发重新计算）
+  const effectiveCapital = rolling?.capital ?? capital ?? DEFAULT_CAPITAL;
+  const [capitalWan, setCapitalWan] = useState<number | null>(
+    Math.round(effectiveCapital / 10000),
+  );
+  useEffect(() => {
+    setCapitalWan(Math.round(effectiveCapital / 10000));
+  }, [effectiveCapital]);
+
+  const commitCapital = () => {
+    const wan =
+      typeof capitalWan === 'number' && Number.isFinite(capitalWan)
+        ? Math.round(capitalWan)
+        : 0;
+    if (wan < MIN_CAPITAL_WAN) {
+      setCapitalWan(Math.round(effectiveCapital / 10000));
+      return;
+    }
+    const next = wan * 10000;
+    if (next !== effectiveCapital) onCapitalCommit(next);
+  };
 
   const syncScrollbar = useCallback(() => {
     const el = boardRef.current;
@@ -143,6 +226,193 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
     event.preventDefault();
   };
 
+  const performance = rolling?.summary.performance;
+  const metricSections = useMemo(
+    () => (performance ? buildRollingMetricSections(performance) : []),
+    [performance],
+  );
+
+  const batchColumns: ColumnsType<BlendRollingBatch> = useMemo(
+    () => [
+      {
+        title: '建仓日',
+        dataIndex: 'entry_date',
+        width: 100,
+        render: (value: string) => <span className="font-mono text-[10px]">{value}</span>,
+      },
+      {
+        title: '结算日',
+        dataIndex: 'exit_date',
+        width: 100,
+        render: (value: string) => <span className="font-mono text-[10px]">{value}</span>,
+      },
+      {
+        title: '持仓 / 有价',
+        key: 'positions',
+        width: 92,
+        align: 'right',
+        render: (_value, row) => (
+          <span className="font-mono text-[11px]">
+            {row.positions} / {row.priced}
+          </span>
+        ),
+      },
+      {
+        title: '批次收益',
+        dataIndex: 'return_pct',
+        width: 90,
+        align: 'right',
+        render: (value: number | null) => (
+          <span className={`font-mono font-bold ${returnToneClass(value)}`}>
+            {formatReturnPct(value)}
+          </span>
+        ),
+      },
+      {
+        title: '盈亏金额',
+        dataIndex: 'pnl_amount',
+        width: 104,
+        align: 'right',
+        render: (value: number | null) => (
+          <span className={`font-mono ${returnToneClass(value)}`}>
+            {formatSignedAmount(value)}
+          </span>
+        ),
+      },
+      {
+        title: '批次权益',
+        dataIndex: 'equity',
+        width: 110,
+        align: 'right',
+        render: (value: number) => <span className="font-mono">{formatAmount(value)}</span>,
+      },
+      {
+        title: '名义金额',
+        dataIndex: 'notional_amount',
+        width: 110,
+        align: 'right',
+        render: (value: number) => <span className="font-mono">{formatAmount(value)}</span>,
+      },
+      {
+        title: '持有',
+        dataIndex: 'holding_days',
+        width: 62,
+        align: 'right',
+        render: (value: number) => <span className="font-mono text-[11px]">{value} 日</span>,
+      },
+      {
+        title: '状态',
+        dataIndex: 'settled',
+        width: 78,
+        render: (value: boolean) =>
+          value ? (
+            <Tag color="green" className="!m-0 !text-[9px]">
+              已结算
+            </Tag>
+          ) : (
+            <Tooltip title="最后一个批次只在末日收盘估值，计入浮动收益，不结算">
+              <Tag color="blue" className="!m-0 !text-[9px]">
+                浮动中
+              </Tag>
+            </Tooltip>
+          ),
+      },
+    ],
+    [],
+  );
+
+  const dailyColumns: ColumnsType<BlendRollingDaily> = useMemo(
+    () => [
+      {
+        title: '建仓日',
+        dataIndex: 'date',
+        width: 100,
+        render: (value: string) => <span className="font-mono text-[10px]">{value}</span>,
+      },
+      {
+        title: '结算日',
+        dataIndex: 'exit_date',
+        width: 100,
+        render: (value: string) => <span className="font-mono text-[10px]">{value}</span>,
+      },
+      {
+        title: '当日收益',
+        dataIndex: 'return_pct',
+        width: 88,
+        align: 'right',
+        render: (value: number | null) => (
+          <span className={`font-mono font-bold ${returnToneClass(value)}`}>
+            {formatReturnPct(value)}
+          </span>
+        ),
+      },
+      {
+        title: '权益',
+        dataIndex: 'equity',
+        width: 110,
+        align: 'right',
+        render: (value: number) => <span className="font-mono">{formatAmount(value)}</span>,
+      },
+      {
+        title: '持仓市值',
+        dataIndex: 'market_value',
+        width: 110,
+        align: 'right',
+        render: (value: number) => <span className="font-mono">{formatAmount(value)}</span>,
+      },
+      {
+        title: '现金',
+        dataIndex: 'cash',
+        width: 100,
+        align: 'right',
+        render: (value: number) => <span className="font-mono">{formatAmount(value)}</span>,
+      },
+      {
+        title: '仓位',
+        dataIndex: 'exposure_pct',
+        width: 74,
+        align: 'right',
+        render: (value: number | null) => (
+          <span className="font-mono text-[11px]">
+            {value === null ? '—' : `${value.toFixed(1)}%`}
+          </span>
+        ),
+      },
+      {
+        title: '基准',
+        dataIndex: 'benchmark_return_pct',
+        width: 80,
+        align: 'right',
+        render: (value: number | null) => (
+          <span className="font-mono text-[11px] text-slate-600">{formatReturnPct(value)}</span>
+        ),
+      },
+      {
+        title: '超额',
+        dataIndex: 'excess_return_pct',
+        width: 84,
+        align: 'right',
+        render: (value: number | null) => (
+          <span className={`font-mono text-[11px] font-bold ${returnToneClass(value)}`}>
+            {formatReturnPct(value)}
+          </span>
+        ),
+      },
+      {
+        title: '状态',
+        dataIndex: 'settled',
+        width: 78,
+        render: (value: boolean) =>
+          value ? (
+            <span className="text-[10px] text-green-700">已结算</span>
+          ) : (
+            <span className="text-[10px] text-blue-700">浮动中</span>
+          ),
+      },
+    ],
+    [],
+  );
+
   if (error) {
     return (
       <div className="p-3" data-testid="combo-rolling-error">
@@ -178,15 +448,56 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
 
   const memberCount = rolling.members.length;
   const latest = rolling.data_trade_date;
-  const performance = rolling.summary.performance;
+  const batches = rolling.batches ?? [];
+  const daily = rolling.daily ?? [];
+  const detailItems = [
+    batches.length > 0
+      ? {
+          key: 'batches',
+          label: `每日批次（${batches.length} 批 · 结算 ${
+            performance?.settled_batches ?? batches.filter((row) => row.settled).length
+          } · 浮动 ${
+            performance?.open_batches ?? batches.filter((row) => !row.settled).length
+          }）`,
+          children: (
+            <Table<BlendRollingBatch>
+              size="small"
+              rowKey="entry_date"
+              columns={batchColumns}
+              dataSource={batches}
+              pagination={false}
+              scroll={{ x: 840 }}
+              data-testid="combo-rolling-batches"
+            />
+          ),
+        }
+      : null,
+    daily.length > 0
+      ? {
+          key: 'daily',
+          label: `逐日净值（${daily.length} 日）`,
+          children: (
+            <Table<BlendRollingDaily>
+              size="small"
+              rowKey="date"
+              columns={dailyColumns}
+              dataSource={daily}
+              pagination={false}
+              scroll={{ x: 940 }}
+              data-testid="combo-rolling-daily"
+            />
+          ),
+        }
+      : null,
+  ].filter((item): item is NonNullable<typeof item> => item !== null);
 
   return (
     <div
       className="h-full min-h-0 min-w-0 flex flex-col bg-white border border-slate-200 rounded-xl overflow-hidden"
       data-testid="combo-rolling-root"
     >
-      <div className="shrink-0 flex items-center gap-3 px-3 py-2 border-b border-slate-100">
-        <div className="flex items-center gap-2 text-[11px] text-slate-500">
+      <div className="shrink-0 flex flex-wrap items-center gap-3 px-3 py-2 border-b border-slate-100">
+        <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
           <span>
             窗口 <strong className="font-mono text-slate-800">{rolling.columns.length}</strong> 日
           </span>
@@ -204,7 +515,7 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
           </span>
           <span className="text-slate-400">生效日 {rolling.target_date}</span>
         </div>
-        <Tooltip title="新进=蓝、留存=白、退出=琥珀；色块只表达名单变化。退出收益单独用红涨绿跌">
+        <Tooltip title="新进=蓝、留存=白、退出=琥珀；色块只表达名单变化。涨跌幅与当日盈亏用红涨绿跌">
           <span className="ml-auto text-[10px] text-slate-400 cursor-help">色块图例</span>
         </Tooltip>
         <Button size="small" icon={<RefreshCw size={13} />} loading={loading} onClick={onRetry}>
@@ -212,63 +523,35 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
         </Button>
       </div>
 
+      <div className="shrink-0 flex flex-wrap items-center gap-2 px-3 py-1 border-b border-slate-100">
+        <span className="text-[11px] text-slate-500">批次本金（万）</span>
+        <InputNumber
+          size="small"
+          className="!w-24"
+          min={MIN_CAPITAL_WAN}
+          max={MAX_CAPITAL_WAN}
+          step={100}
+          value={capitalWan}
+          onChange={(value) => setCapitalWan(typeof value === 'number' ? value : null)}
+          onBlur={commitCapital}
+          onPressEnter={commitCapital}
+          suffix="万"
+          data-testid="combo-rolling-capital"
+        />
+        <DataSourceBadge
+          source={rolling.source ?? null}
+          bounds={rolling.bounds ?? null}
+          benchmark={rolling.benchmark ?? null}
+          capital={effectiveCapital}
+          testId="combo-rolling-source"
+        />
+        <Tooltip title="每日以全部权益等权入选（收盘价），次一交易日收盘结算；最后一批只估值不结算。未计手续费、印花税与滑点。">
+          <span className="ml-auto text-[10px] text-slate-400 cursor-help">换仓口径</span>
+        </Tooltip>
+      </div>
+
       {performance && (
-        <div
-          className="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-1.5 border-b border-slate-100 bg-slate-50/70 text-[11px] text-slate-500"
-          data-testid="combo-rolling-performance"
-        >
-          <span className="font-bold text-slate-600">窗口涨跌</span>
-          <span
-            className={`font-mono text-sm font-black ${returnToneClass(performance.cycle_return_pct)}`}
-            data-testid="combo-rolling-cycle-return"
-          >
-            {formatReturnPct(performance.cycle_return_pct)}
-          </span>
-          <span className="text-slate-400">
-            每日等权换仓 · {performance.cycle_priced_days}/{performance.cycle_days} 日有价
-          </span>
-          <span className="w-px h-3 bg-slate-200" />
-          <span>
-            已了结{' '}
-            <strong className="font-mono text-slate-700">{performance.closed_trades}</strong> 笔
-          </span>
-          <span>
-            盈 <strong className="font-mono text-red-600">{performance.wins}</strong> / 亏{' '}
-            <strong className="font-mono text-green-600">{performance.losses}</strong>
-            {performance.flats > 0 && (
-              <>
-                {' '}
-                / 平 <strong className="font-mono text-slate-500">{performance.flats}</strong>
-              </>
-            )}
-          </span>
-          <span>
-            胜率{' '}
-            <strong className="font-mono text-slate-700">
-              {performance.win_rate_pct === null ? '—' : `${performance.win_rate_pct.toFixed(1)}%`}
-            </strong>
-          </span>
-          <span>
-            单笔均值{' '}
-            <strong className={`font-mono ${returnToneClass(performance.avg_return_pct)}`}>
-              {formatReturnPct(performance.avg_return_pct)}
-            </strong>
-          </span>
-          <span>
-            在场{' '}
-            <strong className="font-mono text-slate-700">{performance.open_positions}</strong> 只 ·
-            浮动{' '}
-            <strong className={`font-mono ${returnToneClass(performance.open_avg_return_pct)}`}>
-              {formatReturnPct(performance.open_avg_return_pct)}
-            </strong>
-          </span>
-          {performance.unpriced_trades > 0 && (
-            <span className="text-slate-400">缺行情 {performance.unpriced_trades} 笔（不计入）</span>
-          )}
-          <Tooltip title="损益按收盘价计：入选日收盘价 → 退出日收盘价；窗口涨跌=每日等权持有当日 TopK、次日收盘换仓的复利收益。均未计费用，缺失行情显示 —。">
-            <span className="ml-auto text-[10px] text-slate-400 cursor-help">口径</span>
-          </Tooltip>
-        </div>
+        <PortfolioMetricsStrip sections={metricSections} testId="combo-rolling-performance" />
       )}
 
       {rolling.warnings.length > 0 && (
@@ -276,7 +559,7 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
           <Alert
             type="warning"
             showIcon
-            message={rolling.warnings.slice(0, 3).join('；')}
+            message={rolling.warnings.slice(0, 3).map(blendWarningLabel).join('；')}
           />
         </div>
       )}
@@ -291,10 +574,11 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
           {rolling.columns.map((column, index) => {
             const isLatest = column.date === latest;
             const exits = exitLabel(column);
+            const market = column.market;
             return (
               <div
                 key={column.date}
-                className="w-[160px] shrink-0 flex flex-col rounded-lg border border-slate-200 bg-slate-50/60"
+                className="w-[168px] shrink-0 flex flex-col rounded-lg border border-slate-200 bg-slate-50/60"
                 data-testid={`combo-rolling-col-${column.date}`}
               >
                 <div
@@ -311,6 +595,23 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
                     {isLatest && <Tag className="!m-0 text-[9px] leading-tight">最新</Tag>}
                   </div>
                   <div className="font-mono text-[11px] font-bold text-slate-700">{column.date}</div>
+                  <Tooltip title={marketDayLabel(market)}>
+                    <div
+                      className="flex items-center justify-between gap-1 cursor-help"
+                      data-testid={`combo-rolling-market-${column.date}`}
+                    >
+                      <span
+                        className={`font-mono text-[10px] font-bold ${returnToneClass(
+                          market?.change_pct,
+                        )}`}
+                      >
+                        {marketChangeLabel(market)}
+                      </span>
+                      <span className="text-[9px] text-slate-400 truncate">
+                        {marketPositionLabel(market?.position)}
+                      </span>
+                    </div>
+                  </Tooltip>
                 </div>
 
                 <div className="flex-1 p-1 space-y-1">
@@ -320,11 +621,11 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
                     const composite = formatResearchScore(researchScore(pick.pct));
                     const cap = capLabel(pick.market_cap_yi);
                     const profileLine = [pick.industry || '行业—', cap ?? '市值—'].join(' · ');
+                    const stats = pick.stats;
+                    const hasPnl =
+                      pick.day_pnl_amount !== null && pick.day_pnl_amount !== undefined;
                     return (
-                      <Tooltip
-                        key={pick.symbol}
-                        title={`${pick.name || pick.symbol} · 排名 ${pick.rank} · 覆盖 ${pick.coverage}/${memberCount} · 综合分 ${composite} · ${positionLabel(pick)} · ${profileLine}`}
-                      >
+                      <Tooltip key={pick.symbol} title={pickStatsLabel(pick)}>
                         <div
                           className={`rounded-md border px-1.5 py-1 ${ROLLING_TONE[status]}`}
                           data-testid={`combo-rolling-pick-${column.date}-${pick.symbol}`}
@@ -344,6 +645,32 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
                               {label}
                             </span>
                             <span className="text-[9px] opacity-70">{rollingHeldLabel(pick)}</span>
+                          </div>
+                          {/* 当日涨跌 / 当日盈亏（仅当日实际持有；红涨绿跌） */}
+                          <div className="flex items-center justify-between gap-1 mt-0.5 font-mono text-[9px]">
+                            <span
+                              className={returnToneClass(pick.change_pct)}
+                              data-testid={`combo-rolling-pick-change-${column.date}-${pick.symbol}`}
+                            >
+                              当日 {formatReturnPct(pick.change_pct)}
+                            </span>
+                            {hasPnl && (
+                              <span
+                                className={returnToneClass(pick.day_pnl_amount)}
+                                data-testid={`combo-rolling-pick-pnl-${column.date}-${pick.symbol}`}
+                              >
+                                {formatSignedAmount(pick.day_pnl_amount)}
+                              </span>
+                            )}
+                          </div>
+                          {/* 窗口内表现：在榜天数 / 首次至今 / 次日均值 */}
+                          <div
+                            className="text-[9px] font-mono opacity-70 truncate"
+                            data-testid={`combo-rolling-pick-stats-${column.date}-${pick.symbol}`}
+                          >
+                            在榜 {stats?.appearances ?? '—'} · 首入{' '}
+                            {formatReturnPct(stats?.since_first_pct)} · 次日{' '}
+                            {formatReturnPct(stats?.next_day_avg_pct)}
                           </div>
                         </div>
                       </Tooltip>
@@ -423,9 +750,20 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
         </div>
       )}
 
+      {detailItems.length > 0 && (
+        <div
+          className="shrink-0 max-h-[38%] overflow-auto border-t border-slate-100 px-2 py-1"
+          data-testid="combo-rolling-details"
+        >
+          <Collapse size="small" items={detailItems} />
+        </div>
+      )}
+
       <div className="shrink-0 px-3 py-1.5 border-t border-slate-100 text-[10px] text-slate-400">
         持有天数 = 本窗口内连续在榜天数；断榜后重新计数，跨窗口不伪造连续。退出收益 =
         退出日收盘价 ÷ 入选日收盘价 − 1（按收盘价计，未计费用；窗口首列按窗口起点计）。
+        批次按「入选日收盘等权建仓 → 次一交易日收盘结算」滚动；格子里的当日盈亏只对
+        当日实际持有的标的计算，新进标的当天不计盈亏。缺失行情一律显示 —。
       </div>
     </div>
   );

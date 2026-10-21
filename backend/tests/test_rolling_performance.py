@@ -247,3 +247,206 @@ def test_rank_pct_from_rank_matches_signal_contract():
 )
 def test_rank_pct_from_rank_bounds(rank: int, n_total: int, pct: float):
     assert rank_pct_from_rank(rank, n_total) == pytest.approx(pct)
+
+
+# ── 每日等权换仓批次口径（2026-10-21 机构级统计）────────────────────────
+
+
+def _rotation(**kwargs):
+    from backend.services.engine.inference.rolling_performance import (
+        simulate_daily_rotation,
+    )
+
+    base = {"capital": 1000.0}
+    base.update(kwargs)
+    return simulate_daily_rotation(**base)
+
+
+@pytest.mark.unit
+def test_daily_rotation_splits_realized_and_open_batch_float():
+    days = [D0, D1, D2]
+    picks = {D0: ["A"], D1: ["B"]}
+    closes = {"A": {D0: 10.0, D1: 11.0}, "B": {D1: 20.0, D2: 19.0}}
+
+    result = _rotation(days=days, picks_by_day=picks, closes=closes)
+
+    batches = result["batches"]
+    assert len(batches) == 2
+    first, second = batches
+    assert first["entry_date"] == D0
+    assert first["exit_date"] == D1
+    assert first["positions"] == 1
+    assert first["priced"] == 1
+    assert first["return_pct"] == pytest.approx(10.0)
+    assert first["notional_amount"] == pytest.approx(1000.0)
+    assert first["pnl_amount"] == pytest.approx(100.0)
+    assert first["equity"] == pytest.approx(1100.0)
+    assert first["settled"] is True
+
+    assert second["entry_date"] == D1
+    assert second["exit_date"] == D2
+    assert second["return_pct"] == pytest.approx(-5.0)
+    assert second["pnl_amount"] == pytest.approx(-55.0)
+    assert second["equity"] == pytest.approx(1045.0)
+    assert second["settled"] is False
+
+    summary = result["summary"]
+    assert summary["initial_capital"] == pytest.approx(1000.0)
+    assert summary["final_equity"] == pytest.approx(1045.0)
+    assert summary["profit_amount"] == pytest.approx(45.0)
+    assert summary["total_return_pct"] == pytest.approx(4.5)
+    assert summary["cycle_return_pct"] == pytest.approx(4.5)
+    assert summary["realized_pnl_amount"] == pytest.approx(100.0)
+    assert summary["realized_return_pct"] == pytest.approx(10.0)
+    assert summary["unrealized_pnl_amount"] == pytest.approx(-55.0)
+    assert summary["unrealized_return_pct"] == pytest.approx(-5.5)
+    assert summary["realized_pnl_amount"] + summary[
+        "unrealized_pnl_amount"
+    ] == pytest.approx(summary["final_equity"] - summary["initial_capital"])
+    assert summary["batches"] == 2
+    assert summary["settled_batches"] == 1
+    assert summary["open_batches"] == 1
+    assert summary["trades"] == 1
+    assert summary["win_rate_pct"] == pytest.approx(100.0)
+    assert summary["profit_factor"] is None
+    assert summary["turnover_x"] == pytest.approx(2.1)
+    assert summary["avg_exposure_pct"] == pytest.approx(66.67, abs=0.01)
+    assert summary["trading_days"] == 2
+
+    assert [row["equity"] for row in result["daily"]] == pytest.approx([1100.0, 1045.0])
+
+
+@pytest.mark.unit
+def test_daily_rotation_benchmark_and_excess():
+    days = [D0, D1, D2]
+    picks = {D0: ["A"], D1: ["B"]}
+    closes = {"A": {D0: 10.0, D1: 11.0}, "B": {D1: 20.0, D2: 19.0}}
+    benchmark = {D0: 100.0, D1: 99.0, D2: 101.0}
+
+    result = _rotation(
+        days=days, picks_by_day=picks, closes=closes, benchmark_closes=benchmark
+    )
+
+    summary = result["summary"]
+    assert summary["benchmark_return_pct"] == pytest.approx(1.0)
+    assert summary["benchmark_coverage_pct"] == pytest.approx(100.0)
+    assert summary["excess_return_pct"] == pytest.approx(3.5)
+    assert summary["information_ratio"] is not None
+
+    daily = result["daily"]
+    assert daily[0]["benchmark_return_pct"] == pytest.approx(-1.0)
+    assert daily[0]["excess_return_pct"] == pytest.approx(11.0)
+    assert daily[1]["benchmark_return_pct"] == pytest.approx(2.0202, abs=1e-4)
+    assert daily[1]["excess_return_pct"] == pytest.approx(-7.0202, abs=1e-4)
+
+
+@pytest.mark.unit
+def test_daily_rotation_missing_exit_price_reduces_denominator():
+    days = [D0, D1]
+    picks = {D0: ["A", "B"]}
+    closes = {"A": {D0: 10.0, D1: 11.0}, "B": {D0: 20.0}}
+
+    result = _rotation(days=days, picks_by_day=picks, closes=closes)
+
+    batch = result["batches"][0]
+    assert batch["positions"] == 2
+    assert batch["priced"] == 1
+    assert batch["return_pct"] == pytest.approx(10.0)
+    assert batch["pnl_amount"] == pytest.approx(100.0)
+    assert batch["settled"] is False
+    summary = result["summary"]
+    assert summary["unrealized_pnl_amount"] == pytest.approx(100.0)
+    assert summary["realized_pnl_amount"] == pytest.approx(0.0)
+    assert summary["priced_batches"] == 1
+    assert summary["unpriced_batches"] == 0
+    assert summary["partial_batches"] == 1
+
+
+@pytest.mark.unit
+def test_daily_rotation_without_picks_stays_in_cash():
+    days = [D0, D1, D2]
+
+    result = _rotation(days=days, picks_by_day={}, closes={})
+
+    summary = result["summary"]
+    assert summary["final_equity"] == pytest.approx(1000.0)
+    assert summary["total_return_pct"] == pytest.approx(0.0)
+    assert summary["realized_pnl_amount"] == pytest.approx(0.0)
+    assert summary["unrealized_pnl_amount"] == pytest.approx(0.0)
+    assert summary["batches"] == 0
+    assert summary["sharpe_ratio"] is None
+    assert summary["final_cash_pct"] == pytest.approx(100.0)
+    assert summary["max_drawdown_pct"] == pytest.approx(0.0)
+
+
+@pytest.mark.unit
+def test_cell_stats_per_symbol_and_per_day_pnl():
+    from backend.services.engine.inference.rolling_performance import cell_stats
+
+    days = [D0, D1, D2]
+    picks = {D0: ["A"], D1: ["A", "B"], D2: ["A", "B"]}
+    closes = {
+        "A": {D0: 10.0, D1: 11.0, D2: 12.0},
+        "B": {D1: 20.0, D2: 18.0},
+    }
+    equity_by_day = {D0: 1000.0, D1: 1100.0, D2: 1095.0}
+
+    out = cell_stats(days, picks, closes, equity_by_day=equity_by_day)
+
+    a = out["by_symbol"]["A"]
+    assert a["appearances"] == 3
+    assert a["streak_days"] == 3
+    assert a["first_seen"] == D0
+    assert a["since_first_pct"] == pytest.approx(20.0)
+    assert a["next_day_samples"] == 2
+    assert a["next_day_avg_pct"] == pytest.approx(9.5455, abs=1e-4)
+    assert a["next_day_win_rate_pct"] == pytest.approx(100.0)
+    # 样本 < 3 不给标准差（细案 §3.5.1）
+    assert a["next_day_std_pct"] is None
+    assert a["latest_close"] == pytest.approx(12.0)
+    assert a["change_pct"] == pytest.approx(9.0909, abs=1e-4)
+
+    b = out["by_symbol"]["B"]
+    assert b["appearances"] == 2
+    assert b["streak_days"] == 2
+    assert b["first_seen"] == D1
+    assert b["since_first_pct"] == pytest.approx(-10.0)
+    assert b["next_day_samples"] == 1
+    assert b["next_day_avg_pct"] == pytest.approx(-10.0)
+    assert b["next_day_std_pct"] is None
+    assert b["latest_close"] == pytest.approx(18.0)
+    assert b["change_pct"] == pytest.approx(-10.0)
+
+    day0 = out["by_day"][D0]["A"]
+    assert day0["change_pct"] is None
+    assert day0["pnl_amount"] is None
+    assert day0["weight_pct"] is None
+
+    day1_a = out["by_day"][D1]["A"]
+    assert day1_a["change_pct"] == pytest.approx(10.0)
+    assert day1_a["weight_pct"] == pytest.approx(100.0)
+    assert day1_a["pnl_amount"] == pytest.approx(100.0)
+    assert out["by_day"][D1]["B"]["pnl_amount"] is None
+
+    day2_a = out["by_day"][D2]["A"]
+    assert day2_a["weight_pct"] == pytest.approx(50.0)
+    assert day2_a["pnl_amount"] == pytest.approx(50.0)
+    day2_b = out["by_day"][D2]["B"]
+    assert day2_b["weight_pct"] == pytest.approx(50.0)
+    assert day2_b["pnl_amount"] == pytest.approx(-55.0)
+
+
+@pytest.mark.unit
+def test_cell_stats_next_day_std_needs_three_samples():
+    from backend.services.engine.inference.rolling_performance import cell_stats
+
+    days = [D0, D1, D2, D3]
+    picks = {day: ["A"] for day in days}
+    closes = {"A": {D0: 10.0, D1: 11.0, D2: 12.0, D3: 12.6}}
+
+    out = cell_stats(days, picks, closes)
+
+    a = out["by_symbol"]["A"]
+    assert a["next_day_samples"] == 3
+    assert a["next_day_std_pct"] == pytest.approx(2.6634, abs=1e-4)
+    assert a["since_first_pct"] == pytest.approx(26.0)

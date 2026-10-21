@@ -345,12 +345,28 @@ async def get_blend_dates(
     return {"blend_id": blend_id, "dates": dates}
 
 
+@router.get("/{blend_id}/bounds", summary="历史数据端口（pred / runs 覆盖范围）")
+async def get_blend_bounds(
+    blend_id: str,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    tenant_id, user_id = _owner(current_user)
+    blend = await _get_blend_or_404(blend_id, tenant_id=tenant_id, user_id=user_id)
+    return {
+        "blend_id": blend_id,
+        **await _run(
+            ModelBlendService().data_bounds(blend, tenant_id=tenant_id, user_id=user_id)
+        ),
+    }
+
+
 @router.get("/{blend_id}/rolling", summary="滚动建仓视图（最近 N+1 日每日 TopK）")
 async def get_blend_rolling(
     blend_id: str,
     date_str: str | None = Query(default=None, alias="date"),
     window: int = Query(default=10, ge=1, le=60),
     per_day: int = Query(default=5, ge=1, le=50),
+    capital: float = Query(default=10_000_000.0, gt=0, le=1e12),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     tenant_id, user_id = _owner(current_user)
@@ -363,6 +379,7 @@ async def get_blend_rolling(
             end_date=_parse_date(date_str),
             window=window,
             per_day=per_day,
+            capital=capital,
         )
     )
 

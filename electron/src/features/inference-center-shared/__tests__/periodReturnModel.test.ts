@@ -5,6 +5,8 @@
 import { describe, expect, it } from 'vitest';
 import type { BlendPeriodDaily } from '../../../services/blendTypes';
 import {
+  buildBenchmarkEquitySeries,
+  buildComparisonGeometry,
   buildEquityGeometry,
   formatPct,
   formatSignedAmount,
@@ -20,10 +22,16 @@ function daily(values: number[], start = '2026-09-01'): BlendPeriodDaily[] {
     date: start.replace('01', String(index + 1).padStart(2, '0')),
     equity,
     cash: 0,
+    market_value: equity,
+    exposure_pct: 100,
     positions: 0,
     entries: 0,
     exits: 0,
+    realized_pnl_amount: 0,
+    unrealized_pnl_amount: 0,
     return_pct: null,
+    benchmark_return_pct: null,
+    excess_return_pct: null,
   }));
 }
 
@@ -70,6 +78,71 @@ describe('periodReturnModel', () => {
     expect(geometry?.baselineY).toBeGreaterThan(geometry?.points[1].y ?? 0);
     expect(geometry?.linePath.startsWith('M')).toBe(true);
     expect(geometry?.areaPath.endsWith('Z')).toBe(true);
+  });
+
+  it('快捷区间优先用 /bounds 的实际可用区间（pred 可回到 2025）', () => {
+    const span = { start: '2025-01-02', end: '2026-10-19' };
+    expect(periodQuickQuery('all', [], span)).toEqual({
+      start: '2025-01-02',
+      end: '2026-10-19',
+    });
+    expect(periodQuickQuery('1m', [], span)).toEqual({
+      start: '2026-09-19',
+      end: '2026-10-19',
+    });
+    expect(periodQuickQuery('1y', [], span)).toEqual({
+      start: '2025-10-19',
+      end: '2026-10-19',
+    });
+  });
+
+  it('基准按日收益复利归一；没有任何基准收益时不画平线', () => {
+    const rows: Array<Pick<BlendPeriodDaily, 'date' | 'benchmark_return_pct'>> = [
+      { date: '2026-09-01', benchmark_return_pct: null },
+      { date: '2026-09-02', benchmark_return_pct: 1 },
+      { date: '2026-09-03', benchmark_return_pct: -0.5 },
+    ];
+    const series = buildBenchmarkEquitySeries(rows, 100000);
+    expect(series).toHaveLength(3);
+    expect(series[0].equity).toBe(100000);
+    expect(series[1].equity).toBeCloseTo(101000, 6);
+    expect(series[2].equity).toBeCloseTo(100495, 6);
+    expect(
+      buildBenchmarkEquitySeries(
+        [
+          { date: '2026-09-01', benchmark_return_pct: null },
+          { date: '2026-09-02', benchmark_return_pct: null },
+        ],
+        100000,
+      ),
+    ).toEqual([]);
+    expect(buildBenchmarkEquitySeries(rows, 0)).toEqual([]);
+  });
+
+  it('组合与基准共享纵轴：跑输时基准线在组合之上', () => {
+    const equity = daily([1000, 900]).map((row, index) => ({
+      date: row.date,
+      equity: row.equity,
+      benchmark_return_pct: index === 0 ? 0 : 10,
+    }));
+    const benchmark = buildBenchmarkEquitySeries(
+      equity.map((row) => ({ date: row.date, benchmark_return_pct: row.benchmark_return_pct })),
+      1000,
+    );
+    const geometry = buildComparisonGeometry(
+      equity.map((row) => ({ date: row.date, equity: row.equity })),
+      benchmark,
+      1000,
+      640,
+      160,
+    );
+    expect(geometry?.benchmarkPath.startsWith('M')).toBe(true);
+    // SVG 里 y 越小越靠上：基准（1100）应高于组合（900）
+    const lastBenchmark = geometry?.benchmarkPoints[1];
+    const lastEquity = geometry?.equity.points[1];
+    expect(lastBenchmark?.y).toBeLessThan(lastEquity?.y ?? 0);
+    expect(geometry?.equity.minEquity).toBe(900);
+    expect(geometry?.equity.maxEquity).toBe(1100);
   });
 
   it('单点与全等值不除零', () => {

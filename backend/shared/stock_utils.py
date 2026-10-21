@@ -1,5 +1,5 @@
 import re
-from typing import Optional
+
 
 class StockCodeUtil:
     """股票代码标准化工具类（分层口径，禁止跨层混用）。
@@ -179,7 +179,7 @@ class StockCodeUtil:
         return "其他"
 
     @staticmethod
-    def detect_market(code: str) -> Optional[str]:
+    def detect_market(code: str) -> str | None:
         """由代码形态推断市场，返回 'CN' / 'HK' / 'US'；无法判定返回 None。
 
         **判据必须互斥且精确** —— 按「前缀即市场」的粗略写法会把美股 SHOP/SHW
@@ -205,3 +205,30 @@ class StockCodeUtil:
         if re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", c) and re.search(r"[A-Z]", c):
             return "US"
         return None
+
+
+def build_prefix_symbol_sql(source: str = "symbol") -> str:
+    """生成「任意写入形态 → 前缀式」的 SQL 表达式。
+
+    与 ``StockCodeUtil.to_prefix`` 逐条对齐：先 ``upper(btrim(...))``（Python 侧
+    同样先 ``upper().strip()``），再按后缀式 / 反向后缀 / 前缀式 / 纯 6 位识别。
+    ``source`` 只在测试里换成 ``VALUES`` 列名，生产恒为 ``symbol``。
+    """
+    value = f"upper(trim({source}))"
+    return f"""
+CASE
+  WHEN {value} ~ '^[0-9]{{6}}\\.(SH|SZ|BJ)$' THEN
+    substr({value}, 8, 2) || substr({value}, 1, 6)
+  WHEN {value} ~ '^(SH|SZ|BJ)\\.[0-9]{{6}}$' THEN
+    substr({value}, 1, 2) || substr({value}, 4, 6)
+  WHEN {value} ~ '^(SH|SZ|BJ)[0-9]{{6}}$' THEN {value}
+  WHEN {value} ~ '^[0-9]{{6}}$' THEN
+    CASE
+      WHEN substr({value}, 1, 2) IN ('60', '68', '90') THEN 'SH' || {value}
+      WHEN substr({value}, 1, 2) IN ('00', '30', '20') THEN 'SZ' || {value}
+      WHEN substr({value}, 1, 2) IN ('83', '43', '87', '88', '92') THEN 'BJ' || {value}
+      ELSE {value}
+    END
+  ELSE {value}
+END
+""".strip()

@@ -15,6 +15,7 @@ import axios, { AxiosInstance } from 'axios';
 import { SERVICE_ENDPOINTS, resolveWebSafeServiceBase } from '../config/services';
 import { authService } from '../features/auth/services/authService';
 import type {
+  BlendBoundsResponse,
   BlendCreateRequest,
   BlendDatesResponse,
   BlendEvidenceResponse,
@@ -151,9 +152,17 @@ class BlendService {
     return resp.data;
   }
 
+  /** 历史数据端口：pred 测试集优先，整组合不可用才降级 runs */
+  async getBounds(blendId: string): Promise<BlendBoundsResponse> {
+    const resp = await this.client.get<BlendBoundsResponse>(
+      `${BASE_PATH}/${blendId}/bounds`,
+    );
+    return resp.data;
+  }
+
   async getRolling(
     blendId: string,
-    params: { date?: string; window?: number; per_day?: number } = {},
+    params: { date?: string; window?: number; per_day?: number; capital?: number } = {},
   ): Promise<BlendRollingResponse> {
     const resp = await this.client.get<BlendRollingResponse>(
       `${BASE_PATH}/${blendId}/rolling`,
@@ -162,6 +171,7 @@ class BlendService {
           date: params.date,
           window: params.window ?? 10,
           per_day: params.per_day ?? 5,
+          capital: params.capital,
         },
         timeout: ROLLING_TIMEOUT_MS,
       },

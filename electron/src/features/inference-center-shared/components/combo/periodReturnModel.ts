@@ -8,36 +8,38 @@
  */
 
 import type {
+  BlendPeriodDaily,
   BlendPeriodQuery,
   BlendPeriodResponse,
 } from '../../../../services/blendTypes';
 import { RESEARCH_SCORE_MISSING } from '../../../shared/researchScore';
+import {
+  BLEND_WARNING_LABELS,
+  blendWarningLabel,
+} from './portfolioMetricsModel';
 
 /** 机读告警码 → 展示文案（后端新增码未登记时原样显示，便于排查） */
-export const PERIOD_WARNING_LABELS: Record<string, string> = {
-  effective_start_clamped: '建仓日早于最早可用评分日，已从首个评分日开始',
-  effective_end_clamped: '截止日没有评分，已夹到最后一个评分日',
-  scoring_gap: '区间内部分交易日无评分，只按评分日建仓',
-  partial_data: '评分覆盖率偏低（30%–80%），结果仅供参考',
-  positions_cap: '持仓上限低于「每日新进 × 持有天数」，满仓后会暂停建仓',
-  underfill: '持仓上限高于「每日新进 × 持有天数」，稳态下资金利用率偏低',
-  missing_entry_price: '部分入选标的缺当日收盘价，已跳过建仓',
-  deferred_exit: '部分标的到期日缺价，已顺延到下一个有效收盘价退出',
-  stale_mark: '期末部分持仓缺最新收盘价，沿用上一有效价估值',
-};
+export const PERIOD_WARNING_LABELS: Record<string, string> = BLEND_WARNING_LABELS;
 
 export function periodWarningLabel(code: string): string {
-  return PERIOD_WARNING_LABELS[code] ?? code;
+  return blendWarningLabel(code);
 }
 
-export type PeriodQuickRange = '1m' | '3m' | '6m' | 'all';
+export type PeriodQuickRange = '1m' | '3m' | '6m' | '1y' | 'all';
 
 export const PERIOD_QUICK_RANGES: Array<{ key: PeriodQuickRange; label: string }> = [
   { key: '1m', label: '近 1 月' },
   { key: '3m', label: '近 3 月' },
   { key: '6m', label: '近 6 月' },
+  { key: '1y', label: '近 1 年' },
   { key: 'all', label: '全部' },
 ];
+
+/** 快捷区间锚点：优先用后端 `/bounds` 的实际可用区间（pred 可回看到测试集起点） */
+export interface PeriodRangeSpan {
+  start?: string | null;
+  end?: string | null;
+}
 
 export function shiftMonthsIso(iso: string, months: number): string {
   const [year, month, day] = iso.split('-').map((part) => Number(part));
@@ -50,20 +52,24 @@ export function shiftMonthsIso(iso: string, months: number): string {
 }
 
 /**
- * 快捷区间 → 查询参数。`dates` 是后端 `/dates` 的可用评分日（**降序**）。
- * 无可用日期时返回空参数（后端会按最新可用日与默认窗口计算并给出空态/业务码）。
+ * 快捷区间 → 查询参数。
+ *
+ * `dates` 是后端 `/dates` 的可用评分日（**降序**，只覆盖推理台账）；
+ * `span` 是 `/bounds` 的实际可用区间（pred 可回看到 2025），优先作为锚点。
+ * 无可用日期时返回空参数（后端按最新可用日与默认窗口计算并给出业务码）。
  */
 export function periodQuickQuery(
   kind: PeriodQuickRange,
   dates: readonly string[],
+  span?: PeriodRangeSpan | null,
 ): BlendPeriodQuery {
-  if (dates.length === 0) return {};
-  const end = dates[0];
+  const end = span?.end || dates[0];
+  if (!end) return {};
   if (kind === 'all') {
-    const start = dates[dates.length - 1];
+    const start = span?.start || dates[dates.length - 1];
     return start && start !== end ? { start, end } : { end };
   }
-  const months = kind === '1m' ? 1 : kind === '3m' ? 3 : 6;
+  const months = kind === '1m' ? 1 : kind === '3m' ? 3 : kind === '6m' ? 6 : 12;
   return { start: shiftMonthsIso(end, -months), end };
 }
 
@@ -117,6 +123,13 @@ export interface EquitySeriesPoint {
   equity: number;
 }
 
+/** 组合 + 基准双线几何（共享纵轴，基准按同一初始资金归一） */
+export interface ComparisonGeometry {
+  equity: EquityGeometry;
+  benchmarkPoints: EquityPoint[];
+  benchmarkPath: string;
+}
+
 /**
  * 权益曲线几何（纯函数，供 SVG 直接渲染）。
  *
@@ -130,13 +143,35 @@ export function buildEquityGeometry(
   height: number,
   padding = 4,
 ): EquityGeometry | null {
-  if (daily.length === 0 || width <= 0 || height <= 0) return null;
-  const values = daily.map((row) => row.equity);
-  const candidates = values.filter((value) => Number.isFinite(value));
-  if (candidates.length === 0) return null;
-  const baseline = Number.isFinite(initialCapital) ? initialCapital : candidates[0];
-  let minEquity = Math.min(...candidates, baseline);
-  let maxEquity = Math.max(...candidates, baseline);
+  return buildComparisonGeometry(daily, [], initialCapital, width, height, padding)?.equity ?? null;
+}
+
+/**
+ * 组合权益 + 基准指数**共享纵轴**的双线几何。
+ *
+ * 为什么共享纵轴：两条线分开归一化会让「跑赢/跑输」在图上不可见——
+ * 基准按初始资金归一后与组合同轴，交点才是真实的超额拐点。
+ * `benchmarkDaily` 为空时退化为单线（`benchmarkPath` 为空串）。
+ */
+export function buildComparisonGeometry(
+  equityDaily: readonly EquitySeriesPoint[],
+  benchmarkDaily: readonly EquitySeriesPoint[],
+  initialCapital: number,
+  width: number,
+  height: number,
+  padding = 4,
+): ComparisonGeometry | null {
+  if (equityDaily.length === 0 || width <= 0 || height <= 0) return null;
+  const equityValues = equityDaily
+    .map((row) => row.equity)
+    .filter((value) => Number.isFinite(value));
+  if (equityValues.length === 0) return null;
+  const benchmarkValues = benchmarkDaily
+    .map((row) => row.equity)
+    .filter((value) => Number.isFinite(value));
+  const baseline = Number.isFinite(initialCapital) ? initialCapital : equityValues[0];
+  let minEquity = Math.min(...equityValues, ...benchmarkValues, baseline);
+  let maxEquity = Math.max(...equityValues, ...benchmarkValues, baseline);
   if (maxEquity - minEquity < 1e-9) {
     minEquity -= 1;
     maxEquity += 1;
@@ -145,34 +180,70 @@ export function buildEquityGeometry(
   const innerHeight = Math.max(1, height - padding * 2);
   const yOf = (value: number) =>
     padding + (1 - (value - minEquity) / (maxEquity - minEquity)) * innerHeight;
-  const xOf = (index: number) =>
-    daily.length === 1
-      ? padding + innerWidth / 2
-      : padding + (index / (daily.length - 1)) * innerWidth;
-  const points = daily.map((row, index) => ({
-    x: round2(xOf(index)),
-    y: round2(yOf(row.equity)),
-    equity: row.equity,
-    date: row.date,
-  }));
-  const linePath = points
-    .map((point, index) => `${index === 0 ? 'M' : 'L'}${point.x},${point.y}`)
-    .join(' ');
+  const toPoints = (series: readonly EquitySeriesPoint[]): EquityPoint[] =>
+    series.map((row, index) => ({
+      x: round2(
+        series.length === 1
+          ? padding + innerWidth / 2
+          : padding + (index / (series.length - 1)) * innerWidth,
+      ),
+      y: round2(yOf(row.equity)),
+      equity: row.equity,
+      date: row.date,
+    }));
+  const points = toPoints(equityDaily);
+  const linePath = toPath(points);
   const first = points[0];
   const last = points[points.length - 1];
   const areaPath = `${linePath} L${last.x},${round2(height)} L${first.x},${round2(height)} Z`;
+  const benchmarkPoints = benchmarkValues.length ? toPoints(benchmarkDaily) : [];
   return {
-    points,
-    linePath,
-    areaPath,
-    baselineY: round2(yOf(baseline)),
-    minEquity,
-    maxEquity,
+    equity: {
+      points,
+      linePath,
+      areaPath,
+      baselineY: round2(yOf(baseline)),
+      minEquity,
+      maxEquity,
+    },
+    benchmarkPoints,
+    benchmarkPath: benchmarkPoints.length ? toPath(benchmarkPoints) : '',
   };
+}
+
+function toPath(points: readonly EquityPoint[]): string {
+  return points
+    .map((point, index) => `${index === 0 ? 'M' : 'L'}${point.x},${point.y}`)
+    .join(' ');
 }
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+/**
+ * 由逐日基准收益复利出「基准按初始资金归一」的权益序列。
+ *
+ * 没有一天有基准收益 → 返回空数组（不画一条平线冒充基准）；
+ * 首日缺收益（无前收）时停在初始资金，从第二日起复利。
+ */
+export function buildBenchmarkEquitySeries(
+  daily: readonly Pick<BlendPeriodDaily, 'date' | 'benchmark_return_pct'>[],
+  initialCapital: number,
+): EquitySeriesPoint[] {
+  if (!Number.isFinite(initialCapital) || initialCapital <= 0) return [];
+  let value = initialCapital;
+  let started = false;
+  const out: EquitySeriesPoint[] = [];
+  for (const row of daily) {
+    const ret = row.benchmark_return_pct;
+    if (typeof ret === 'number' && Number.isFinite(ret)) {
+      value *= 1 + ret / 100;
+      started = true;
+    }
+    out.push({ date: row.date, equity: value });
+  }
+  return started ? out : [];
 }
 
 /** 「建仓日 / 截止日 / 资金 / 持仓上限」摘要行（实际生效区间） */
