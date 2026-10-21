@@ -193,6 +193,15 @@ export interface BlendRollingCellStats {
   change_pct: number | null;
 }
 
+/** 当日批次的建仓状态（可交易性口径） */
+export type BlendRollingBuyStatus =
+  | 'bought'
+  | 'next_day'
+  | 'skip_st'
+  | 'skip_low_adv'
+  | 'skip_no_amount'
+  | 'skip_no_price';
+
 /** 滚动建仓：每列一日、每列 Top `per_day`；`exits` 只在「昨列→今日」标注 */
 export interface BlendRollingPick {
   symbol: string;
@@ -215,6 +224,12 @@ export interface BlendRollingPick {
   weight_pct?: number | null;
   /** 当日盈亏金额（元）：仅当日实际持有的标的才有值 */
   day_pnl_amount?: number | null;
+  /** 当日批次的建仓状态；旧后端缺失为 undefined */
+  buy_status?: BlendRollingBuyStatus | null;
+  /** 计划建仓权重（%）：跳过者为 0，末日候选为次日计划权重 */
+  entry_weight_pct?: number | null;
+  /** 入选日 ADV20（亿元）；缺失为 null */
+  adv_yi?: number | null;
   /** 窗口内表现统计（在榜天数 / 首次至今 / 次日收益等） */
   stats?: BlendRollingCellStats | null;
 }
@@ -253,7 +268,10 @@ export interface BlendRollingColumn {
 export interface BlendRollingBatch {
   entry_date: string;
   exit_date: string;
+  /** 当日候选只数 */
   positions: number;
+  /** 实际建仓只数（ST/退市、成交额不足等不建仓）；旧后端缺失 */
+  bought?: number;
   priced: number;
   return_pct: number | null;
   notional_amount: number;
@@ -335,13 +353,48 @@ export interface BlendRollingPerformance {
   settled_batches: number;
   open_batches: number;
   priced_batches: number;
+  /** 有建仓但算不出收益的批次数（真缺价）；跳过全部标的的批次不计入 */
   unpriced_batches: number;
+  /** 已建仓标的中部分缺价的批次数 */
   partial_batches: number;
+  /** 全部标的被跳过、实际未建仓的批次数；旧后端缺失 */
+  no_position_batches?: number;
   cycle_days: number;
   cycle_priced_days: number;
   cycle_win_days: number;
   cycle_loss_days: number;
   entry_convention: string;
+  /** 是否实际应用成交额约束；旧后端缺失 */
+  capacity_applied?: boolean;
+  /** 是否实际应用 ST/退市过滤；旧后端缺失 */
+  st_filter_applied?: boolean;
+  /** 各批次候选标的合计（不含末列） */
+  evaluated_picks?: number;
+  /** 实际建仓标的合计 */
+  bought_positions?: number;
+  skipped_st?: number;
+  skipped_low_adv?: number;
+  skipped_no_amount?: number;
+  skipped_no_price?: number;
+  min_adv_yi?: number;
+  adv_participation?: number;
+  adv_lookback_days?: number;
+  min_adv_days?: number;
+}
+
+/** 本轮可交易性参数与数据源状态 */
+export interface BlendRollingFilters {
+  market?: string;
+  exclude_st?: boolean;
+  /** ST/退市过滤是否生效（数据源故障时为 false） */
+  st_applied?: boolean;
+  st_error?: string | null;
+  /** 成交额约束是否生效 */
+  capacity_applied?: boolean;
+  min_adv_yi?: number;
+  adv_participation?: number;
+  adv_lookback_days?: number;
+  min_adv_days?: number;
 }
 
 export interface BlendRollingSummary {
@@ -371,6 +424,8 @@ export interface BlendRollingResponse {
   daily?: BlendRollingDaily[];
   members: BlendRankingMember[];
   summary: BlendRollingSummary;
+  /** 本轮可交易性参数与数据源状态；旧后端缺失 */
+  filters?: BlendRollingFilters;
   warnings: string[];
 }
 

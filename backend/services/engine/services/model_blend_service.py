@@ -40,6 +40,11 @@ from backend.services.engine.inference.blend_engine import (
 from backend.services.engine.inference import portfolio_metrics as metrics
 from backend.services.engine.inference.period_performance import simulate_period
 from backend.services.engine.inference.rolling_performance import (
+    DEFAULT_ADV_LOOKBACK_DAYS,
+    DEFAULT_ADV_PARTICIPATION,
+    DEFAULT_MIN_ADV_DAYS,
+    DEFAULT_MIN_ADV_YI,
+    YI,
     cell_stats,
     compute_rolling_performance,
     simulate_daily_rotation,
@@ -1147,16 +1152,20 @@ class ModelBlendService:
         window: int = 10,
         per_day: int = 5,
         capital: float = DEFAULT_PERIOD_CAPITAL,
+        exclude_st: bool = True,
+        min_adv_yi: float = DEFAULT_MIN_ADV_YI,
+        adv_participation: float = DEFAULT_ADV_PARTICIPATION,
     ) -> dict[str, Any]:
         """滚动建仓视图：最近 ``window+1`` 个交易日，每日 Top ``per_day``。
 
         选中口径与榜单完全同源（组合分排序），历史数据源与 ``period()``
         共用 ``_history_rows``（pred 测试集优先、整组合降级 runs）。
 
-        统计口径是**每日批次**：入选日收盘按全部权益等权建仓，次一交易日
-        收盘结算；最后一批只估值不结算（计入浮动）。``realized + unrealized
-        == final_equity - initial_capital``。名单侧的连续在榜只服务列展示，
-        不参与组合胜率。
+        统计口径是**每日批次**：入选日收盘按等权预算建仓，单票金额再受
+        ``ADV20 × 参与率`` 约束；ST/退市（当前截面）与成交额不足的标的不
+        建仓、不替补，资金留现金。次一交易日收盘结算；最后一批只估值不结算
+        （计入浮动）。``realized + unrealized == final_equity - initial_capital``。
+        名单侧的连续在榜只服务列展示，不参与组合胜率。
         """
         if not 1 <= int(window) <= 60:
             raise BlendError("滚窗必须在 [1, 60]")
@@ -1164,7 +1173,13 @@ class ModelBlendService:
             raise BlendError("每日只数必须在 [1, 50]")
         if not _finite(capital) or float(capital) <= 0:
             raise BlendError("初始资金必须是正数")
+        if not _finite(min_adv_yi) or float(min_adv_yi) < 0:
+            raise BlendError("最低成交额必须为非负数")
+        if not _finite(adv_participation) or not 0 < float(adv_participation) <= 0.2:
+            raise BlendError("成交额参与率必须在 (0, 0.2]")
         capital = float(capital)
+        min_adv_yi = float(min_adv_yi)
+        adv_participation = float(adv_participation)
         members = await self.members_from_blend(blend)
         if len(members) < MIN_MEMBERS:
             raise BlendError(f"组合至少需要 {MIN_MEMBERS} 个模型")
@@ -1244,6 +1259,21 @@ class ModelBlendService:
             if days and symbols
             else {}
         )
+        # 可交易性数据：仅 A 股有统一成交额与 ST/退市标记。
+        # None = 不可用 → 纯函数等权回退/不剔除，并由 warnings 明示。
+        amounts: dict[str, dict[date, float]] | None = None
+        risk_flags: dict[str, str] | None = None
+        st_error: str | None = None
+        if days and symbols and market == CN_MARKET:
+            amount_start = days[0] - timedelta(
+                days=max(45, DEFAULT_ADV_LOOKBACK_DAYS * 3)
+            )
+            amounts = await self._amount_history(symbols, amount_start, days[-1])
+            if not amounts:
+                amounts = None
+            if exclude_st:
+                flags, st_error = await self._risk_flags(symbols, market=market)
+                risk_flags = flags if st_error is None else None
         benchmark_closes: dict[date, float] = {}
         rotation: dict[str, Any] = {
             "batches": [],
@@ -1263,12 +1293,17 @@ class ModelBlendService:
                 closes=closes,
                 capital=capital,
                 benchmark_closes=benchmark_closes,
+                amounts=amounts,
+                risk_flags=risk_flags,
+                min_adv_yi=min_adv_yi,
+                adv_participation=adv_participation,
             )
             cells = cell_stats(
                 days,
                 picks_by_day,
                 closes,
                 equity_by_day=rotation["equity_by_day"],
+                entry_plans=rotation.get("entry_plans"),
             )
             market_by_day = metrics.market_day_stats(days, benchmark_closes)
 
@@ -1304,6 +1339,7 @@ class ModelBlendService:
             picks: list[dict[str, Any]] = []
             today: set[str] = set()
             day_cells = cells["by_day"].get(day) or {}
+            day_plans = (rotation.get("entry_plans") or {}).get(day) or {}
             for row in (rows_by_day.get(day) or [])[: int(per_day)]:
                 symbol = str(row["symbol"])
                 today.add(symbol)
@@ -1312,6 +1348,8 @@ class ModelBlendService:
                 profile = profiles.get(symbol) or {}
                 cell = day_cells.get(symbol) or {}
                 stats = cells["by_symbol"].get(symbol) or {}
+                entry = day_plans.get(symbol) or {}
+                adv = entry.get("adv")
                 picks.append(
                     {
                         **row,
@@ -1325,6 +1363,14 @@ class ModelBlendService:
                         "change_pct": cell.get("change_pct"),
                         "weight_pct": cell.get("weight_pct"),
                         "day_pnl_amount": cell.get("pnl_amount"),
+                        # 当日计划：是否建仓 / 计划权重 / ADV20（亿元）
+                        "buy_status": entry.get("status"),
+                        "entry_weight_pct": (
+                            round(float(entry.get("weight") or 0.0) * 100.0, 4)
+                            if entry
+                            else None
+                        ),
+                        "adv_yi": round(float(adv) / YI, 4) if adv else None,
                         "stats": {
                             "appearances": stats.get("appearances"),
                             "streak_days": stats.get("streak_days", held),
@@ -1385,6 +1431,28 @@ class ModelBlendService:
         warnings = list(readiness.warnings)
         if days and market == CN_MARKET and not benchmark_closes:
             warnings.append("benchmark_unavailable")
+        if days and symbols and market == CN_MARKET:
+            if amounts is None:
+                # 成交额不可用：本轮未校验容量，按等权回退（明示，不静默）
+                warnings.append("tradability_unavailable")
+            if exclude_st:
+                warnings.append(
+                    "st_filter_static"
+                    if risk_flags is not None
+                    else "st_filter_unavailable"
+                )
+        filters = {
+            "market": market,
+            "exclude_st": bool(exclude_st),
+            "st_applied": risk_flags is not None,
+            # 只回固定原因码，异常原文只进服务端日志（避免响应面泄漏内部路径/SQL）
+            "st_error": "risk_flags_unavailable" if st_error else None,
+            "capacity_applied": amounts is not None,
+            "min_adv_yi": min_adv_yi,
+            "adv_participation": adv_participation,
+            "adv_lookback_days": DEFAULT_ADV_LOOKBACK_DAYS,
+            "min_adv_days": DEFAULT_MIN_ADV_DAYS,
+        }
         return {
             "blend_id": str(blend["blend_id"]),
             "data_trade_date": target.isoformat(),
@@ -1400,6 +1468,7 @@ class ModelBlendService:
             "batches": batch_rows,
             "daily": daily_rows,
             "members": self._member_payload(members, {}, weights),
+            "filters": filters,
             "summary": {
                 "unique_symbols": len(
                     {pick["symbol"] for column in columns for pick in column["picks"]}
@@ -2526,6 +2595,57 @@ class ModelBlendService:
             if day is None or not _finite(close) or float(close) <= 0:
                 continue
             out.setdefault(prefix, {})[day] = float(close)
+        return out
+
+    @staticmethod
+    async def _amount_history(
+        symbols: Sequence[str], start: date, end: date
+    ) -> dict[str, dict[date, float]]:
+        """窗口内每日成交额（元）：``symbol → {date: amount}``。
+
+        用不复权 ``daily_unadjusted``：成交额本身不受复权影响，且与
+        ``stock_daily_latest.amount`` 同源。QuantDB 的 amount 单位是**万元**，
+        这里统一 ×10,000 换成元（与 ``_quotes`` 的 ADV20 口径一致）。
+        行情源不可用返回空映射，调用方按「成交额不可用」明示降级。
+        """
+        suffix_to_prefix: dict[str, str] = {}
+        for symbol in symbols:
+            suffix = StockCodeUtil.to_suffix(symbol)
+            if suffix:
+                suffix_to_prefix[suffix] = symbol
+        if not suffix_to_prefix or end < start:
+            return {}
+        try:
+            from backend.services.engine.data_platform.quantdb_hub import (
+                QuantDBDataHub,
+            )
+
+            hub = QuantDBDataHub.get_instance()
+            if hub is None or not hub.available:
+                return {}
+            frame = await asyncio.to_thread(
+                hub.fetch_daily_kline_batch,
+                list(suffix_to_prefix),
+                start,
+                end,
+                adjust="none",
+            )
+        except Exception as exc:  # pragma: no cover - 行情缺失按缺失处理
+            logger.warning("滚动建仓读取成交额失败: %s", exc)
+            return {}
+        if frame is None or frame.empty:
+            return {}
+        out: dict[str, dict[date, float]] = {}
+        for _, row in frame.iterrows():
+            prefix = suffix_to_prefix.get(str(row.get("symbol")))
+            if not prefix:
+                continue
+            raw_day = row.get("trade_date")
+            day = raw_day.date() if hasattr(raw_day, "date") else _parse_date(raw_day)
+            amount = row.get("amount")
+            if day is None or not (_finite(amount) and float(amount) > 0):
+                continue
+            out.setdefault(prefix, {})[day] = float(amount) * 10_000.0
         return out
 
     @staticmethod

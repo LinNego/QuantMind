@@ -367,6 +367,10 @@ async def get_blend_rolling(
     window: int = Query(default=10, ge=1, le=60),
     per_day: int = Query(default=5, ge=1, le=50),
     capital: float = Query(default=10_000_000.0, gt=0, le=1e12),
+    # 可交易性硬条件：ST/退市剔除 + ADV20 最低成交额（亿元）+ 参与率
+    exclude_st: bool = Query(default=True),
+    min_adv_yi: float = Query(default=1.0, ge=0, le=1000),
+    adv_participation: float = Query(default=0.01, gt=0, le=0.2),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     tenant_id, user_id = _owner(current_user)
@@ -380,6 +384,9 @@ async def get_blend_rolling(
             window=window,
             per_day=per_day,
             capital=capital,
+            exclude_st=exclude_st,
+            min_adv_yi=min_adv_yi,
+            adv_participation=adv_participation,
         )
     )
 

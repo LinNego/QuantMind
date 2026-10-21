@@ -178,6 +178,9 @@ export const BLEND_WARNING_LABELS: Record<string, string> = {
   deferred_exit: '部分标的到期日缺价，已顺延到下一个有效收盘价退出',
   stale_mark: '期末部分持仓缺最新收盘价，沿用上一有效价估值',
   benchmark_unavailable: '基准（沪深300）行情未取到，基准与超额一律显示 —',
+  st_filter_static: 'ST/退市按当前证券主表截面剔除（静态口径，历史重算含前视偏差）',
+  st_filter_unavailable: 'ST/退市数据源不可用：本轮未剔除，结果可能包含风险警示标的',
+  tradability_unavailable: '成交额数据不可用：本轮未校验容量，按等权预算估算',
 };
 
 /** 成员级告警码前缀 → 文案模板 */

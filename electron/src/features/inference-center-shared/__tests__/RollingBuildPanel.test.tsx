@@ -2,7 +2,7 @@
  * 滚动建仓面板：色块只表达名单变化，不得把涨跌方向从颜色里带回来。
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type {
   BlendRollingPerformance,
@@ -179,6 +179,11 @@ function performance(over: Partial<BlendRollingPerformance> = {}): BlendRollingP
 }
 
 describe('RollingBuildPanel', () => {
+  // 折叠状态写 localStorage：每个用例从「展开」开始，避免互相污染
+  beforeEach(() => {
+    window.localStorage.removeItem('qm:combo:rolling:metrics-collapsed');
+  });
+
   it('出错只显示错误与重试，不显示过期看板', () => {
     const onRetry = vi.fn();
     render(<RollingBuildPanel {...baseProps} rolling={rolling()} error="读取失败" onRetry={onRetry} />);
@@ -392,11 +397,131 @@ describe('RollingBuildPanel', () => {
     );
   });
 
+  it('顶部统计可折叠：折叠后只留一行摘要，状态写入 localStorage', () => {
+    const data = rolling();
+    data.summary.performance = performance({
+      evaluated_picks: 20,
+      bought_positions: 18,
+      final_cash_pct: 3.2,
+    });
+    render(<RollingBuildPanel {...baseProps} rolling={data} />);
+
+    const toggle = screen.getByTestId('combo-rolling-performance-toggle');
+    expect(toggle.textContent).toBe('收起统计');
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByTestId('combo-rolling-total-return')).toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(toggle.textContent).toBe('展开统计');
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByTestId('combo-rolling-total-return')).not.toBeInTheDocument();
+    const header = screen.getByTestId('combo-rolling-performance-header');
+    expect(header.textContent).toContain('窗口收益 +4.50%');
+    expect(header.textContent).toContain('收益金额 +45.00 万');
+    expect(header.textContent).toContain('建仓 18/20');
+    expect(header.textContent).toContain('期末现金 3.20%');
+    expect(header.textContent).not.toMatch(/undefined/);
+    expect(window.localStorage.getItem('qm:combo:rolling:metrics-collapsed')).toBe('1');
+
+    fireEvent.click(screen.getByTestId('combo-rolling-performance-toggle'));
+    expect(screen.getByTestId('combo-rolling-total-return')).toBeInTheDocument();
+    expect(window.localStorage.getItem('qm:combo:rolling:metrics-collapsed')).toBeNull();
+  });
+
+  it('折叠状态从 localStorage 恢复', () => {
+    window.localStorage.setItem('qm:combo:rolling:metrics-collapsed', '1');
+    const data = rolling();
+    data.summary.performance = performance();
+    render(<RollingBuildPanel {...baseProps} rolling={data} />);
+    expect(screen.queryByTestId('combo-rolling-total-return')).not.toBeInTheDocument();
+    expect(screen.getByTestId('combo-rolling-performance-toggle').textContent).toBe('展开统计');
+    // 摘要里的未知字段按 — 处理，不渲染 undefined
+    expect(screen.getByTestId('combo-rolling-performance-header').textContent).not.toMatch(
+      /undefined/,
+    );
+  });
+
+  it('格子展示建仓状态：建仓 x% / 次日建仓 / 未建仓原因，且不用红绿', () => {
+    const data = rolling();
+    data.columns[0].picks[0] = {
+      ...data.columns[0].picks[0],
+      buy_status: 'skip_st',
+      adv_yi: 2.5,
+    };
+    data.columns[1].picks[0] = {
+      ...data.columns[1].picks[0],
+      buy_status: 'bought',
+      entry_weight_pct: 2.5,
+      adv_yi: 3.2,
+    };
+    data.columns[1].picks[1] = {
+      ...data.columns[1].picks[1],
+      buy_status: 'skip_low_adv',
+      adv_yi: 0.2,
+    };
+    data.columns[1].picks.push({
+      symbol: 'SH600003', code: 'SH600003', name: '戊', score: 0.3, rank: 3, row_rank: 3,
+      coverage: 13, pct: 0.4, position: 'HOLD', held_days: 0, is_new: true,
+      change_pct: 0, buy_status: 'next_day',
+    });
+    const { container } = render(<RollingBuildPanel {...baseProps} rolling={data} />);
+
+    expect(
+      screen.getByTestId('combo-rolling-pick-buy-2026-10-19-SH600001').textContent,
+    ).toBe('未建仓 · ST/退市');
+    const bought = screen.getByTestId('combo-rolling-pick-buy-2026-10-20-SH600001');
+    expect(bought.textContent).toBe('建仓 2.5%');
+    expect(bought.innerHTML).toContain('text-indigo-700');
+    expect(
+      screen.getByTestId('combo-rolling-pick-buy-2026-10-20-SH600002').textContent,
+    ).toBe('未建仓 · 成交额不足');
+    const nextDay = screen.getByTestId('combo-rolling-pick-buy-2026-10-20-SH600003');
+    expect(nextDay.textContent).toBe('次日建仓');
+    expect(nextDay.innerHTML).toContain('text-sky-700');
+
+    const toneText = [
+      screen.getByTestId('combo-rolling-pick-buy-2026-10-19-SH600001').innerHTML,
+      bought.innerHTML,
+      nextDay.innerHTML,
+    ].join(' ');
+    expect(toneText).not.toMatch(/red|green|rose|emerald/);
+    expect(container.textContent).not.toMatch(/买入|卖出|BUY|SELL|undefined/);
+  });
+
+  it('旧后端没有 buy_status：不渲染建仓标签，保持原样', () => {
+    const { container } = render(<RollingBuildPanel {...baseProps} rolling={rolling()} />);
+    expect(
+      screen.queryByTestId('combo-rolling-pick-buy-2026-10-20-SH600001'),
+    ).not.toBeInTheDocument();
+    expect(container.textContent).not.toMatch(/undefined/);
+  });
+
+  it('批次明细展示建仓只数；旧后端缺字段显示 —', async () => {
+    render(<RollingBuildPanel {...baseProps} rolling={rolling()} />);
+    fireEvent.click(screen.getByText(/每日批次（2 批/));
+    await screen.findByTestId('combo-rolling-batches');
+    const bought = screen.getAllByTestId('combo-rolling-batch-bought');
+    expect(bought[0].textContent).toBe('—');
+  });
+
   it('滚动告警抬头展示', () => {
     render(
       <RollingBuildPanel {...baseProps} rolling={rolling({ warnings: ['部分成员当日无评分'] })} />,
     );
     expect(screen.getByTestId('combo-rolling-warnings')).toBeInTheDocument();
     expect(screen.getByText('部分成员当日无评分')).toBeInTheDocument();
+  });
+
+  it('可交易性告警优先展示，不被前 3 条成员级告警挤掉', () => {
+    render(
+      <RollingBuildPanel
+        {...baseProps}
+        rolling={rolling({
+          warnings: ['甲成员无评分', '乙成员无评分', '丙成员无评分', 'tradability_unavailable'],
+        })}
+      />,
+    );
+    const alert = screen.getByTestId('combo-rolling-warnings');
+    expect(alert.textContent).toContain('成交额数据不可用');
   });
 });

@@ -363,6 +363,62 @@ def test_daily_rotation_missing_exit_price_reduces_denominator():
 
 
 @pytest.mark.unit
+def test_daily_rotation_all_skipped_is_not_counted_as_missing_price():
+    """全部标的被跳过 = 无建仓批次，不得计成「缺价」或「部分缺价」。"""
+    days = [D0, D1]
+    picks = {D0: ["A", "B"]}
+    closes = {"A": {D0: 10.0, D1: 11.0}, "B": {D0: 20.0, D1: 21.0}}
+
+    result = _rotation(
+        days=days,
+        picks_by_day=picks,
+        closes=closes,
+        risk_flags={"A": "ST", "B": "退市"},
+    )
+
+    batch = result["batches"][0]
+    assert batch["positions"] == 2
+    assert batch["bought"] == 0
+    assert batch["priced"] == 0
+    assert batch["return_pct"] is None
+    summary = result["summary"]
+    assert summary["priced_batches"] == 0
+    assert summary["unpriced_batches"] == 0
+    assert summary["partial_batches"] == 0
+    assert summary["no_position_batches"] == 1
+    assert summary["final_equity"] == pytest.approx(1000.0)
+    assert summary["final_cash_pct"] == pytest.approx(100.0)
+
+
+@pytest.mark.unit
+def test_daily_rotation_partial_batches_compare_against_bought():
+    """部分缺价的分母是实际建仓只数：有跳过但建仓标的都有价，不算部分缺价。"""
+    days = [D0, D1]
+    picks = {D0: ["A", "B", "C"]}
+    closes = {
+        "A": {D0: 10.0, D1: 11.0},
+        "B": {D0: 20.0, D1: 19.0},
+        "C": {D0: 30.0, D1: 33.0},
+    }
+
+    result = _rotation(
+        days=days,
+        picks_by_day=picks,
+        closes=closes,
+        risk_flags={"C": "ST"},
+    )
+
+    batch = result["batches"][0]
+    assert batch["bought"] == 2
+    assert batch["priced"] == 2
+    summary = result["summary"]
+    assert summary["partial_batches"] == 0
+    assert summary["unpriced_batches"] == 0
+    assert summary["no_position_batches"] == 0
+    assert summary["skipped_st"] == 1
+
+
+@pytest.mark.unit
 def test_daily_rotation_without_picks_stays_in_cash():
     days = [D0, D1, D2]
 
@@ -434,6 +490,276 @@ def test_cell_stats_per_symbol_and_per_day_pnl():
     day2_b = out["by_day"][D2]["B"]
     assert day2_b["weight_pct"] == pytest.approx(50.0)
     assert day2_b["pnl_amount"] == pytest.approx(-55.0)
+
+
+# ── 可交易性：ST/退市剔除 + ADV20 容量约束（2026-10-21）─────────────────
+
+
+def _amount_days(count: int, *, amount: float, end: date = D0) -> dict[date, float]:
+    return {
+        date.fromordinal(end.toordinal() - offset): amount for offset in range(count)
+    }
+
+
+@pytest.mark.unit
+def test_trailing_adv_uses_last_20_days_up_to_entry_and_requires_15():
+    from backend.services.engine.inference.rolling_performance import trailing_adv
+
+    full = {
+        date.fromordinal(D0.toordinal() - offset): float(21 - offset)
+        for offset in range(20)
+    }
+    # 入选日之后的数据不得计入（防未来函数）
+    full[date.fromordinal(D0.toordinal() + 1)] = 999.0
+    short = _amount_days(14, amount=500_000_000.0)
+    amounts = {"A": full, "B": short}
+
+    # 21..2 的均值 = 11.5；入选日之后的 999 不得参与
+    assert trailing_adv(amounts, "A", D0) == pytest.approx(11.5)
+    assert trailing_adv(amounts, "B", D0) is None
+    assert trailing_adv(amounts, "C", D0) is None
+
+
+@pytest.mark.unit
+def test_daily_rotation_skips_st_and_keeps_cash():
+    from backend.services.engine.inference.rolling_performance import (
+        simulate_daily_rotation,
+    )
+
+    days = [D0, D1]
+    picks = {D0: ["A", "B"]}
+    closes = {"A": {D0: 10.0, D1: 11.0}, "B": {D0: 10.0, D1: 12.0}}
+
+    result = simulate_daily_rotation(
+        days=days,
+        picks_by_day=picks,
+        closes=closes,
+        capital=1000.0,
+        risk_flags={"A": "ST"},
+    )
+
+    batch = result["batches"][0]
+    assert batch["positions"] == 2
+    assert batch["bought"] == 1
+    assert batch["priced"] == 1
+    # 预算 = 1000/2 = 500；A 被剔除后不替补，500 留现金
+    assert batch["notional_amount"] == pytest.approx(500.0)
+    assert batch["return_pct"] == pytest.approx(10.0)
+    assert batch["pnl_amount"] == pytest.approx(100.0)
+    assert batch["equity"] == pytest.approx(1100.0)
+    daily = result["daily"][0]
+    assert daily["cash"] == pytest.approx(500.0)
+    assert daily["exposure_pct"] == pytest.approx(50.0)
+    plan = result["entry_plans"][D0]
+    assert plan["A"]["status"] == "skip_st"
+    assert plan["A"]["weight"] == 0.0
+    assert plan["B"]["status"] == "bought"
+    assert plan["B"]["weight"] == pytest.approx(0.5)
+
+    summary = result["summary"]
+    assert summary["st_filter_applied"] is True
+    assert summary["capacity_applied"] is False
+    assert summary["evaluated_picks"] == 2
+    assert summary["bought_positions"] == 1
+    assert summary["skipped_st"] == 1
+    assert summary["final_cash_pct"] == pytest.approx(45.45, abs=0.01)
+
+
+@pytest.mark.unit
+def test_daily_rotation_skips_low_adv_and_missing_amount():
+    from backend.services.engine.inference.rolling_performance import (
+        simulate_daily_rotation,
+    )
+
+    days = [D0, D1]
+    picks = {D0: ["A", "B", "C"]}
+    closes = {
+        "A": {D0: 10.0, D1: 11.0},
+        "B": {D0: 10.0, D1: 12.0},
+        "C": {D0: 10.0, D1: 13.0},
+    }
+    amounts = {
+        # 5000 万 < 1 亿门槛
+        "A": _amount_days(20, amount=50_000_000.0),
+        "B": _amount_days(20, amount=500_000_000.0),
+    }
+
+    result = simulate_daily_rotation(
+        days=days,
+        picks_by_day=picks,
+        closes=closes,
+        capital=1000.0,
+        amounts=amounts,
+    )
+
+    plan = result["entry_plans"][D0]
+    assert plan["A"]["status"] == "skip_low_adv"
+    assert plan["C"]["status"] == "skip_no_amount"
+    assert plan["B"]["status"] == "bought"
+    assert plan["B"]["adv"] == pytest.approx(500_000_000.0)
+    assert plan["B"]["value"] == pytest.approx(1000.0 / 3.0)
+    batch = result["batches"][0]
+    assert batch["bought"] == 1
+    assert batch["return_pct"] == pytest.approx(6.6667, abs=1e-4)
+    summary = result["summary"]
+    assert summary["capacity_applied"] is True
+    assert summary["skipped_low_adv"] == 1
+    assert summary["skipped_no_amount"] == 1
+
+
+@pytest.mark.unit
+def test_daily_rotation_caps_position_at_participation_of_adv():
+    from backend.services.engine.inference.rolling_performance import (
+        simulate_daily_rotation,
+    )
+
+    days = [D0, D1]
+    picks = {D0: ["A"]}
+    closes = {"A": {D0: 10.0, D1: 20.0}}
+    amounts = {"A": _amount_days(20, amount=50_000.0)}
+
+    result = simulate_daily_rotation(
+        days=days,
+        picks_by_day=picks,
+        closes=closes,
+        capital=1000.0,
+        amounts=amounts,
+        # 关闭 1 亿门槛，单独验证参与率上限
+        min_adv_yi=0.0,
+        adv_participation=0.01,
+    )
+
+    plan = result["entry_plans"][D0]["A"]
+    assert plan["status"] == "bought"
+    # 等权预算 1000，ADV×1% = 500 → 只能建 500
+    assert plan["value"] == pytest.approx(500.0)
+    batch = result["batches"][0]
+    assert batch["notional_amount"] == pytest.approx(500.0)
+    assert batch["return_pct"] == pytest.approx(50.0)
+    assert batch["pnl_amount"] == pytest.approx(500.0)
+    assert batch["equity"] == pytest.approx(1500.0)
+    assert result["summary"]["final_cash_pct"] == pytest.approx(33.33, abs=0.01)
+
+
+@pytest.mark.unit
+def test_daily_rotation_without_amounts_falls_back_to_equal_weight():
+    from backend.services.engine.inference.rolling_performance import (
+        simulate_daily_rotation,
+    )
+
+    days = [D0, D1]
+    picks = {D0: ["A", "B"]}
+    closes = {"A": {D0: 10.0, D1: 11.0}, "B": {D0: 10.0, D1: 9.0}}
+
+    result = simulate_daily_rotation(
+        days=days, picks_by_day=picks, closes=closes, capital=1000.0
+    )
+
+    batch = result["batches"][0]
+    assert batch["return_pct"] == pytest.approx(0.0)  # 等权均值 (+10% −10%) / 2
+    assert batch["notional_amount"] == pytest.approx(1000.0)
+    summary = result["summary"]
+    assert summary["capacity_applied"] is False
+    assert summary["st_filter_applied"] is False
+    assert summary["bought_positions"] == 2
+
+
+@pytest.mark.unit
+def test_daily_rotation_skips_pick_without_entry_price():
+    from backend.services.engine.inference.rolling_performance import (
+        simulate_daily_rotation,
+    )
+
+    days = [D0, D1]
+    picks = {D0: ["A", "B"]}
+    closes = {"A": {D0: 10.0, D1: 11.0}}
+
+    result = simulate_daily_rotation(
+        days=days, picks_by_day=picks, closes=closes, capital=1000.0
+    )
+
+    plan = result["entry_plans"][D0]
+    assert plan["B"]["status"] == "skip_no_price"
+    assert plan["B"]["value"] == 0.0
+    batch = result["batches"][0]
+    assert batch["bought"] == 1
+    # 不替补：A 只拿等权预算 500，其余留现金
+    assert batch["notional_amount"] == pytest.approx(500.0)
+    assert batch["return_pct"] == pytest.approx(5.0)
+    assert result["summary"]["skipped_no_price"] == 1
+
+
+@pytest.mark.unit
+def test_last_day_picks_are_next_day_candidates_not_bought():
+    from backend.services.engine.inference.rolling_performance import (
+        simulate_daily_rotation,
+    )
+
+    days = [D0, D1]
+    picks = {D0: ["A"], D1: ["B"]}
+    closes = {"A": {D0: 10.0, D1: 11.0}, "B": {D1: 20.0}}
+
+    result = simulate_daily_rotation(
+        days=days, picks_by_day=picks, closes=closes, capital=1000.0
+    )
+
+    assert result["entry_plans"][D1]["B"]["status"] == "next_day"
+    assert result["entry_plans"][D1]["B"]["value"] == 0.0
+    summary = result["summary"]
+    # 末列候选不计入批次口径
+    assert summary["evaluated_picks"] == 1
+    assert summary["bought_positions"] == 1
+
+
+@pytest.mark.unit
+def test_cell_stats_carries_buy_status_and_capacity_weights():
+    from backend.services.engine.inference.rolling_performance import (
+        cell_stats,
+        simulate_daily_rotation,
+    )
+
+    days = [D0, D1, D2]
+    picks = {D0: ["A", "B"], D1: ["A", "B"], D2: ["A", "B"]}
+    closes = {
+        "A": {D0: 10.0, D1: 11.0, D2: 12.0},
+        "B": {D0: 20.0, D1: 22.0, D2: 22.0},
+    }
+    rotation = simulate_daily_rotation(
+        days=days,
+        picks_by_day=picks,
+        closes=closes,
+        capital=1000.0,
+        risk_flags={"B": "ST"},
+    )
+
+    out = cell_stats(
+        days,
+        picks,
+        closes,
+        equity_by_day=rotation["equity_by_day"],
+        entry_plans=rotation["entry_plans"],
+    )
+
+    day0_a = out["by_day"][D0]["A"]
+    assert day0_a["buy_status"] == "bought"
+    assert day0_a["entry_weight_pct"] == pytest.approx(50.0)
+    assert day0_a["weight_pct"] is None
+    day0_b = out["by_day"][D0]["B"]
+    assert day0_b["buy_status"] == "skip_st"
+    assert day0_b["entry_weight_pct"] == pytest.approx(0.0)
+    assert day0_b["weight_pct"] is None
+
+    # 当日权重取前一交易日计划：A 建仓 500/1000 = 50%
+    day1_a = out["by_day"][D1]["A"]
+    assert day1_a["weight_pct"] == pytest.approx(50.0)
+    assert day1_a["pnl_amount"] == pytest.approx(50.0)
+    day1_b = out["by_day"][D1]["B"]
+    assert day1_b["weight_pct"] is None
+    assert day1_b["pnl_amount"] is None
+
+    day2_a = out["by_day"][D2]["A"]
+    assert day2_a["buy_status"] == "next_day"
+    assert day2_a["entry_weight_pct"] == pytest.approx(50.0)
 
 
 @pytest.mark.unit

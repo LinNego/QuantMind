@@ -7,7 +7,7 @@
  * - 红涨绿跌由调用方给 `tone`，本组件不判断方向。
  */
 
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Tag, Tooltip } from 'antd';
 import type { BlendBenchmark, BlendBounds, BlendDataSource } from '../../../../services/blendTypes';
 import {
@@ -41,10 +41,36 @@ export interface MetricSection {
 export interface PortfolioMetricsStripProps {
   sections: MetricSection[];
   testId: string;
+  /** 可折叠：右上角切换；折叠状态写 localStorage（按 storageKey 区分面板） */
+  collapsible?: boolean;
+  storageKey?: string;
+  /** 折叠态摘要（一行，缺失时用默认文案） */
+  collapsedSummary?: React.ReactNode;
 }
 
 const HERO_CLASS = 'text-base font-black';
 const NORMAL_CLASS = 'text-[12px] font-bold';
+const COLLAPSED_STORAGE_VERSION = '1';
+
+function readCollapsed(key: string): boolean {
+  try {
+    return window.localStorage.getItem(key) === COLLAPSED_STORAGE_VERSION;
+  } catch {
+    return false;
+  }
+}
+
+function writeCollapsed(key: string, collapsed: boolean): void {
+  try {
+    if (collapsed) {
+      window.localStorage.setItem(key, COLLAPSED_STORAGE_VERSION);
+    } else {
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    // 隐私模式/存储禁用：折叠仍然生效，只是不记忆
+  }
+}
 
 function metricNode(item: MetricItem): React.ReactNode {
   const value = (
@@ -75,28 +101,70 @@ function metricNode(item: MetricItem): React.ReactNode {
 export const PortfolioMetricsStrip: React.FC<PortfolioMetricsStripProps> = ({
   sections,
   testId,
+  collapsible = false,
+  storageKey,
+  collapsedSummary,
 }) => {
+  const storeKey = storageKey ?? `${testId}:collapsed`;
+  const [collapsed, setCollapsed] = useState<boolean>(() =>
+    collapsible ? readCollapsed(storeKey) : false,
+  );
+
+  useEffect(() => {
+    // storageKey 变化（切换面板）时重新读取；不可折叠时强制展开
+    setCollapsed(collapsible ? readCollapsed(storeKey) : false);
+  }, [collapsible, storeKey]);
+
   const visible = sections.filter((section) => section.items.length > 0);
   if (visible.length === 0) return null;
+
+  const toggle = () => {
+    // 写 localStorage 放在 updater 外：updater 必须保持纯函数（StrictMode 会双调用）
+    const next = !collapsed;
+    setCollapsed(next);
+    writeCollapsed(storeKey, next);
+  };
+
+  const rows = visible.map((section) => (
+    <div
+      key={section.key}
+      className="flex flex-wrap items-baseline gap-x-4 gap-y-1 px-3 py-1.5"
+      data-testid={`${testId}-${section.key}`}
+    >
+      {section.title && (
+        <span className="w-10 shrink-0 text-[10px] font-black tracking-wide text-slate-400">
+          {section.title}
+        </span>
+      )}
+      {section.items.map((item) => metricNode(item))}
+    </div>
+  ));
+
   return (
     <div
       className="shrink-0 divide-y divide-slate-100 border-b border-slate-100 bg-slate-50/70"
       data-testid={testId}
     >
-      {visible.map((section) => (
+      {collapsible && (
         <div
-          key={section.key}
-          className="flex flex-wrap items-baseline gap-x-4 gap-y-1 px-3 py-1.5"
-          data-testid={`${testId}-${section.key}`}
+          className="flex items-center justify-between gap-2 px-3 py-0.5"
+          data-testid={`${testId}-header`}
         >
-          {section.title && (
-            <span className="w-10 shrink-0 text-[10px] font-black tracking-wide text-slate-400">
-              {section.title}
-            </span>
-          )}
-          {section.items.map((item) => metricNode(item))}
+          <span className="min-w-0 truncate text-[10px] text-slate-500">
+            {collapsed ? collapsedSummary ?? '统计已收起' : '组合统计'}
+          </span>
+          <button
+            type="button"
+            className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-blue-700 hover:bg-blue-50"
+            aria-expanded={!collapsed}
+            onClick={toggle}
+            data-testid={`${testId}-toggle`}
+          >
+            {collapsed ? '展开统计' : '收起统计'}
+          </button>
         </div>
-      ))}
+      )}
+      {!(collapsible && collapsed) && rows}
     </div>
   );
 };

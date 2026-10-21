@@ -86,12 +86,27 @@ describe('buildRollingMetricSections', () => {
 
   it('批次计数区分结算与浮动，胜率提示只统计已结算批次', () => {
     const sections = buildRollingMetricSections(performance());
-    expect(find(sections, 'combo-rolling-batches')?.value).toBe('11（结算 10 · 浮动 1）');
+    expect(find(sections, 'combo-rolling-batch-counts')?.value).toBe('11（结算 10 · 浮动 1）');
     const win = sections
       .flatMap((section) => section.items)
       .find((item) => item.key === 'win');
     expect(win?.value).toBe('50.0%');
     expect(win?.hint).toContain('仅已结算批次');
+  });
+
+  it('批次明细：新后端给「无建仓」批次数，旧后端不硬造', () => {
+    const withSkips = buildRollingMetricSections(
+      performance({ no_position_batches: 3, partial_batches: 1, unpriced_batches: 2 }),
+    );
+    const hint = String(find(withSkips, 'combo-rolling-batch-counts')?.hint);
+    expect(hint).toContain('已计价 11');
+    expect(hint).toContain('缺价 2');
+    expect(hint).toContain('部分缺价 1');
+    expect(hint).toContain('无建仓 3 批');
+    const legacyHint = String(
+      find(buildRollingMetricSections(performance()), 'combo-rolling-batch-counts')?.hint,
+    );
+    expect(legacyHint).not.toContain('无建仓');
   });
 
   it('基准不可用：基准/超额/IR 全部 —，不写 0', () => {
@@ -128,7 +143,7 @@ describe('buildRollingMetricSections', () => {
       flats: undefined,
     } as unknown as BlendRollingPerformance;
     const sections = buildRollingMetricSections(legacy);
-    const counts = find(sections, 'combo-rolling-batches');
+    const counts = find(sections, 'combo-rolling-batch-counts');
     expect(counts?.value).toBe('—（结算 — · 浮动 —）');
     expect(String(counts?.hint)).not.toMatch(/undefined/);
     const win = sections
@@ -137,8 +152,96 @@ describe('buildRollingMetricSections', () => {
     expect(String(win?.hint)).not.toMatch(/undefined/);
   });
 
+  it('执行约束段：建仓覆盖 / 容量 / ST / 跳过明细', () => {
+    const sections = buildRollingMetricSections(
+      performance({
+        evaluated_picks: 50,
+        bought_positions: 40,
+        capacity_applied: true,
+        st_filter_applied: true,
+        skipped_st: 2,
+        skipped_low_adv: 5,
+        skipped_no_amount: 2,
+        skipped_no_price: 1,
+        min_adv_yi: 1,
+        adv_participation: 0.01,
+        adv_lookback_days: 20,
+        min_adv_days: 15,
+      }),
+    );
+    expect(sections.map((section) => section.key)).toEqual([
+      'returns',
+      'risk',
+      'batches',
+      'tradability',
+    ]);
+    expect(find(sections, 'combo-rolling-coverage')?.value).toBe('40 / 50（80%）');
+    expect(find(sections, 'combo-rolling-capacity')?.value).toBe('1 亿 · 参与率 1.0%');
+    expect(String(find(sections, 'combo-rolling-capacity')?.hint)).toContain('ADV20');
+    expect(find(sections, 'combo-rolling-st-filter')?.value).toBe('已启用');
+    expect(find(sections, 'combo-rolling-skips')?.value).toBe('10 只');
+    expect(find(sections, 'combo-rolling-skips')?.hint).toBe(
+      'ST/退市 2 · 成交额不足 5 · 缺成交额 2 · 缺入选价 1',
+    );
+  });
+
+  it('旧后端没有可交易性字段：整段省略，不渲染一串 —', () => {
+    const sections = buildRollingMetricSections(performance());
+    expect(sections.map((section) => section.key)).toEqual(['returns', 'risk', 'batches']);
+  });
+
+  it('成交额/ST 数据源不可用：明确写「未启用」，提示说明原因', () => {
+    const sections = buildRollingMetricSections(
+      performance({ capacity_applied: false, st_filter_applied: false }),
+    );
+    expect(find(sections, 'combo-rolling-capacity')?.value).toBe('未启用');
+    expect(String(find(sections, 'combo-rolling-capacity')?.hint)).toContain('未校验容量');
+    expect(find(sections, 'combo-rolling-st-filter')?.value).toBe('未启用');
+    expect(JSON.stringify(sections)).not.toMatch(/undefined/);
+  });
+
+  it('非 A 股市场：写「不适用」，不误报为数据源故障', () => {
+    const sections = buildRollingMetricSections(
+      performance({ capacity_applied: false, st_filter_applied: false }),
+      { market: 'US', exclude_st: true, st_applied: false, capacity_applied: false },
+    );
+    expect(find(sections, 'combo-rolling-capacity')?.value).toBe('不适用');
+    expect(String(find(sections, 'combo-rolling-capacity')?.hint)).toContain('该市场');
+    expect(find(sections, 'combo-rolling-st-filter')?.value).toBe('不适用');
+    expect(String(find(sections, 'combo-rolling-st-filter')?.hint)).toContain('该市场');
+  });
+
+  it('显式关闭 ST 过滤：写「已关闭」，不误报为数据源故障', () => {
+    const sections = buildRollingMetricSections(
+      performance({ capacity_applied: true, st_filter_applied: false }),
+      { market: 'CN', exclude_st: false, st_applied: false, capacity_applied: true },
+    );
+    expect(find(sections, 'combo-rolling-st-filter')?.value).toBe('已关闭');
+    expect(String(find(sections, 'combo-rolling-st-filter')?.hint)).toContain('exclude_st=false');
+  });
+
+  it('评估数为 0：覆盖显示 — 而不是 0%', () => {
+    const sections = buildRollingMetricSections(
+      performance({ evaluated_picks: 0, bought_positions: 0 }),
+    );
+    expect(find(sections, 'combo-rolling-coverage')?.value).toBe('—');
+  });
+
   it('合规：展示面不出现买卖字眼', () => {
-    const text = JSON.stringify(buildRollingMetricSections(performance()));
+    const text = JSON.stringify(
+      buildRollingMetricSections(
+        performance({
+          evaluated_picks: 50,
+          bought_positions: 40,
+          capacity_applied: true,
+          st_filter_applied: true,
+          skipped_st: 2,
+          skipped_low_adv: 5,
+          skipped_no_amount: 2,
+          skipped_no_price: 1,
+        }),
+      ),
+    );
     expect(text).not.toMatch(/买入|卖出|加仓|减仓|清仓/);
   });
 });

@@ -1301,6 +1301,9 @@ def _rolling_service(
     source="pred",
     readiness=None,
     runs=None,
+    amounts=None,
+    risk_flags=None,
+    risk_error=None,
 ):
     """替身窗口：只喂表头三列（符号/分数/名次），其余口径由真库用例覆盖。"""
     members = models or [_model("a"), _model("b")]
@@ -1346,6 +1349,18 @@ def _rolling_service(
         calls["close_history"] = {"symbols": list(symbols), "start": start, "end": end}
         return dict(closes or {})
 
+    async def fake_amounts(symbols, start, end):
+        calls["amount_history"] = {
+            "symbols": list(symbols),
+            "start": start,
+            "end": end,
+        }
+        return dict(amounts or {})
+
+    async def fake_risk_flags(symbols, market="CN"):
+        calls["risk_flags"] = {"symbols": list(symbols), "market": market}
+        return dict(risk_flags or {}), risk_error
+
     async def fake_common_date(**_kwargs):
         calls["common_date"] = True
         return D_ROLL
@@ -1364,6 +1379,8 @@ def _rolling_service(
     svc._stock_names = fake_names
     svc._stock_profiles = fake_profiles
     svc._close_history = fake_closes
+    svc._amount_history = fake_amounts
+    svc._risk_flags = fake_risk_flags
     svc.latest_common_date = fake_common_date
     svc._next_trading_day = fake_next
     svc.members_from_blend = fake_members
@@ -1725,6 +1742,195 @@ async def test_rolling_rejects_non_positive_capital():
     svc, _ = _rolling_service({}, closes={})
     with pytest.raises(BlendError):
         await svc.rolling({"blend_id": "bl_x"}, tenant_id="t", user_id="u", capital=0)
+
+
+def _adv_series(day: date, amount: float, count: int = 20) -> dict[date, float]:
+    return {
+        date.fromordinal(day.toordinal() - offset): amount for offset in range(count)
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_skips_low_adv_and_caps_weight_by_turnover():
+    d0, d1 = _roll_days(1, 0)
+    rows = {
+        d0: [_roll_row("SH600000", 1), _roll_row("SZ000001", 2)],
+        d1: [_roll_row("SH600000", 1), _roll_row("SZ000001", 2)],
+    }
+    closes = {
+        "SH600000": {d0: 10.0, d1: 11.0},
+        "SZ000001": {d0: 10.0, d1: 12.0},
+    }
+    svc, calls = _rolling_service(
+        rows,
+        closes=closes,
+        amounts={
+            "SH600000": _adv_series(d0, 100_000_000.0),  # 1 亿 → 过门槛
+            "SZ000001": _adv_series(d0, 50_000_000.0),  # 5000 万 → 不足
+        },
+    )
+
+    payload = await svc.rolling(
+        {"blend_id": "bl_x"}, tenant_id="t", user_id="u", window=2, per_day=5
+    )
+
+    assert calls["amount_history"]["symbols"] == ["SH600000", "SZ000001"]
+    first = {pick["symbol"]: pick for pick in payload["columns"][0]["picks"]}
+    # 等权预算 500 万，ADV×1% = 100 万 → 按 100 万建仓
+    assert first["SH600000"]["buy_status"] == "bought"
+    assert first["SH600000"]["entry_weight_pct"] == pytest.approx(10.0)
+    assert first["SH600000"]["adv_yi"] == pytest.approx(1.0)
+    assert first["SZ000001"]["buy_status"] == "skip_low_adv"
+    assert first["SZ000001"]["entry_weight_pct"] == pytest.approx(0.0)
+    assert first["SZ000001"]["adv_yi"] == pytest.approx(0.5)
+
+    performance = payload["summary"]["performance"]
+    assert performance["capacity_applied"] is True
+    assert performance["st_filter_applied"] is True
+    assert performance["evaluated_picks"] == 2
+    assert performance["bought_positions"] == 1
+    assert performance["skipped_low_adv"] == 1
+    assert performance["min_adv_yi"] == pytest.approx(1.0)
+    assert payload["batches"][0]["bought"] == 1
+    assert payload["batches"][0]["notional_amount"] == pytest.approx(1_000_000.0)
+    assert payload["batches"][0]["return_pct"] == pytest.approx(1.0)
+    assert "st_filter_static" in payload["warnings"]
+    assert "tradability_unavailable" not in payload["warnings"]
+    assert payload["filters"]["capacity_applied"] is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_marks_st_picks_as_not_bought():
+    d0, d1 = _roll_days(1, 0)
+    rows = {
+        d0: [_roll_row("SH600000", 1), _roll_row("SZ000001", 2)],
+        d1: [_roll_row("SH600000", 1), _roll_row("SZ000001", 2)],
+    }
+    closes = {
+        "SH600000": {d0: 10.0, d1: 11.0},
+        "SZ000001": {d0: 10.0, d1: 12.0},
+    }
+    svc, _ = _rolling_service(
+        rows,
+        closes=closes,
+        amounts={
+            "SH600000": _adv_series(d0, 100_000_000.0),
+            "SZ000001": _adv_series(d0, 100_000_000.0),
+        },
+        risk_flags={"SH600000": "ST"},
+    )
+
+    payload = await svc.rolling(
+        {"blend_id": "bl_x"}, tenant_id="t", user_id="u", window=2, per_day=5
+    )
+
+    first = {pick["symbol"]: pick for pick in payload["columns"][0]["picks"]}
+    assert first["SH600000"]["buy_status"] == "skip_st"
+    assert first["SH600000"]["entry_weight_pct"] == pytest.approx(0.0)
+    assert first["SZ000001"]["buy_status"] == "bought"
+    performance = payload["summary"]["performance"]
+    assert performance["skipped_st"] == 1
+    assert performance["bought_positions"] == 1
+    assert "st_filter_static" in payload["warnings"]
+    assert payload["filters"]["st_applied"] is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_warns_when_st_source_unavailable():
+    d0, d1 = _roll_days(1, 0)
+    rows = {d0: [_roll_row("SH600000", 1)], d1: [_roll_row("SH600000", 1)]}
+    closes = {"SH600000": {d0: 10.0, d1: 11.0}}
+    svc, _ = _rolling_service(
+        rows,
+        closes=closes,
+        amounts={"SH600000": _adv_series(d0, 100_000_000.0)},
+        risk_error="instrument source down",
+    )
+
+    payload = await svc.rolling(
+        {"blend_id": "bl_x"}, tenant_id="t", user_id="u", window=2, per_day=5
+    )
+
+    assert "st_filter_unavailable" in payload["warnings"]
+    assert "st_filter_static" not in payload["warnings"]
+    assert payload["filters"]["st_applied"] is False
+    # 响应面只回固定原因码，不泄漏异常原文
+    assert payload["filters"]["st_error"] == "risk_flags_unavailable"
+    assert payload["summary"]["performance"]["st_filter_applied"] is False
+    assert payload["columns"][0]["picks"][0]["buy_status"] == "bought"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_warns_when_turnover_source_unavailable():
+    d0, d1 = _roll_days(1, 0)
+    rows = {
+        d0: [_roll_row("SH600000", 1), _roll_row("SZ000001", 2)],
+        d1: [_roll_row("SH600000", 1), _roll_row("SZ000001", 2)],
+    }
+    closes = {
+        "SH600000": {d0: 10.0, d1: 11.0},
+        "SZ000001": {d0: 10.0, d1: 12.0},
+    }
+    svc, _ = _rolling_service(rows, closes=closes)  # amounts 缺省为空
+
+    payload = await svc.rolling(
+        {"blend_id": "bl_x"}, tenant_id="t", user_id="u", window=2, per_day=5
+    )
+
+    assert "tradability_unavailable" in payload["warnings"]
+    performance = payload["summary"]["performance"]
+    assert performance["capacity_applied"] is False
+    picks = payload["columns"][0]["picks"]
+    assert all(pick["buy_status"] == "bought" for pick in picks)
+    assert all(pick["entry_weight_pct"] == pytest.approx(50.0) for pick in picks)
+    assert all(pick["adv_yi"] is None for pick in picks)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_non_cn_skips_tradability_sources():
+    d0, d1 = _roll_days(1, 0)
+    rows = {d0: [_roll_row("AAPL", 1)], d1: [_roll_row("AAPL", 1)]}
+    closes = {"AAPL": {d0: 10.0, d1: 11.0}}
+    svc, calls = _rolling_service(rows, closes=closes)
+
+    payload = await svc.rolling(
+        {"blend_id": "bl_x", "market": "US"},
+        tenant_id="t",
+        user_id="u",
+        window=2,
+        per_day=5,
+    )
+
+    assert "amount_history" not in calls
+    assert "risk_flags" not in calls
+    assert payload["filters"]["capacity_applied"] is False
+    assert payload["filters"]["st_applied"] is False
+    assert not any(
+        warning.startswith(("st_filter", "tradability"))
+        for warning in payload["warnings"]
+    )
+    assert payload["columns"][0]["picks"][0]["buy_status"] == "bought"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"min_adv_yi": -1.0}, "最低成交额"),
+        ({"adv_participation": 0.0}, "参与率"),
+        ({"adv_participation": 0.5}, "参与率"),
+    ],
+)
+async def test_rolling_rejects_invalid_tradability_params(kwargs, message):
+    svc, _ = _rolling_service({}, closes={})
+    with pytest.raises(BlendError, match=message):
+        await svc.rolling({"blend_id": "bl_x"}, tenant_id="t", user_id="u", **kwargs)
 
 
 @pytest.mark.unit

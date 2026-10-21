@@ -10,7 +10,8 @@
  * 窗口内在榜天数 / 首次入选至今 / 次日收益均值与胜率（hover 给完整统计）。
  * 每列头部（同日追加）：沪深300 当日涨跌幅、收盘、相对 20 日线位置。
  *
- * 口径：入选日收盘按全部权益等权建仓 → 次一交易日收盘结算；最后一批只估值不结算。
+ * 口径：入选日收盘按等权预算建仓（受 ST/退市与成交额门槛约束，跳过不替补）
+ * → 次一交易日收盘结算；最后一批只估值不结算。
  * 退出只在「昨列 → 今日」标注一次（后端已限定），这里不做二次推算。
  */
 
@@ -45,7 +46,7 @@ import {
   marketDayLabel,
   marketPositionLabel,
 } from './portfolioMetricsModel';
-import { formatSignedAmount, formatWinRate } from './periodReturnModel';
+import { formatPct, formatSignedAmount, formatWinRate } from './periodReturnModel';
 import { DataSourceBadge, PortfolioMetricsStrip } from './PortfolioMetricsStrip';
 import { buildRollingMetricSections } from './rollingMetricsSections';
 import './rollingBoard.css';
@@ -60,6 +61,84 @@ const HIDDEN_SCROLLBAR: ScrollGeometry = {
 const DEFAULT_CAPITAL = 10_000_000;
 const MIN_CAPITAL_WAN = 1;
 const MAX_CAPITAL_WAN = 1_000_000;
+/** 统计条折叠状态（按面板区分：周期收益面板用另一把键） */
+const METRICS_COLLAPSED_KEY = 'qm:combo:rolling:metrics-collapsed';
+
+/** 告警条只展示前 3 条；可交易性硬条件缺席优先露出，不能被成员级告警挤掉 */
+const PRIORITY_WARNING_CODES = new Set([
+  'tradability_unavailable',
+  'st_filter_unavailable',
+  'st_filter_static',
+]);
+
+function orderedWarnings(warnings: string[]): string[] {
+  const priority: string[] = [];
+  const rest: string[] = [];
+  for (const warning of warnings) {
+    (PRIORITY_WARNING_CODES.has(warning) ? priority : rest).push(warning);
+  }
+  return [...priority, ...rest];
+}
+
+/**
+ * 建仓状态文案：展示面只说「建仓 / 未建仓」，不出现买卖字眼。
+ * 后端新增状态码未登记时降级为「未建仓」，不吞成空白。
+ */
+const BUY_STATUS_TEXT: Record<string, string> = {
+  bought: '建仓',
+  next_day: '次日建仓',
+  skip_st: '未建仓 · ST/退市',
+  skip_low_adv: '未建仓 · 成交额不足',
+  skip_no_amount: '未建仓 · 缺成交额',
+  skip_no_price: '未建仓 · 缺收盘价',
+};
+
+/** 建仓状态配色：只用蓝/靛/灰，不借用红绿（红绿在 A 股是涨跌方向） */
+const BUY_STATUS_TONE: Record<string, string> = {
+  bought: 'border-indigo-200 bg-indigo-50 text-indigo-700',
+  next_day: 'border-sky-200 bg-sky-50 text-sky-700',
+};
+const BUY_STATUS_SKIP_TONE = 'border-slate-200 bg-slate-100 text-slate-500';
+
+function buyStatusLabel(pick: BlendRollingPick): string | null {
+  const status = pick.buy_status;
+  if (!status) return null;
+  if (status === 'bought') {
+    const weight = pick.entry_weight_pct;
+    return typeof weight === 'number' && Number.isFinite(weight)
+      ? `建仓 ${weight.toFixed(1)}%`
+      : '建仓';
+  }
+  return BUY_STATUS_TEXT[status] ?? '未建仓';
+}
+
+function buyStatusTone(pick: BlendRollingPick): string {
+  return BUY_STATUS_TONE[String(pick.buy_status ?? '')] ?? BUY_STATUS_SKIP_TONE;
+}
+
+/** 建仓状态 hover 说明（跳过原因 + ADV） */
+function buyStatusHint(pick: BlendRollingPick): string {
+  const adv =
+    typeof pick.adv_yi === 'number' && Number.isFinite(pick.adv_yi)
+      ? `ADV20 ${pick.adv_yi.toFixed(2)} 亿`
+      : null;
+  switch (pick.buy_status) {
+    case 'bought':
+      return ['按入选日收盘建仓', adv].filter(Boolean).join(' · ');
+    case 'next_day':
+      return '末日入选为下一批次候选：只给计划权重，本窗口不建仓';
+    case 'skip_st':
+      return 'ST/退市标的（按当前证券主表静态标记）不建仓，对应资金留作现金';
+    case 'skip_low_adv':
+      return ['ADV20 低于门槛，不建仓', adv].filter(Boolean).join(' · ');
+    case 'skip_no_amount':
+      return '缺 ADV20（有效成交额历史不足），不建仓';
+    case 'skip_no_price':
+      return '缺入选日收盘价，不建仓';
+    default:
+      return '本批次未建仓';
+  }
+}
 
 /** 市值（亿元）→ 展示值；缺失返回 null（渲染 `—`，不写 0） */
 function capLabel(marketCapYi: number | null | undefined): string | null {
@@ -94,6 +173,19 @@ function pickStatsLabel(pick: BlendRollingPick): string {
   }
   if (pick.day_pnl_amount !== null && pick.day_pnl_amount !== undefined) {
     parts.push(`当日盈亏 ${formatSignedAmount(pick.day_pnl_amount)}`);
+  }
+  const buyLabel = buyStatusLabel(pick);
+  if (buyLabel) parts.push(`建仓状态 ${buyLabel}`);
+  // 跳过者的 weight 恒为 0（不是「按 0% 建仓」），只在有计划权重时展示
+  if (
+    pick.buy_status === 'next_day' &&
+    typeof pick.entry_weight_pct === 'number' &&
+    Number.isFinite(pick.entry_weight_pct)
+  ) {
+    parts.push(`计划建仓比例 ${pick.entry_weight_pct.toFixed(2)}%`);
+  }
+  if (typeof pick.adv_yi === 'number' && Number.isFinite(pick.adv_yi)) {
+    parts.push(`ADV20 ${pick.adv_yi.toFixed(2)} 亿`);
   }
   return parts.join(' · ');
 }
@@ -227,10 +319,30 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
   };
 
   const performance = rolling?.summary.performance;
+  // filters 用于区分「数据源不可用」与「该市场不适用 / 手动关闭」
+  const filters = rolling?.filters;
   const metricSections = useMemo(
-    () => (performance ? buildRollingMetricSections(performance) : []),
-    [performance],
+    () => (performance ? buildRollingMetricSections(performance, filters) : []),
+    [performance, filters],
   );
+  // 折叠后仍保留一行关键数字：窗口收益 / 收益金额 / 建仓覆盖 / 期末现金
+  const collapsedSummary = useMemo(() => {
+    if (!performance) return undefined;
+    const parts = [
+      `窗口收益 ${formatReturnPct(performance.total_return_pct)}`,
+      `收益金额 ${formatSignedAmount(performance.profit_amount)}`,
+    ];
+    if (
+      typeof performance.evaluated_picks === 'number' &&
+      Number.isFinite(performance.evaluated_picks) &&
+      typeof performance.bought_positions === 'number' &&
+      Number.isFinite(performance.bought_positions)
+    ) {
+      parts.push(`建仓 ${performance.bought_positions}/${performance.evaluated_picks}`);
+    }
+    parts.push(`期末现金 ${formatPct(performance.final_cash_pct)}`);
+    return parts.join(' · ');
+  }, [performance]);
 
   const batchColumns: ColumnsType<BlendRollingBatch> = useMemo(
     () => [
@@ -247,7 +359,7 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
         render: (value: string) => <span className="font-mono text-[10px]">{value}</span>,
       },
       {
-        title: '持仓 / 有价',
+        title: '入选 / 有价',
         key: 'positions',
         width: 92,
         align: 'right',
@@ -255,6 +367,20 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
           <span className="font-mono text-[11px]">
             {row.positions} / {row.priced}
           </span>
+        ),
+      },
+      {
+        title: '建仓',
+        dataIndex: 'bought',
+        width: 62,
+        align: 'right',
+        render: (value: number | undefined, row) => (
+          <Tooltip title={`入选 ${row.positions} 只中实际建仓 ${value ?? '—'} 只；跳过的标的不替补`}>
+            {/* 每行同 testid：断言请用 getAllByTestId / querySelectorAll，不要用单数 getByTestId */}
+            <span className="font-mono text-[11px]" data-testid="combo-rolling-batch-bought">
+              {value ?? '—'}
+            </span>
+          </Tooltip>
         ),
       },
       {
@@ -466,7 +592,7 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
               columns={batchColumns}
               dataSource={batches}
               pagination={false}
-              scroll={{ x: 840 }}
+              scroll={{ x: 920 }}
               data-testid="combo-rolling-batches"
             />
           ),
@@ -545,13 +671,19 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
           capital={effectiveCapital}
           testId="combo-rolling-source"
         />
-        <Tooltip title="每日以全部权益等权入选（收盘价），次一交易日收盘结算；最后一批只估值不结算。未计手续费、印花税与滑点。">
+        <Tooltip title="每日按全部权益等权预算入选（收盘价）；ST/退市与成交额不足的标的不建仓，单只金额不超过 ADV20 的参与率上限；次一交易日收盘结算，最后一批只估值不结算。未计手续费、印花税与滑点。">
           <span className="ml-auto text-[10px] text-slate-400 cursor-help">换仓口径</span>
         </Tooltip>
       </div>
 
       {performance && (
-        <PortfolioMetricsStrip sections={metricSections} testId="combo-rolling-performance" />
+        <PortfolioMetricsStrip
+          sections={metricSections}
+          testId="combo-rolling-performance"
+          collapsible
+          storageKey={METRICS_COLLAPSED_KEY}
+          collapsedSummary={collapsedSummary}
+        />
       )}
 
       {rolling.warnings.length > 0 && (
@@ -559,7 +691,10 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
           <Alert
             type="warning"
             showIcon
-            message={rolling.warnings.slice(0, 3).map(blendWarningLabel).join('；')}
+            message={orderedWarnings(rolling.warnings)
+              .slice(0, 3)
+              .map(blendWarningLabel)
+              .join('；')}
           />
         </div>
       )}
@@ -620,6 +755,7 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
                     const label = positionLabel(pick);
                     const composite = formatResearchScore(researchScore(pick.pct));
                     const cap = capLabel(pick.market_cap_yi);
+                    const buyLabel = buyStatusLabel(pick);
                     const profileLine = [pick.industry || '行业—', cap ?? '市值—'].join(' · ');
                     const stats = pick.stats;
                     const hasPnl =
@@ -646,6 +782,22 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
                             </span>
                             <span className="text-[9px] opacity-70">{rollingHeldLabel(pick)}</span>
                           </div>
+                          {/* 建仓状态：建仓 x% / 次日建仓 / 未建仓 · 原因（蓝灰，不借用红绿） */}
+                          {buyLabel && (
+                            <div
+                              className="mt-0.5"
+                              data-testid={`combo-rolling-pick-buy-${column.date}-${pick.symbol}`}
+                              title={buyStatusHint(pick)}
+                            >
+                              <span
+                                className={`inline-block rounded border px-1 text-[9px] font-bold ${buyStatusTone(
+                                  pick,
+                                )}`}
+                              >
+                                {buyLabel}
+                              </span>
+                            </div>
+                          )}
                           {/* 当日涨跌 / 当日盈亏（仅当日实际持有；红涨绿跌） */}
                           <div className="flex items-center justify-between gap-1 mt-0.5 font-mono text-[9px]">
                             <span
@@ -762,8 +914,11 @@ export const RollingBuildPanel: React.FC<RollingBuildPanelProps> = ({
       <div className="shrink-0 px-3 py-1.5 border-t border-slate-100 text-[10px] text-slate-400">
         持有天数 = 本窗口内连续在榜天数；断榜后重新计数，跨窗口不伪造连续。退出收益 =
         退出日收盘价 ÷ 入选日收盘价 − 1（按收盘价计，未计费用；窗口首列按窗口起点计）。
-        批次按「入选日收盘等权建仓 → 次一交易日收盘结算」滚动；格子里的当日盈亏只对
-        当日实际持有的标的计算，新进标的当天不计盈亏。缺失行情一律显示 —。
+        批次按「入选日收盘等权预算建仓 → 次一交易日收盘结算」滚动；入选后先过 ST/退市与
+        成交额门槛（ADV20 缺失或低于门槛的标的不建仓），单只金额 = min(等权预算,
+        ADV20 × 参与率)，跳过的标的不替补、对应资金留作现金。ST 标记取当前证券主表
+        截面，历史重算含前视偏差。格子里的当日盈亏只对当日实际持有的标的计算，新进标的
+        当天不计盈亏。缺失行情一律显示 —。
       </div>
     </div>
   );
