@@ -225,7 +225,10 @@ def _build_snapshot(year: int, dry_run: bool = False) -> dict | None:
     -- 所以「补上 union_by_name」不是修复。要新列请显式点名，并先想清楚 NULL 段怎么处理。
     -- 回归测试见 backend/tests/test_factor_partition.py::test_duckdb_glob_with*。
     FROM read_parquet('{qdb}/1_kline_data/daily_backward/**/*.parquet', hive_partitioning=true) k
-    JOIN read_parquet('{qdb}/6_ml_datasets/features_daily/**/*.parquet', hive_partitioning=true) f
+    -- features_daily 的 glob 必须收窄到 dt=*/data.parquet：同级 report/factor_series.parquet
+    -- 是聚合产物、无 dt 列，`**/*.parquet` + hive_partitioning 会直接抛
+    -- `Hive partition mismatch ... key "dt" not found`（2026-10-21 实测）。
+    JOIN read_parquet('{qdb}/6_ml_datasets/features_daily/dt=*/data.parquet', hive_partitioning=true) f
       ON k.symbol = f.symbol AND k.dt = f.dt
     WHERE k.dt BETWEEN {year_start} AND {year_end}
     """
@@ -522,7 +525,7 @@ def main():
     con = duckdb.connect()
     qdb = str(QDB_DIR)
     r = con.execute(f"""
-        SELECT min(dt), max(dt) FROM read_parquet('{qdb}/6_ml_datasets/features_daily/**/*.parquet', hive_partitioning=true)
+        SELECT min(dt), max(dt) FROM read_parquet('{qdb}/6_ml_datasets/features_daily/dt=*/data.parquet', hive_partitioning=true)
     """).fetchone()
     con.close()
 

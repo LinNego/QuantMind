@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import uuid
@@ -2948,6 +2949,84 @@ def _load_quantdb_stock_names() -> dict[str, str]:
     return result
 
 
+# ── features_daily 市值标注 ────────────────────────────────────────────
+# 分区目录形如 dt=YYYYMMDD/data.parquet；同级 report/ 下还有 factor_series.parquet
+# 等非分区产物（不带 dt 列）。只按精确路径读目标交易日的 data.parquet——用
+# `**/*.parquet` 配合 hive_partitioning 会把 report 产物扫进来，DuckDB 抛
+# `Hive partition mismatch ... key "dt" not found`，市值/分层/负向标签全空。
+
+MARKET_CAP_TIER_EDGES_YI: tuple[tuple[float, str], ...] = (
+    (30.0, "微盘"),
+    (100.0, "小盘"),
+    (300.0, "中盘"),
+    (1000.0, "大盘"),
+)
+MARKET_CAP_TIER_TAIL = "超大盘"
+
+
+def _symbol_code6(raw: Any) -> str:
+    """股票代码折成 6 位纯数字（兼容 600036.SH / SH600036 / 600036）。"""
+    text = str(raw or "").strip().upper()
+    if not text:
+        return ""
+    code = text.split(".")[0]
+    for prefix in ("SH", "SZ", "BJ"):
+        if code.startswith(prefix):
+            return code[len(prefix) :]
+    return code
+
+
+def _market_cap_tier_zh(total_mv_yi: float) -> str:
+    """总市值（亿元）分档：微盘<30 / 小盘30-100 / 中盘100-300 / 大盘300-1000 / 超大盘。"""
+    for edge, label in MARKET_CAP_TIER_EDGES_YI:
+        if total_mv_yi < edge:
+            return label
+    return MARKET_CAP_TIER_TAIL
+
+
+def _finite_or_none(value: Any) -> float | None:
+    """float 化；None/非数值/NaN/Inf 一律 None（展示层据此显示 —，不能变成 0）。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _load_features_daily_market_cap(
+    fd_dir: Path, dt_int: int
+) -> dict[str, dict[str, float | None]]:
+    """读取 features_daily 单日的总/流通市值（元），键为 6 位纯数字代码。
+
+    只读精确分区文件 ``dt={dt_int}/data.parquet``；分区不存在返回空映射。
+    同步阻塞调用，端点里经 ``asyncio.to_thread`` 执行。
+    """
+    path = Path(fd_dir) / f"dt={dt_int}" / "data.parquet"
+    if not path.is_file():
+        return {}
+
+    import duckdb as _duckdb
+
+    con = _duckdb.connect()
+    try:
+        mv_rows = con.execute(
+            "SELECT symbol, total_mv, float_mv FROM read_parquet(?)", [str(path)]
+        ).fetchdf()
+    finally:
+        con.close()
+
+    mv_map: dict[str, dict[str, float | None]] = {}
+    for _, row in mv_rows.iterrows():
+        key = _symbol_code6(row["symbol"])
+        if not key:
+            continue
+        mv_map[key] = {
+            "total_mv": _finite_or_none(row["total_mv"]),
+            "float_mv": _finite_or_none(row["float_mv"]),
+        }
+    return mv_map
+
+
 @router.get("/inference/runs/{run_id}", summary="查看模型推理结果明细（用户态）")
 async def get_model_inference_run_detail(
     run_id: str,
@@ -3196,80 +3275,26 @@ async def get_model_inference_run_detail(
             logger.warning("标注申万行业失败: %s", exc)
 
         # ── 市值标注（QuantDB features_daily parquet）──
-        # 市值分档：微盘<30亿 / 小盘30-100亿 / 中盘100-300亿 / 大盘300-1000亿 / 超大盘>1000亿
         try:
             data_date = run.get("data_trade_date") or run.get("inference_date")
             _d = str(data_date)[:10] if data_date else ""
             dt_int = int(_d.replace("-", "")) if _d else 0
             qdb_dir = os.getenv("QM_QUANTDB_DATA_DIR", "/data/quantdb")
             fd_dir = Path(qdb_dir) / "6_ml_datasets" / "features_daily"
-            # features_daily 目录缺失/为空时直接跳过，避免 DuckDB 对空 glob 的内部卡顿
-            parquet_exists = fd_dir.is_dir() and any(fd_dir.rglob("*.parquet"))
-            if dt_int and parquet_exists:
-                fpath = f"{fd_dir}/**/*.parquet"
-
-                def _load_mv():
-                    import duckdb as _duckdb
-
-                    con = _duckdb.connect()
-                    try:
-                        return con.execute(
-                            f"""
-                            SELECT symbol, total_mv, float_mv
-                            FROM read_parquet('{fpath}', hive_partitioning=true)
-                            WHERE dt = {dt_int}
-                            """
-                        ).fetchdf()
-                    finally:
-                        con.close()
-
+            if dt_int:
                 # 在线程中执行，避免同步 DuckDB 查询阻塞 API 事件循环
-                mv_rows = await asyncio.to_thread(_load_mv)
-                mv_map: dict[str, dict] = {}
-                for _, row in mv_rows.iterrows():
-                    raw_sym = str(row["symbol"]).strip().upper()
-                    # 归一化为 6 位纯数字，与信号表 symbol（纯数字）对齐
-                    key = (
-                        raw_sym.split(".")[0]
-                        .replace("SH", "")
-                        .replace("SZ", "")
-                        .replace("BJ", "")
-                    )
-                    mv_map[key] = {
-                        "total_mv": float(row["total_mv"])
-                        if row["total_mv"] is not None
-                        and str(row["total_mv"]) not in ("nan", "None")
-                        else None,
-                        "float_mv": float(row["float_mv"])
-                        if row["float_mv"] is not None
-                        and str(row["float_mv"]) not in ("nan", "None")
-                        else None,
-                    }
+                mv_map = await asyncio.to_thread(
+                    _load_features_daily_market_cap, fd_dir, dt_int
+                )
                 for item in signals:
-                    sym = str(item.get("symbol") or "").strip().upper()
-                    key = (
-                        sym.split(".")[0]
-                        .replace("SH", "")
-                        .replace("SZ", "")
-                        .replace("BJ", "")
-                    )
-                    mv = mv_map.get(key) or {}
+                    mv = mv_map.get(_symbol_code6(item.get("symbol"))) or {}
                     tm = mv.get("total_mv")
                     item["total_mv"] = tm
                     if tm is not None:
                         # 单位：parquet 为元，转亿
                         yiyi = tm / 1e8
                         item["market_cap_yi"] = round(yiyi, 2)
-                        if yiyi < 30:
-                            item["market_cap_tier"] = "微盘"
-                        elif yiyi < 100:
-                            item["market_cap_tier"] = "小盘"
-                        elif yiyi < 300:
-                            item["market_cap_tier"] = "中盘"
-                        elif yiyi < 1000:
-                            item["market_cap_tier"] = "大盘"
-                        else:
-                            item["market_cap_tier"] = "超大盘"
+                        item["market_cap_tier"] = _market_cap_tier_zh(yiyi)
         except Exception as exc:  # pragma: no cover - 市值标注失败不影响主流程
             logger.warning("标注市值失败: %s", exc)
 
