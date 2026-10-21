@@ -448,8 +448,11 @@ def init_from_modelscope(
     **安全不变量（2026-10-21 用户红线，改动前先读）**：
     - 本函数**从不删除**本地文件或目录，也不清空数据根；
     - 只覆盖**远端清单列出**的路径（.part → sha256 校验 → ``os.replace`` 原子替换）；
-    - 远端没有的本地文件、未选中的数据集、以及它们的同步状态登记，一律原样保留；
-    - 远端清单为空/不可识别 → 在任何本地写入之前直接中止（RuntimeError）。
+    - 本地文件只增不减：远端没有的本地文件、未选中数据集的全部内容，原样保留；
+    - 同步状态库仅对**本次远端命中**的数据集按远端 sha256 重建（该数据集内本地
+      独有文件的 objects 登记会随重建移除）；未选中数据集的状态登记不动；
+    - 远端清单为空/不可识别 → 在任何数据/状态写入之前直接中止（RuntimeError）；
+    - 枚举阶段收到取消 → 返回 ``cancelled=True``，不做任何本地改动。
     """
     from backend.shared.quantdb_datasets import DATASETS
 
@@ -460,7 +463,6 @@ def init_from_modelscope(
             raise ValueError(f"未知数据集: {', '.join(sorted(unknown))}")
 
     root = resolve_data_root()
-    root.mkdir(parents=True, exist_ok=True)
     started = time.time()
 
     _progress(progress_cb, "phase", phase="enumerate", message="枚举魔搭远端清单")
@@ -472,6 +474,25 @@ def init_from_modelscope(
         progress_cb=progress_cb,
     )
     grouped = _group_remote(remote, datasets)
+
+    if should_cancel is not None and should_cancel():
+        # 取消发生在枚举阶段：list_remote_files 此时通常返回空清单，
+        # 必须先于空清单守卫处理，否则会被误报成「远端为空」并记为 failed。
+        _progress(progress_cb, "phase", phase="cancelled", message="已取消（枚举阶段）")
+        return {
+            "root": str(root),
+            "repo_id": repo_id or _repo_id(),
+            "cancelled": True,
+            "datasets": {},
+            "total_files": 0,
+            "downloaded": 0,
+            "skipped": 0,
+            "errors": 0,
+            "downloaded_bytes": 0,
+            "error_samples": [],
+            "state": {"mode": "meta", "status": "skipped"},
+            "elapsed_sec": round(time.time() - started, 1),
+        }
 
     if datasets is not None:
         missing = [d for d in datasets if d not in grouped]
@@ -485,11 +506,14 @@ def init_from_modelscope(
     if total_files == 0:
         # 空清单绝不能往下走：那意味着「远端什么都没枚举到」，
         # 继续执行只会把状态库按空集重建/写出一份误导性的完成回执。
-        # 本地数据本来就不会被删，这里再在**任何本地写入之前**显式中止。
+        # 本地数据本来就不会被删，这里再在**任何数据/状态写入之前**显式中止。
         raise RuntimeError(
             "魔搭远端清单为空（未枚举到任何可识别的 parquet 数据集）；"
             "已中止，未改动本地数据"
         )
+
+    # 数据根目录也只在确认有东西可拉之后才创建（空清单/取消时不落任何痕迹）。
+    root.mkdir(parents=True, exist_ok=True)
     _progress(
         progress_cb,
         "enumerate_done",

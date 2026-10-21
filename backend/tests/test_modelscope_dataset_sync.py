@@ -373,12 +373,17 @@ def test_init_rejects_unknown_dataset(tmp_path, monkeypatch):
 def test_init_aborts_on_empty_remote_manifest_without_touching_local(
     tmp_path, monkeypatch
 ):
-    """远端清单为空 → 直接中止；本地文件一个字节都不动。
+    """远端清单为空 → 直接中止；本地文件/状态库一个字节都不动。
 
     用户红线（2026-10-21）：数据集初始化**绝不能**「先清空再拉」，
     无论远端枚举失败、仓库下线还是 API 返回空清单，都不得删除本地数据。
+
+    断言必须覆盖「任何本地写入之前」：两套同步状态库（quantmind / sdk）
+    都不能被创建——否则守卫若被挪到状态库重建之后，只查数据文件会漏网。
     """
     import pytest
+
+    from backend.scripts.quantdb_daily_sync import _state_path
 
     root = tmp_path / "quantdb"
     monkeypatch.setenv("QM_QUANTDB_DATA_DIR", str(root))
@@ -392,13 +397,42 @@ def test_init_aborts_on_empty_remote_manifest_without_touching_local(
         ms.init_from_modelscope(None)
 
     assert sentinel.read_bytes() == b"local-only"
+    assert not _state_path(root).exists()
+    assert not (root / "quantdb_sync.sqlite").exists()
+
+
+def test_init_cancel_during_enumeration_returns_cancelled_without_writes(
+    tmp_path, monkeypatch
+):
+    """枚举阶段取消 → cancelled=True，不误报「远端为空」，不落任何本地痕迹。
+
+    list_remote_files 在取消时返回空清单；守卫必须先判取消再判空，
+    否则后台任务会把用户主动取消记成 failed（2026-10-21 代码审查发现）。
+    """
+    from backend.scripts.quantdb_daily_sync import _state_path
+
+    root = tmp_path / "quantdb"
+    monkeypatch.setenv("QM_QUANTDB_DATA_DIR", str(root))
+    monkeypatch.setenv("QUANTDB_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [])
+
+    summary = ms.init_from_modelscope(None, should_cancel=lambda: True)
+
+    assert summary["cancelled"] is True
+    assert summary["downloaded"] == 0
+    assert summary["errors"] == 0
+    assert not root.exists()
+    assert not _state_path(root).exists()
+    assert not (root / "quantdb_sync.sqlite").exists()
 
 
 def test_init_never_deletes_local_only_files_or_state(tmp_path, monkeypatch):
     """只覆盖远端清单内的文件：远端没有的本地文件与未涉及的数据集原样保留。
 
     远端「有明细」才允许动——而且是逐文件原子覆盖；远端没有的路径（本地独有
-    分区、其它数据集）与本函数无关，一条都不许删，状态库也不许清。
+    分区、其它数据集）与数据文件一条都不许删。状态库口径：仅本次远端命中的
+    数据集按远端 sha256 重建（其本地独有文件的 objects 登记会随之移除），
+    未选中数据集的状态登记不动。
     """
     root = tmp_path / "quantdb"
     monkeypatch.setenv("QM_QUANTDB_DATA_DIR", str(root))
