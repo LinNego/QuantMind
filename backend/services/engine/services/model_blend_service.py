@@ -2099,10 +2099,12 @@ class ModelBlendService:
     async def _close_history(
         symbols: Sequence[str], start: date, end: date
     ) -> dict[str, dict[date, float]]:
-        """窗口内每日收盘价（未复权）：``symbol → {date: close}``。
+        """窗口内每日前复权收盘价：``symbol → {date: close}``。
 
-        尾盘买入口径：买入/卖出都用当日收盘价，不引入盘中价。行情源不可用
-        或读取失败返回空映射——损益展示为 `—`，不猜 0。
+        尾盘买入口径：买入/卖出都用当日收盘价，不引入盘中价。跨日/跨月持有
+        必须用前复权（``daily_forward``）——``daily_backward`` 是跨分区拼接的
+        坏序列（会平滑漂移），不复权遇除权除息会产生假跳空。
+        行情源不可用或读取失败返回空映射——损益展示为 `—`，不猜 0。
         """
         suffix_to_prefix: dict[str, str] = {}
         for symbol in symbols:
@@ -2125,7 +2127,7 @@ class ModelBlendService:
                 list(suffix_to_prefix),
                 start,
                 end,
-                adjust="none",
+                adjust="qfq",
             )
         except Exception as exc:  # pragma: no cover - 行情缺失按缺失处理
             logger.warning("滚动建仓读取收盘价失败: %s", exc)
