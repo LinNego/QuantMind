@@ -72,7 +72,7 @@ def _job(job_id: str = "job_1", **overrides) -> dict:
         "failed_days": 0,
         "skipped_days": 0,
         "current_model_id": "m1",
-        "current_date": "2026-10-13",
+        "current_trade_date": "2026-10-13",
         "model_results": [],
         "logs": ["m1 2026-10-12 完成"],
         "error": None,

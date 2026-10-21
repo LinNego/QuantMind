@@ -461,7 +461,7 @@ class _ProgressWriter:
             await self._write(
                 True,
                 current_model_id=model["model_id"],
-                current_date=None,
+                current_trade_date=None,
             )
             return
         if kind == "model_finished":
@@ -495,7 +495,7 @@ class _ProgressWriter:
         await self._write(
             status != "completed",
             current_model_id=str(event.get("model_id") or ""),
-            current_date=date.fromisoformat(day) if day else None,
+            current_trade_date=date.fromisoformat(day) if day else None,
         )
 
 
@@ -635,7 +635,7 @@ async def _run_job(
             finished_at=utc_now(),
             heartbeat_at=utc_now(),
             current_model_id=None,
-            current_date=None,
+            current_trade_date=None,
             completed_days=result.completed_days,
             failed_days=result.failed_days,
             skipped_days=result.skipped_days,
@@ -679,7 +679,7 @@ def job_payload(job: dict[str, Any]) -> dict[str, Any]:
     if job.get("current_model_id"):
         current = {
             "model_id": job["current_model_id"],
-            "date": str(job["current_date"]) if job.get("current_date") else None,
+            "date": str(job["current_trade_date"]) if job.get("current_trade_date") else None,
         }
     return {
         "job_id": job.get("job_id"),

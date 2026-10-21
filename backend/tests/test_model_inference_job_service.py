@@ -111,6 +111,43 @@ def test_ensure_tables_creates_table_and_indexes(monkeypatch):
     assert "idx_qm_inference_jobs_status_heartbeat" in statements
 
 
+#: PostgreSQL 里这类「无括号函数式关键字」不能当裸列名：建表直接报
+#: ``syntax error at or near "current_date"``。SQLAlchemy 的 RESERVED_WORDS
+#: 不收录它们，所以这里显式列出来做回归闸门。
+_PG_FUNCTION_KEYWORDS = frozenset(
+    {
+        "current_date",
+        "current_time",
+        "current_timestamp",
+        "localtime",
+        "localtimestamp",
+        "current_user",
+        "session_user",
+        "current_role",
+        "current_catalog",
+        "current_schema",
+        "user",
+    }
+)
+
+
+def _ddl_columns() -> list[str]:
+    ddl = mp._DDL[0]
+    body = ddl.split("(", 1)[1].rsplit(")", 1)[0]
+    return [
+        line.strip().rstrip(",").split()[0]
+        for line in body.splitlines()
+        if line.strip().rstrip(",")
+    ]
+
+
+def test_ddl_columns_avoid_postgres_function_keywords():
+    columns = _ddl_columns()
+    # 任务进度列必须是合规名：2026-10-21 线上启动失败就是 current_date 建表被拒
+    assert "current_trade_date" in columns
+    assert sorted(set(columns) & _PG_FUNCTION_KEYWORDS) == []
+
+
 def test_row_parses_json_strings_and_tolerates_garbage():
     parsed = mp.ModelInferenceJobPersistence._row(
         {

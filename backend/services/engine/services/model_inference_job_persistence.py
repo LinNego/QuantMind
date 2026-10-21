@@ -19,6 +19,8 @@ from backend.shared.utc_datetime import utc_now
 ACTIVE_STATUSES = ("queued", "running", "cancelling")
 TERMINAL_STATUSES = ("partial", "completed", "failed", "cancelled")
 
+# 列名必须是 ``current_trade_date``：``current_date`` 是 PostgreSQL 的函数式
+# 关键字，当裸列名建表直接 ``syntax error at or near "current_date"``。
 _DDL = (
     """
     CREATE TABLE IF NOT EXISTS qm_model_inference_jobs (
@@ -35,7 +37,7 @@ _DDL = (
         failed_days      INTEGER NOT NULL DEFAULT 0,
         skipped_days     INTEGER NOT NULL DEFAULT 0,
         current_model_id TEXT,
-        current_date     DATE,
+        current_trade_date DATE,
         model_results    JSONB NOT NULL DEFAULT '[]'::jsonb,
         logs             JSONB NOT NULL DEFAULT '[]'::jsonb,
         error            TEXT,
@@ -72,7 +74,7 @@ _UPDATABLE = frozenset(
         "failed_days",
         "skipped_days",
         "current_model_id",
-        "current_date",
+        "current_trade_date",
         "model_results",
         "logs",
         "error",

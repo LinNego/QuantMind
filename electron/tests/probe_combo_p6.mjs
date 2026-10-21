@@ -74,6 +74,13 @@ try {
   // 3) 左侧组合列表：模板或已保存组合
   await page.locator('[data-testid="combo-list"]').waitFor({ timeout: 20000 }).catch(() => {});
   const items = page.locator('[data-testid^="combo-item-"]');
+  // combo-list 一挂载就可见，此时清单还在骨架期：等到「有项 / 明确空态 / 读取失败」再计数，
+  // 否则零项只是请求没回来，会把正常加载误报成失败。
+  for (let i = 0; i < 40; i += 1) {
+    if ((await items.count()) > 0) break;
+    if (/暂无可用模板|暂无已保存组合|读取失败/.test(await bodyText())) break;
+    await page.waitForTimeout(500);
+  }
   const nItems = await items.count();
   if (nItems > 0) ok('组合列表有可选项', `${nItems} 项`);
   else bad('组合列表有可选项', (await bodyText()).slice(0, 300));
