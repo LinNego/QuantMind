@@ -17,6 +17,7 @@ from unittest.mock import patch
 import pytest
 
 from backend.services.live_trading.services import sltp_executor as ex
+from backend.services.live_trading.services import sltp_position_evidence as EV
 from backend.services.live_trading.services.lot_rules import (
     align_sell_quantity,
     describe_violation,
@@ -88,8 +89,10 @@ class Harness:
         fallback: dict | None = None,
         default_detail: dict | None = None,
         state: dict | None = None,
+        evidence=None,
     ) -> None:
         self.redis = FakeRedis(cfg=ex.merge_config(cfg), state=state)
+        self.evidence = evidence
         self.client = FakeClient(
             ticks=ticks, details=details, positions=positions, default_detail=default_detail
         )
@@ -131,6 +134,7 @@ class Harness:
             now=lambda: self.now,
             fallback_config=lambda tenant, user: self.fallback,
             cancel_order=cancel_order,
+            position_evidence=self.evidence,
         )
 
     def cycle(self) -> dict:
@@ -575,6 +579,81 @@ class TestStateMachine:
         assert st["entry_price"] == 95.0
         # 95×0.95=90.25，现价 90 ≤ 90.25 → 触发
         assert len(h.dispatched) == 1
+
+
+# --------------------------------------------------------------------------
+# 4b. 触发时柜台无持仓（2026-10-21 601728.SH 假「T+1 锁定」告警）
+# --------------------------------------------------------------------------
+class TestTriggerWithoutPosition:
+    """规则里已经烘了 ``entry_price`` 的 auto 规则，持仓卖掉后仍会评估价格。
+
+    2026-10-21 实录：账户已清仓，601728.SH 的 auto 规则（entry 6.772）触发移动
+    止损，执行器把「持仓列表里没有这只票」当成「有仓但可用 0」，推了一条
+    「T+1 锁定或已被挂单占用」的假告警。下面四条钉住新口径：
+
+    * 账户快照确认空仓 ⇒ 安静跳过（不推告警）；
+    * 快照仍显示持有 ⇒ 告警「持仓通道不一致」（不是 T+1）；
+    * 快照过期/读不到 ⇒ 告警「未查到持仓」（不静默）；
+    * 所有分支都不许出现「T+1」措辞。
+    """
+
+    def _evidence(self, verdict, reason="快照说明", volume=0.0):
+        async def fn(*, tenant_id: str, user_id: str, symbol: str):
+            return EV.PositionEvidence(verdict=verdict, reason=reason, volume=volume)
+
+        return fn
+
+    def _harness(self, evidence) -> Harness:
+        return Harness(
+            cfg=_cfg([_rule()]),
+            ticks={"600036.SH": {"lastPrice": 90.0}},
+            positions=[],
+            evidence=evidence,
+        )
+
+    def test_flat_snapshot_skips_silently(self) -> None:
+        h = self._harness(self._evidence(EV.EVIDENCE_ABSENT))
+        summary = h.cycle()
+        assert h.dispatched == []
+        assert not any("触发未卖出" in n["title"] for n in h.notices)
+        assert not any("T+1" in n["content"] for n in h.notices)
+        assert summary["no_position"] == 1
+        st = h.state()["rules"]["600036.SH"]
+        assert st["status"] == ex.ST_SKIPPED
+        assert st["skip_reason"] == "no_position"
+
+    def test_snapshot_still_held_alerts_channel_mismatch(self) -> None:
+        h = self._harness(
+            self._evidence(
+                EV.EVIDENCE_HELD, reason="最近账户快照仍显示持有 1000 股", volume=1000
+            )
+        )
+        h.cycle()
+        assert h.dispatched == []
+        alerts = [n for n in h.notices if "持仓通道不一致" in n["title"]]
+        assert len(alerts) == 1
+        assert alerts[0]["level"] == "warning"
+        assert "仍显示持有 1000 股" in alerts[0]["content"]
+        assert "T+1" not in alerts[0]["content"]
+
+    def test_unknown_evidence_still_alerts_without_t1_wording(self) -> None:
+        h = self._harness(
+            self._evidence(EV.EVIDENCE_UNKNOWN, reason="快照已过期（999 秒前）")
+        )
+        h.cycle()
+        assert h.dispatched == []
+        alerts = [n for n in h.notices if "未查到持仓" in n["title"]]
+        assert len(alerts) == 1
+        assert "快照已过期" in alerts[0]["content"]
+        assert "T+1" not in alerts[0]["content"]
+
+    def test_not_wired_evidence_is_unknown_not_silent(self) -> None:
+        """执行器没接线证据面时按 unknown 处理：宁可告警，不许静默吞掉。"""
+        h = self._harness(None)
+        h.cycle()
+        alerts = [n for n in h.notices if "未查到持仓" in n["title"]]
+        assert len(alerts) == 1
+        assert "T+1" not in alerts[0]["content"]
 
 
 # --------------------------------------------------------------------------

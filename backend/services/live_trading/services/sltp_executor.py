@@ -53,6 +53,13 @@ from backend.services.live_trading.services.lot_rules import (
     is_full_position_sell,
     protect_sell_price,
 )
+from backend.services.live_trading.services.sltp_position_evidence import (
+    EVIDENCE_ABSENT,
+    EVIDENCE_HELD,
+    EVIDENCE_UNKNOWN,
+    PositionEvidence,
+    position_evidence,
+)
 from backend.services.live_trading.services.tdx_quote_feed import (
     check_sltp_trigger,
     load_sltp_config,
@@ -920,6 +927,9 @@ class SltpDeps:
     fallback_config: Callable[[str, str], dict[str, Any]] = load_sltp_config
     # 撤单（余量策略 cancel/requote 用）；未注入时策略退化为 alert_only
     cancel_order: Callable[[str], Awaitable[bool]] | None = None
+    #: 触发时「柜台没有这只票」的第二份证据（账户快照，见 sltp_position_evidence）。
+    #: ``None`` = 未接线 → 判 ``unknown``（按异常告警，绝不静默跳过）。
+    position_evidence: Callable[..., Awaitable[PositionEvidence]] | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1092,6 +1102,9 @@ async def run_sltp_cycle(
         "failed": 0,
         #: T+1 当日买入不可卖：不是失败（下一交易日自动继续），单列便于观察。
         "t1_locked": 0,
+        #: 触发时柜台持仓列表里根本没有这只票（规则残留在已清仓的标的上）。
+        #: 与 ``t1_locked`` 分开：一个是有仓不能卖，一个是没仓可卖。
+        "no_position": 0,
         #: 本轮登记的暂时性失败重试（不落终态；终态才进 ``failed``）。它不是「失败」
         #: 也不是「成功」：日志/测试按它观察保护性重试，人不再需要从 status 猜。
         "retry_scheduled": 0,
@@ -1391,6 +1404,74 @@ async def _apply_ratchet(
     return positions, stop_this_cycle
 
 
+async def _position_evidence(
+    deps: SltpDeps, symbol: str, *, tenant_id: str, user_id: str
+) -> PositionEvidence:
+    """取第二份证据；未接线/读取失败一律 ``unknown``（宁可告警，不许静默）。"""
+    fn = deps.position_evidence
+    if fn is None:
+        return PositionEvidence(EVIDENCE_UNKNOWN, "执行器未接线账户快照证据")
+    try:
+        return await fn(tenant_id=tenant_id, user_id=user_id, symbol=symbol)
+    except Exception as exc:  # noqa: BLE001 证据面坏掉不许带崩真单保护
+        logger.warning("[SltpExec] %s 账户快照证据读取失败: %s", symbol, exc)
+        return PositionEvidence(EVIDENCE_UNKNOWN, f"账户快照证据读取失败: {exc}")
+
+
+async def _skip_without_position(
+    deps: SltpDeps,
+    *,
+    symbol: str,
+    st: dict[str, Any],
+    reason: str,
+    user_id: str,
+    tenant_id: str,
+    summary: dict[str, Any],
+) -> None:
+    """触发时柜台持仓列表里没有这只票：判空仓证据，安静跳过或告警。
+
+    2026-10-21 601728.SH 实录：账户已清仓，auto 规则（``entry_price`` 烘在规则里，
+    评估时不再回查持仓）触发移动止损，旧实现把空持仓当成「有仓但可用 0」，
+    推出「柜台可用数量为 0（T+1 锁定或已被挂单占用）」——措辞是假的，告警也就
+    成了噪音。无持仓与 T+1 锁定是两件事：前者没仓可卖，后者有仓不能卖。
+    """
+    st["status"] = ST_SKIPPED
+    st["skip_reason"] = "no_position"
+    summary["no_position"] = int(summary.get("no_position", 0) or 0) + 1
+    evidence = await _position_evidence(
+        deps, symbol, tenant_id=tenant_id, user_id=user_id
+    )
+    if evidence.verdict == EVIDENCE_ABSENT:
+        # 新鲜账户快照确认空仓：规则保护的对象已不存在，不打扰人。
+        logger.info(
+            "[SltpExec] %s 触发但柜台无持仓（%s）；%s，按已清仓跳过，不告警",
+            symbol,
+            reason,
+            evidence.reason,
+        )
+        return
+    logger.warning(
+        "[SltpExec] %s 触发但柜台无持仓（%s）；证据=%s：%s",
+        symbol,
+        reason,
+        evidence.verdict,
+        evidence.reason,
+    )
+    if evidence.verdict == EVIDENCE_HELD:
+        title = f"{symbol} 触发但持仓通道不一致"
+        content = (
+            f"{reason}；但柜台持仓列表里没有该标的，{evidence.reason}。"
+            "两条通道数据打架，本次未下达卖单；请检查桥/账户持仓通道后人工处理。"
+        )
+    else:
+        title = f"{symbol} 触发但未查到持仓"
+        content = (
+            f"{reason}；柜台持仓列表里没有该标的，且{evidence.reason}。"
+            "本次未下达卖单：若已清仓可删除该规则，否则请检查账户持仓通道。"
+        )
+    await deps.notify(user_id, title, content, "warning", tenant_id=tenant_id)
+
+
 async def _execute_trigger(
     deps: SltpDeps,
     cfg: dict[str, Any],
@@ -1406,6 +1487,17 @@ async def _execute_trigger(
     summary: dict[str, Any],
 ) -> None:
     symbol = rule["symbol"]
+    if position is None:
+        await _skip_without_position(
+            deps,
+            symbol=symbol,
+            st=st,
+            reason=reason,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            summary=summary,
+        )
+        return
     can_use = _to_float((position or {}).get("can_use_volume")) or 0.0
     held = _to_float((position or {}).get("volume")) or 0.0
     quantity, note = plan_sell_quantity(symbol, rule, can_use)
@@ -2048,6 +2140,7 @@ def _build_default_deps(redis: Any, tenant_id: str = "default") -> SltpDeps:
         notify=notify,
         order_reader=order_reader,
         cancel_order=cancel_order,
+        position_evidence=position_evidence,
         extras={"broker": broker},
     )
 
@@ -2115,6 +2208,7 @@ async def run_qmt_sltp_executor_task() -> None:
                     or summary.get("failed")
                     or summary.get("retry_scheduled")
                     or summary.get("t1_locked")
+                    or summary.get("no_position")
                 ):
                     logger.info(
                         "[SltpExec] 本轮：%s", json.dumps(summary, ensure_ascii=False)
