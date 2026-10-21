@@ -31,6 +31,7 @@ from backend.services.engine.inference.blend_engine import (
     BlendResult,
     BlendRow,
     combine_member_ranks,
+    dispersion_band,
     position_of,
 )
 from backend.services.engine.inference.blend_plan import (
@@ -197,6 +198,10 @@ def _clone_window(payload: Mapping[str, Any]) -> dict[str, Any]:
             day: dict(values) for day, values in (payload.get("scores") or {}).items()
         },
         "top": {day: set(values) for day, values in (payload.get("top") or {}).items()},
+        "top_rows": {
+            day: [dict(row) for row in rows]
+            for day, rows in (payload.get("top_rows") or {}).items()
+        },
         "days": list(payload.get("days") or []),
     }
 
@@ -534,6 +539,8 @@ class ModelBlendService:
             "position": row.position,
             "coverage": row.coverage,
             "dispersion": row.dispersion,
+            # 分歧档位由后端唯一口径给出（前端不再自带阈值，避免两套算法漂移）
+            "dispersion_band": dispersion_band(row.dispersion),
             "contributions": dict(row.contributions),
             "missing_members": list(row.missing_members),
         }
@@ -715,6 +722,108 @@ class ModelBlendService:
                 )
             ).all()
         return [str(row[0]) for row in rows]
+
+    async def rolling(
+        self,
+        blend: Mapping[str, Any],
+        *,
+        tenant_id: str,
+        user_id: str,
+        end_date: date | None = None,
+        window: int = 10,
+        per_day: int = 5,
+    ) -> dict[str, Any]:
+        """滚动建仓视图：最近 ``window+1`` 个交易日，每日 Top ``per_day``。
+
+        选中口径与榜单完全同源（组合分排序），不另算一套；
+        ``held_days`` 只统计**本窗口内**连续在榜天数（超出窗口的历史见榜单
+        ``history``/纸面台账，不在这里猜）。
+        """
+        if not 1 <= int(window) <= 60:
+            raise BlendError("滚窗必须在 [1, 60]")
+        if not 1 <= int(per_day) <= 50:
+            raise BlendError("每日只数必须在 [1, 50]")
+        members = await self.members_from_blend(blend)
+        if len(members) < MIN_MEMBERS:
+            raise BlendError(f"组合至少需要 {MIN_MEMBERS} 个模型")
+        weights = _weights_from_members(blend, members)
+        member_ids = [str(m["model_id"]) for m in members]
+        target = end_date or await self.latest_common_date(
+            tenant_id=tenant_id, user_id=user_id, model_ids=member_ids
+        )
+        if target is None:
+            raise BlendError("所选模型没有共同数据日", code="no_common_date")
+
+        stats = await self._window_stats(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            members=members,
+            weights=weights,
+            method=str(blend.get("method") or "mean"),
+            trim_count=int(blend.get("trim_count") or 2),
+            min_coverage=int(blend.get("min_coverage") or 2),
+            consensus_min_count=int(blend.get("consensus_min_count") or 0),
+            end_date=target,
+            lookback=int(window),
+            top_k=int(per_day),
+            symbols=[],
+        )
+        names = await self._stock_names()
+        rows_by_day = stats.get("top_rows") or {}
+        days = sorted(day for day in rows_by_day if day <= target)[-(int(window) + 1) :]
+
+        streak: dict[str, int] = {}
+        previous: set[str] = set()
+        columns: list[dict[str, Any]] = []
+        for day in days:
+            picks: list[dict[str, Any]] = []
+            today: set[str] = set()
+            for row in (rows_by_day.get(day) or [])[: int(per_day)]:
+                symbol = str(row["symbol"])
+                today.add(symbol)
+                held = streak.get(symbol, 0) + 1
+                streak[symbol] = held
+                picks.append(
+                    {
+                        **row,
+                        "code": symbol,
+                        "name": names.get(symbol) or "",
+                        "held_days": held,
+                        "is_new": held == 1,
+                    }
+                )
+            columns.append(
+                {
+                    "date": day.isoformat(),
+                    "picks": picks,
+                    "exits": sorted(previous - today),
+                }
+            )
+            # 断榜后再次入选按「新进」计，不伪造连续持有
+            streak = {
+                symbol: count for symbol, count in streak.items() if symbol in today
+            }
+            previous = today
+
+        latest = columns[-1] if columns else {"picks": [], "exits": []}
+        return {
+            "blend_id": str(blend["blend_id"]),
+            "data_trade_date": target.isoformat(),
+            "target_date": (await self._next_trading_day(target)).isoformat(),
+            "window": int(window),
+            "per_day": int(per_day),
+            "days": [day.isoformat() for day in days],
+            "columns": columns,
+            "members": self._member_payload(members, {}, weights),
+            "summary": {
+                "unique_symbols": len(
+                    {pick["symbol"] for column in columns for pick in column["picks"]}
+                ),
+                "new_today": sum(1 for pick in latest["picks"] if pick["is_new"]),
+                "exited_today": len(latest["exits"]),
+            },
+            "warnings": [],
+        }
 
     async def create_blend(
         self,
@@ -1028,10 +1137,14 @@ class ModelBlendService:
                      ROW_NUMBER() OVER (
                        PARTITION BY data_trade_date
                        ORDER BY score DESC, coverage DESC, symbol ASC
-                     ) AS rn
+                     ) AS rn,
+                     RANK() OVER (
+                       PARTITION BY data_trade_date ORDER BY score DESC
+                     ) AS score_rank,
+                     COUNT(*) OVER (PARTITION BY data_trade_date) AS n_total
               FROM weighted
             )
-            SELECT data_trade_date, symbol, score, coverage, rn
+            SELECT data_trade_date, symbol, score, coverage, rn, score_rank, n_total
             FROM ranked
             WHERE rn <= :top_k OR symbol = ANY(:symbols)
             ORDER BY data_trade_date, rn
@@ -1044,7 +1157,7 @@ class ModelBlendService:
             limit=lookback + 1,
         )
         if not run_dates:
-            return {"scores": {}, "top": {}, "days": []}
+            return {"scores": {}, "top": {}, "top_rows": {}, "days": []}
         start = min(run_dates)
         async with get_session(read_only=True) as session:
             rows = (
@@ -1069,13 +1182,32 @@ class ModelBlendService:
 
         by_date: dict[date, dict[str, float]] = {}
         top_by_date: dict[date, set[str]] = {}
-        for day, symbol, score, _coverage, rn in rows:
+        top_rows_by_date: dict[date, list[dict[str, Any]]] = {}
+        for day, symbol, score, coverage, rn, score_rank, n_total in rows:
             key = day if isinstance(day, date) else date.fromisoformat(str(day))
             symbol = str(symbol)
             if _finite(score):
                 by_date.setdefault(key, {})[symbol] = float(score)
             if int(rn) <= top_k:
                 top_by_date.setdefault(key, set()).add(symbol)
+                # pct 与 blend_engine.percent_rank_map 同口径：(最小名次-1)/(n-1)；
+                # 缺总数为 1 时按 0.0（与 compute_rank_pct 的 n==1 分支一致）。
+                pct = (
+                    0.0
+                    if int(n_total) <= 1
+                    else (int(score_rank) - 1) / (int(n_total) - 1)
+                )
+                top_rows_by_date.setdefault(key, []).append(
+                    {
+                        "symbol": symbol,
+                        "score": float(score) if _finite(score) else None,
+                        "rank": int(score_rank),
+                        "row_rank": int(rn),
+                        "coverage": int(coverage),
+                        "pct": pct,
+                        "position": position_of(pct),
+                    }
+                )
         score_days = sorted(day for day in by_date if day < end_date)[-lookback:]
         top_days = sorted(day for day in top_by_date if day <= end_date)[
             -(lookback + 1) :
@@ -1083,6 +1215,12 @@ class ModelBlendService:
         payload = {
             "scores": {day: by_date[day] for day in score_days},
             "top": {day: top_by_date[day] for day in top_days},
+            "top_rows": {
+                day: sorted(
+                    top_rows_by_date.get(day, []), key=lambda row: row["row_rank"]
+                )
+                for day in top_days
+            },
             "days": score_days,
         }
         _window_cache_put(cache_key, payload)

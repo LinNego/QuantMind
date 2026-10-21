@@ -168,6 +168,7 @@ def test_window_cache_hit_returns_isolated_copy_and_expires(monkeypatch):
     payload = {
         "scores": {day: {"SH600000": 0.5}},
         "top": {day: {"SH600000"}},
+        "top_rows": {day: [{"symbol": "SH600000", "row_rank": 1}]},
         "days": [day],
     }
     blend_service_module._window_cache.clear()
@@ -175,7 +176,11 @@ def test_window_cache_hit_returns_isolated_copy_and_expires(monkeypatch):
     hit = _window_cache_get("unit-key")
     assert hit == payload
     hit["scores"][day]["SH600000"] = 9.9
-    assert _window_cache_get("unit-key")["scores"][day]["SH600000"] == 0.5
+    # 滚动视图会往行上挂名称/持有天数，缓存必须深拷贝
+    hit["top_rows"][day][0]["row_rank"] = 99
+    cached = _window_cache_get("unit-key")
+    assert cached["scores"][day]["SH600000"] == 0.5
+    assert cached["top_rows"][day][0]["row_rank"] == 1
 
     now = time.monotonic()
     monkeypatch.setattr(blend_service_module.time, "monotonic", lambda: now + 61.0)
@@ -819,6 +824,212 @@ async def test_prefix_symbol_sql_matches_stock_code_util():
     got = {str(raw): str(folded) for raw, folded in rows}
     for raw in cases:
         assert got[raw] == StockCodeUtil.to_prefix(raw), raw
+
+
+# ── 滚动建仓视图（P5） ───────────────────────────────────────────────────
+
+
+def _roll_row(symbol: str, rank: int) -> dict:
+    return {
+        "symbol": symbol,
+        "score": 1.0 - rank * 0.01,
+        "rank": rank,
+        "row_rank": rank,
+        "coverage": 2,
+        "pct": 1.0 - rank * 0.01,
+        "position": "BUY",
+    }
+
+
+def _rolling_service(rows_by_day, *, models=None):
+    """替身窗口：只喂表头三列（符号/分数/名次），其余口径由真库用例覆盖。"""
+    members = models or [_model("a"), _model("b")]
+    svc = _service(members)
+    calls: dict = {}
+
+    async def fake_window_stats(**kwargs):
+        calls["window_stats"] = kwargs
+        return {"scores": {}, "top": {}, "top_rows": rows_by_day, "days": []}
+
+    async def fake_names():
+        return {"SH600000": "浦发银行"}
+
+    async def fake_common_date(**_kwargs):
+        calls["common_date"] = True
+        return D_ROLL
+
+    async def fake_next(day):
+        return date.fromordinal(day.toordinal() + 1)
+
+    async def fake_members(_blend):
+        return list(members)
+
+    svc._window_stats = fake_window_stats
+    svc._stock_names = fake_names
+    svc.latest_common_date = fake_common_date
+    svc._next_trading_day = fake_next
+    svc.members_from_blend = fake_members
+    return svc, calls
+
+
+D_ROLL = date(2026, 10, 19)
+
+
+def _roll_days(*offsets: int) -> list[date]:
+    return [date.fromordinal(D_ROLL.toordinal() - offset) for offset in offsets]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_builds_streaks_new_flags_and_exits():
+    d0, d1, d2 = _roll_days(2, 1, 0)
+    rows = {
+        d0: [_roll_row("SH600000", 1), _roll_row("SZ000001", 2)],
+        d1: [_roll_row("SZ000001", 1), _roll_row("SZ000002", 2)],
+        d2: [
+            _roll_row("SH600000", 1),
+            _roll_row("SZ000001", 2),
+            _roll_row("SZ000003", 3),
+            _roll_row("SZ000004", 4),
+        ],
+    }
+    svc, calls = _rolling_service(rows)
+    payload = await svc.rolling(
+        {"blend_id": "bl_x", "members": []},
+        tenant_id="t",
+        user_id="u",
+        window=10,
+        per_day=5,
+    )
+
+    assert [column["date"] for column in payload["columns"]] == [
+        d0.isoformat(),
+        d1.isoformat(),
+        d2.isoformat(),
+    ]
+    by_day = {column["date"]: column for column in payload["columns"]}
+    assert [pick["symbol"] for pick in by_day[d2.isoformat()]["picks"]] == [
+        "SH600000",
+        "SZ000001",
+        "SZ000003",
+        "SZ000004",
+    ]
+    # 连续在榜 +1；断榜后归零（d1 掉出，d2 再入选 = 新进）
+    held = {
+        (column["date"], pick["symbol"]): pick["held_days"]
+        for column in payload["columns"]
+        for pick in column["picks"]
+    }
+    assert held[(d0.isoformat(), "SH600000")] == 1
+    assert held[(d2.isoformat(), "SH600000")] == 1
+    assert held[(d2.isoformat(), "SZ000001")] == 3
+    assert held[(d2.isoformat(), "SZ000003")] == 1
+    assert by_day[d0.isoformat()]["picks"][0]["is_new"] is True
+    assert by_day[d0.isoformat()]["picks"][0]["name"] == "浦发银行"
+    assert by_day[d1.isoformat()]["picks"][0]["is_new"] is False
+    # 退出只在「昨列 → 今日」标注一次
+    assert by_day[d0.isoformat()]["exits"] == []
+    assert by_day[d1.isoformat()]["exits"] == ["SH600000"]
+    assert by_day[d2.isoformat()]["exits"] == ["SZ000002"]
+    assert payload["summary"] == {
+        "unique_symbols": 5,
+        "new_today": 3,
+        "exited_today": 1,
+    }
+    assert payload["data_trade_date"] == D_ROLL.isoformat()
+    assert (
+        payload["target_date"] == date.fromordinal(D_ROLL.toordinal() + 1).isoformat()
+    )
+    assert calls["window_stats"]["end_date"] == D_ROLL
+    assert calls["window_stats"]["lookback"] == 10
+    assert calls["window_stats"]["top_k"] == 5
+    assert calls["window_stats"]["symbols"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_reentry_after_gap_is_new_not_continued():
+    d0, d1, d2 = _roll_days(2, 1, 0)
+    rows = {
+        d0: [_roll_row("SH600000", 1)],
+        d1: [_roll_row("SZ000001", 1)],
+        d2: [_roll_row("SH600000", 1)],
+    }
+    svc, _ = _rolling_service(rows)
+    payload = await svc.rolling(
+        {"blend_id": "bl_x"}, tenant_id="t", user_id="u", window=10, per_day=5
+    )
+    last = payload["columns"][-1]["picks"][0]
+    assert last["symbol"] == "SH600000"
+    assert last["held_days"] == 1
+    assert last["is_new"] is True
+    assert payload["columns"][1]["exits"] == ["SH600000"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_caps_columns_and_picks_per_day():
+    days = [
+        date.fromordinal(D_ROLL.toordinal() - offset) for offset in range(5, -1, -1)
+    ]
+    rows = {
+        day: [_roll_row(f"SH60000{index}", index + 1) for index in range(4)]
+        for index, day in enumerate(days)
+    }
+    svc, _ = _rolling_service(rows)
+    payload = await svc.rolling(
+        {"blend_id": "bl_x"}, tenant_id="t", user_id="u", window=2, per_day=2
+    )
+    assert [column["date"] for column in payload["columns"]] == [
+        day.isoformat() for day in days[-3:]
+    ]
+    assert all(len(column["picks"]) == 2 for column in payload["columns"])
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_uses_explicit_end_date_without_lookup():
+    rows = {D_ROLL: [_roll_row("SH600000", 1)]}
+    svc, calls = _rolling_service(rows)
+    payload = await svc.rolling(
+        {"blend_id": "bl_x"},
+        tenant_id="t",
+        user_id="u",
+        end_date=D_ROLL,
+        window=10,
+        per_day=5,
+    )
+    assert "common_date" not in calls
+    assert payload["data_trade_date"] == D_ROLL.isoformat()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("window", "per_day"), [(0, 5), (61, 5), (10, 0), (10, 51)])
+async def test_rolling_rejects_out_of_range_window(window, per_day):
+    svc, _ = _rolling_service({})
+    with pytest.raises(BlendError):
+        await svc.rolling(
+            {"blend_id": "bl_x"},
+            tenant_id="t",
+            user_id="u",
+            window=window,
+            per_day=per_day,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rolling_without_common_date_raises_business_code():
+    svc, _rolling_calls = _rolling_service({})
+
+    async def no_date(**_kwargs):
+        return None
+
+    svc.latest_common_date = no_date
+    with pytest.raises(BlendError) as exc:
+        await svc.rolling({"blend_id": "bl_x"}, tenant_id="t", user_id="u")
+    assert exc.value.code == "no_common_date"
 
 
 # ── 真库：榜单 / 窗口 / 计划 ─────────────────────────────────────────────

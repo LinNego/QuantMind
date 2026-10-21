@@ -77,6 +77,15 @@ class _FakeService:
         self._record("available_dates", blend=blend, **kwargs)
         return ["2026-10-19", "2026-10-16"]
 
+    async def rolling(self, blend, **kwargs):
+        self._record("rolling", blend=blend, **kwargs)
+        return {
+            "blend_id": "bl_x",
+            "columns": [],
+            "days": [],
+            "summary": {"unique_symbols": 0, "new_today": 0, "exited_today": 0},
+        }
+
     async def plan(self, blend, **kwargs):
         self._record("plan", blend=blend, **kwargs)
         return dict(self.plan_payload)
@@ -320,6 +329,74 @@ def test_ranking_404_when_no_common_date(api):
     service.dates = None
     resp = client.get(f"{BASE}/bl_x/ranking")
     assert resp.status_code == 404
+
+
+def test_rolling_passes_window_per_day_and_date(api):
+    client, service, persistence = api
+    persistence.blends["bl_x"] = _blend()
+    resp = client.get(
+        f"{BASE}/bl_x/rolling",
+        params={"date": "2026-10-19", "window": 10, "per_day": 5},
+    )
+    assert resp.status_code == 200
+    name, kwargs = service.calls[-1]
+    assert name == "rolling"
+    assert kwargs["end_date"] == date(2026, 10, 19)
+    assert kwargs["window"] == 10
+    assert kwargs["per_day"] == 5
+    assert kwargs["blend"]["blend_id"] == "bl_x"
+
+
+def test_rolling_defaults_and_bounds(api):
+    client, service, persistence = api
+    persistence.blends["bl_x"] = _blend()
+    assert client.get(f"{BASE}/bl_x/rolling").status_code == 200
+    _, kwargs = service.calls[-1]
+    assert kwargs["end_date"] is None
+    assert kwargs["window"] == 10
+    assert kwargs["per_day"] == 5
+    # 越界由 Query 约束在进服务前拦下
+    assert client.get(f"{BASE}/bl_x/rolling", params={"window": 0}).status_code == 422
+    assert client.get(f"{BASE}/bl_x/rolling", params={"per_day": 51}).status_code == 422
+
+
+def test_create_plan_without_overrides_leaves_config_to_service(api):
+    client, service, persistence = api
+    persistence.blends["bl_x"] = _blend()
+    resp = client.post(f"{BASE}/bl_x/plans", json={})
+    assert resp.status_code == 200
+    assert service.calls[-1][1]["plan_config"] is None
+
+
+def test_create_plan_overrides_merge_with_blend_defaults(api):
+    client, service, persistence = api
+    persistence.blends["bl_x"] = _blend(
+        rolling_window=8, entry_per_day=3, target_positions=60
+    )
+    resp = client.post(
+        f"{BASE}/bl_x/plans",
+        json={"capital": 20000000.0, "top_k": 30},
+    )
+    assert resp.status_code == 200
+    cfg = service.calls[-1][1]["plan_config"]
+    assert cfg.capital == 20_000_000.0
+    assert cfg.top_k == 30
+    # 未显式给的字段沿用组合自身配置，不静默回默认
+    assert cfg.hold_days == 8
+    assert cfg.entry_per_day == 3
+    assert cfg.target_positions == 60
+
+
+def test_create_plan_rejects_out_of_range_overrides(api):
+    client, _service, persistence = api
+    persistence.blends["bl_x"] = _blend()
+    for body in (
+        {"top_k": 0},
+        {"capital": 0},
+        {"hold_days": 61},
+        {"entry_per_day": 51},
+    ):
+        assert client.post(f"{BASE}/bl_x/plans", json=body).status_code == 422, body
 
 
 def test_create_plan_passes_persist_flag(api):

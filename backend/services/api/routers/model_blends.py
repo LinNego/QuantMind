@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from backend.services.api.user_app.middleware.auth import get_current_user
+from backend.services.engine.inference.blend_plan import PlanConfig
 from backend.services.engine.services import combo_auto
 from backend.services.engine.services.model_blend_service import (
     BlendError,
@@ -118,6 +119,12 @@ class BlendPatchBody(BaseModel):
 class PlanBody(BaseModel):
     data_trade_date: str | None = None
     persist: bool = True
+    # 可选覆盖（缺省沿用组合配置），让前端「资金 / TopK / 持有日 / 每日新进」可调
+    capital: float | None = Field(default=None, gt=0, le=1e12)
+    top_k: int | None = Field(default=None, ge=1, le=2000)
+    hold_days: int | None = Field(default=None, ge=1, le=60)
+    entry_per_day: int | None = Field(default=None, ge=1, le=50)
+    target_positions: int | None = Field(default=None, ge=1, le=500)
 
 
 # ── 模型识别 ────────────────────────────────────────────────────────────
@@ -299,6 +306,28 @@ async def get_blend_dates(
     return {"blend_id": blend_id, "dates": dates}
 
 
+@router.get("/{blend_id}/rolling", summary="滚动建仓视图（最近 N+1 日每日 TopK）")
+async def get_blend_rolling(
+    blend_id: str,
+    date_str: str | None = Query(default=None, alias="date"),
+    window: int = Query(default=10, ge=1, le=60),
+    per_day: int = Query(default=5, ge=1, le=50),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    tenant_id, user_id = _owner(current_user)
+    blend = await _get_blend_or_404(blend_id, tenant_id=tenant_id, user_id=user_id)
+    return await _run(
+        ModelBlendService().rolling(
+            blend,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            end_date=_parse_date(date_str),
+            window=window,
+            per_day=per_day,
+        )
+    )
+
+
 @router.get("/{blend_id}/ranking", summary="当日组合榜单")
 async def get_blend_ranking(
     blend_id: str,
@@ -357,16 +386,57 @@ async def create_plan(
 ):
     tenant_id, user_id = _owner(current_user)
     blend = await _get_blend_or_404(blend_id, tenant_id=tenant_id, user_id=user_id)
+    plan_config = _plan_config(blend, body)
     payload = await _run(
         ModelBlendService().plan(
             blend,
             tenant_id=tenant_id,
             user_id=user_id,
             data_trade_date=_parse_date(body.data_trade_date),
+            plan_config=plan_config,
             persist=body.persist,
         )
     )
     return payload
+
+
+def _plan_config(blend: Mapping[str, Any], body: PlanBody) -> PlanConfig | None:
+    """只在前端显式改参数时构造 PlanConfig；缺省仍走组合自身配置。"""
+    if all(
+        value is None
+        for value in (
+            body.capital,
+            body.top_k,
+            body.hold_days,
+            body.entry_per_day,
+            body.target_positions,
+        )
+    ):
+        return None
+    defaults = PlanConfig()
+    return PlanConfig(
+        capital=body.capital if body.capital is not None else defaults.capital,
+        top_k=(
+            body.top_k
+            if body.top_k is not None
+            else int(blend.get("target_positions") or defaults.top_k)
+        ),
+        hold_days=(
+            body.hold_days
+            if body.hold_days is not None
+            else int(blend.get("rolling_window") or defaults.hold_days)
+        ),
+        entry_per_day=(
+            body.entry_per_day
+            if body.entry_per_day is not None
+            else int(blend.get("entry_per_day") or defaults.entry_per_day)
+        ),
+        target_positions=(
+            body.target_positions
+            if body.target_positions is not None
+            else int(blend.get("target_positions") or defaults.target_positions)
+        ),
+    )
 
 
 @router.get("/{blend_id}/plans", summary="历史计划")
