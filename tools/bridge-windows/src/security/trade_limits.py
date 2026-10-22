@@ -9,10 +9,13 @@
 下单与撤单**各自独立计数**：撤单是减小风险的动作，不能因为当日下单额度
 用尽而被连坐；但撤单本身也有 299/秒、1999/天的硬上限。
 
+**计数持久化**：日计数落盘到 data/trade_limits_*.json。桥重启不能清零日额度；
+状态文件读失败/写失败一律 fail-closed（拒绝下单），宁可当日不交易也不越线。
 多桥实例不共享计数——生产必须只跑一个桥（本项目约定）。
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -40,6 +43,8 @@ def verify_hard_limits() -> None:
     """
     if (HARD_MAX_TRADES_PER_SEC != 299 or HARD_MAX_TRADES_PER_DAY != 1999):
         raise SystemExit("交易硬上限被篡改：必须为 299/1999，拒绝启动")
+    if WARN_AT_TRADES_PER_DAY != 150:
+        raise SystemExit("交易预警阈值被篡改：必须为 150，拒绝启动")
     # 行为自检：第 300 笔/秒必须被拒
     g = TradeRateGuard()
     now = datetime(2026, 1, 5, 9, 30, 0)
@@ -68,17 +73,21 @@ class TradeRateGuard:
     """滑动 1 秒窗口 + 自然日计数；线程安全（下单在线程池里并发）。"""
 
     def __init__(self, max_per_sec: int = HARD_MAX_TRADES_PER_SEC,
-                 max_per_day: int = HARD_MAX_TRADES_PER_DAY):
+                 max_per_day: int = HARD_MAX_TRADES_PER_DAY,
+                 state_path: str = ""):
         self.max_per_sec = max_per_sec
         self.max_per_day = max_per_day
+        self.state_path = state_path
         self._lock = threading.Lock()
         self._recent: deque[float] = deque()
-        self._day = ""
+        self._day = datetime.now().strftime("%Y%m%d")
         self._day_count = 0
-        self.denied_sec = 0
-        self.denied_day = 0
         self._warned_150 = False
         self._warning_pending = False
+        self._state_error = ""
+        self.denied_sec = 0
+        self.denied_day = 0
+        self._load_state()
 
     def _check_immutable(self) -> None:
         if (self.max_per_sec, self.max_per_day) != (
@@ -86,14 +95,52 @@ class TradeRateGuard:
             raise HardLimitTampered(
                 f"交易硬上限被篡改: {self.max_per_sec}/s, {self.max_per_day}/d")
 
+    def _load_state(self) -> None:
+        if not self.state_path:
+            return
+        try:
+            with open(self.state_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            # 读不到/损坏 = 无法证明当日额度 → fail-closed
+            self._state_error = f"硬上限状态文件不可读: {exc}"
+            log.critical(self._state_error)
+            return
+        try:
+            if data.get("day") == self._day:
+                self._day_count = int(data.get("count", 0))
+                self._warned_150 = bool(data.get("warned_150", False))
+                if (self._day_count >= WARN_AT_TRADES_PER_DAY
+                        and not self._warned_150):
+                    self._warned_150 = True
+                    self._warning_pending = True
+        except (TypeError, ValueError):
+            self._state_error = "硬上限状态文件内容非法"
+            log.critical(self._state_error)
+
+    def _persist(self) -> None:
+        if not self.state_path:
+            return
+        data = {"day": self._day, "count": self._day_count,
+                "warned_150": self._warned_150}
+        os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.state_path)
+
     def _roll_day(self, now: datetime) -> None:
         day = now.strftime("%Y%m%d")
         if day != self._day:
             self._day = day
             self._day_count = 0
-            self._recent.clear()
             self._warned_150 = False
             self._warning_pending = False
+            self._recent.clear()
 
     def allow(self, now: datetime | None = None,
               mono: float | None = None) -> tuple[bool, str]:
@@ -106,6 +153,8 @@ class TradeRateGuard:
         except HardLimitTampered:
             log.critical("交易硬上限被篡改，进程停机（用户铁律：改了就停机）")
             os._exit(3)
+        if self._state_error:
+            return False, f"{self._state_error}（fail-closed，拒绝交易）"
         now = now or datetime.now()
         ts = mono if mono is not None else time.monotonic()
         with self._lock:
@@ -120,11 +169,18 @@ class TradeRateGuard:
                 self.denied_day += 1
                 return False, (f"硬上限：{self.max_per_day} 笔/日已用尽，"
                                f"今日拒绝（写死，不可改）")
-            self._recent.append(ts)
             self._day_count += 1
             if self._day_count == WARN_AT_TRADES_PER_DAY and not self._warned_150:
                 self._warned_150 = True
                 self._warning_pending = True
+            try:
+                self._persist()
+            except OSError as exc:
+                # 落盘失败 = 重启后无法证明额度 → fail-closed（本笔不放行）
+                self._day_count -= 1
+                log.critical("交易硬上限状态落盘失败，拒绝本笔: %s", exc)
+                return False, "硬上限状态落盘失败（fail-closed，拒绝本笔）"
+            self._recent.append(ts)
             return True, ""
 
     def consume_warning(self) -> str:
@@ -152,4 +208,6 @@ class TradeRateGuard:
                 "denied_day": self.denied_day,
                 "warn_at": WARN_AT_TRADES_PER_DAY,
                 "warned_150": self._warned_150,
+                "persisted": bool(self.state_path),
+                "state_error": self._state_error,
             }

@@ -19,17 +19,21 @@ class PlanExecutor:
     """执行 TradePlan: 卖先买后, 资金/持仓校验, 幂等去重, 交易记录同步到共享目录."""
 
     def __init__(self, tdx: TdxClient, shared_report_dir: str,
-                 trade_log_file: str = "trade_log.jsonl"):
+                 trade_log_file: str = "trade_log.jsonl", state_dir: str = ""):
         self.tdx = tdx
         self.shared_report_dir = shared_report_dir
         self.trade_log_file = os.path.join(shared_report_dir, trade_log_file)
+        self.state_dir = state_dir
         # 幂等去重：check-then-add 必须原子（trade 槽 2 并发 + file_sync 同进程）
         self._executed_plans: OrderedDict[str, bool] = OrderedDict()
         self._dedup_lock = threading.Lock()
         self._account_id = -1          # 未显式指定则用 0
         # 写死的交易硬上限：299/秒、1999/日（见 security/trade_limits.py）
         verify_hard_limits()
-        self.order_guard = TradeRateGuard()
+        # 日计数持久化：桥重启不能清零 1999/日 额度
+        self.order_guard = TradeRateGuard(
+            state_path=os.path.join(state_dir, "trade_limits_orders.json")
+            if state_dir else "")
         self._plan_deadline_s = 20.0
 
     def resolve_account_id(self, account: str, account_type: str) -> int:

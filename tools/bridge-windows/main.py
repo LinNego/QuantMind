@@ -118,7 +118,7 @@ async def main():
     report_dir = os.path.join(shared_dir, "execution_reports")
     os.makedirs(report_dir, exist_ok=True)
 
-    executor = PlanExecutor(tdx, report_dir)
+    executor = PlanExecutor(tdx, report_dir, state_dir=data_dir)
     tracker = OrderTracker(tdx, os.path.join(data_dir, "active_orders.json"))
     sltp = StopLossDaemon(tdx, os.path.join(data_dir, "stop_loss_state.json"),
                           poll_interval=cfg.get("sltp_daemon.poll_interval_seconds", 5.0),
@@ -159,7 +159,8 @@ async def main():
         try:
             runner = await start_http_server(host, port, token, tdx, executor, tracker, sltp,
                                              cache_db=cache_db, rate_limiter=rate_limiter,
-                                             memory_cache=memory_cache)
+                                             memory_cache=memory_cache,
+                                             trade_limits_dir=data_dir)
             tasks.append(asyncio.create_task(_wait_forever(runner)))
             log.info(f"通达信桥控制台: http://127.0.0.1:{port}/ui")
             # 自动打开网页控制台 (延迟确保服务已监听)

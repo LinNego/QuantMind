@@ -21,6 +21,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows 控制台默认 GBK，打印 ✅/❌ 会 UnicodeEncodeError；与 main.py 同样收口 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 # ---- mock 通达信 17709 ----
 CAPTURED = []
 
@@ -412,6 +420,21 @@ def main():
     assert "_dedup_lock" in _pe_src and "TdxTimeoutError" in _pe_src
     assert "consume_warning" in _pe_src
     print("  ✅ 常量/启动自检/篡改停机/150 预警")
+
+    # 日计数持久化：重启不清零；状态文件损坏 fail-closed
+    _sp = os.path.join(tempfile.mkdtemp(), "limits.json")
+    _today = datetime.now()
+    _gp = TradeRateGuard(state_path=_sp)
+    _ok, _ = _gp.allow(_today, mono=3000.0)
+    assert _ok
+    _gp2 = TradeRateGuard(state_path=_sp)
+    assert _gp2.stats()["day_count"] == 1, _gp2.stats()
+    with open(_sp, "w", encoding="utf-8") as _f:
+        _f.write("not-json")
+    _gp3 = TradeRateGuard(state_path=_sp)
+    _ok, _reason = _gp3.allow(_today, mono=3001.0)
+    assert not _ok and "fail-closed" in _reason, _reason
+    print("  ✅ 日计数落盘/重启续计/损坏 fail-closed")
 
     # 日志按大小滚动：bridge.log 曾无限增长到 1.5GB。
     print("\n=== bridge.log 按大小滚动 ===")

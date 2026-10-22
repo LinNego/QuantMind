@@ -406,8 +406,13 @@ def _cache_stats_sync(cache_db, memory_cache) -> dict | None:
 def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
               tracker: OrderTracker, sltp, cache_db=None, port: int = 8550,
               extra_tokens: list = None, rate_limiter=None,
-              memory_cache=None) -> web.Application:
+              memory_cache=None, trade_limits_dir: str = "") -> web.Application:
     app = web.Application()
+    if trade_limits_dir:
+        # 撤单日计数独立持久化；桥重启不清零
+        global _cancel_guard
+        _cancel_guard = TradeRateGuard(
+            state_path=os.path.join(trade_limits_dir, "trade_limits_cancels.json"))
     # 后台日志写入器：事件循环只入队，SQLite 在独立线程批量 commit。
     global _log_writer
     writer = _LogWriter(cache_db) if cache_db is not None else None
