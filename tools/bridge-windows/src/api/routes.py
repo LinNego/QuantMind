@@ -20,6 +20,106 @@ log = logging.getLogger(__name__)
 # 通达信调用超时 (秒) - 防止单个阻塞调用挂死整个桥
 TDX_CALL_TIMEOUT = 8.0
 
+# 交易/数据分槽（2026-10-22 实测：4 个并发全市场 pricevol 会把全局 Semaphore(4)
+# 占满，快照/下单要等 3.6s；TQ 17709 本身支持并发，堵点是桥槽）。
+# trade=2 保证下单/撤单/账户/委托查询永远有槽；data=2 给行情/采集/热集。
+# 总数 4 与实测 TQ 并发深度对齐；不要随意加到 3+3。
+TRADE_SEM_SLOTS = 2
+DATA_SEM_SLOTS = 2
+TRADE_CALL_TIMEOUT = 8.0
+DATA_CALL_TIMEOUT = 15.0
+
+# 只读/写入类交易方法：走 trade 槽，绝不被行情数据挤占。
+TRADE_METHODS = frozenset({
+    "order_stock", "cancel_order_stock", "query_stock_asset",
+    "query_stock_positions", "query_stock_orders", "stock_account",
+})
+
+_trade_semaphore = None
+_data_semaphore = None
+
+# 信号量观测（全部在事件循环内更新，无需加锁）
+_sem_stats = {
+    "trade": {"inflight": 0, "waiting": 0, "calls": 0, "timeouts": 0,
+              "wait_ms_last": 0.0, "wait_ms_max": 0.0},
+    "data": {"inflight": 0, "waiting": 0, "calls": 0, "timeouts": 0,
+             "wait_ms_last": 0.0, "wait_ms_max": 0.0},
+}
+
+
+def _get_semaphores():
+    global _trade_semaphore, _data_semaphore
+    if _trade_semaphore is None:
+        _trade_semaphore = asyncio.Semaphore(TRADE_SEM_SLOTS)
+    if _data_semaphore is None:
+        _data_semaphore = asyncio.Semaphore(DATA_SEM_SLOTS)
+    return _trade_semaphore, _data_semaphore
+
+
+def call_kind(method: str) -> str:
+    """按方法名分类：交易类走 trade 槽，其余走 data 槽。唯一出处。"""
+    return "trade" if method in TRADE_METHODS else "data"
+
+
+def semaphores_stats() -> dict:
+    """给 /stats 用的信号量快照（含配额与在途/等待）。"""
+    trade_sem, data_sem = _get_semaphores()
+    return {
+        "trade": {**_sem_stats["trade"], "slots": TRADE_SEM_SLOTS,
+                  "available": trade_sem._value},
+        "data": {**_sem_stats["data"], "slots": DATA_SEM_SLOTS,
+                 "available": data_sem._value},
+    }
+
+
+async def _call_tdx(func, *args, kind: str = "data", timeout: float | None = None):
+    """在后台线程跑通达信调用, 带超时 + 交易/数据分槽, 防止阻塞事件循环.
+
+    kind="trade"：下单/撤单/账户/委托查询，2 个专用槽；
+    kind="data" ：行情/财务/板块/采集，2 个槽（与热集/采集任务共享）。
+    数据调用再忙，也不会占掉交易槽。
+    """
+    if kind not in ("trade", "data"):
+        raise ValueError(f"非法 kind: {kind}")
+    trade_sem, data_sem = _get_semaphores()
+    sem = trade_sem if kind == "trade" else data_sem
+    stat = _sem_stats[kind]
+    stat["calls"] += 1
+    queued = sem.locked()
+    acquired = False
+    if queued:
+        stat["waiting"] += 1
+    t0 = time.monotonic()
+    try:
+        async with sem:
+            acquired = True
+            waited_ms = (time.monotonic() - t0) * 1000.0
+            if queued:
+                stat["waiting"] -= 1
+            stat["wait_ms_last"] = waited_ms
+            stat["wait_ms_max"] = max(stat["wait_ms_max"], waited_ms)
+            if waited_ms > 1000.0:
+                log.error("[TQ] %s 槽等待 %.0fms（可能被数据面挤占）", kind, waited_ms)
+            elif waited_ms > 200.0:
+                log.warning("[TQ] %s 槽等待 %.0fms", kind, waited_ms)
+            stat["inflight"] += 1
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(func, *args),
+                    timeout=timeout if timeout is not None else (
+                        TRADE_CALL_TIMEOUT if kind == "trade" else DATA_CALL_TIMEOUT),
+                )
+            except asyncio.TimeoutError:
+                stat["timeouts"] += 1
+                raise TdxError("通达信响应超时")
+            finally:
+                stat["inflight"] -= 1
+    except BaseException:
+        # 取消/异常发生在拿到槽之前：把等待计数还回去
+        if queued and not acquired and stat["waiting"] > 0:
+            stat["waiting"] -= 1
+        raise
+
 # stats 账户缓存 (避免网页高频轮询压垮通达信)
 _stats_cache = {"ts": 0, "account": None}
 
@@ -29,31 +129,12 @@ _stats_cache = {"ts": 0, "account": None}
 CACHE_STATS_TTL_S = 60.0
 _cache_stats_cache = {"ts": 0.0, "data": None}
 
-# 通达信并发信号量: 延迟初始化 (绑定运行中的 event loop, 避免 loop 冲突)
-_tdx_semaphore = None
-
 # 交易方法只能走 /api/v1/plans/execute 与 /api/v1/orders/cancel。
 # 透传路径（/api/v1/tdx/call）不做幂等去重、不做卖前持仓校验，且被归入
 # **读**限流桶（600/min）——放行等于给每个 token 一条绕过交易闸的旁路。
 # 更危险的是：`order_stock` 的 `side` 参数经 JSON 传进来构造不出 Side 枚举，
 # `TdxClient.call` 会一律落到 STOCK_SELL（买变卖）。这里直接封死。
 FORBIDDEN_CALL_METHODS = frozenset({"order_stock", "cancel_order_stock", "call"})
-
-
-def _get_semaphore():
-    global _tdx_semaphore
-    if _tdx_semaphore is None:
-        _tdx_semaphore = asyncio.Semaphore(4)
-    return _tdx_semaphore
-
-
-async def _call_tdx(func, *args):
-    """在后台线程跑通达信调用, 带超时 + 并发限制, 防止阻塞事件循环."""
-    async with _get_semaphore():
-        try:
-            return await asyncio.wait_for(asyncio.to_thread(func, *args), timeout=TDX_CALL_TIMEOUT)
-        except asyncio.TimeoutError:
-            raise TdxError("通达信响应超时")
 
 
 def json_error(status: int, code: str, message: str, details=None):
@@ -258,6 +339,8 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             "status": "ok",
             "tdx_connected": tdx_connected,
             "server_time": datetime.now().isoformat(timespec="seconds"),
+            # 交易/数据分槽的占用与等待：采集器/看门狗可用它判断是否该让路
+            "semaphores": semaphores_stats(),
         })
 
     async def execute_plan(request: web.Request):
@@ -275,7 +358,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             if o.side not in ("buy", "sell"):
                 return json_error(400, "PLAN_VALIDATION_ERROR", f"非法方向: {o.side}")
         try:
-            report = await _call_tdx(executor.execute_plan, plan)
+            report = await _call_tdx(executor.execute_plan, plan, kind="trade")
             if report["status"] == "duplicate":
                 return json_error(409, "DUPLICATE_PLAN", report.get("message", "重复计划"))
             report["channel_used"] = "http"
@@ -292,14 +375,14 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     async def query_account(request: web.Request):
         data = await request.json()
         account_id = await _call_tdx(executor.resolve_account_id,
-                                     data.get("account", ""), data.get("account_type", "stock"))
+                                     data.get("account", ""), data.get("account_type", "stock"), kind="trade")
         try:
             def _do():
                 asset = parser.parse_asset(tdx.query_stock_asset(account_id))
                 positions = [parser.parse_position(p)
                              for p in tdx.query_stock_positions(account_id)]
                 return asset, positions
-            asset, positions = await _call_tdx(_do)
+            asset, positions = await _call_tdx(_do, kind="trade")
             return web.json_response({"account_id": account_id, "asset": asset,
                                       "positions": positions, "channel_used": "http"})
         except TdxError as e:
@@ -308,14 +391,14 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     async def query_orders(request: web.Request):
         data = await request.json()
         account_id = await _call_tdx(executor.resolve_account_id,
-                                     data.get("account", ""), data.get("account_type", "stock"))
+                                     data.get("account", ""), data.get("account_type", "stock"), kind="trade")
         try:
             def _do():
                 return [parser.parse_order(o)
                         for o in tdx.query_stock_orders(
                             account_id, data.get("stock_code", ""),
                             data.get("cancelable_only", False))]
-            orders = await _call_tdx(_do)
+            orders = await _call_tdx(_do, kind="trade")
             return web.json_response({"orders": orders, "channel_used": "http"})
         except TdxError as e:
             return json_error(502, "TDX_UNAVAILABLE", str(e))
@@ -333,7 +416,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             try:
                 orders = await _call_tdx(
                     lambda: [parser.parse_order(o) for o in tdx.query_stock_orders(
-                        account_id, stock_code, False)])
+                        account_id, stock_code, False)], kind="trade")
             except Exception:
                 continue
             for o in orders or []:
@@ -348,10 +431,10 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         stock_code = data.get("stock_code", "")
         order_id = data.get("order_id", "")
         account_id = await _call_tdx(executor.resolve_account_id,
-                                     data.get("account", ""), data.get("account_type", "stock"))
+                                     data.get("account", ""), data.get("account_type", "stock"), kind="trade")
         try:
             res = await _call_tdx(tdx.cancel_order_stock, account_id,
-                                  stock_code, order_id)
+                                  stock_code, order_id, kind="trade")
             # 直连账号成功码为 "2" (下单路径 plan_executor 同样把 "2" 当成功),
             # 撤单只认 "1" 会把已受理的撤单报成失败 (2026-10-12 实盘假失败根因)
             ok = str(res.get("Value", "0")) in ("1", "2")
@@ -479,7 +562,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
                     return _run_tdx_sync(tdx, method, params)
                 result = memory_cache.get_or_fetch(cache_key, cache_ttl, _fetch)
             else:
-                result = await _call_tdx(tdx.call, method, params)
+                result = await _call_tdx(tdx.call, method, params, kind=call_kind(method))
             _dur = round((_time.monotonic() - _t0) * 1000, 1)
             # 自动缓存常见查询到 SQLite (若启用缓存)
             if cache_db and method in ("get_market_data", "get_stock_info",
@@ -599,9 +682,9 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             stats_data["account"] = _stats_cache.get("account")
         else:
             try:
-                account_id = await _call_tdx(executor.resolve_account_id, "", "stock")
-                asset = await _call_tdx(tdx.query_stock_asset, account_id)
-                positions = await _call_tdx(tdx.query_stock_positions, account_id)
+                account_id = await _call_tdx(executor.resolve_account_id, "", "stock", kind="trade")
+                asset = await _call_tdx(tdx.query_stock_asset, account_id, kind="trade")
+                positions = await _call_tdx(tdx.query_stock_positions, account_id, kind="trade")
                 stats_data["account"] = {
                     "currency": asset.get("Currency", ""),
                     "balance": float(asset.get("Balance", 0) or 0),
@@ -629,6 +712,8 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
                 stats_data["security"] = rate_limiter.stats()
             except Exception:
                 stats_data["security"] = None
+        # 交易/数据分槽观测：交易槽等待 >1s 已打 ERROR，这里给控制台/探针看
+        stats_data["semaphores"] = semaphores_stats()
         return web.json_response({"success": True, "data": stats_data})
 
     async def reset_token(request: web.Request):

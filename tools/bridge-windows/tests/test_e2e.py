@@ -9,7 +9,7 @@ import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -29,11 +29,12 @@ class MockTdx:
         self.cancels = []      # cancel_order_stock 收到的参数
         self.orders_placed = []
         self.port = None
+        self.pricevol_delay = 0.0
         self._httpd = None
         self._thread = None
 
     def start(self):
-        self._httpd = HTTPServer(("127.0.0.1", 0), self._handler)
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._handler)
         self.port = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
@@ -89,6 +90,12 @@ class _MockHandler(BaseHTTPRequestHandler):
             result.update({"Now": f"{self.mock.price}", "Max": "12.00", "Min": "10.00"})
         elif method == "get_market_data":
             result.update({"Close": [f"{self.mock.price}"], "Date": ["20260812"]})
+        elif method == "get_pricevol":
+            # 模拟全市场快照的耗时（用于验证 trade/data 分槽）
+            time.sleep(self.mock.pricevol_delay)
+            codes = (body.get("params") or {}).get("stock_list", [])
+            result["Value"] = {c: {"Now": f"{self.mock.price}", "LastClose": "10.00",
+                                   "Volume": "1000"} for c in codes}
         else:
             result["ErrorId"] = "-1"
             result["Msg"] = f"unknown {method}"
@@ -175,6 +182,28 @@ async def run_tests():
             h = await resp.json()
             assert h["status"] == "ok"
         print("[PASS] 健康检查 GET OK")
+
+        # 交易/数据分槽：4 个慢数据调用（data 槽只有 2）不能堵住账户查询（trade 槽）。
+        # 旧实现是全局 Semaphore(4)：4 个 pricevol 会占满，账户查询要等 0.8s。
+        mock.pricevol_delay = 0.8
+        slow = [asyncio.create_task(api(
+                    "/api/v1/tdx/call",
+                    {"method": "get_pricevol",
+                     "params": {"stock_list": ["600519.SH"]}}))
+                for _ in range(4)]
+        await asyncio.sleep(0.15)
+        t0 = time.monotonic()
+        status, _acct = await api("/api/v1/account/query", {"account_type": "stock"})
+        trade_ms = (time.monotonic() - t0) * 1000.0
+        assert status == 200 and trade_ms < 500, f"交易被数据堵住: {trade_ms:.0f}ms"
+        slow_results = await asyncio.gather(*slow)
+        assert all(r[0] == 200 for r in slow_results), slow_results
+        mock.pricevol_delay = 0.0
+        async with session.get(base + "/api/v1/health") as resp:
+            h = await resp.json()
+            assert h["semaphores"]["trade"]["slots"] == 2, h
+            assert h["semaphores"]["data"]["slots"] == 2, h
+        print(f"[PASS] 交易/数据分槽：数据慢调用期间账户查询 {trade_ms:.0f}ms")
 
         # 透传端点不得放行交易方法：side 经 JSON 构造不出 Side 枚举会买变卖，
         # 且该路径被归入读限流桶，绕过计划级幂等与卖前持仓校验。

@@ -344,6 +344,15 @@ def main():
     assert "/api/v1/cache/trades" not in _ro, "cache/trades 仍在匿名白名单"
     print("  ✅ cache/logs 与 cache/trades 已移出匿名白名单")
 
+    # 交易/数据分槽：4 个并发数据调用不能占满交易槽。
+    print("\n=== 交易/数据双信号量 ===")
+    assert "TRADE_SEM_SLOTS = 2" in _routes_src, "缺少 TRADE_SEM_SLOTS=2"
+    assert "DATA_SEM_SLOTS = 2" in _routes_src, "缺少 DATA_SEM_SLOTS=2"
+    assert "TRADE_METHODS" in _routes_src, "缺少交易方法分类表"
+    assert "kind=call_kind(method)" in _routes_src, "/tdx/call 未按方法分类"
+    assert "semaphores_stats()" in _routes_src, "缺少信号量观测"
+    print("  ✅ trade=2 / data=2 + 方法分类 + /health 观测")
+
     # 日志按大小滚动：bridge.log 曾无限增长到 1.5GB。
     print("\n=== bridge.log 按大小滚动 ===")
     from src.utils.log_setup import build_handlers

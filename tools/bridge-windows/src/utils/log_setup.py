@@ -16,17 +16,19 @@ LOG_BACKUP_COUNT = 5
 
 
 def build_handlers(log_dir: str, max_bytes: int = LOG_MAX_BYTES,
-                   backup_count: int = LOG_BACKUP_COUNT) -> list[logging.Handler]:
-    """构造桥的日志 handler 列表（控制台 + 滚动文件）。
+                   backup_count: int = LOG_BACKUP_COUNT,
+                   filename: str = "bridge.log") -> list[logging.Handler]:
+    """构造桥/采集器的日志 handler 列表（控制台 + 滚动文件）。
 
     windowed/exe 模式没有 stderr，用 NullHandler 占位；源码模式输出到控制台。
+    ``filename`` 供采集器复用（collector.log），桥默认 bridge.log。
     """
     os.makedirs(log_dir, exist_ok=True)
     handlers: list[logging.Handler] = [
         logging.StreamHandler() if sys.stderr else logging.NullHandler()
     ]
     handlers.append(RotatingFileHandler(
-        os.path.join(log_dir, "bridge.log"),
+        os.path.join(log_dir, filename),
         maxBytes=max_bytes,
         backupCount=backup_count,
         encoding="utf-8",
