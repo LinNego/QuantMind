@@ -12,6 +12,14 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows 控制台默认 GBK，打印 ✅ 会 UnicodeEncodeError；与 main.py 同样收口 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 from src.collector.aggregator import BarAggregator  # noqa: E402
 from src.collector.config import CollectorConfig, load_config  # noqa: E402
 from src.collector.server import build_app  # noqa: E402
