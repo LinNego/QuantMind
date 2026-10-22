@@ -320,6 +320,12 @@ def main():
     assert "min_interval_sec" in _main_src, "main.py 的 _auto_open_ui 缺少节流间隔参数"
     print("  ✅ 自动打开控制台已节流")
 
+    # 访问日志降噪：每请求一行会把 bridge.log 撑到 GB 级。
+    print("\n=== aiohttp.access 日志降噪 ===")
+    assert 'logging.getLogger("aiohttp.access").setLevel(logging.WARNING)' in _main_src, \
+        "aiohttp.access 未降到 WARNING，bridge.log 会被每请求一行撑爆"
+    print("  ✅ 访问日志只保留 WARNING 以上")
+
     # 透传端点不得放行交易方法：绕过幂等/卖前校验/写限流，且 side 会买变卖。
     print("\n=== 透传端点不得放行交易方法 ===")
     assert "FORBIDDEN_CALL_METHODS" in _routes_src, \

@@ -40,6 +40,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=build_handlers(_log_dir),
 )
+# 访问日志降噪：生产 bridge.log 曾到 1.41GB，绝大多数是 aiohttp.access 的
+# 每请求一行（热集轮转每秒数条）。调用审计已由 SQLite tdx_log 承担，
+# 这里只保留 WARNING 以上，减少 I/O 与磁盘增长。
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 log = logging.getLogger("bridge-windows")
 
 
