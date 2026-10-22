@@ -83,17 +83,20 @@ MARKET_FACTOR_SOURCES: dict[str, tuple[FactorSource, ...]] = {
 # - features_daily：含未来收益标签列（return_Nd）与 OHLCV 重复列；
 # - alpha_library_labels：纯标签库；
 # - alpha_library：历史策略预计算 Alpha 库（1300+ 清单性质）；
-# - factor_defs：1300+ 条研究/报告同源清单库。
+# - factor_defs：1300+ 条研究/报告同源清单库；
+# - futures_factors_labels：期货前视收益标签库，与 futures_factors 同根。
 # EXCLUDED_FROM_TRAINING —— 读取层硬拦（标签/泄漏库，任何路径都不得当特征源）。
 EXCLUDED_FROM_DISCOVERY: frozenset[str] = frozenset({
     "features_daily",
     "alpha_library_labels",
     "alpha_library",
     "factor_defs",
+    "futures_factors_labels",
 })
 EXCLUDED_FROM_TRAINING: frozenset[str] = frozenset({
     "features_daily",
     "alpha_library_labels",
+    "futures_factors_labels",
 })
 DEFAULT_FACTOR_SOURCE_BY_MARKET: dict[str, FactorSource] = {
     "CN": "l1_factors",

@@ -455,6 +455,24 @@ def test_label_libraries_blocked_as_secondary_source(tmp_path):
             )
 
 
+def test_futures_label_library_is_not_discovered_or_trainable(tmp_path):
+    """期货标签库与特征同根：必须同时挡住发现面与训练面，否则 fwd_* 直接进特征。"""
+    _write_factor_partition(tmp_path, "l1_factors", _frame("2024-01-02", 10), "20240102")
+    _write_factor_partition(
+        tmp_path,
+        "futures_factors_labels",
+        pd.DataFrame(
+            {"symbol": ["CU0.CN"], "dt": ["20240102"], "fwd_ret_1d": [0.01]}
+        ),
+        "20240102",
+    )
+
+    reader = QuantDBFactorReader(tmp_path, market="FUTURES")
+    assert "futures_factors_labels" not in reader.discover_market_sources("FUTURES")
+    with pytest.raises(QuantDBFactorError, match="excluded"):
+        reader.validate_source("futures_factors_labels")
+
+
 def test_previously_excluded_feature_library_allowed_as_secondary(tmp_path):
     """factor_defs 曾因"清单库"性质排除在训练直读外——现只拦发现面，训练面放行。"""
     _write_factor_partition(tmp_path, "l1_factors", _frame("2024-01-02", 10), "20240102")
