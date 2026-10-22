@@ -16,13 +16,22 @@ future_return_Nd，两代并存于不同分区）必须全部在 meta_cols 排�
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
+import pandas as pd
+import pytest
 
 from backend.scripts.screen_factors import (
+    OURS,
     REPORT_DATASETS,
     _dedup_first_wins,
     _gate_candidates,
+    _load_ours,
+    _load_report,
     _matrix_from_cache,
+    _report_path,
+    _screen_dir,
 )
 from backend.services.engine.factor_report import datasets as ds
 from backend.services.engine.factor_research.discovery import AUTO_PRIORITY, AUTO_SKIP
@@ -196,3 +205,71 @@ def test_matrix_from_cache_rejects_missing_name_and_bad_shape():
     mat = np.eye(2)
     assert _matrix_from_cache(["a", "b"], mat, ["a", "z"]) is None  # 未覆盖候选列
     assert _matrix_from_cache(["a", "b"], np.eye(3), ["a", "b"]) is None  # 形状不符
+
+
+# ---------- 替代报告目录（截断窗口实验） ----------
+
+
+def test_load_report_from_alternate_dir(tmp_path):
+    """--reports-dir 必须按 <dir>/<dataset>/factor_report.json 读取，且不碰生产快照。"""
+    report = {
+        "correlation": {"factors": ["f1", "f2"], "matrix": [[1.0, 0.5], [0.5, 1.0]]},
+        "factors": [
+            {"name": "f1", "ic_mean": 0.03, "icir": 0.4, "display_name": "因子一"}
+        ],
+    }
+    target = tmp_path / "reports" / "cand_factors" / "factor_report.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps(report), encoding="utf-8")
+
+    assert _report_path("cand_factors", tmp_path / "reports") == target
+    names, matrix, metrics = _load_report("cand_factors", tmp_path / "reports")
+
+    assert names == ["f1", "f2"]
+    assert matrix.shape == (2, 2)
+    assert metrics["f1"]["ic_mean"] == 0.03
+    assert metrics["f1"]["display_name"] == "因子一"
+    assert metrics["f2"]["ic_mean"] is None
+    assert metrics["f2"]["library"] == "cand_factors"
+    assert metrics["f2"]["display_name"] == "f2"
+
+
+def test_screen_dir_defaults_to_production_and_accepts_override(tmp_path, monkeypatch):
+    """--out-dir 必须同时搬走交叉相关缓存，否则生产跑会复用错窗口的矩阵。"""
+    root = tmp_path / "q"
+    (root / "keep").mkdir(parents=True)
+    monkeypatch.setenv("QM_QUANTDB_DATA_DIR", str(root))
+    assert _screen_dir() == root / OURS / "screening"
+    assert _screen_dir(tmp_path / "staging") == tmp_path / "staging"
+
+
+def test_load_ours_from_alternate_dir(tmp_path):
+    """--ours-dir 让自有因子库与报告库用同一截断窗口，不覆盖生产快照。"""
+    (tmp_path / "metrics.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "f_a": {"ic_mean": 0.01, "ic_ir": 0.5},
+                    "f_b": {"ic_mean": -0.02, "ic_ir": -0.4},
+                },
+                "meta": {"window": ["2020-01-23", "2025-12-31"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    pd.DataFrame([{"factor_a": "f_a", "factor_b": "f_b", "corr": 0.25}]).to_parquet(
+        tmp_path / "corr.parquet", index=False
+    )
+
+    names, matrix, metrics = _load_ours(tmp_path)
+
+    assert names == ["f_a", "f_b"]
+    assert matrix.tolist() == [[1.0, 0.25], [0.25, 1.0]]
+    assert metrics["f_a"]["ic_mean"] == 0.01
+    assert metrics["f_a"]["icir"] == 0.5
+    assert metrics["f_a"]["library"] == OURS
+
+
+def test_load_report_alternate_dir_missing_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        _load_report("cand_factors", tmp_path / "absent")

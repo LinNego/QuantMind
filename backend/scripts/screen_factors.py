@@ -118,12 +118,17 @@ def _dataset_dir(dataset: str) -> Path:
     return resolve_quantdb_dir() / "6_ml_datasets" / dataset
 
 
-def _load_report(dataset: str) -> tuple[list[str], np.ndarray, dict[str, dict]]:
-    rep = json.loads(
-        (_dataset_dir(dataset) / "report" / "factor_report.json").read_text(
-            encoding="utf-8"
-        )
-    )
+def _report_path(dataset: str, reports_dir: str | Path | None = None) -> Path:
+    """报告快照路径。``reports_dir`` 用于跑「截断窗口」等替代报告，不覆盖生产快照。"""
+    if reports_dir:
+        return Path(reports_dir) / dataset / "factor_report.json"
+    return _dataset_dir(dataset) / "report" / "factor_report.json"
+
+
+def _load_report(
+    dataset: str, reports_dir: str | Path | None = None
+) -> tuple[list[str], np.ndarray, dict[str, dict]]:
+    rep = json.loads(_report_path(dataset, reports_dir).read_text(encoding="utf-8"))
     names = list(rep["correlation"]["factors"])
     matrix = np.asarray(rep["correlation"]["matrix"], dtype=np.float64)
     by_name = {f["name"]: f for f in rep["factors"]}
@@ -142,8 +147,26 @@ def _load_report(dataset: str) -> tuple[list[str], np.ndarray, dict[str, dict]]:
     return names, matrix, metrics
 
 
-def _load_ours() -> tuple[list[str], np.ndarray, dict[str, dict]]:
-    root = resolve_quantdb_dir() / OURS
+def _screen_dir(out_dir: str | Path | None = None) -> Path:
+    """筛选产物目录（factor_selection.json / kept_features.txt / cross_corr.npz）。
+
+    ``out_dir`` 用于截断窗口等实验：联合相关缓存与产物一起搬走，否则既覆盖
+    生产快照，又会让后续生产跑复用错窗口的相关矩阵（缓存静默中毒）。
+    """
+    if out_dir:
+        return Path(out_dir)
+    return resolve_quantdb_dir() / OURS / "screening"
+
+
+def _load_ours(
+    ours_dir: str | Path | None = None,
+) -> tuple[list[str], np.ndarray, dict[str, dict]]:
+    """自有因子库（``factor_research``）的指标与相关阵。
+
+    ``ours_dir`` 指向替代快照（如 ``FACTOR_RESEARCH_OUT`` 产出的截断窗口），
+    不传则读生产目录。
+    """
+    root = Path(ours_dir) if ours_dir else resolve_quantdb_dir() / OURS
     m = json.loads((root / "metrics.json").read_text(encoding="utf-8"))
     metrics_json = m.get("metrics", {})
     names = sorted(metrics_json)
@@ -298,12 +321,14 @@ def _union_cross_corr(
     candidates: list[str],
     max_dates: int = 0,
     workers: int = 1,
+    ours_dir: str | Path | None = None,
 ) -> tuple[np.ndarray, int]:
     """单遍联合相关：各库分区 × factor_research 打分，月末截面 Spearman 逐期均值。
 
     blocks: [(dataset, 因子名列表)]；candidates: 参与列子集（**过门槛候选**，
     names_all 序）；返回 (候选列联合相关均值矩阵, 使用的期数)。
     workers>1 时按日期池化，父进程按日期序累加（imap 保序）——与串行逐位一致。
+    ``ours_dir`` 指向替代打分快照（截断窗口实验），不传读生产。
     """
     root = resolve_quantdb_dir()
     cand_set = set(candidates)
@@ -314,8 +339,9 @@ def _union_cross_corr(
     if k == 0:
         return np.empty((0, 0)), 0
 
+    ours_root = Path(ours_dir) if ours_dir else root / OURS
     scores = pd.read_parquet(
-        root / OURS / "monthly_scores.parquet",
+        ours_root / "monthly_scores.parquet",
         columns=["trade_date", "symbol", "factor_code", "score"],
     )
     scores["symbol"] = scores["symbol"].astype("category")
@@ -421,7 +447,25 @@ def main() -> int:
         default=",".join([*REPORT_DATASETS, OURS]),
         help="参与筛选的库（逗号分隔；默认全部）",
     )
+    ap.add_argument(
+        "--reports-dir",
+        default=None,
+        help="替代报告根目录（<dir>/<dataset>/factor_report.json）；用于截断窗口等实验，不覆盖生产快照",
+    )
+    ap.add_argument(
+        "--ours-dir",
+        default=None,
+        help="自有因子库替代快照目录（metrics.json + corr.parquet）；"
+        "配 FACTOR_RESEARCH_OUT 用同一截断窗口，不覆盖生产快照",
+    )
+    ap.add_argument(
+        "--out-dir",
+        default=None,
+        help="替代输出目录（factor_selection.json / kept_features.txt / cross_corr.npz）；"
+        "截断窗口实验必须给，否则会覆盖生产筛选快照与相关缓存",
+    )
     args = ap.parse_args()
+    screen_dir = _screen_dir(args.out_dir)
     wanted = [x.strip() for x in args.libraries.split(",") if x.strip()]
 
     t0 = time.time()
@@ -432,20 +476,21 @@ def main() -> int:
     for ds in REPORT_DATASETS:
         if ds not in wanted:
             continue
-        rep_file = _dataset_dir(ds) / "report" / "factor_report.json"
+        rep_file = _report_path(ds, args.reports_dir)
         if not rep_file.exists():
             print(
-                f"      ⚠ {ds} 无因子报告快照，跳过（先跑 build_factor_report.py --dataset {ds}）"
+                f"      ⚠ {ds} 无因子报告快照（{rep_file}），跳过"
+                f"（先跑 build_factor_report.py --dataset {ds}）"
             )
             continue
-        nms, mat, mets = _load_report(ds)
+        nms, mat, mets = _load_report(ds, args.reports_dir)
         print(f"[1/5] {ds}: {len(nms)} 因子（报告矩阵 {mat.shape}）")
         blocks.append((ds, nms, mat))
         names_all.extend(nms)
         for n, m in mets.items():
             metrics.setdefault(n, m)  # 首见为准——与跨库去重的先到先得同序
     if use_ours:
-        nms, mat, mets = _load_ours()
+        nms, mat, mets = _load_ours(args.ours_dir)
         print(f"[2/5] {OURS}: {len(nms)} 因子")
         blocks.append((OURS, nms, mat))
         names_all.extend(nms)
@@ -494,7 +539,7 @@ def main() -> int:
         M = M_full[np.ix_(sel, sel)]
         cross_note = f"未计算跨库（{note}；仅库内去重）"
     else:
-        cache_file = resolve_quantdb_dir() / OURS / "screening" / "cross_corr.npz"
+        cache_file = screen_dir / "cross_corr.npz"
         M = None
         if cache_file.exists() and not args.refresh_cross:
             try:
@@ -522,11 +567,19 @@ def main() -> int:
                     f"{args.cross_workers} 路并行）..."
                 )
                 M, used = _union_cross_corr(
-                    cross_blocks, our_names, candidates, workers=args.cross_workers
+                    cross_blocks,
+                    our_names,
+                    candidates,
+                    workers=args.cross_workers,
+                    ours_dir=args.ours_dir,
                 )
             else:
                 M, used = _union_cross_corr(
-                    [(OURS, our_names)], [], candidates, workers=args.cross_workers
+                    [(OURS, our_names)],
+                    [],
+                    candidates,
+                    workers=args.cross_workers,
+                    ours_dir=args.ours_dir,
                 )
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(
@@ -587,7 +640,7 @@ def main() -> int:
     )
 
     # ---- 落盘 ----
-    out_dir = resolve_quantdb_dir() / OURS / "screening"
+    out_dir = screen_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     def _row(n: str) -> dict:
