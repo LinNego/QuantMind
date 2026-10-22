@@ -81,12 +81,17 @@ def _build_panel(
     末月（最新快照）fwd_ret 为 NaN —— 仍保留，个股表要读最新截面。
     """
     dates = next(iter(scores.values())).index
-    syms = pd.Index(next(iter(scores.values())).columns)
+    # symbol 轴 = 各因子列名的并集（先到先得、稳定序），不能只取首个因子：
+    # 估值/行情面板列集实测不同（多 1 只），只取首个会静默丢掉别的因子算得出的票。
+    syms = pd.Index(dict.fromkeys(c for sc in scores.values() for c in sc.columns))
     fwd = fwd.reindex(index=dates, columns=syms)
     fwd_np = fwd.to_numpy(dtype=np.float32)
     fcode, tds, ranks, sym_out, sc_out, raw_out, fr_out = [], [], [], [], [], [], []
     for code, sc in scores.items():
-        s = sc.to_numpy(dtype=np.float32)
+        # 必须 reindex 到统一 symbol 轴：各因子列集/列序可不同（实测估值面板比行情
+        # 面板多 1 只）——直接 to_numpy() 按位置取会越界，或更糟：列序不同时把分数
+        # 静默记到别的票头上（2026-10-22 截断窗构建在 [6/8] 炸出）。
+        s = sc.reindex(index=dates, columns=syms).to_numpy(dtype=np.float32)
         r = raw[code].reindex(index=dates, columns=syms).to_numpy(dtype=np.float32)
         r = np.where(np.isfinite(r), r, np.nan)
         for i, d in enumerate(dates):
