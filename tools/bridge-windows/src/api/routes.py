@@ -219,10 +219,12 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
                 return json_error(415, "UNSUPPORTED_MEDIA_TYPE", "仅支持 application/json")
 
         # 只读状态/页面豁免鉴权 (仅展示, 不含写操作)
+        # ⚠️ `/api/v1/cache/logs` 与 `/api/v1/cache/trades` **不在此列**：
+        # 它们返回调用明细与交易台账（含标的/方向/数量/委托号），属于敏感数据，
+        # 必须带 token；仅行情缓存 kline/get 保持匿名可读。
         read_only = ("/api/v1/health", "/api/v1/stats", "/ui", "/favicon.ico",
-                     "/api/v1/cache/kline", "/api/v1/cache/logs",
-                     "/api/v1/cache/trades", "/api/v1/cache/get")
-        if path in read_only or path.startswith("/api/v1/cache/"):
+                     "/api/v1/cache/kline", "/api/v1/cache/get")
+        if path in read_only:
             if rate_limiter:
                 # 只读接口也限流 (防 DDoS)
                 err = rate_limiter.check(client_ip, path, True)

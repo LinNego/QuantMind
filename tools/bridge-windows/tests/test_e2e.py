@@ -188,6 +188,17 @@ async def run_tests():
         assert status == 403, f"{status} {denied}"
         print("[PASS] 透传 cancel_order_stock 被 403 拒绝")
 
+        # 调用/成交日志属敏感数据：必须带 token（e2e 未启用缓存 → 鉴权通过后 501）
+        async with session.get(base + "/api/v1/cache/logs?limit=1") as resp:
+            assert resp.status == 401, f"cache/logs 未鉴权应为 401, 实际 {resp.status}"
+        async with session.get(base + "/api/v1/cache/logs?limit=1",
+                               headers={"Authorization": f"Bearer {TOKEN}"}) as resp:
+            assert resp.status == 501, \
+                f"cache/logs 带 token 应通过鉴权(501=未启用缓存), 实际 {resp.status}"
+        async with session.get(base + "/api/v1/cache/trades?limit=1") as resp:
+            assert resp.status == 401, f"cache/trades 未鉴权应为 401, 实际 {resp.status}"
+        print("[PASS] cache/logs 与 cache/trades 需要 token")
+
         # 6. HTTP 下单 (新 plan_id 避免幂等冲突)
         http_plan = TradePlan(plan_id="plan_http_001",
                               orders=[Order(stock_code="600519.SH", side="buy", volume=100, price=1650.0)])

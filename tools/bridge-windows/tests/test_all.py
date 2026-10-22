@@ -320,6 +320,15 @@ def main():
         assert _m in _deny_block, f"透传仍放行交易方法: {_m}"
     print("  ✅ order_stock / cancel_order_stock 已封")
 
+    # 调用/成交日志含标的、方向、委托号——不能再匿名可读。
+    print("\n=== 调用/成交日志需鉴权 ===")
+    assert 'path.startswith("/api/v1/cache/")' not in _routes_src, \
+        "cache/ 前缀仍被整体豁免鉴权"
+    _ro = _routes_src.split("read_only = (", 1)[1].split(")", 1)[0]
+    assert "/api/v1/cache/logs" not in _ro, "cache/logs 仍在匿名白名单"
+    assert "/api/v1/cache/trades" not in _ro, "cache/trades 仍在匿名白名单"
+    print("  ✅ cache/logs 与 cache/trades 已移出匿名白名单")
+
     # 日志按大小滚动：bridge.log 曾无限增长到 1.5GB。
     print("\n=== bridge.log 按大小滚动 ===")
     from src.utils.log_setup import build_handlers

@@ -309,10 +309,20 @@ async function loadStats() {
 }
 
 async function loadLogs() {
+  // 调用日志自 2026-10-22 起需要 token（含标的/方向/委托号等敏感字段）。
+  const token = document.getElementById('tokenInput').value.trim();
+  const tbody = document.querySelector('#logTable tbody');
+  if (!token) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#64748b;">在下方「Token 管理」输入 BRIDGE_AUTH_TOKEN 后点顶部刷新</td></tr>';
+    return;
+  }
   try {
-    const data = await api('/api/v1/cache/logs?limit=30');
-    if (!data.success) return;
-    const tbody = document.querySelector('#logTable tbody');
+    const data = await api('/api/v1/cache/logs?limit=30',
+      {headers: {'Authorization': 'Bearer ' + token}});
+    if (!data.success) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#fca5a5;">日志读取失败：' + ((data.error && data.error.message) || 'token 无效') + '</td></tr>';
+      return;
+    }
     tbody.innerHTML = (data.data||[]).map(l => `
       <tr>
         <td style="white-space:nowrap;">${l.created_at ? l.created_at.replace('T',' ').slice(5,19) : '-'}</td>

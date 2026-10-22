@@ -43,7 +43,9 @@ function Write-Log($msg) {
 
 function Test-BridgeAlive {
     try {
-        $resp = Invoke-WebRequest -Uri $BridgeUrl -TimeoutSec 5 -UseBasicParsing
+        # 15s：/stats 在 9GB 旧库上单次 COUNT(*) 可到 12s（已移出事件循环，
+        # 但繁忙时健康探测仍可能排队）。原 5s 会在桥只是忙时误判「假活」杀掉。
+        $resp = Invoke-WebRequest -Uri $BridgeUrl -TimeoutSec 15 -UseBasicParsing
         return ($resp.StatusCode -eq 200)
     } catch {
         return $false
