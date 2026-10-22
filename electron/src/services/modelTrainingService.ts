@@ -751,6 +751,12 @@ class ModelTrainingService {
     return resp.data;
   }
 
+  /** 已归档 → 恢复使用（ready/candidate）；不自动接管默认位。 */
+  async restoreUserModel(modelId: string): Promise<UserModelRecord> {
+    const resp = await this.client.post<UserModelRecord>(`/models/${encodeURIComponent(modelId)}/restore`);
+    return resp.data;
+  }
+
   async activateUserModel(modelId: string): Promise<UserModelRecord> {
     const resp = await this.client.post<UserModelRecord>(`/models/${modelId}/activate`);
     return resp.data;

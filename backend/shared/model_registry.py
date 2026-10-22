@@ -23,7 +23,7 @@ from backend.shared.model_algorithm_meta import (
     comparison_index,
     read_xgboost_best_iteration,
 )
-from backend.shared.model_retirement import AUDIT_ACTION_ARCHIVE
+from backend.shared.model_retirement import AUDIT_ACTION_ARCHIVE, AUDIT_ACTION_RESTORE
 from backend.shared.model_rollout_store import latest_promotion_of
 
 logger = logging.getLogger(__name__)
@@ -197,6 +197,31 @@ def _inherit_data_plane_from_members(
         if chosen_dir:
             out["data_dir"] = chosen_dir
     return out, warnings
+
+
+def _restore_target_status(metadata: dict[str, Any]) -> str | None:
+    """恢复后的状态：优先归档时记录的原始状态；记录为不可用状态时**拒绝**。
+
+    归档会覆盖 ``status``，若不记录原状态，candidate（软门禁拦下）恢复时会被
+    悄悄抬成 ready。``archived_from_status`` 存在但值不是 ready/active/candidate
+    （典型：failed / syncing / 已归档二次归档）时返回 ``None`` —— 调用方必须
+    明确拒绝，绝不能落回 ready 把坏模型复活成「使用中」。
+
+    旧归档行没有该键：按质量门禁口径回退——有 ``quality_warnings`` 回 candidate，
+    否则回 ready（ready 另由调用方强制要求非空且存在的 model_file 兜底）。
+    """
+    meta = metadata if isinstance(metadata, dict) else {}
+    if "archived_from_status" in meta:
+        recorded = str(meta.get("archived_from_status") or "").strip().lower()
+        if recorded in {"ready", "active"}:
+            return "ready"
+        if recorded == "candidate":
+            return "candidate"
+        return None
+    warnings = meta.get("quality_warnings")
+    if isinstance(warnings, (list, tuple, set)) and len(warnings) > 0:
+        return "candidate"
+    return "ready"
 
 
 class ModelRegistryService:
@@ -1019,22 +1044,37 @@ class ModelRegistryService:
             raise ValueError("system model cannot be archived")
 
         now = datetime.now(timezone.utc)
+        # 记录归档前状态：archive 会覆盖 status，恢复时据此回到 ready/candidate，
+        # 不把软门禁拦下的候选模型悄悄抬成 ready。只做 JSONB 增量合并，避免把
+        # get_model 之后并发写入的其它元数据（如展示名）整列覆盖回去。
+        archive_patch = {
+            "archived_from_status": str(model.get("status") or ""),
+            "archived_at": now.isoformat(),
+        }
         async with get_session() as session:
-            await session.execute(
+            update_result = await session.execute(
                 text(
                     """
                     UPDATE qm_user_models
-                    SET status = 'archived', is_default = FALSE, updated_at = :updated_at
+                    SET status = 'archived', is_default = FALSE, updated_at = :updated_at,
+                        metadata_json = COALESCE(metadata_json, '{}'::jsonb)
+                                        || CAST(:metadata_patch AS JSONB)
                     WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                      AND status IS DISTINCT FROM 'archived'
                     """
                 ),
                 {
                     "tenant_id": tenant,
                     "user_id": user,
                     "model_id": mid,
+                    "metadata_patch": json.dumps(archive_patch, ensure_ascii=False),
                     "updated_at": now,
                 },
             )
+            # 幂等保护：重复归档会覆盖 archived_from_status（把 candidate 洗成
+            # archived/不可恢复状态）并重复写审计，必须明确拒绝。
+            if not getattr(update_result, "rowcount", 0):
+                raise ValueError("model is already archived")
 
             # 回退只在**本市场**找继任（§5.5：CN 归档不许动 HK/US 的默认；
             # 旧实现不分区，跨市场「最近更新 ready」会被错误扶上马）
@@ -1167,6 +1207,154 @@ class ModelRegistryService:
         if archived is None:
             raise ValueError("archive result unavailable")
         return archived
+
+    async def restore_model(
+        self, *, tenant_id: str, user_id: str, model_id: str
+    ) -> dict[str, Any]:
+        """已归档模型 → 恢复使用（ready/candidate），**不动默认位**。
+
+        拒绝（诚实拒绝，不制造坏状态）：非归档状态、系统模型、归档前状态不可用
+        （failed/syncing 等）、产物已清退（``artifacts_purged`` 墓碑）、产物
+        目录/模型文件缺失；恢复为 ready 时强制要求非空且存在的 model_file。
+
+        整段校验在 ``SELECT ... FOR UPDATE`` 行锁内完成，与退役清退的「锁行→删
+        产物→写墓碑」互斥：不会出现「恢复校验通过后被清退删盘」的坏 ready 行。
+        恢复与审计（action=model.restore）同事务落库；是否接管推理仍由用户
+        「设为默认」决定。
+        """
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        mid = str(model_id).strip()
+        if not mid:
+            raise ValueError("model_id is required")
+
+        now = datetime.now(timezone.utc)
+        async with get_session() as session:
+            # 行锁：与 model_retirement._purge_one 的 FOR UPDATE 同一把锁。
+            locked = (
+                (
+                    await session.execute(
+                        text(
+                            """
+                            SELECT status, storage_path, model_file, metadata_json
+                            FROM qm_user_models
+                            WHERE tenant_id = :tenant_id AND user_id = :user_id
+                              AND model_id = :model_id
+                            FOR UPDATE
+                            """
+                        ),
+                        {
+                            "tenant_id": tenant,
+                            "user_id": user,
+                            "model_id": mid,
+                        },
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if locked is None:
+                raise ValueError("model not found")
+            if str(locked.get("status") or "") != "archived":
+                raise ValueError("model is not archived")
+
+            metadata = (
+                locked.get("metadata_json")
+                if isinstance(locked.get("metadata_json"), dict)
+                else {}
+            )
+            if bool(metadata.get("readonly")):
+                raise ValueError("system model cannot be restored")
+            if bool(metadata.get("artifacts_purged")):
+                raise ValueError(
+                    "模型产物已清退，无法恢复；请从训练记录重新训练或从备份恢复"
+                )
+
+            target_status = _restore_target_status(metadata)
+            if target_status is None:
+                recorded = (
+                    str(metadata.get("archived_from_status") or "").strip() or "空"
+                )
+                raise ValueError(
+                    f"模型归档前状态为 {recorded}，不支持恢复；"
+                    "请从训练记录重新训练或从备份恢复"
+                )
+
+            market = _model_market_of({"metadata_json": metadata})
+            self._assert_restore_artifacts(
+                {
+                    "storage_path": str(locked.get("storage_path") or ""),
+                    "model_file": str(locked.get("model_file") or ""),
+                },
+                require_model_file=target_status == "ready",
+            )
+
+            result = await session.execute(
+                text(
+                    """
+                    UPDATE qm_user_models
+                    SET status = :status, updated_at = :updated_at
+                    WHERE tenant_id = :tenant_id AND user_id = :user_id
+                      AND model_id = :model_id AND status = 'archived'
+                    """
+                ),
+                {
+                    "tenant_id": tenant,
+                    "user_id": user,
+                    "model_id": mid,
+                    "status": target_status,
+                    "updated_at": now,
+                },
+            )
+            # 行锁下状态不可变，这里只作最后一道防御；失败即整事务回滚。
+            if not getattr(result, "rowcount", 0):
+                raise ValueError("model is not archived")
+
+            await session.execute(
+                text(
+                    "INSERT INTO user_audit_logs "
+                    "(user_id, tenant_id, action, resource, resource_id, description, success, created_at) "
+                    "VALUES (:user_id, :tenant_id, :action, :resource, :resource_id, :description, TRUE, :created_at)"
+                ),
+                {
+                    "user_id": user,
+                    "tenant_id": tenant,
+                    "action": AUDIT_ACTION_RESTORE,
+                    "resource": "qm_user_models",
+                    "resource_id": mid,
+                    "description": (
+                        f"恢复归档模型 {mid}（market={market}，恢复为 {target_status}）"
+                    )[:2000],
+                    "created_at": now,
+                },
+            )
+
+        restored = await self.get_model(tenant_id=tenant, user_id=user, model_id=mid)
+        if restored is None:
+            raise ValueError("restore result unavailable")
+        return restored
+
+    def _assert_restore_artifacts(
+        self, model: dict[str, Any], *, require_model_file: bool
+    ) -> None:
+        """恢复前校验产物仍在：目录必须在用户模型根内且含 model_file。
+
+        产物被清退或目录缺失时恢复成「使用中」只会得到一个读不到权重的坏模型
+        （推理侧静默回落），因此这里直接拒绝。恢复为 ready（可被默认位/推理
+        选中）时额外强制 model_file 非空且存在——空文件的 failed 行绝不允许
+        借「恢复」变成可推理状态。
+        """
+        owned = self._resolve_owned_model_dir(model)
+        if owned is None:
+            raise ValueError("模型产物目录缺失或越界，无法恢复")
+        if not owned.is_dir():
+            raise ValueError(f"模型产物目录不存在，无法恢复：{owned}")
+        model_file = str(model.get("model_file") or "").strip()
+        if not model_file:
+            if require_model_file:
+                raise ValueError("模型未声明模型文件，无法恢复为使用中")
+            return
+        if not (owned / model_file).is_file():
+            raise ValueError(f"模型文件缺失，无法恢复：{model_file}")
 
     async def activate_model(
         self, *, tenant_id: str, user_id: str, model_id: str

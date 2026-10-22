@@ -1520,6 +1520,23 @@ async def archive_user_model(
     return model
 
 
+@router.post("/{model_id}/restore", summary="恢复已归档的用户模型（用户态）")
+async def restore_user_model(
+    model_id: str,
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """归档 → 恢复使用（ready/candidate）；产物已清退/缺失则明确拒绝。"""
+    tenant_id = str(current_user.get("tenant_id") or "default")
+    user_id = str(current_user.get("user_id") or current_user.get("sub") or "")
+    try:
+        model = await model_registry_service.restore_model(
+            tenant_id=tenant_id, user_id=user_id, model_id=model_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return model
+
+
 @router.post("/{model_id}/activate", summary="手动激活候选模型（用户态）")
 async def activate_user_model(
     model_id: str,

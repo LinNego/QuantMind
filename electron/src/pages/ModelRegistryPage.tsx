@@ -5,7 +5,7 @@ import {
   Archive, Brain, Clock, XCircle, X,
   ChevronRight, Play, Download, ChevronDown,
   ChevronUp, Shield, Zap, ListFilter, Activity,
-  Compass, Sparkles, Pencil, ArrowUpDown,
+  Compass, Sparkles, Pencil, ArrowUpDown, RotateCcw,
 } from 'lucide-react';
 import {
   Button, Card, Tag, Typography, Empty, Spin, message,
@@ -88,6 +88,7 @@ export const ModelRegistryPage: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [settingDefault, setSettingDefault] = useState(false);
   const [archiving, setArchiving] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   const [activating, setActivating] = useState(false);
   const [showRenameModal, setShowRenameModal] = useState(false);
   const [renameValue, setRenameValue] = useState('');
@@ -461,6 +462,28 @@ export const ModelRegistryPage: React.FC = () => {
     });
   };
 
+  const handleRestore = () => {
+    if (!selectedModel) return;
+    Modal.confirm({
+      title: '恢复模型',
+      content: `确定将 "${modelDisplayName(selectedModel)}"（${selectedModel.model_id}）恢复到使用中？恢复后重新参与推理；如需接管推理，请再「设为默认」。`,
+      okText: '确认恢复',
+      cancelText: '取消',
+      onOk: async () => {
+        setRestoring(true);
+        try {
+          await modelTrainingService.restoreUserModel(selectedModel.model_id);
+          message.success('已恢复使用');
+          setListTab('active');
+          await loadModels(true);
+          setSelectedId(selectedModel.model_id);
+        } catch (err: any) {
+          message.error(`恢复失败: ${err?.response?.data?.detail ?? err?.message ?? '未知'}`);
+        } finally { setRestoring(false); }
+      },
+    });
+  };
+
   const handleActivate = () => {
     if (!selectedModel) return;
     Modal.confirm({
@@ -799,8 +822,8 @@ export const ModelRegistryPage: React.FC = () => {
                   className="p-8 max-w-5xl mx-auto"
                 >
                   {/* ── 模型 Header ── */}
-                  <div className="flex justify-between items-start mb-6">
-                    <div>
+                  <div className="flex justify-between items-start mb-6 gap-4">
+                    <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2 mb-2">
                         {/* 状态 badge */}
                         <span className={clsx(
@@ -862,7 +885,15 @@ export const ModelRegistryPage: React.FC = () => {
                         className="rounded-xl h-9 px-4 font-bold border-slate-200 text-xs"
                         onClick={() => setShowConfigModal(true)}
                       >配置</Button>
-                      {selectedModel.status !== 'archived' && (
+                      {selectedModel.status === 'archived' ? (
+                        <Button
+                          type="primary"
+                          icon={<RotateCcw size={13} />}
+                          className="rounded-xl h-9 px-5 font-black bg-emerald-600 hover:bg-emerald-500 border-none text-xs"
+                          onClick={handleRestore}
+                          loading={restoring}
+                        >恢复使用</Button>
+                      ) : (
                         <>
                           {selectedModel.status === 'candidate' && (
                             <Button

@@ -22,6 +22,7 @@ updated_at（保住该代理语义）。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -38,8 +39,10 @@ KEEP_N = 3
 #: 清退冷却（§7：30 天）
 COOLDOWN_DAYS = 30
 
-#: 审计动作名（user_audit_logs.action）——归档在 model_registry 侧，清退在本模块
+#: 审计动作名（user_audit_logs.action）——生命周期动作常量唯一出处；
+#: 归档/恢复在 model_registry 侧实现，清退在本模块，三处共用这里的定义。
 AUDIT_ACTION_ARCHIVE = "model.archive"
+AUDIT_ACTION_RESTORE = "model.restore"
 AUDIT_ACTION_PURGE = "model.retire_purge"
 
 
@@ -346,29 +349,104 @@ async def sweep_retirement(
         return summary
 
     for item in plan["purge"]:
-        result = purge_model_artifacts(root, item["model_id"], item.get("storage_path"))
-        if result["removed"] or result["reason"] == "not_found":
-            await _mark_purged(item, result, keep_n=keep_n, cooldown_days=cooldown_days)
+        outcome = await _purge_one(
+            item, root, keep_n=keep_n, cooldown_days=cooldown_days
+        )
+        if outcome["claimed"]:
             item["purged"] = True
+            result = outcome["result"]
             item["files_removed"] = result["files_removed"]
             item["bytes_freed"] = result["bytes_freed"]
+        elif outcome["reason"] == "status_changed":
+            # 计划生成后用户恢复了该模型（status 已非 archived）：不删盘、不写墓碑。
+            summary["skipped"].append(
+                {
+                    "model_id": item["model_id"],
+                    "tenant_id": item["tenant_id"],
+                    "user_id": item["user_id"],
+                    "market": item["market"],
+                    "reason": "status_changed",
+                }
+            )
         else:
-            summary["errors"].append({**result, "tenant_id": item["tenant_id"],
-                                      "user_id": item["user_id"]})
+            result = outcome["result"]
+            summary["errors"].append(
+                {**result, "tenant_id": item["tenant_id"], "user_id": item["user_id"]}
+            )
     return summary
 
 
-async def _mark_purged(
+async def _purge_one(
+    item: Mapping[str, Any],
+    root: Path | str,
+    *,
+    keep_n: int,
+    cooldown_days: int,
+) -> dict[str, Any]:
+    """单模型清退：**先锁行 → 删产物 → 写墓碑**，全程持锁。
+
+    与 ``model_registry.restore_model`` 的 ``SELECT ... FOR UPDATE`` 互斥，消除
+    「恢复校验产物通过 → 清退删盘」的 TOCTOU：
+
+    - 恢复先拿锁：本函数等锁，拿到后发现 status 已非 archived → 跳过（不删盘）；
+    - 清退先拿锁：恢复等锁，拿到后看到 ``artifacts_purged`` 墓碑 → 拒绝恢复。
+
+    ``status_changed`` 之外的非成功结果都带原始 ``result`` 供上层记 errors。
+    """
+    from sqlalchemy import text
+
+    from backend.shared.database_manager_v2 import get_session
+
+    async with get_session() as session:
+        status = (
+            await session.execute(
+                text(
+                    "SELECT status FROM qm_user_models "
+                    "WHERE tenant_id = :tenant_id AND user_id = :user_id "
+                    "AND model_id = :model_id FOR UPDATE"
+                ),
+                {
+                    "tenant_id": item["tenant_id"],
+                    "user_id": item["user_id"],
+                    "model_id": item["model_id"],
+                },
+            )
+        ).scalar_one_or_none()
+        if status is None:
+            return {
+                "claimed": False,
+                "reason": "missing_row",
+                "result": {
+                    "model_id": item["model_id"],
+                    "removed": False,
+                    "reason": "missing_row",
+                },
+            }
+        if str(status) != "archived":
+            return {"claimed": False, "reason": "status_changed"}
+
+        result = await asyncio.to_thread(
+            purge_model_artifacts, root, item["model_id"], item.get("storage_path")
+        )
+        if not (result["removed"] or result["reason"] == "not_found"):
+            return {"claimed": False, "reason": "purge_failed", "result": result}
+        await _mark_purged_locked(
+            session, item, result, keep_n=keep_n, cooldown_days=cooldown_days
+        )
+        return {"claimed": True, "result": result}
+
+
+async def _mark_purged_locked(
+    session: Any,
     item: Mapping[str, Any],
     result: Mapping[str, Any],
     *,
     keep_n: int,
     cooldown_days: int,
 ) -> None:
-    """墓碑 + 审计（同事务）。**不动 updated_at**——它是归档时间戳代理（见模块 docstring）。"""
+    """墓碑 + 审计（调用方事务内，且已持行锁）。**不动 updated_at**——归档时间戳代理。"""
     from sqlalchemy import text
 
-    from backend.shared.database_manager_v2 import get_session
     from backend.shared.utc_datetime import utc_now
 
     now = utc_now()
@@ -385,33 +463,33 @@ async def _mark_purged(
         f"产物已清 {'not_found（已不在盘）' if result.get('reason') == 'not_found' else str(result.get('files_removed')) + ' 文件'}，"
         f"释放 {int(result.get('bytes_freed') or 0)} 字节；DB 行保留（墓碑 artifacts_purged）"
     )
-    async with get_session() as session:
-        await session.execute(
-            text(
-                "UPDATE qm_user_models "
-                "SET metadata_json = COALESCE(metadata_json, '{}'::jsonb) || CAST(:patch AS JSONB) "
-                "WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id"
-            ),
-            {
-                "patch": json.dumps(patch, ensure_ascii=False),
-                "tenant_id": item["tenant_id"],
-                "user_id": item["user_id"],
-                "model_id": item["model_id"],
-            },
-        )
-        await session.execute(
-            text(
-                "INSERT INTO user_audit_logs "
-                "(user_id, tenant_id, action, resource, resource_id, description, success, created_at) "
-                "VALUES (:user_id, :tenant_id, :action, :resource, :resource_id, :description, TRUE, :created_at)"
-            ),
-            {
-                "user_id": item["user_id"],
-                "tenant_id": item["tenant_id"],
-                "action": AUDIT_ACTION_PURGE,
-                "resource": "qm_user_models",
-                "resource_id": item["model_id"],
-                "description": description[:2000],
-                "created_at": now,
-            },
-        )
+    await session.execute(
+        text(
+            "UPDATE qm_user_models "
+            "SET metadata_json = COALESCE(metadata_json, '{}'::jsonb) || CAST(:patch AS JSONB) "
+            "WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id "
+            "AND status = 'archived'"
+        ),
+        {
+            "patch": json.dumps(patch, ensure_ascii=False),
+            "tenant_id": item["tenant_id"],
+            "user_id": item["user_id"],
+            "model_id": item["model_id"],
+        },
+    )
+    await session.execute(
+        text(
+            "INSERT INTO user_audit_logs "
+            "(user_id, tenant_id, action, resource, resource_id, description, success, created_at) "
+            "VALUES (:user_id, :tenant_id, :action, :resource, :resource_id, :description, TRUE, :created_at)"
+        ),
+        {
+            "user_id": item["user_id"],
+            "tenant_id": item["tenant_id"],
+            "action": AUDIT_ACTION_PURGE,
+            "resource": "qm_user_models",
+            "resource_id": item["model_id"],
+            "description": description[:2000],
+            "created_at": now,
+        },
+    )

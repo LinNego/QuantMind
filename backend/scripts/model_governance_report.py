@@ -5,8 +5,8 @@
 
 - ``qm_model_rollouts``——晋升/回滚/拒绝的治理链（谁在何时基于何证据决策，理由必填）；
   活跃阶段（replay_eval/observing/gate_passed）进度另列；
-- ``user_audit_logs``——生命周期动作（``model.archive`` 归档、``model.retire_purge``
-  退役清退；见 ``backend/shared/model_retirement.py``）。
+- ``user_audit_logs``——生命周期动作（``model.archive`` 归档、``model.restore``
+  恢复、``model.retire_purge`` 退役清退；见 ``backend/shared/model_retirement.py``）。
 
 用法::
 
@@ -32,6 +32,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from backend.shared.model_retirement import (  # noqa: E402
     AUDIT_ACTION_ARCHIVE,
     AUDIT_ACTION_PURGE,
+    AUDIT_ACTION_RESTORE,
 )
 
 _DECIDED_STAGES = ("promoted", "rolled_back", "rejected")
@@ -116,12 +117,14 @@ async def _collect(args: argparse.Namespace) -> dict:
                     text(
                         "SELECT created_at, tenant_id, user_id, action, resource_id, description "
                         "FROM user_audit_logs "
-                        "WHERE action IN (:a_archive, :a_purge) AND created_at >= :since"
+                        "WHERE action IN (:a_archive, :a_purge, :a_restore) "
+                        "AND created_at >= :since"
                         f"{owner_sql} ORDER BY created_at DESC LIMIT :lim"
                     ),
                     {
                         "a_archive": AUDIT_ACTION_ARCHIVE,
                         "a_purge": AUDIT_ACTION_PURGE,
+                        "a_restore": AUDIT_ACTION_RESTORE,
                         **owner_params,
                         "since": since,
                         "lim": args.limit,
