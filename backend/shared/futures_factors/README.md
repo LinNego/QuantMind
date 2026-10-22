@@ -126,6 +126,40 @@ fwd_xs_hd  = fwd_ret_hd - 同日全品种均值
   该报告的 `close_fwd` 标签**不含执行滞后**（`close[t+k]/close[t]−1`），
   只用于横向筛查；本节的 IC 才是按训练标签口径算的。
 
+## 训练读取
+
+```python
+import os
+from pathlib import Path
+
+import pandas as pd
+
+from backend.services.engine.data_platform.quantdb_factor_reader import (
+    QuantDBFactorReader,
+)
+from backend.shared.futures_factors.registry import FEATURE_COLS
+
+reader = QuantDBFactorReader(market="FUTURES")
+X = reader.read_range(
+    "futures_factors", features=list(FEATURE_COLS),
+    start="2025-01-01", end="2026-10-21",
+)  # 输出 symbol, trade_date, 因子列, OHLCV
+
+root = Path(os.environ.get("QM_QUANTFUTURES_DATA_DIR", "data/quantfutures"))
+y = pd.concat(
+    pd.read_parquet(p)
+    for p in sorted((root / "6_ml_datasets" / "futures_factors_labels").glob("dt=*/data.parquet"))
+)
+y["trade_date"] = pd.to_datetime(y["date"])
+df = X.merge(
+    y[["symbol", "trade_date", "fwd_ret_1d", "fwd_xs_1d", "fwd_ret_5d", "fwd_xs_5d"]],
+    on=["symbol", "trade_date"], how="left",
+)
+```
+
+`read_range` 的 `features` 必须显式传列名；`futures_factors_labels` 已在读取层
+的发现/训练排除清单里，不会被自动当成因子源。
+
 ## 训练前处理
 
 1. **切分**：`fwd_*` 标签是重叠窗口，按时间切分时验证/测试集前留 `h+1` 个交易日
