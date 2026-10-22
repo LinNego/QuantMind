@@ -261,56 +261,60 @@ class TdxClient:
 
     # ---- 专业数据 ----
 
+    # ---- pro-data（财务/个股交易/板块交易/市场交易/单股单表） ----
+    # 发给 DLL 的键必须是 **table_list**（官方 tqcenter 的 batch_json 同用此键）。
+    # 旧实现发 field_list，DLL 直接回 `json has no table_list`（ErrorId=10），
+    # 被采集链路误判成「缺数据包 blocked」——2026-10-22 直连 17709 实测纠正。
     def get_financial_data(self, stock_list: list = None, field_list: list = None,
                            start_time: str = "", end_time: str = "",
                            report_type: str = "report_time") -> dict:
         return self._call("get_financial_data", {
-            "stock_list": stock_list or [], "field_list": field_list or [],
+            "stock_list": stock_list or [], "table_list": field_list or [],
             "start_time": start_time, "end_time": end_time, "report_type": report_type})
 
     def get_financial_data_by_date(self, stock_list: list = None, field_list: list = None,
                                    year: int = 0, mmdd: int = 0) -> dict:
         return self._call("get_financial_data_by_date", {
-            "stock_list": stock_list or [], "field_list": field_list or [],
+            "stock_list": stock_list or [], "table_list": field_list or [],
             "year": year, "mmdd": mmdd})
 
     def get_gpjy_value(self, stock_list: list = None, field_list: list = None,
                        start_time: str = "", end_time: str = "") -> dict:
         return self._call("get_gpjy_value", {
-            "stock_list": stock_list or [], "field_list": field_list or [],
+            "stock_list": stock_list or [], "table_list": field_list or [],
             "start_time": start_time, "end_time": end_time})
 
     def get_gpjy_value_by_date(self, stock_list: list = None, field_list: list = None,
                                year: int = 0, mmdd: int = 0) -> dict:
         return self._call("get_gpjy_value_by_date", {
-            "stock_list": stock_list or [], "field_list": field_list or [],
+            "stock_list": stock_list or [], "table_list": field_list or [],
             "year": year, "mmdd": mmdd})
 
     def get_bkjy_value(self, stock_list: list = None, field_list: list = None,
                        start_time: str = "", end_time: str = "") -> dict:
         return self._call("get_bkjy_value", {
-            "stock_list": stock_list or [], "field_list": field_list or [],
+            "stock_list": stock_list or [], "table_list": field_list or [],
             "start_time": start_time, "end_time": end_time})
 
     def get_bkjy_value_by_date(self, stock_list: list = None, field_list: list = None,
                                year: int = 0, mmdd: int = 0) -> dict:
         return self._call("get_bkjy_value_by_date", {
-            "stock_list": stock_list or [], "field_list": field_list or [],
+            "stock_list": stock_list or [], "table_list": field_list or [],
             "year": year, "mmdd": mmdd})
 
     def get_scjy_value(self, field_list: list = None, start_time: str = "",
                        end_time: str = "") -> dict:
         return self._call("get_scjy_value", {
-            "field_list": field_list or [], "start_time": start_time, "end_time": end_time})
+            "table_list": field_list or [], "start_time": start_time, "end_time": end_time})
 
     def get_scjy_value_by_date(self, field_list: list = None, year: int = 0,
                                mmdd: int = 0) -> dict:
         return self._call("get_scjy_value_by_date", {
-            "field_list": field_list or [], "year": year, "mmdd": mmdd})
+            "table_list": field_list or [], "year": year, "mmdd": mmdd})
 
     def get_gp_one_data(self, stock_list: list = None, field_list: list = None) -> dict:
         return self._call("get_gp_one_data", {
-            "stock_list": stock_list or [], "field_list": field_list or []})
+            "stock_list": stock_list or [], "table_list": field_list or []})
 
     # ---- 板块管理 ----
 

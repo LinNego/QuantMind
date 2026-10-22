@@ -213,7 +213,16 @@ def main():
     CAPTURED.clear()
     tdx.get_financial_data(["600519.SH"], ["FN1"], "20260101", "20261231")
     m, p = CAPTURED[-1]
-    assert p["stock_list"] == ["600519.SH"] and p["field_list"] == ["FN1"]
+    assert p["stock_list"] == ["600519.SH"] and p["table_list"] == ["FN1"], p
+    assert "field_list" not in p, "pro-data 必须发 table_list（DLL 只认这个键）"
+    CAPTURED.clear()
+    tdx.get_scjy_value(["SC01"])
+    m, p = CAPTURED[-1]
+    assert p["table_list"] == ["SC01"] and "field_list" not in p, p
+    CAPTURED.clear()
+    tdx.get_gp_one_data(["600519.SH"], ["GO1"])
+    m, p = CAPTURED[-1]
+    assert p["table_list"] == ["GO1"] and "field_list" not in p, p
     CAPTURED.clear()
     tdx.formula_process_mul_xg("CROSS", ["600519.SH"], return_count=3)
     m, p = CAPTURED[-1]
