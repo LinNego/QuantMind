@@ -1,477 +1,797 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>通达信交易桥 - 控制台</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TDX Bridge · 通达信交易桥</title>
 <style>
-* { margin:0; padding:0; box-sizing:border-box; }
-body { font-family:'Segoe UI','Microsoft YaHei',sans-serif; background:#0f172a; color:#e2e8f0; min-height:100vh; }
-.header { background:#1e293b; padding:20px 24px; border-bottom:1px solid #334155; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; }
-.header h1 { font-size:20px; color:#38bdf8; display:flex; align-items:center; gap:10px; }
-.header .sub { color:#94a3b8; font-size:13px; margin-top:4px; }
-.status-badge { padding:6px 14px; border-radius:20px; font-size:13px; font-weight:bold; }
-.status-ok { background:#065f46; color:#34d399; }
-.status-warn { background:#78350f; color:#fbbf24; }
-.status-err { background:#7f1d1d; color:#fca5a5; }
-.container { padding:24px; max-width:1200px; margin:0 auto; }
-.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; margin-bottom:24px; }
-.card { background:#1e293b; border-radius:12px; padding:18px; border:1px solid #334155; }
-.card h3 { font-size:14px; color:#94a3b8; margin-bottom:14px; display:flex; align-items:center; gap:8px; }
-.card .value { font-size:26px; font-weight:bold; color:#f1f5f9; }
-.card .label { font-size:12px; color:#64748b; margin-top:4px; }
-.card .detail { font-size:12px; color:#94a3b8; margin-top:8px; line-height:1.7; }
-.kpi-row { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin-bottom:24px; }
-.kpi { background:#1e293b; border-radius:12px; padding:16px; border:1px solid #334155; text-align:center; }
-.kpi .v { font-size:22px; font-weight:bold; color:#38bdf8; }
-.kpi .l { font-size:12px; color:#64748b; margin-top:4px; }
-.section { background:#1e293b; border-radius:12px; padding:18px; border:1px solid #334155; margin-bottom:24px; }
-.section h2 { font-size:15px; color:#f1f5f9; margin-bottom:14px; }
-table { width:100%; border-collapse:collapse; font-size:12px; }
-th { text-align:left; color:#94a3b8; padding:8px 10px; border-bottom:1px solid #334155; font-weight:500; }
-td { padding:8px 10px; border-bottom:1px solid #1e293b; color:#cbd5e1; }
-tr:hover td { background:#0f172a; }
-.method-select { width:100%; padding:10px; border-radius:8px; background:#0f172a; color:#e2e8f0; border:1px solid #334155; font-size:13px; }
-textarea { width:100%; padding:10px; border-radius:8px; background:#0f172a; color:#e2e8f0; border:1px solid #334155; font-size:12px; font-family:monospace; min-height:80px; }
-button { padding:10px 20px; border-radius:8px; border:none; background:#0ea5e9; color:#fff; font-size:13px; font-weight:bold; cursor:pointer; }
-button:hover { background:#0284c7; }
-button.secondary { background:#334155; }
-button.danger { background:#dc2626; }
-.result-box { margin-top:12px; padding:12px; background:#0f172a; border-radius:8px; border:1px solid #334155; font-size:12px; font-family:monospace; white-space:pre-wrap; max-height:300px; overflow:auto; color:#34d399; }
-.token-box { display:flex; gap:10px; align-items:center; }
-.token-box input { flex:1; padding:10px; border-radius:8px; background:#0f172a; color:#e2e8f0; border:1px solid #334155; font-family:monospace; font-size:12px; }
-.refresh-btn { background:transparent; border:1px solid #334155; color:#94a3b8; padding:6px 12px; font-size:12px; }
-.refresh-btn:hover { color:#38bdf8; border-color:#38bdf8; }
-.copy-btn { background:#334155; padding:6px 12px; font-size:12px; }
-.badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold; }
-.badge-green { background:#065f46; color:#34d399; }
-.badge-red { background:#7f1d1d; color:#fca5a5; }
-.badge-yellow { background:#78350f; color:#fbbf24; }
-.badge-blue { background:#1e3a8a; color:#93c5fd; }
-.ip-chip { display:inline-block; background:#0f172a; border:1px solid #334155; border-radius:6px; padding:4px 10px; margin:3px; font-family:monospace; font-size:12px; color:#38bdf8; }
-.copyable { cursor:pointer; }
-.copyable:hover { color:#38bdf8; text-decoration:underline; }
+  :root{
+    --bg:#070d17; --bg2:#0a1322; --surface:#0d1727; --surface2:#111e31;
+    --line:#1b2a41; --line2:#243a58; --text:#e8eef8; --muted:#7d90ab;
+    --accent:#38bdf8; --accent2:#22d3ee; --green:#22c55e; --amber:#f59e0b; --red:#ef4444;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:Inter,"Segoe UI",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  html[data-theme="light"]{
+    --bg:#f4f7fb; --bg2:#eef3f9; --surface:#ffffff; --surface2:#f7f9fc;
+    --line:#dce5f0; --line2:#c7d4e4; --text:#15243a; --muted:#5e718c;
+    --accent:#0284c7; --accent2:#0891b2; --green:#15803d; --amber:#b45309; --red:#b91c1c;
+  }
+  html[data-theme="light"] body{
+    background:
+      radial-gradient(1100px 520px at 8% -8%,rgba(2,132,199,.07),transparent 62%),
+      radial-gradient(900px 500px at 100% 0%,rgba(8,145,178,.05),transparent 58%),
+      var(--bg);
+  }
+  html[data-theme="light"] .pill{background:rgba(255,255,255,.86);color:#4f647f}
+  html[data-theme="light"] .pill.ok{color:#166534;background:rgba(22,163,74,.10);border-color:rgba(22,163,74,.28)}
+  html[data-theme="light"] .pill.bad{color:#991b1b;background:rgba(220,38,38,.08);border-color:rgba(220,38,38,.25)}
+  html[data-theme="light"] .pill.warn{color:#92400e;background:rgba(217,119,6,.09);border-color:rgba(217,119,6,.25)}
+  html[data-theme="light"] .kpi{background:linear-gradient(180deg,#fff,#fbfcfe);box-shadow:0 2px 10px rgba(21,36,58,.05)}
+  html[data-theme="light"] .panel{background:linear-gradient(180deg,#fff,#fbfcfe);box-shadow:0 2px 12px rgba(21,36,58,.045)}
+  html[data-theme="light"] .slot{background:linear-gradient(180deg,#fff,#fbfcfe);box-shadow:0 2px 10px rgba(21,36,58,.04)}
+  html[data-theme="light"] .panel-head h2{color:#243b55}
+  html[data-theme="light"] .res-row .num,
+  html[data-theme="light"] .metrics .m strong,
+  html[data-theme="light"] .kpi .sub b,
+  html[data-theme="light"] .slot-nums strong,
+  html[data-theme="light"] .slot-foot b,
+  html[data-theme="light"] .account-grid .a strong{color:#1b2f48}
+  html[data-theme="light"] .bar{background:#e5edf7}
+  html[data-theme="light"] .slot-badge,
+  html[data-theme="light"] .badge{background:#eef3f9;color:#4d627c;border-color:var(--line2)}
+  html[data-theme="light"] .badge.green{background:rgba(22,163,74,.10);color:#166534}
+  html[data-theme="light"] .badge.red{background:rgba(220,38,38,.08);color:#991b1b}
+  html[data-theme="light"] .badge.amber{background:rgba(217,119,6,.09);color:#92400e}
+  html[data-theme="light"] .account-grid .a{background:#f7f9fc}
+  html[data-theme="light"] input,
+  html[data-theme="light"] select,
+  html[data-theme="light"] textarea{background:#fff;color:var(--text)}
+  html[data-theme="light"] .result-box{background:#f7f9fc;color:#243b55}
+  html[data-theme="light"] th{border-bottom-color:#dce5f0}
+  html[data-theme="light"] td{border-bottom-color:#e8eef6}
+  html[data-theme="light"] tr:hover td{background:rgba(2,132,199,.035)}
+  html[data-theme="light"] .btn{background:#fff;color:#1b2f48}
+  html[data-theme="light"] .btn:hover{border-color:var(--accent);color:#075985}
+  html[data-theme="light"] .btn.primary{background:linear-gradient(135deg,#0284c7,#0891b2);color:#fff}
+  html[data-theme="light"] .brand-sub,
+  html[data-theme="light"] .hint,
+  html[data-theme="light"] .muted,
+  html[data-theme="light"] .clock{color:#5e718c}
+  html[data-theme="light"] .slot-name{color:#0369a1}
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:
+      radial-gradient(1100px 520px at 8% -8%,rgba(56,189,248,.10),transparent 62%),
+      radial-gradient(900px 500px at 100% 0%,rgba(34,211,238,.06),transparent 58%),
+      var(--bg);
+    color:var(--text);font-family:var(--sans);font-size:15px;line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  .app{max-width:1680px;margin:0 auto;padding:22px 26px 40px}
+  .topbar{display:flex;align-items:center;gap:22px;padding:6px 2px 18px;border-bottom:1px solid var(--line);margin-bottom:18px}
+  .brand{display:flex;align-items:center;gap:12px;min-width:250px}
+  .brand-mark{width:42px;height:42px;border-radius:11px;display:grid;place-items:center;
+    background:linear-gradient(145deg,#0ea5e9,#0e7490);color:#001018;font:800 12px/1 var(--mono);
+    box-shadow:0 8px 24px rgba(14,165,233,.25), inset 0 1px 0 rgba(255,255,255,.25)}
+  .brand-title{font-size:18px;font-weight:650;letter-spacing:.2px}
+  .brand-sub{font-size:10px;letter-spacing:1.8px;color:var(--muted);text-transform:uppercase;margin-top:2px}
+  .status-strip{display:flex;gap:8px;flex-wrap:wrap;flex:1}
+  .pill{display:inline-flex;align-items:center;gap:7px;padding:7px 12px;border:1px solid var(--line2);
+    border-radius:999px;background:rgba(17,30,49,.72);font-size:12.5px;color:var(--muted);white-space:nowrap}
+  .pill i{width:7px;height:7px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 3px rgba(125,144,171,.10)}
+  .pill.ok{color:#b7f7d3;border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.08)}
+  .pill.ok i{background:var(--green);box-shadow:0 0 0 3px rgba(34,197,94,.15)}
+  .pill.bad{color:#ffd0d0;border-color:rgba(239,68,68,.38);background:rgba(239,68,68,.09)}
+  .pill.bad i{background:var(--red);box-shadow:0 0 0 3px rgba(239,68,68,.16)}
+  .pill.warn{color:#ffe3a8;border-color:rgba(245,158,11,.38);background:rgba(245,158,11,.08)}
+  .pill.warn i{background:var(--amber);box-shadow:0 0 0 3px rgba(245,158,11,.16)}
+  .top-actions{display:flex;align-items:center;gap:12px}
+  .clock{font:13px var(--mono);color:var(--muted);letter-spacing:.5px}
+  .btn{border:1px solid var(--line2);background:var(--surface2);color:var(--text);
+    padding:9px 15px;border-radius:9px;font:600 13px var(--sans);cursor:pointer;transition:.18s}
+  .btn:hover{border-color:var(--accent);color:#dff7ff;transform:translateY(-1px)}
+  .btn:active{transform:translateY(0)}
+  .btn.primary{background:linear-gradient(135deg,#0ea5e9,#0891b2);border-color:transparent;color:#001018}
+  .btn.ghost{background:transparent}
+  .grid{display:grid;gap:12px}
+  .kpi-grid{grid-template-columns:repeat(auto-fit,minmax(195px,1fr));margin-bottom:12px}
+  .kpi{position:relative;background:linear-gradient(180deg,rgba(17,30,49,.96),rgba(13,23,39,.96));
+    border:1px solid var(--line);border-radius:13px;padding:14px 16px 13px;overflow:hidden;transition:.2s}
+  .kpi:hover{border-color:var(--line2);transform:translateY(-1px)}
+  .kpi::before{content:"";position:absolute;left:0;top:14px;bottom:14px;width:2px;background:var(--accent);opacity:.75}
+  .kpi.warn::before{background:var(--amber)}
+  .kpi.bad::before{background:var(--red)}
+  .kpi .label{font-size:11px;letter-spacing:1.4px;text-transform:uppercase;color:var(--muted)}
+  .kpi .value{font:650 27px/1.25 var(--mono);margin-top:6px;letter-spacing:-.4px}
+  .kpi .sub{font-size:12px;color:var(--muted);margin-top:3px}
+  .kpi .sub b{color:#c6d6ea;font-weight:600}
+  .grid-2{grid-template-columns:1.35fr 1fr;margin-bottom:12px}
+  @media(max-width:1080px){.grid-2{grid-template-columns:1fr}}
+  .panel{background:linear-gradient(180deg,rgba(13,23,39,.97),rgba(10,19,34,.97));
+    border:1px solid var(--line);border-radius:14px;padding:17px 18px;margin-bottom:12px}
+  .panel-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:14px}
+  .panel-head h2{margin:0;font-size:14px;letter-spacing:.8px;text-transform:uppercase;color:#c7d6e8}
+  .hint{font-size:11.5px;color:var(--muted);letter-spacing:.3px}
+  .res-row{display:grid;grid-template-columns:76px 1fr 64px;align-items:center;gap:12px;margin:10px 0}
+  .res-row .name{font-size:12.5px;color:var(--muted)}
+  .res-row .num{font:600 13px var(--mono);color:#cfe0f3;text-align:right}
+  .bar{height:6px;border-radius:999px;background:#16243a;overflow:hidden;position:relative}
+  .bar i{display:block;height:100%;width:0;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .5s ease}
+  .bar.warn i{background:linear-gradient(90deg,#f59e0b,#fbbf24)}
+  .bar.bad i{background:linear-gradient(90deg,#ef4444,#f87171)}
+  .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px 14px;margin-top:14px;padding-top:13px;border-top:1px dashed var(--line)}
+  .metrics .m{display:flex;flex-direction:column;gap:2px}
+  .metrics .m span{font-size:11.5px;color:var(--muted)}
+  .metrics .m strong{font:600 14px var(--mono);color:#dbe8f7;font-weight:600}
+  .slot-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+  .slot{background:linear-gradient(180deg,rgba(17,30,49,.95),rgba(12,22,38,.95));
+    border:1px solid var(--line);border-radius:12px;padding:14px;transition:.2s}
+  .slot:hover{border-color:var(--line2)}
+  .slot-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+  .slot-name{font:700 13px var(--mono);letter-spacing:1.5px;color:var(--accent)}
+  .slot-sub{font-size:11.5px;color:var(--muted)}
+  .slot-badge{margin-left:auto;font:600 11px var(--mono);color:#9fb4cd;background:#142033;border:1px solid var(--line2);padding:3px 8px;border-radius:999px}
+  .slot-nums{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px}
+  .slot-nums div{display:flex;flex-direction:column;gap:1px}
+  .slot-nums strong{font:650 20px var(--mono);color:#eaf3ff}
+  .slot-nums span{font-size:11px;color:var(--muted)}
+  .slot-foot{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:10px;font:12px var(--mono);color:var(--muted)}
+  .slot-foot b{color:#cfe0f3;font-weight:600}
+  .account-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+  .account-grid .a{background:#101c2e;border:1px solid var(--line);border-radius:10px;padding:11px 12px}
+  .account-grid .a span{display:block;font-size:11.5px;color:var(--muted)}
+  .account-grid .a strong{display:block;font:650 18px var(--mono);margin-top:3px;color:#eaf3ff}
+  table{width:100%;border-collapse:collapse}
+  th{font-size:11px;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+  td{font-size:12.5px;padding:9px 10px;border-bottom:1px solid rgba(27,42,65,.6);color:#c9d7e8;vertical-align:middle}
+  tr:hover td{background:rgba(56,189,248,.04)}
+  .mono{font-family:var(--mono)}
+  .muted{color:var(--muted)}
+  .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:999px;font:600 10.5px var(--mono);border:1px solid var(--line2);color:#a9bdd6;background:#122033}
+  .badge.green{color:#b7f7d3;border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.08)}
+  .badge.red{color:#ffd0d0;border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.08)}
+  .badge.amber{color:#ffe3a8;border-color:rgba(245,158,11,.35);background:rgba(245,158,11,.08)}
+  .field{display:flex;flex-direction:column;gap:5px;margin-bottom:10px}
+  .field label{font-size:11.5px;color:var(--muted);letter-spacing:.4px}
+  input,select,textarea{width:100%;background:#0b1525;border:1px solid var(--line2);border-radius:8px;color:var(--text);
+    padding:10px 12px;font:13px var(--mono);outline:none;transition:.18s}
+  input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(56,189,248,.12)}
+  textarea{min-height:82px;resize:vertical}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  .row > *{flex:1}
+  .result-box{display:none;margin-top:10px;background:#0b1525;border:1px solid var(--line2);border-radius:9px;padding:12px;
+    font:12.5px/1.55 var(--mono);white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto;color:#c9d7e8}
+  .msg{font-size:12.5px;color:var(--muted);margin-top:8px;white-space:pre-wrap}
+  .empty{padding:18px;text-align:center;color:var(--muted);font-size:12.5px}
+  .sparkline{height:3px;border-radius:999px;background:#16243a;margin-top:8px;overflow:hidden}
+  .sparkline i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:0;transition:width .4s}
+  footer{padding:18px 2px 0;border-top:1px solid var(--line);margin-top:18px;font-size:11.5px;color:var(--muted);
+    display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .dot{width:6px;height:6px;border-radius:50%;display:inline-block;background:var(--muted)}
+  .dot.green{background:var(--green)} .dot.red{background:var(--red)} .dot.amber{background:var(--amber)}
 </style>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('tdx-theme')||'dark'}catch(e){}</script>
 </head>
 <body>
-
-<div class="header">
-  <div>
-    <h1>📡 通达信交易桥 控制台</h1>
-    <div class="sub">Windows 桥管理面板 · 实时状态监控 · 接口调试</div>
-  </div>
-  <div style="display:flex;align-items:center;gap:12px;">
-    <span id="tdxBadge" class="status-badge status-warn">检测中...</span>
-    <button class="refresh-btn" onclick="loadStats()">🔄 刷新</button>
-  </div>
-</div>
-
-<div class="container">
-
-  <!-- 本机信息 -->
-  <div class="section">
-    <h2>🖥️ 本机信息</h2>
-    <div id="machineInfo" style="font-size:13px;color:#94a3b8;line-height:2;">
-      加载中...
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">TDX</div>
+      <div>
+        <div class="brand-title">通达信交易桥</div>
+        <div class="brand-sub">Bridge Control · Trading Desk</div>
+      </div>
     </div>
-  </div>
+    <div class="status-strip">
+      <span class="pill" id="pillTdx"><i></i><span>TDX 探测中</span></span>
+      <span class="pill" id="pillCollector"><i></i><span>采集器探测中</span></span>
+      <span class="pill" id="pillLimits"><i></i><span>硬上限 --</span></span>
+      <span class="pill" id="pillWriter"><i></i><span>日志线程 --</span></span>
+    </div>
+    <div class="top-actions">
+      <span class="clock" id="clock">--:--:--</span>
+      <button class="btn ghost" id="themeBtn" onclick="toggleTheme()">浅色</button>
+      <button class="btn ghost" onclick="refreshAll()">刷新</button>
+    </div>
+  </header>
 
-  <!-- 连接状态 -->
-  <div class="grid">
-    <div class="card">
-      <h3>🔗 桥状态</h3>
-      <div id="bridgeStatus" class="value">-</div>
-      <div class="detail" id="bridgeDetail"></div>
-    </div>
-    <div class="card">
-      <h3>💼 通达信</h3>
-      <div id="tdxStatus" class="value">-</div>
-      <div class="detail" id="tdxDetail"></div>
-    </div>
-    <div class="card">
-      <h3>🔑 Token</h3>
-      <div id="tokenStatus" class="value">-</div>
-      <div class="detail" id="tokenDetail"></div>
-    </div>
-    <div class="card">
-      <h3>💾 缓存</h3>
-      <div id="cacheStatus" class="value">-</div>
-      <div class="detail" id="cacheDetail"></div>
-    </div>
-  </div>
+  <main>
+    <section class="grid kpi-grid">
+      <div class="kpi" id="kpiOrders">
+        <div class="label">今日下单</div>
+        <div class="value" id="kpiOrdersValue">--</div>
+        <div class="sub" id="kpiOrdersSub">硬上限 1999 · 第 150 笔预警</div>
+      </div>
+      <div class="kpi" id="kpiCancels">
+        <div class="label">今日撤单</div>
+        <div class="value" id="kpiCancelsValue">--</div>
+        <div class="sub" id="kpiCancelsSub">独立计数 · 不被下单额度连坐</div>
+      </div>
+      <div class="kpi" id="kpiOrderSlot">
+        <div class="label">ORDER 槽</div>
+        <div class="value" id="kpiOrderSlotValue">--</div>
+        <div class="sub" id="kpiOrderSlotSub">下单 / 撤单专用</div>
+      </div>
+      <div class="kpi" id="kpiTradeSlot">
+        <div class="label">TRADE 槽</div>
+        <div class="value" id="kpiTradeSlotValue">--</div>
+        <div class="sub" id="kpiTradeSlotSub">账户 / 委托查询</div>
+      </div>
+      <div class="kpi" id="kpiDataSlot">
+        <div class="label">DATA 槽</div>
+        <div class="value" id="kpiDataSlotValue">--</div>
+        <div class="sub" id="kpiDataSlotSub">行情 / 采集 / 推送</div>
+      </div>
+      <div class="kpi" id="kpiLogQueue">
+        <div class="label">日志队列</div>
+        <div class="value" id="kpiLogQueueValue">--</div>
+        <div class="sub" id="kpiLogQueueSub">调用 / 交易 · 丢弃计数</div>
+      </div>
+    </section>
 
-  <!-- 账户概览 -->
-  <div class="section">
-    <h2>💰 账户概览</h2>
-    <div id="accountEmpty" style="color:#64748b;font-size:13px;padding:12px;">账户数据加载中...</div>
-    <div class="kpi-row" id="accountKpi" style="display:none;">
-      <div class="kpi"><div class="v" id="kpiAsset">-</div><div class="l">总资产</div></div>
-      <div class="kpi"><div class="v" id="kpiCash">-</div><div class="l">可用资金</div></div>
-      <div class="kpi"><div class="v" id="kpiMarket">-</div><div class="l">持仓市值</div></div>
-      <div class="kpi"><div class="v" id="kpiBalance">-</div><div class="l">余额</div></div>
-    </div>
-  </div>
+    <section class="grid grid-2">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>系统资源</h2>
+          <span class="hint" id="sysOs">--</span>
+        </div>
+        <div class="res-row">
+          <span class="name">CPU</span>
+          <div class="bar" id="cpuBarWrap"><i id="cpuBar"></i></div>
+          <span class="num" id="cpuNum">--</span>
+        </div>
+        <div class="res-row">
+          <span class="name">内存</span>
+          <div class="bar" id="memBarWrap"><i id="memBar"></i></div>
+          <span class="num" id="memNum">--</span>
+        </div>
+        <div class="res-row">
+          <span class="name">磁盘</span>
+          <div class="bar" id="diskBarWrap"><i id="diskBar"></i></div>
+          <span class="num" id="diskNum">--</span>
+        </div>
+        <div class="metrics">
+          <div class="m"><span>进程 RSS</span><strong id="mRss">--</strong></div>
+          <div class="m"><span>线程数</span><strong id="mThreads">--</strong></div>
+          <div class="m"><span>进程 CPU</span><strong id="mProcCpu">--</strong></div>
+          <div class="m"><span>PID</span><strong id="mPid">--</strong></div>
+          <div class="m"><span>运行时长</span><strong id="mUptime">--</strong></div>
+          <div class="m"><span>TQ 健康延迟</span><strong id="mHealthMs">--</strong></div>
+          <div class="m"><span>事件循环 lag</span><strong id="mLoopLag">--</strong></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>采集器</h2>
+          <span class="hint" id="colVersion">--</span>
+        </div>
+        <div class="res-row" style="grid-template-columns:76px 1fr;">
+          <span class="name">状态</span>
+          <span id="colStatus" class="badge">探测中</span>
+        </div>
+        <div class="metrics" style="border-top:none;margin-top:6px;padding-top:0">
+          <div class="m"><span>宇宙</span><strong id="colUniverse">--</strong></div>
+          <div class="m"><span>快照 lag</span><strong id="colSnapAge">--</strong></div>
+          <div class="m"><span>分钟线 lag</span><strong id="colBarAge">--</strong></div>
+          <div class="m"><span>一轮耗时</span><strong id="colCycleMs">--</strong></div>
+          <div class="m"><span>本轮股票数</span><strong id="colCount">--</strong></div>
+          <div class="m"><span>空轮次</span><strong id="colEmpty">--</strong></div>
+        </div>
+        <div class="hint" id="colError" style="margin-top:10px"></div>
+      </div>
+    </section>
 
-  <!-- 缓存统计 -->
-  <div class="section">
-    <h2>📊 缓存统计</h2>
-    <div id="cacheStats" style="color:#94a3b8;font-size:13px;">加载中...</div>
-  </div>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>拥挤度 · 交易 / 数据分槽</h2>
+        <span class="hint">wait = 等槽延迟 · exec = TQ 执行延迟 · 百分比 = 槽占用</span>
+      </div>
+      <div class="slot-grid" id="slotGrid"></div>
+    </section>
 
-  <!-- 最近日志 -->
-  <div class="section">
-    <h2>📜 最近调用日志</h2>
-    <div style="max-height:280px;overflow:auto;">
+    <section class="grid grid-2">
+      <div class="panel">
+        <div class="panel-head"><h2>账户概览</h2><span class="hint" id="acctCurrency">--</span></div>
+        <div class="account-grid">
+          <div class="a"><span>总资产</span><strong id="acctAsset">--</strong></div>
+          <div class="a"><span>现金</span><strong id="acctCash">--</strong></div>
+          <div class="a"><span>市值</span><strong id="acctMv">--</strong></div>
+          <div class="a"><span>持仓数</span><strong id="acctPos">--</strong></div>
+        </div>
+        <div class="metrics">
+          <div class="m"><span>主机</span><strong id="sysHost">--</strong></div>
+          <div class="m"><span>端口</span><strong id="sysPort">--</strong></div>
+          <div class="m"><span>Token</span><strong id="sysToken">--</strong></div>
+        </div>
+        <div class="hint mono" id="sysUrl" style="margin-top:10px">--</div>
+        <div class="hint mono" id="sysShared" style="margin-top:3px">--</div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>缓存与安全</h2><span class="hint">SQLite / 限流</span></div>
+        <div class="metrics" style="border-top:none;margin-top:0;padding-top:0">
+          <div class="m"><span>调用日志行</span><strong id="cacheLogRows">--</strong></div>
+          <div class="m"><span>K 线行</span><strong id="cacheKline">--</strong></div>
+          <div class="m"><span>交易台账行</span><strong id="cacheTradeRows">--</strong></div>
+          <div class="m"><span>缓存库</span><strong id="cacheDisk">--</strong></div>
+          <div class="m"><span>活跃 IP</span><strong id="secActive">--</strong></div>
+          <div class="m"><span>封禁 IP</span><strong id="secBanned">--</strong></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>最近调用</h2>
+        <span class="hint">需要访问 token · 只读</span>
+      </div>
       <table id="logTable">
         <thead><tr><th>时间</th><th>方法</th><th>代码</th><th>耗时</th><th>状态</th></tr></thead>
-        <tbody></tbody>
+        <tbody><tr><td colspan="5" class="empty">在下方输入 token 后刷新</td></tr></tbody>
       </table>
-    </div>
-  </div>
+    </section>
 
-  <!-- 接口测试 -->
-  <div class="section">
-    <h2>🧪 接口测试</h2>
-    <div style="display:grid;grid-template-columns:1fr 2fr;gap:12px;">
-      <div>
-        <div style="font-size:12px;color:#94a3b8;margin-bottom:6px;">方法</div>
-        <select id="methodSelect" class="method-select"></select>
+    <section class="grid grid-2">
+      <div class="panel">
+        <div class="panel-head"><h2>接口测试</h2><span class="hint">通用 JSON-RPC 透传（交易方法已封）</span></div>
+        <div class="field">
+          <label>访问 token</label>
+          <input id="tokenInput" type="password" placeholder="BRIDGE_AUTH_TOKEN" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>方法</label>
+          <select id="methodSelect"></select>
+        </div>
+        <div class="field">
+          <label>参数 JSON</label>
+          <textarea id="paramsBox">{}</textarea>
+        </div>
+        <div class="row">
+          <button class="btn primary" onclick="callMethod()">执行</button>
+          <button class="btn ghost" onclick="clearResult()">清空</button>
+        </div>
+        <div class="result-box" id="resultBox"></div>
       </div>
-      <div>
-        <div style="font-size:12px;color:#94a3b8;margin-bottom:6px;">参数 (JSON)</div>
-        <textarea id="paramsBox">{}</textarea>
+      <div class="panel">
+        <div class="panel-head"><h2>Token 管理</h2><span class="hint">SHA256 存储 · 可随时吊销</span></div>
+        <div class="row">
+          <div class="field" style="flex:1"><label>名称</label><input id="tokenName" placeholder="如 collector / ui"></div>
+          <div class="field" style="flex:0 0 90px"><label>数量</label><input id="tokenCount" type="number" min="1" max="20" value="1"></div>
+        </div>
+        <div class="row">
+          <button class="btn primary" onclick="addTokens()">生成 token</button>
+          <button class="btn ghost" onclick="loadTokens()">刷新列表</button>
+          <button class="btn ghost" onclick="resetToken()">重置主 token</button>
+        </div>
+        <div class="msg" id="tokenMsg"></div>
+        <table id="tokenTable" style="margin-top:10px">
+          <thead><tr><th>ID</th><th>名称</th><th>状态</th><th>创建</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
       </div>
-    </div>
-    <div style="margin-top:12px;">
-      <button onclick="callMethod()">🚀 调用接口</button>
-    </div>
-    <div id="resultBox" class="result-box" style="display:none;"></div>
-  </div>
+    </section>
+  </main>
 
-  <!-- Token 管理 -->
-  <div class="section">
-    <h2>🔑 Token 管理</h2>
-    <div style="font-size:12px;color:#94a3b8;margin-bottom:12px;">
-      每台电脑/客户端分配独立 token, 支持批量生成、随时吊销。token 以 SHA256 哈希存储, 不保存明文。
-    </div>
-
-    <!-- 当前 token (用于管理操作) -->
-    <div class="token-box" style="margin-bottom:14px;">
-      <input id="tokenInput" type="text" placeholder="输入管理员 token (主 BRIDGE_AUTH_TOKEN, 用于增删管理)" style="font-family:monospace;">
-      <button class="copy-btn" onclick="copyText(document.getElementById('tokenInput').value)">📋 复制</button>
-    </div>
-
-    <!-- 新增 token -->
-    <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap;">
-      <input id="tokenName" type="text" placeholder="用途/备注 (如: 客户端101)" style="flex:1;min-width:150px;padding:10px;border-radius:8px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;font-size:12px;">
-      <input id="tokenCount" type="number" value="1" min="1" max="100" style="width:80px;padding:10px;border-radius:8px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;font-size:12px;">
-      <button onclick="addTokens()">➕ 生成 token</button>
-      <button class="secondary" onclick="loadTokens()">🔄 刷新</button>
-    </div>
-    <div id="tokenMsg" style="margin-bottom:10px;font-size:12px;color:#34d399;"></div>
-
-    <!-- token 列表 -->
-    <table id="tokenTable">
-      <thead><tr><th>ID</th><th>用途/备注</th><th>Token 哈希</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </div>
-
+  <footer>
+    <span>TDX Bridge · 实盘交易通道 · 硬上限 299/秒 · 1999/日（写死）</span>
+    <span id="lastUpdate">等待数据…</span>
+  </footer>
 </div>
 
 <script>
+const $ = (s) => document.querySelector(s);
+const S = { live: null, stats: null, timers: [], last: 0 };
+
 const METHODS = ['get_match_stkinfo','get_stock_info','get_more_info','get_stock_list','get_sector_list',
   'get_stock_list_in_sector','get_user_sector','get_relation','get_divid_factors','get_gb_info',
   'get_kzz_info','get_ipo_info','get_trackzs_etf_info','get_pricevol','get_exday_data','get_zdt_data',
   'get_trading_dates','get_financial_data','get_financial_data_by_date','get_gpjy_value','get_bkjy_value',
   'get_scjy_value','get_gp_one_data','create_sector','delete_sector','rename_sector','clear_sector',
-  'refresh_cache','refresh_kline','download_file','exec_to_tdx','send_file','send_bt_data',
+  'refresh_cache','refresh_kline','download_file','send_file','send_bt_data',
   'formula_zb','formula_xg','formula_exp','formula_get_data','formula_set_data','formula_set_data_info',
   'formula_process_mul_xg','formula_process_mul_zb','formula_process_mul_exp'];
 
-function fmtMoney(v) {
-  if (v === null || v === undefined) return '-';
-  return '¥' + Number(v).toLocaleString('zh-CN', {minimumFractionDigits:2, maximumFractionDigits:2});
+function fmtBytes(b){
+  if (b === null || b === undefined) return '--';
+  const u = ['B','KB','MB','GB','TB']; let i = 0, v = Number(b);
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + ' ' + u[i];
+}
+function fmtMs(ms){
+  if (ms === null || ms === undefined) return '--';
+  return ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : Math.round(ms) + 'ms';
+}
+function fmtAge(ms){ return ms === null || ms === undefined ? '--' : fmtMs(ms) + ' 前'; }
+function fmtInt(n){ return (n === null || n === undefined) ? '--' : Number(n).toLocaleString('en-US'); }
+function fmtNum(n, d=2){ return (n === null || n === undefined) ? '--' : Number(n).toLocaleString('zh-CN',{minimumFractionDigits:d,maximumFractionDigits:d}); }
+function pct(a, b){ return b ? Math.min(100, Math.round(100 * a / b)) : 0; }
+function barClass(p){ return p >= 85 ? 'bad' : p >= 60 ? 'warn' : ''; }
+
+async function fetchJSON(path, opts = {}, timeout = 8000){
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    const res = await fetch(path, { ...opts, signal: ctrl.signal });
+    const text = await res.text();
+    let body; try { body = JSON.parse(text); } catch { throw new Error('非 JSON 响应'); }
+    return { status: res.status, body };
+  } finally { clearTimeout(timer); }
 }
 
-function fmtTime(ts) {
-  return new Date(ts).toLocaleString('zh-CN', {hour12:false});
+function setPill(id, state, text){
+  const el = $(id); if (!el) return;
+  el.classList.remove('ok','bad','warn');
+  if (state) el.classList.add(state);
+  const span = el.querySelector('span'); if (span) span.textContent = text;
 }
 
-async function api(path, opts = {}) {
-  const res = await fetch(path, {
-    headers: {'Content-Type':'application/json', ...(opts.headers||{})},
-    ...opts
-  });
-  return res.json();
+function renderSlot(kind, name, sub, s){
+  const card = document.getElementById('slot-' + kind);
+  if (!card || !s) return;
+  const inflight = s.inflight || 0, slots = s.slots || 1, waiting = s.waiting || 0;
+  card.querySelector('[data-f=inflight]').textContent = inflight + '/' + slots;
+  card.querySelector('[data-f=waiting]').textContent = waiting;
+  card.querySelector('[data-f=waitmax]').textContent = fmtMs(s.wait_ms_max);
+  const util = pct(inflight + waiting, slots);
+  const bar = card.querySelector('.bar');
+  bar.className = 'bar ' + barClass(util);
+  bar.querySelector('i').style.width = util + '%';
+  card.querySelector('[data-f=ep50]').textContent = fmtMs(s.exec_ms_p50);
+  card.querySelector('[data-f=ep95]').textContent = fmtMs(s.exec_ms_p95);
+  card.querySelector('[data-f=calls]').textContent = fmtInt(s.calls);
+  card.querySelector('[data-f=timeouts]').textContent = fmtInt(s.timeouts);
 }
 
-function initMethods() {
-  const sel = document.getElementById('methodSelect');
-  sel.innerHTML = METHODS.map(m => `<option value="${m}">${m}</option>`).join('');
-  // 常用方法预填参数
-  sel.onchange = () => {
-    const m = sel.value;
-    const defaults = {
-      'get_stock_info': '{"stock_code":"600519.SH","field_list":["Name","Zsz"]}',
-      'get_market_snapshot': '{"stock_code":"600519.SH"}',
-      'get_stock_list': '{"market":"50","list_type":1}',
-      'get_financial_data': '{"stock_list":["600519.SH"],"field_list":["FN1"]}',
-      'get_zdt_data': '{"stock_list":["600519.SH"]}',
-      'formula_xg': '{"formula_name":"CROSS","formula_arg":"5,20"}',
-      'get_stock_list_in_sector': '{"block_code":"880301"}',
-    };
-    document.getElementById('paramsBox').value = defaults[m] || '{}';
+function renderSlots(sems){
+  if (!sems) return;
+  renderSlot('order', 'ORDER', '下单 / 撤单', sems.order);
+  renderSlot('trade', 'TRADE', '账户 / 委托', sems.trade);
+  renderSlot('data', 'DATA', '行情 / 采集', sems.data);
+}
+
+function renderLive(d, health){
+  S.live = d; S.last = Date.now();
+  const sys = d.system || {};
+  const lim = d.trade_limits || {};
+  const ord = lim.orders || {}, can = lim.cancels || {};
+  const lw = d.log_writer || {};
+  const col = d.collector || {};
+
+  const tdxOk = !!health?.tdx_connected;
+  setPill('#pillTdx', tdxOk ? 'ok' : 'bad', tdxOk ? 'TDX 已连接' : 'TDX 未连接');
+  const colOk = col.status === 'ok';
+  setPill('#pillCollector', colOk ? 'ok' : (col.status === 'degraded' ? 'warn' : 'bad'),
+    colOk ? '采集器在线' : (col.status === 'degraded' ? '采集器降级' : '采集器离线'));
+  const limWarn = !!ord.state_error;
+  setPill('#pillLimits', limWarn ? 'bad' : ((ord.day_count || 0) >= (ord.warn_at || 150) ? 'warn' : 'ok'),
+    `硬上限 ${fmtInt(ord.day_count)}/${fmtInt(ord.day_limit)}`);
+  const drop = (lw.dropped_calls || 0) + (lw.dropped_trades || 0);
+  setPill('#pillWriter', drop ? 'bad' : 'ok',
+    `日志队列 ${fmtInt((lw.queue_calls || 0) + (lw.queue_trades || 0))}`);
+
+  // KPI：下单/撤单
+  const ordPct = pct(ord.day_count, ord.day_limit);
+  $('#kpiOrdersValue').textContent = fmtInt(ord.day_count) + ' / ' + fmtInt(ord.day_limit);
+  $('#kpiOrdersSub').innerHTML = `剩余 <b>${fmtInt(ord.day_remaining)}</b> · 本秒 <b>${fmtInt(ord.last_sec_count)}/${fmtInt(ord.sec_limit)}</b> · ${ord.persisted ? '已落盘' : '未落盘'}`;
+  $('#kpiOrders').className = 'kpi ' + (ord.state_error ? 'bad' : ((ord.day_count || 0) >= (ord.warn_at || 150) ? 'warn' : ''));
+  $('#kpiCancelsValue').textContent = fmtInt(can.day_count) + ' / ' + fmtInt(can.day_limit);
+  $('#kpiCancelsSub').innerHTML = `剩余 <b>${fmtInt(can.day_remaining)}</b> · 本秒 <b>${fmtInt(can.last_sec_count)}/${fmtInt(can.sec_limit)}</b>`;
+  $('#kpiCancels').className = 'kpi ' + (can.state_error ? 'bad' : ((can.day_count || 0) >= (can.warn_at || 150) ? 'warn' : ''));
+
+  // KPI：三个槽
+  const sems = d.semaphores || {};
+  const kpiSlot = (prefix, kind) => {
+    const s = sems[kind] || {};
+    $('#' + prefix + 'Value').textContent = `${s.inflight || 0} / ${s.slots || 0}`;
+    const util = pct((s.inflight || 0) + (s.waiting || 0), s.slots || 1);
+    $('#' + prefix).className = 'kpi ' + (util >= 85 ? 'bad' : util >= 60 ? 'warn' : '');
+    $('#' + prefix + 'Sub').innerHTML = `等待 <b>${s.waiting || 0}</b> · wait max <b>${fmtMs(s.wait_ms_max)}</b>`;
   };
-  sel.onchange();
+  kpiSlot('kpiOrderSlot', 'order');
+  kpiSlot('kpiTradeSlot', 'trade');
+  kpiSlot('kpiDataSlot', 'data');
+
+  // KPI：日志队列
+  $('#kpiLogQueueValue').textContent = fmtInt((lw.queue_calls || 0) + (lw.queue_trades || 0));
+  $('#kpiLogQueueSub').innerHTML = `调用 <b>${fmtInt(lw.queue_calls)}</b> · 交易 <b>${fmtInt(lw.queue_trades)}</b> · 丢弃 <b>${fmtInt(drop)}</b>`;
+  $('#kpiLogQueue').className = 'kpi ' + (drop ? 'bad' : '');
+
+  // 系统资源
+  $('#sysOs').textContent = sys.os || '--';
+  const cpu = sys.cpu_percent || 0, mem = sys.mem_percent || 0, disk = sys.disk_percent || 0;
+  $('#cpuBar').style.width = Math.min(cpu, 100) + '%';
+  $('#cpuBarWrap').className = 'bar ' + barClass(cpu);
+  $('#cpuNum').textContent = cpu + '%';
+  $('#memBar').style.width = Math.min(mem, 100) + '%';
+  $('#memBarWrap').className = 'bar ' + barClass(mem);
+  $('#memNum').textContent = mem + '%';
+  $('#diskBar').style.width = Math.min(disk, 100) + '%';
+  $('#diskBarWrap').className = 'bar ' + barClass(disk);
+  $('#diskNum').textContent = disk + '%';
+  $('#mRss').textContent = fmtBytes(sys.process_rss);
+  $('#mThreads').textContent = fmtInt(sys.threads);
+  $('#mProcCpu').textContent = (sys.process_cpu_percent || 0) + '%';
+  $('#mPid').textContent = fmtInt(sys.pid);
+  $('#mUptime').textContent = fmtUptime(sys.uptime_s);
+  const hp = d.health_probe || {};
+  $('#mHealthMs').textContent = fmtMs(hp.last_ms) + (hp.failures ? ` · 失败 ${hp.failures}` : '');
+  const ll = d.loop_lag || {};
+  $('#mLoopLag').textContent = fmtMs(ll.last_ms) + (ll.max_ms ? ` · max ${fmtMs(ll.max_ms)}` : '');
+
+  // 采集器
+  $('#colVersion').textContent = col.version ? 'v' + col.version : '--';
+  const colBadge = $('#colStatus');
+  colBadge.className = 'badge ' + (colOk ? 'green' : (col.status === 'degraded' ? 'amber' : 'red'));
+  colBadge.textContent = colOk ? '在线' : (col.status === 'degraded' ? '降级' : '离线');
+  $('#colUniverse').textContent = fmtInt(col.universe_size);
+  $('#colSnapAge').textContent = fmtAge(col.snapshot_age_ms);
+  $('#colBarAge').textContent = fmtAge(col.bar_age_ms);
+  $('#colCycleMs').textContent = fmtMs(col.last_cycle_ms);
+  $('#colCount').textContent = fmtInt(col.last_pricevol_count);
+  $('#colEmpty').textContent = fmtInt(col.empty_cycles);
+  $('#colError').textContent = col.error ? ('错误：' + String(col.error).slice(0, 160)) : '';
+
+  renderSlots(sems);
+  $('#lastUpdate').textContent = '更新 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }) +
+    ' · bridge ' + (d.bridge?.version || '--');
 }
 
-async function loadStats() {
+function fmtUptime(s){
+  if (s === null || s === undefined) return '--';
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m`;
+  return `${m}m ${s % 60}s`;
+}
+
+async function loadLive(){
   try {
-    const data = await api('/api/v1/stats');
-    if (!data.success) return;
-    const d = data.data;
-
-    // 本机信息
-    document.getElementById('machineInfo').innerHTML = `
-      <div>主机名: <b>${d.hostname || '-'}</b></div>
-      <div>本机 IP 地址:
-        ${(d.local_ips||[]).map(ip => `<span class="ip-chip copyable" onclick="copyText('${ip}')" title="点击复制">${ip}</span>`).join(' ') || '-'}
-      </div>
-      <div>桥访问地址: <span class="ip-chip copyable" onclick="copyText('${d.bridge_url}')">${d.bridge_url}</span> <small>(复制给 QuantMind / Ubuntu)</small></div>
-      <div>共享目录: <span class="ip-chip">${d.shared_dir || '-'}</span></div>
-      <div>桥端口: <b>${d.port}</b></div>
-    `;
-
-    // 连接状态
-    const bridgeEl = document.getElementById('bridgeStatus');
-    bridgeEl.textContent = '在线';
-    bridgeEl.style.color = '#34d399';
-    document.getElementById('bridgeDetail').textContent = '服务时间: ' + fmtTime(d.server_time);
-
-    const tdxEl = document.getElementById('tdxStatus');
-    if (d.tdx_connected) {
-      tdxEl.textContent = '已连接';
-      tdxEl.style.color = '#34d399';
-      document.getElementById('tdxDetail').textContent = '通达信客户端在线, 可交易查询';
-      document.getElementById('tdxBadge').textContent = '● 通达信已连接';
-      document.getElementById('tdxBadge').className = 'status-badge status-ok';
-    } else {
-      tdxEl.textContent = '未连接';
-      tdxEl.style.color = '#fbbf24';
-      document.getElementById('tdxDetail').textContent = '请确认通达信已运行 + keepalive 策略运行中';
-      document.getElementById('tdxBadge').textContent = '⚠ 通达信未连接';
-      document.getElementById('tdxBadge').className = 'status-badge status-warn';
-    }
-
-    document.getElementById('tokenStatus').textContent = d.token_configured ? '已配置' : '未配置';
-    document.getElementById('tokenStatus').style.color = d.token_configured ? '#34d399' : '#fca5a5';
-    document.getElementById('tokenDetail').textContent = d.token_configured ? '鉴权已启用' : '请设置 BRIDGE_AUTH_TOKEN';
-
-    // 缓存
-    if (d.cache) {
-      const c = d.cache;
-      document.getElementById('cacheStatus').textContent = (c.tdx_log||0) + ' 条日志';
-      document.getElementById('cacheDetail').innerHTML = `
-        K线 ${c.kline||0} · 股票信息 ${c.stock_info||0} · 快照 ${c.market_snapshot||0} · 财务 ${c.financial||0}
-        <br>磁盘 ${(c.disk_bytes||0/1024/1024).toFixed(2)} MB
-      `;
-      document.getElementById('cacheStats').innerHTML = `
-        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;text-align:center;">
-          <div><b style="font-size:20px;color:#38bdf8;">${c.kline||0}</b><br><span style="font-size:12px;color:#64748b;">K线条数</span></div>
-          <div><b style="font-size:20px;color:#38bdf8;">${c.stock_info||0}</b><br><span style="font-size:12px;color:#64748b;">股票信息</span></div>
-          <div><b style="font-size:20px;color:#38bdf8;">${c.market_snapshot||0}</b><br><span style="font-size:12px;color:#64748b;">行情快照</span></div>
-          <div><b style="font-size:20px;color:#38bdf8;">${c.trade_log||0}</b><br><span style="font-size:12px;color:#64748b;">交易记录</span></div>
-        </div>
-      `;
-    } else {
-      document.getElementById('cacheStatus').textContent = '未启用';
-      document.getElementById('cacheStats').textContent = '缓存未启用';
-    }
-
-    // 账户
-    if (d.account) {
-      document.getElementById('accountEmpty').style.display = 'none';
-      document.getElementById('accountKpi').style.display = 'grid';
-      document.getElementById('kpiAsset').textContent = fmtMoney(d.account.asset);
-      document.getElementById('kpiCash').textContent = fmtMoney(d.account.cash);
-      document.getElementById('kpiMarket').textContent = fmtMoney(d.account.market_value);
-      document.getElementById('kpiBalance').textContent = fmtMoney(d.account.balance);
-    } else {
-      document.getElementById('accountEmpty').textContent = '账户数据不可用 (通达信未连接或未登录)';
-    }
-
-    // 日志
-    loadLogs();
+    const [sres, hres] = await Promise.allSettled([
+      fetchJSON('/api/v1/system', {}, 6000),
+      fetchJSON('/api/v1/health', {}, 4000),
+    ]);
+    const d = sres.status === 'fulfilled' ? sres.value.body.data : null;
+    const health = hres.status === 'fulfilled' ? hres.value.body : null;
+    if (!d) throw new Error('system unavailable');
+    renderLive(d, health);
   } catch (e) {
-    console.error(e);
+    setPill('#pillTdx', 'bad', 'TDX 探测失败');
+    $('#lastUpdate').textContent = '系统数据不可达：' + e.message;
   }
 }
 
-async function loadLogs() {
-  // 调用日志自 2026-10-22 起需要 token（含标的/方向/委托号等敏感字段）。
-  const token = document.getElementById('tokenInput').value.trim();
-  const tbody = document.querySelector('#logTable tbody');
+async function loadStats(){
+  try {
+    const { body } = await fetchJSON('/api/v1/stats', {}, 25000);
+    const d = body.data || {};
+    S.stats = d;
+    const acct = d.account || {};
+    $('#acctCurrency').textContent = acct.currency || '--';
+    $('#acctAsset').textContent = acct.asset === undefined ? '--' : '¥ ' + fmtNum(acct.asset);
+    $('#acctCash').textContent = acct.cash === undefined ? '--' : '¥ ' + fmtNum(acct.cash);
+    $('#acctMv').textContent = acct.market_value === undefined ? '--' : '¥ ' + fmtNum(acct.market_value);
+    $('#acctPos').textContent = fmtInt(acct.position_count);
+    $('#sysHost').textContent = d.hostname || '--';
+    $('#sysPort').textContent = d.port || '--';
+    $('#sysToken').textContent = d.token_configured ? '已配置' : '未配置';
+    $('#sysUrl').textContent = d.bridge_url || '--';
+    $('#sysShared').textContent = d.shared_dir ? ('共享：' + d.shared_dir) : '';
+    const cache = d.cache || {};
+    $('#cacheLogRows').textContent = fmtInt(cache.tdx_log);
+    $('#cacheKline').textContent = fmtInt(cache.kline);
+    $('#cacheTradeRows').textContent = fmtInt(cache.trade_log);
+    $('#cacheDisk').textContent = fmtBytes(cache.disk_bytes);
+    const sec = d.security || {};
+    $('#secActive').textContent = fmtInt(sec.active_ips);
+    $('#secBanned').textContent = fmtInt(sec.banned_ips);
+  } catch (e) {
+    $('#lastUpdate').textContent = 'stats 不可达：' + e.message;
+  }
+}
+
+async function loadLogs(){
+  const token = $('#tokenInput').value.trim();
+  const tbody = $('#logTable tbody');
   if (!token) {
-    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#64748b;">在下方「Token 管理」输入 BRIDGE_AUTH_TOKEN 后点顶部刷新</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">输入 token 后点击刷新查看调用日志</td></tr>';
     return;
   }
   try {
-    const data = await api('/api/v1/cache/logs?limit=30',
-      {headers: {'Authorization': 'Bearer ' + token}});
-    if (!data.success) {
-      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#fca5a5;">日志读取失败：' + ((data.error && data.error.message) || 'token 无效') + '</td></tr>';
+    const { body, status } = await fetchJSON('/api/v1/cache/logs?limit=30', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (status !== 200 || !body.success) {
+      tbody.innerHTML = `<tr><td colspan="5" class="empty">日志读取失败：${(body.error && body.error.message) || status}</td></tr>`;
       return;
     }
-    tbody.innerHTML = (data.data||[]).map(l => `
+    tbody.innerHTML = (body.data || []).map(l => `
       <tr>
-        <td style="white-space:nowrap;">${l.created_at ? l.created_at.replace('T',' ').slice(5,19) : '-'}</td>
-        <td><span class="badge badge-blue">${l.method||''}</span></td>
-        <td>${l.symbol||'-'}</td>
-        <td>${l.duration_ms != null ? l.duration_ms.toFixed(0)+'ms' : '-'}</td>
-        <td><span class="badge ${l.status==='ok'?'badge-green':'badge-red'}">${l.status||''}</span></td>
-      </tr>
-    `).join('') || '<tr><td colspan="5" style="text-align:center;color:#64748b;">暂无日志</td></tr>';
-  } catch (e) {}
+        <td class="mono muted">${l.created_at ? l.created_at.replace('T',' ').slice(5,19) : '-'}</td>
+        <td><span class="badge">${l.method || ''}</span></td>
+        <td class="mono">${l.symbol || '-'}</td>
+        <td class="mono">${l.duration_ms != null ? Math.round(l.duration_ms) + 'ms' : '-'}</td>
+        <td><span class="badge ${l.status === 'ok' ? 'green' : 'red'}">${l.status || ''}</span></td>
+      </tr>`).join('') || '<tr><td colspan="5" class="empty">暂无日志</td></tr>';
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty">日志读取失败：${e.message}</td></tr>`;
+  }
 }
 
-async function callMethod() {
-  const method = document.getElementById('methodSelect').value;
-  const token = document.getElementById('tokenInput').value.trim();
+async function callMethod(){
+  const method = $('#methodSelect').value;
+  const token = $('#tokenInput').value.trim();
   let params;
-  try {
-    params = JSON.parse(document.getElementById('paramsBox').value || '{}');
-  } catch (e) {
-    document.getElementById('resultBox').style.display = 'block';
-    document.getElementById('resultBox').textContent = '❌ 参数 JSON 解析失败: ' + e.message;
-    document.getElementById('resultBox').style.color = '#fca5a5';
+  try { params = JSON.parse($('#paramsBox').value || '{}'); }
+  catch (e) {
+    showResult('参数 JSON 解析失败: ' + e.message, 'bad');
     return;
   }
-  if (!token) {
-    document.getElementById('resultBox').style.display = 'block';
-    document.getElementById('resultBox').textContent = '⚠️ 请先在 Token 管理输入 BRIDGE_AUTH_TOKEN';
-    document.getElementById('resultBox').style.color = '#fbbf24';
-    return;
-  }
-  document.getElementById('resultBox').style.display = 'block';
-  document.getElementById('resultBox').textContent = '⏳ 调用中...';
-  document.getElementById('resultBox').style.color = '#fbbf24';
+  if (!token) { showResult('请先输入访问 token', 'warn'); return; }
+  showResult('执行中…', 'muted');
   try {
-    const data = await api('/api/v1/tdx/call', {
-      method:'POST', body: JSON.stringify({method, params}),
-      headers: {'Authorization': 'Bearer ' + token}
-    });
-    document.getElementById('resultBox').style.color = '#34d399';
-    document.getElementById('resultBox').textContent = JSON.stringify(data, null, 2);
-  } catch (e) {
-    document.getElementById('resultBox').textContent = '❌ 调用失败: ' + e.message;
-    document.getElementById('resultBox').style.color = '#fca5a5';
-  }
+    const { body, status } = await fetchJSON('/api/v1/tdx/call', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method, params })
+    }, 30000);
+    showResult(JSON.stringify(body, null, 2), (status === 200 && body.success) ? 'ok' : 'bad');
+  } catch (e) { showResult('调用失败: ' + e.message, 'bad'); }
 }
-
-function adminToken() {
-  return document.getElementById('tokenInput').value.trim();
+function showResult(text, tone){
+  const box = $('#resultBox'); box.style.display = 'block'; box.textContent = text;
+  box.style.color = tone === 'ok' ? '#b7f7d3' : tone === 'bad' ? '#ffd0d0' : tone === 'warn' ? '#ffe3a8' : '#c9d7e8';
 }
+function clearResult(){ const b = $('#resultBox'); b.style.display = 'none'; b.textContent = ''; }
 
-async function loadTokens() {
+function adminToken(){ return $('#tokenInput').value.trim(); }
+async function loadTokens(){
   const token = adminToken();
-  if (!token) {
-    document.getElementById('tokenMsg').textContent = '⚠️ 请先输入管理员 token (主 BRIDGE_AUTH_TOKEN)';
-    document.getElementById('tokenMsg').style.color = '#fbbf24';
-    return;
-  }
+  if (!token) { $('#tokenMsg').textContent = '请先输入管理员 token'; return; }
   try {
-    const data = await api('/api/v1/auth/tokens', {
-      headers: {'Authorization': 'Bearer ' + token}
-    });
-    if (!data.success) {
-      document.getElementById('tokenMsg').textContent = '❌ ' + (data.error?.message || '获取失败');
-      document.getElementById('tokenMsg').style.color = '#fca5a5';
-      return;
-    }
+    const { body } = await fetchJSON('/api/v1/auth/tokens', { headers: { 'Authorization': 'Bearer ' + token } });
+    if (!body.success) { $('#tokenMsg').textContent = '读取失败：' + ((body.error && body.error.message) || ''); return; }
     const tbody = document.querySelector('#tokenTable tbody');
-    tbody.innerHTML = (data.tokens||[]).map(t => `
+    tbody.innerHTML = (body.tokens || []).map(t => `
       <tr>
-        <td>${t.id}</td>
+        <td class="mono">${t.id}</td>
         <td>${t.name || '-'}</td>
-        <td style="font-family:monospace;font-size:11px;">${t.token_hash.slice(0,16)}...</td>
-        <td><span class="badge ${t.active ? 'badge-green' : 'badge-red'}">${t.active ? '启用' : '禁用'}</span></td>
-        <td style="font-size:11px;">${(t.created_at||'').replace('T',' ').slice(0,16)}</td>
-        <td><button class="danger" style="padding:4px 10px;font-size:11px;" onclick="deleteToken('${t.token_hash}')">🗑 删除</button></td>
-      </tr>
-    `).join('') || '<tr><td colspan="6" style="text-align:center;color:#64748b;">暂无 token, 点击"生成 token"创建</td></tr>';
-    document.getElementById('tokenMsg').textContent = `✅ 共 ${(data.tokens||[]).length} 个 token`;
-    document.getElementById('tokenMsg').style.color = '#34d399';
-  } catch (e) {
-    document.getElementById('tokenMsg').textContent = '❌ ' + e.message;
-    document.getElementById('tokenMsg').style.color = '#fca5a5';
-  }
+        <td><span class="badge ${t.active ? 'green' : 'red'}">${t.active ? 'active' : 'off'}</span></td>
+        <td class="mono muted">${(t.created_at || '').slice(0,16).replace('T',' ')}</td>
+        <td><button class="btn ghost" style="padding:4px 9px" onclick="deleteToken('${t.token_hash}')">删除</button></td>
+      </tr>`).join('') || '<tr><td colspan="5" class="empty">暂无 token</td></tr>';
+    $('#tokenMsg').textContent = '';
+  } catch (e) { $('#tokenMsg').textContent = '读取失败：' + e.message; }
 }
-
-async function addTokens() {
+async function addTokens(){
   const token = adminToken();
-  const name = document.getElementById('tokenName').value.trim();
-  const count = parseInt(document.getElementById('tokenCount').value || '1');
-  if (!token) {
-    document.getElementById('tokenMsg').textContent = '⚠️ 请先输入管理员 token';
-    document.getElementById('tokenMsg').style.color = '#fbbf24';
-    return;
-  }
+  if (!token) { $('#tokenMsg').textContent = '请先输入管理员 token'; return; }
+  const name = $('#tokenName').value.trim();
+  const count = parseInt($('#tokenCount').value || '1', 10);
   try {
-    const data = await api('/api/v1/auth/tokens', {
-      method:'POST',
-      body: JSON.stringify({name, count}),
-      headers: {'Authorization': 'Bearer ' + token}
+    const { body } = await fetchJSON('/api/v1/auth/tokens', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, count })
     });
-    if (data.success) {
-      let msg = `✅ 已生成 ${data.count} 个 token:`;
-      (data.tokens||[]).forEach(t => msg += '\n' + t.name + ': ' + t.token);
-      document.getElementById('tokenMsg').textContent = msg;
-      document.getElementById('tokenMsg').style.color = '#34d399';
-      // 自动填入第一个新 token 到输入框方便复制
-      if (data.tokens && data.tokens[0]) {
-        document.getElementById('tokenInput').value = data.tokens[0].token;
-      }
+    if (body.success) {
+      $('#tokenMsg').textContent = '已生成 ' + body.count + ' 个 token：\n' +
+        (body.tokens || []).map(t => t.name + ': ' + t.token).join('\n');
+      if (body.tokens && body.tokens[0]) $('#tokenInput').value = body.tokens[0].token;
       loadTokens();
     } else {
-      document.getElementById('tokenMsg').textContent = '❌ ' + (data.error?.message || '生成失败');
-      document.getElementById('tokenMsg').style.color = '#fca5a5';
+      $('#tokenMsg').textContent = '生成失败：' + ((body.error && body.error.message) || '');
     }
-  } catch (e) {
-    document.getElementById('tokenMsg').textContent = '❌ ' + e.message;
-    document.getElementById('tokenMsg').style.color = '#fca5a5';
-  }
+  } catch (e) { $('#tokenMsg').textContent = '生成失败：' + e.message; }
 }
-
-async function deleteToken(tokenHash) {
+async function deleteToken(tokenHash){
   const token = adminToken();
   if (!token) return;
-  if (!confirm('确定删除这个 token?\n删除后该客户端将无法访问桥')) return;
+  if (!confirm('确定删除这个 token？删除后该客户端将无法访问桥')) return;
   try {
-    const data = await api('/api/v1/auth/tokens/' + tokenHash, {
-      method:'DELETE', headers: {'Authorization': 'Bearer ' + token}
+    const { body } = await fetchJSON('/api/v1/auth/tokens/' + tokenHash, {
+      method: 'DELETE', headers: { 'Authorization': 'Bearer ' + token }
     });
-    document.getElementById('tokenMsg').textContent = data.success ? '✅ token 已删除' : '❌ 删除失败';
-    document.getElementById('tokenMsg').style.color = data.success ? '#34d399' : '#fca5a5';
+    $('#tokenMsg').textContent = body.success ? 'token 已删除' : '删除失败';
     loadTokens();
-  } catch (e) {
-    document.getElementById('tokenMsg').textContent = '❌ ' + e.message;
-    document.getElementById('tokenMsg').style.color = '#fca5a5';
-  }
+  } catch (e) { $('#tokenMsg').textContent = '删除失败：' + e.message; }
 }
 
-function copyText(text) {
-  navigator.clipboard.writeText(text).then(() => {
-    const el = event.target;
-    el.textContent = '✓ 已复制';
-    setTimeout(() => el.textContent = text.includes('.') ? text : (el.classList.contains('ip-chip') ? text : el.textContent), 1500);
+async function resetToken(){
+  const token = adminToken();
+  if (!token) { $('#tokenMsg').textContent = '请先输入管理员 token'; return; }
+  if (!confirm('重置主 token？生成后必须同步 Linux .env，否则后端立刻鉴权失败')) return;
+  try {
+    const { body } = await fetchJSON('/api/v1/auth/reset-token', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (body.success) {
+      $('#tokenInput').value = body.new_token;
+      $('#tokenMsg').textContent = '新主 token（需同步 Linux .env）：\n' + body.new_token;
+    } else {
+      $('#tokenMsg').textContent = '重置失败：' + ((body.error && body.error.message) || '');
+    }
+  } catch (e) { $('#tokenMsg').textContent = '重置失败：' + e.message; }
+}
+
+function initMethods(){
+  const sel = $('#methodSelect');
+  sel.innerHTML = METHODS.map(m => `<option value="${m}">${m}</option>`).join('');
+  const defaults = {
+    get_stock_info: '{"stock_code":"600519.SH","field_list":["Name","Zsz"]}',
+    get_market_snapshot: '{"stock_code":"600519.SH"}',
+    get_stock_list: '{"market":"5","list_type":1}',
+    get_pricevol: '{"stock_list":["600519.SH","000001.SZ"]}',
+    get_sector_list: '{"list_type":0}',
+    get_trading_dates: '{"market":"5","count":5}',
+    get_trackzs_etf_info: '{"zs_code":"000300.SH"}',
+  };
+  const apply = () => { $('#paramsBox').value = defaults[sel.value] || '{}'; };
+  sel.onchange = apply; apply();
+}
+
+function buildSlots(){
+  const defs = [
+    ['order', 'ORDER', '下单 / 撤单专用'],
+    ['trade', 'TRADE', '账户 / 委托查询'],
+    ['data', 'DATA', '行情 / 采集 / 推送'],
+  ];
+  $('#slotGrid').innerHTML = defs.map(([k, name, sub]) => `
+    <div class="slot" id="slot-${k}">
+      <div class="slot-head">
+        <span class="slot-name">${name}</span><span class="slot-sub">${sub}</span>
+        <span class="slot-badge">${k === 'order' ? '2 槽' : '1 槽'}</span>
+      </div>
+      <div class="slot-nums">
+        <div><strong data-f="inflight">0</strong><span>在途 / 槽</span></div>
+        <div><strong data-f="waiting">0</strong><span>等待</span></div>
+        <div><strong data-f="waitmax">--</strong><span>等待峰值</span></div>
+      </div>
+      <div class="bar"><i></i></div>
+      <div class="slot-foot">
+        <span>exec p50 <b data-f="ep50">--</b></span>
+        <span>p95 <b data-f="ep95">--</b></span>
+        <span>calls <b data-f="calls">--</b></span>
+        <span>timeout <b data-f="timeouts">--</b></span>
+      </div>
+    </div>`).join('');
+}
+
+function startPolling(){
+  stopPolling();
+  S.timers = [setInterval(loadLive, 5000), setInterval(loadStats, 15000)];
+}
+function stopPolling(){ S.timers.forEach(clearInterval); S.timers = []; }
+function refreshAll(){ loadLive(); loadStats(); loadLogs(); }
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { stopPolling(); }
+  else { refreshAll(); startPolling(); }
+});
+
+setInterval(() => {
+  $('#clock').textContent = new Date().toLocaleString('zh-CN', {
+    hour12: false, month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
   });
+}, 1000);
+
+function applyTheme(theme){
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem('tdx-theme', theme); } catch (e) {}
+  const btn = document.getElementById('themeBtn');
+  if (btn) btn.textContent = theme === 'light' ? '深色' : '浅色';
+}
+function toggleTheme(){
+  applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
 }
 
-// 每 15 秒自动刷新状态
+applyTheme(document.documentElement.dataset.theme || 'dark');
+buildSlots();
 initMethods();
+loadLive();
 loadStats();
-setInterval(loadStats, 15000);
+startPolling();
 </script>
 </body>
 </html>

@@ -6,6 +6,8 @@ import queue
 import sys
 import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from aiohttp import web
 
@@ -17,8 +19,19 @@ from ..security.trade_limits import TradeRateGuard
 from ..tdx.client import TdxClient, TdxError, TdxTimeoutError
 from ..tdx import parser
 from ..utils.auth import verify_token
+from ..utils.system_metrics import SystemMetrics
 
 log = logging.getLogger(__name__)
+
+# 专用线程池：绝不让 TQ 长调用/孤儿线程占满默认池，把 /health/账户/撤单拖死。
+# TQ 4 个 worker 与 order=2 + trade=1 + data=1 的并发上限对齐；health/cache 各自独立。
+_TQ_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tq-call")
+_HEALTH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tq-health")
+_CACHE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cache-write")
+_PROBE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="probe")
+_system_metrics = SystemMetrics()
+_BRIDGE_STARTED_AT = datetime.now().astimezone().isoformat(timespec="seconds")
+_collector_cache = {"ts": 0.0, "data": None}
 
 # 通达信调用超时 (秒) - 防止单个阻塞调用挂死整个桥
 TDX_CALL_TIMEOUT = 8.0
@@ -48,9 +61,31 @@ _data_semaphore = None
 # 信号量观测（全部在事件循环内更新，无需加锁）
 _sem_stats = {
     k: {"inflight": 0, "waiting": 0, "calls": 0, "timeouts": 0,
-        "wait_ms_last": 0.0, "wait_ms_max": 0.0}
+        "wait_ms_last": 0.0, "wait_ms_max": 0.0,
+        "exec_ms_last": 0.0, "exec_ms_max": 0.0}
     for k in ("order", "trade", "data")
 }
+_latencies = {k: deque(maxlen=200) for k in ("order", "trade", "data")}
+_health_stats = {"calls": 0, "failures": 0, "last_ms": 0.0, "max_ms": 0.0}
+_loop_lag = {"last_ms": 0.0, "max_ms": 0.0}
+
+
+async def _loop_lag_task() -> None:
+    """事件循环 lag 心跳：0.1s 睡眠实际晚了多少。持续 >200ms 说明循环被同步代码按住。"""
+    while True:
+        t0 = time.monotonic()
+        await asyncio.sleep(0.1)
+        lag = max(0.0, (time.monotonic() - t0 - 0.1) * 1000.0)
+        _loop_lag["last_ms"] = round(lag, 1)
+        _loop_lag["max_ms"] = max(_loop_lag["max_ms"], round(lag, 1))
+
+
+def _pct(vals, p: float) -> float:
+    if not vals:
+        return 0.0
+    v = sorted(vals)
+    idx = min(len(v) - 1, max(0, int(round((p / 100.0) * (len(v) - 1)))))
+    return round(v[idx], 1)
 
 
 def _get_semaphores():
@@ -75,8 +110,12 @@ def semaphores_stats() -> dict:
     sems = _get_semaphores()
     slots = {"order": ORDER_SEM_SLOTS, "trade": TRADE_SEM_SLOTS,
              "data": DATA_SEM_SLOTS}
-    return {k: {**_sem_stats[k], "slots": slots[k],
-                "available": sems[k]._value} for k in slots}
+    out = {}
+    for k, n in slots.items():
+        lats = list(_latencies[k])
+        out[k] = {**_sem_stats[k], "slots": n, "available": sems[k]._value,
+                  "exec_ms_p50": _pct(lats, 50), "exec_ms_p95": _pct(lats, 95)}
+    return out
 
 
 async def _call_tdx(func, *args, kind: str = "data", timeout: float | None = None):
@@ -110,9 +149,11 @@ async def _call_tdx(func, *args, kind: str = "data", timeout: float | None = Non
             elif waited_ms > 200.0:
                 log.warning("[TQ] %s 槽等待 %.0fms", kind, waited_ms)
             stat["inflight"] += 1
+            t_exec = time.monotonic()
             try:
+                loop = asyncio.get_running_loop()
                 return await asyncio.wait_for(
-                    asyncio.to_thread(func, *args),
+                    loop.run_in_executor(_TQ_EXECUTOR, func, *args),
                     timeout=timeout if timeout is not None else (
                         ORDER_CALL_TIMEOUT if kind == "order"
                         else TRADE_CALL_TIMEOUT if kind == "trade"
@@ -123,6 +164,10 @@ async def _call_tdx(func, *args, kind: str = "data", timeout: float | None = Non
                 raise TdxError("通达信响应超时")
             finally:
                 stat["inflight"] -= 1
+                exec_ms = (time.monotonic() - t_exec) * 1000.0
+                stat["exec_ms_last"] = round(exec_ms, 1)
+                stat["exec_ms_max"] = max(stat["exec_ms_max"], round(exec_ms, 1))
+                _latencies[kind].append(exec_ms)
     except BaseException:
         # 取消/异常发生在拿到槽之前：把等待计数还回去
         if queued and not acquired and stat["waiting"] > 0:
@@ -376,13 +421,96 @@ def _record_trade(cache_db, plan_id, event, symbol, side, volume, price,
         log.warning("记录交易日志失败(忽略)", exc_info=True)
 
 
+def _fetch_collector_health() -> dict:
+    """本机采集器（127.0.0.1:8560）健康；未启动返回 down。"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                "http://127.0.0.1:8560/health", timeout=0.8) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return payload.get("data") or {"status": "unknown"}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "down", "error": str(exc)[:120]}
+
+
+async def _collector_health_cached() -> dict:
+    now = time.monotonic()
+    if now - _collector_cache["ts"] < 3.0 and _collector_cache["data"] is not None:
+        return _collector_cache["data"]
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(_PROBE_EXECUTOR, _fetch_collector_health)
+    _collector_cache["ts"] = now
+    _collector_cache["data"] = data
+    return data
+
+
 _cache_write_sem = asyncio.Semaphore(2)
 
 
 async def _cache_result_async(*args) -> None:
-    """把 cache 写入丢进线程 + 限并发；失败不影响主流程。"""
+    """把 cache 写入丢进专用线程池 + 限并发；失败不影响主流程。"""
     async with _cache_write_sem:
-        await asyncio.to_thread(_cache_result, *args)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(_CACHE_EXECUTOR, _cache_result, *args)
+
+
+async def _run_cache(fn, *args):
+    """cache 读也出事件循环：GET /cache/* 每 15s 被 UI 轮询，等 CacheDb 锁会冻桥。"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_CACHE_EXECUTOR, fn, *args)
+
+
+_local_ips_cache: list | None = None
+
+
+def _compute_local_ips() -> list:
+    import socket
+    ips = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ips.append(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = info[4][0]
+            if ip not in ips and not ip.startswith("127."):
+                ips.append(ip)
+    except Exception:
+        pass
+    return ips or ["127.0.0.1"]
+
+
+async def _local_ips_cached() -> list:
+    global _local_ips_cache
+    if _local_ips_cache is None:
+        loop = asyncio.get_running_loop()
+        _local_ips_cache = await loop.run_in_executor(
+            _HEALTH_EXECUTOR, _compute_local_ips)
+    return _local_ips_cache
+
+
+async def _health_probe(tdx) -> bool:
+    loop = asyncio.get_running_loop()
+    t0 = time.monotonic()
+    ok = False
+    try:
+        ok = await asyncio.wait_for(
+            loop.run_in_executor(_HEALTH_EXECUTOR, tdx.health_check_fast, 1.0),
+            timeout=2.0)
+    except asyncio.TimeoutError:
+        ok = False
+    finally:
+        ms = (time.monotonic() - t0) * 1000.0
+        _health_stats["calls"] += 1
+        _health_stats["last_ms"] = round(ms, 1)
+        _health_stats["max_ms"] = max(_health_stats["max_ms"], round(ms, 1))
+        if not ok:
+            _health_stats["failures"] += 1
+    return ok
 
 
 def _cache_stats_sync(cache_db, memory_cache) -> dict | None:
@@ -449,7 +577,20 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     writer = _LogWriter(cache_db) if cache_db is not None else None
     _log_writer = writer
     if writer is not None:
-        app.on_cleanup.append(lambda _app: writer.stop())
+        async def _stop_writer(_app):
+            writer.stop()
+
+        app.on_cleanup.append(_stop_writer)
+    # 事件循环 lag 心跳（UI/探针直接量化“循环被按住”）
+    try:
+        lag_task = asyncio.get_running_loop().create_task(_loop_lag_task())
+
+        async def _cancel_lag(_app):
+            lag_task.cancel()
+
+        app.on_cleanup.append(_cancel_lag)
+    except RuntimeError:
+        pass
     # 支持多 token: 主 token + 扩展 tokens
     valid_tokens = [token] + [t for t in (extra_tokens or []) if t]
 
@@ -476,8 +617,9 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         # ⚠️ `/api/v1/cache/logs` 与 `/api/v1/cache/trades` **不在此列**：
         # 它们返回调用明细与交易台账（含标的/方向/数量/委托号），属于敏感数据，
         # 必须带 token；仅行情缓存 kline/get 保持匿名可读。
-        read_only = ("/api/v1/health", "/api/v1/stats", "/ui", "/favicon.ico",
-                     "/api/v1/cache/kline", "/api/v1/cache/get")
+        read_only = ("/api/v1/health", "/api/v1/stats", "/api/v1/system",
+                     "/ui", "/favicon.ico", "/api/v1/cache/kline",
+                     "/api/v1/cache/get")
         if path in read_only:
             if rate_limiter:
                 # 只读接口也限流 (防 DDoS)
@@ -507,13 +649,14 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     app.middlewares.append(auth_middleware)
 
     async def health(request: web.Request):
-        tdx_connected = await asyncio.to_thread(tdx.health_check_fast, 1.0)
+        tdx_connected = await _health_probe(tdx)
         return web.json_response({
             "status": "ok",
             "tdx_connected": tdx_connected,
             "server_time": datetime.now().isoformat(timespec="seconds"),
             # 交易/数据分槽的占用与等待：采集器/看门狗可用它判断是否该让路
             "semaphores": semaphores_stats(),
+            "loop_lag": dict(_loop_lag),
             # 写死的交易硬上限余量（299/秒、1999/日）
             "trade_limits": {
                 "orders": executor.order_guard.stats(),
@@ -799,7 +942,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         symbol = query.get("symbol", "")
         period = query.get("period", "1d")
         limit = int(query.get("limit", 500))
-        rows = cache_db.get_kline(symbol, period, limit)
+        rows = await _run_cache(cache_db.get_kline, symbol, period, limit)
         return web.json_response({"success": True, "symbol": symbol, "period": period,
                                   "count": len(rows), "data": rows})
 
@@ -810,7 +953,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         query = request.query
         method = query.get("method", "")
         limit = int(query.get("limit", 100))
-        rows = cache_db.get_logs(method, limit)
+        rows = await _run_cache(cache_db.get_logs, method, limit)
         return web.json_response({"success": True, "count": len(rows), "data": rows})
 
     async def cache_trades(request: web.Request):
@@ -820,7 +963,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         query = request.query
         symbol = query.get("symbol", "")
         limit = int(query.get("limit", 100))
-        rows = cache_db.get_trade_logs(symbol, limit)
+        rows = await _run_cache(cache_db.get_trade_logs, symbol, limit)
         return web.json_response({"success": True, "count": len(rows), "data": rows})
 
     async def cache_get(request: web.Request):
@@ -833,13 +976,13 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         block = query.get("block", "")
         data = None
         if ctype == "snapshot":
-            data = cache_db.get_snapshot(symbol)
+            data = await _run_cache(cache_db.get_snapshot, symbol)
         elif ctype == "stock_info":
-            data = cache_db.get_stock_info(symbol)
+            data = await _run_cache(cache_db.get_stock_info, symbol)
         elif ctype == "financial":
-            data = cache_db.get_financial(symbol)
+            data = await _run_cache(cache_db.get_financial, symbol)
         elif ctype == "sector":
-            data = cache_db.get_sector_stocks(block or symbol)
+            data = await _run_cache(cache_db.get_sector_stocks, block or symbol)
         return web.json_response({"success": data is not None, "type": ctype,
                                   "symbol": symbol, "data": data})
 
@@ -851,28 +994,34 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
 
     # ---- 桥状态 / 网页控制台 ----
 
+    async def system(request: web.Request):
+        """系统资源 + 交易/数据分槽 + 采集器状态（UI 5s 轮询，轻量）。"""
+        loop = asyncio.get_running_loop()
+        sysinfo = await loop.run_in_executor(_PROBE_EXECUTOR, _system_metrics.sample)
+        collector = await _collector_health_cached()
+        return web.json_response({"success": True, "data": {
+            "system": sysinfo,
+            "semaphores": semaphores_stats(),
+            "trade_limits": {
+                "orders": executor.order_guard.stats(),
+                "cancels": _cancel_guard.stats(),
+            },
+            "log_writer": _log_writer.stats() if _log_writer is not None else None,
+            "health_probe": dict(_health_stats),
+            "loop_lag": dict(_loop_lag),
+            "collector": collector,
+            "bridge": {"version": "1.0.0", "pid": os.getpid(),
+                        "started_at": _BRIDGE_STARTED_AT},
+            "server_time": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }})
+
     async def stats(request: web.Request):
         """桥状态总览: 本机IP/共享路径/连接状态/账户/缓存统计."""
         import socket
-        # 获取本机 IPv4 地址
-        local_ips = []
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ips.append(s.getsockname()[0])
-            s.close()
-        except Exception:
-            pass
-        try:
-            hostname = socket.gethostname()
-            for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
-                ip = info[4][0]
-                if ip not in local_ips and not ip.startswith("127."):
-                    local_ips.append(ip)
-        except Exception:
-            pass
-
-        tdx_connected = await asyncio.to_thread(tdx.health_check_fast, 1.0)
+        # 本机 IP 缓存 + 线程池：getaddrinfo 在 Windows 可能阻塞数秒，绝不能在循环里
+        local_ips = await _local_ips_cached()
+        hostname = socket.gethostname()
+        tdx_connected = await _health_probe(tdx)
         stats_data = {
             "hostname": socket.gethostname(),
             "local_ips": local_ips,
@@ -911,8 +1060,9 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         # 桥自带控制台又开一个标签 → 更多 /stats。2026-10-13 的启动失败即此自毁循环。
         # 详见 `_cache_stats_sync` 的 docstring。
         if cache_db:
-            stats_data["cache"] = await asyncio.to_thread(
-                _cache_stats_sync, cache_db, memory_cache
+            loop = asyncio.get_running_loop()
+            stats_data["cache"] = await loop.run_in_executor(
+                _CACHE_EXECUTOR, _cache_stats_sync, cache_db, memory_cache
             )
         # 限流状态
         if rate_limiter:
@@ -997,6 +1147,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             return _web.Response(text="<h1>ui.html 未找到</h1>", content_type="text/html")
 
     app.router.add_get("/api/v1/stats", stats)
+    app.router.add_get("/api/v1/system", system)
     app.router.add_post("/api/v1/auth/reset-token", reset_token)
     app.router.add_get("/api/v1/auth/tokens", list_tokens)
     app.router.add_post("/api/v1/auth/tokens", add_token)

@@ -44,8 +44,8 @@ failover:
 
 tdx:
   base_url: "http://127.0.0.1:17709/"
-  request_timeout_seconds: 15
-  max_retries: 2
+  request_timeout_seconds: 8
+  max_retries: 0
 
 sltp_daemon:
   enabled: true

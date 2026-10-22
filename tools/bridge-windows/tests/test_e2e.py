@@ -187,6 +187,13 @@ async def run_tests():
             assert h["status"] == "ok"
         print("[PASS] 健康检查 GET OK")
 
+        async with session.get(base + "/api/v1/system") as resp:
+            _sys = await resp.json()
+            assert resp.status == 200 and _sys.get("success"), _sys
+            assert _sys["data"]["semaphores"]["order"]["slots"] == 2, _sys
+            assert "system" in _sys["data"] and "trade_limits" in _sys["data"]
+        print("[PASS] /api/v1/system 系统资源 + 拥挤度")
+
         # 交易/数据分槽：4 个慢数据调用（data 槽只有 1）不能堵住账户查询（trade 槽）。
         # 旧实现是全局 Semaphore(4)：4 个 pricevol 会占满，账户查询要等 0.8s。
         mock.pricevol_delay = 0.8

@@ -103,6 +103,7 @@ class CollectorService:
         self._runner = None
         self._bridge_health: dict = {}
         self._bridge_health_ts = 0.0
+        self._bridge_refreshing = False
         self._db_stats: dict = {}
         self._db_stats_ts = 0.0
         self._db_stats_lock = asyncio.Lock()
@@ -344,15 +345,35 @@ class CollectorService:
     # ---- 读侧 ----
 
     async def _bridge_health_cached(self) -> dict:
+        """/health 绝不等待桥：有过期数据先返回旧值，后台刷新。
+
+        桥繁忙时 client.health() 可能 >1s；若在 /health 里 await，会让桥侧
+        0.8s 的采集器探针误报「离线」。
+        """
         now = time.monotonic()
         if now - self._bridge_health_ts < 5.0 and self._bridge_health:
             return self._bridge_health
+        if self._bridge_health:
+            if not self._bridge_refreshing:
+                self._bridge_refreshing = True
+                asyncio.create_task(self._refresh_bridge_health())
+            return self._bridge_health
+        try:
+            self._bridge_health = await asyncio.wait_for(
+                self.client.health(), timeout=0.8)
+        except (BridgeError, asyncio.TimeoutError) as exc:
+            self._bridge_health = {"status": "down", "error": str(exc)[:120]}
+        self._bridge_health_ts = now
+        return self._bridge_health
+
+    async def _refresh_bridge_health(self) -> None:
         try:
             self._bridge_health = await self.client.health()
         except BridgeError as exc:
-            self._bridge_health = {"status": "down", "error": str(exc)}
-        self._bridge_health_ts = now
-        return self._bridge_health
+            self._bridge_health = {"status": "down", "error": str(exc)[:120]}
+        finally:
+            self._bridge_health_ts = time.monotonic()
+            self._bridge_refreshing = False
 
     async def _db_stats_cached(self) -> dict:
         now = time.monotonic()
@@ -386,6 +407,9 @@ class CollectorService:
             "snapshot_age_ms": self._age_ms(self.snapshot_ts),
             "bar_age_ms": self._age_ms(self.bar_ts),
             "universe_size": len(self.universe),
+            "last_cycle_ms": self.last_cycle_ms,
+            "last_pricevol_count": self.last_pricevol_count,
+            "empty_cycles": self.empty_cycles,
         }
 
     async def health(self) -> dict:

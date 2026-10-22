@@ -315,9 +315,11 @@ def main():
         "COUNT(*) 会按住事件循环 3-52s，连 /health 一起停摆，触发看门狗杀桥的"
         "自毁循环。必须经 asyncio.to_thread(_cache_stats_sync, ...) 出循环。"
     )
-    assert "asyncio.to_thread(\n                _cache_stats_sync" in _routes_src or \
-        "asyncio.to_thread(_cache_stats_sync" in _routes_src, \
-        "stats 必须把缓存计数丢进线程（_cache_stats_sync）"
+    assert ("run_in_executor(\n                _CACHE_EXECUTOR, _cache_stats_sync"
+            in _routes_src or
+            "run_in_executor(_CACHE_EXECUTOR, _cache_stats_sync" in _routes_src or
+            "asyncio.to_thread(_cache_stats_sync" in _routes_src), \
+        "stats 必须把缓存计数丢出事件循环（_cache_stats_sync）"
     assert "CACHE_STATS_TTL_S = 60.0" in _routes_src, \
         "_cache_stats_sync 的 TTL 缓存（60s）也一并守着——计数本身就该廉价，别每 15s 重算一遍"
     print("  ✅ 缓存计数走线程 + 60s TTL 缓存")
@@ -436,6 +438,18 @@ def main():
     _ok, _reason = _gp3.allow(_today, mono=3001.0)
     assert not _ok and "fail-closed" in _reason, _reason
     print("  ✅ 日计数落盘/重启续计/损坏 fail-closed")
+
+    # 系统资源指标（UI /api/v1/system 用）
+    print("\n=== 系统资源指标 ===")
+    from src.utils.system_metrics import SystemMetrics
+    _sys = SystemMetrics().sample()
+    for _k in ("cpu_percent", "process_cpu_percent", "mem_total", "mem_used",
+               "process_rss", "disk_total", "disk_free", "threads", "pid",
+               "uptime_s"):
+        assert _k in _sys, _k
+    assert "run_in_executor(_PROBE_EXECUTOR" in _routes_src
+    assert "/api/v1/system" in _routes_src
+    print("  ✅ SystemMetrics + /api/v1/system 已挂载")
 
     # 日志按大小滚动：bridge.log 曾无限增长到 1.5GB。
     print("\n=== bridge.log 按大小滚动 ===")
