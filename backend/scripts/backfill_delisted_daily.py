@@ -537,14 +537,16 @@ def fetch_stock_pair(
 def _frames_by_dataset(
     raw: pd.DataFrame, qfq: pd.DataFrame, datasets: Iterable[str]
 ) -> dict[str, pd.DataFrame]:
-    backward = build_backward(raw, qfq)
-    mapping = {
-        "daily_unadjusted": raw[["symbol", "time", *OHLCV_COLUMNS]],
-        "daily_forward": qfq[["symbol", "time", *OHLCV_COLUMNS]],
-        "daily_backward": backward,
-        "valuation": build_valuation(raw),
+    names = tuple(datasets)
+    # 按需构造：只算请求的数据集，避免为 daily_* 计算 valuation 时因缺
+    # turn/pe_ttm 等列而失败（delisted_daily_store 只取三张 K 线表）。
+    builders = {
+        "daily_unadjusted": lambda: raw[["symbol", "time", *OHLCV_COLUMNS]],
+        "daily_forward": lambda: qfq[["symbol", "time", *OHLCV_COLUMNS]],
+        "daily_backward": lambda: build_backward(raw, qfq),
+        "valuation": lambda: build_valuation(raw),
     }
-    return {name: mapping[name] for name in datasets}
+    return {name: builders[name]() for name in names}
 
 
 def _manifest_record(

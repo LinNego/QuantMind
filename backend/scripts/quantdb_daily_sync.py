@@ -84,6 +84,15 @@ FULL_REWRITE_V2_DATASETS = {
     "index_daily",
 }
 
+# 有退市股独立仓的三张 K 线表（须与 backend/scripts/delisted_daily_store.py
+# 的 DELISTED_DATASETS 保持一致；此处不 import，避免 AutoDL native 无
+# backend/scripts 子树时连同步模块都导入失败）。
+DELISTED_DAILY_DATASETS = (
+    "daily_unadjusted",
+    "daily_forward",
+    "daily_backward",
+)
+
 # V1 非分区数据集 (全量 ETag 增量)
 V1_DATASETS = [
     {"category_id": "2", "sub_category": "sector_concept", "dir": "2_base_sector"},
@@ -765,7 +774,7 @@ def _add_price_derived_cols(df: pd.DataFrame) -> pd.DataFrame:
         return df
     df = df.sort_values("trade_date")
     derived = pd.DataFrame(index=df.index)
-    for sym, grp in df.groupby("symbol", sort=False):
+    for _sym, grp in df.groupby("symbol", sort=False):
         close = grp["close"].astype(float)
         prev_close = close.shift(1)
         tr = pd.concat(
@@ -865,7 +874,7 @@ def fill_pg_from_parquet(
 
     sym_filter = ""
     if symbols:
-        qdb_syms = {s for s in symbols} | {
+        qdb_syms = set(symbols) | {
             f"{s[2:]}.{s[:2]}" for s in symbols if len(s) > 2 and s[:2] in ("SH", "SZ", "BJ")
         }
         quoted = ", ".join("'" + s.replace("'", "''") + "'" for s in sorted(qdb_syms))
@@ -1110,6 +1119,7 @@ def run_daily_sync(
         "started": datetime.now().isoformat(),
         "parquet": None,
         "l1_ohlcv_backfill": None,
+        "delisted_inject": None,
         "pg_fill": None,
         "qlib_cache": None,
         "feature_snapshot": None,
@@ -1187,6 +1197,50 @@ def run_daily_sync(
             except Exception as exc:
                 log.warning("L1 OHLCV backfill failed: %s", exc)
                 result["l1_ohlcv_backfill"] = {"status": "error", "reason": str(exc)}
+
+        # 退市股日线写回：这三张表属 FULL_REWRITE_V2_DATASETS，整分区重写只含
+        # 在市 universe；独立仓 daily_*_delisted 不在同步清单内，重写后按 symbol
+        # 补回（只增不改、上游优先、幂等）。失败隔离，不打断同步。
+        requested_daily = [
+            name
+            for name in DELISTED_DAILY_DATASETS
+            if datasets is None or name in datasets
+        ]
+        if (
+            requested_daily
+            and not dry_run
+            and not (should_cancel and should_cancel())
+        ):
+            try:
+                from backend.scripts.delisted_daily_store import (
+                    inject_after_sync as _inject_delisted_daily,
+                )
+
+                result["delisted_inject"] = _inject_delisted_daily(
+                    QUANTDB_DATA_DIR,
+                    datasets=requested_daily,
+                    since=since,
+                )
+            except ModuleNotFoundError as exc:
+                missing = str(getattr(exc, "name", "") or "")
+                if missing.startswith("backend.scripts"):
+                    log.info(
+                        "退市股日线写回跳过（当前环境无 %s，AutoDL native 模式属预期）",
+                        missing,
+                    )
+                    result["delisted_inject"] = {
+                        "status": "skipped",
+                        "reason": f"module unavailable: {missing}",
+                    }
+                else:
+                    log.warning("退市股日线写回失败: %s", exc)
+                    result["delisted_inject"] = {
+                        "status": "error",
+                        "reason": str(exc),
+                    }
+            except Exception as exc:
+                log.warning("退市股日线写回失败: %s", exc)
+                result["delisted_inject"] = {"status": "error", "reason": str(exc)}
 
     # Phase 1.5: 额外数据源（北向/南向，按数据源勾选控制；逐数据集路径只同步请求项）
     result["sources"] = _sync_extra_sources(dry_run=dry_run, datasets=datasets)
