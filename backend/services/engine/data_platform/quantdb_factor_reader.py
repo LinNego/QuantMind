@@ -25,7 +25,12 @@ from backend.shared.stock_utils import StockCodeUtil
 logger = logging.getLogger(__name__)
 
 FactorSource = Literal[
-    "l1_factors", "l2_factors", "l1_l2_factors", "ccass_factors", "south_factors"
+    "l1_factors",
+    "l2_factors",
+    "l1_l2_factors",
+    "ccass_factors",
+    "south_factors",
+    "futures_factors",
 ]
 
 FACTOR_SOURCE_DIRS: dict[FactorSource, str] = {
@@ -35,6 +40,7 @@ FACTOR_SOURCE_DIRS: dict[FactorSource, str] = {
     "ccass_factors": "6_ml_datasets/ccass_factors",
     "south_factors": "6_ml_datasets/south_factors",
     "alpha_library": "6_ml_datasets/alpha_library",
+    "futures_factors": "6_ml_datasets/futures_factors",
 }
 DAILY_BACKWARD_DIR = "1_kline_data/daily_backward"
 DEFAULT_FACTOR_SOURCE: FactorSource = "l1_factors"
@@ -64,7 +70,7 @@ MARKET_FACTOR_SOURCES: dict[str, tuple[FactorSource, ...]] = {
     "HK": ("l1_factors", "ccass_factors", "south_factors"),
     "US": ("l1_factors",),
     "CRYPTO": ("l1_factors",),
-    "FUTURES": ("l1_factors",),
+    "FUTURES": ("l1_factors", "futures_factors"),
     "CUSTOM": ("l1_factors",),
 }
 

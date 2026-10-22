@@ -29,6 +29,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from backend.shared.futures_factors.registry import META_COLS as _FUTURES_META_COLS
+
 _ID_COLS = ("symbol", "date", "time", "dt")
 _OHLCV_COLS = ("open", "high", "low", "close", "volume", "amount")
 
@@ -296,6 +298,16 @@ DATASETS_BY_MARKET: dict[str, dict[str, dict]] = {
             "meta_cols": _ID_COLS + _OHLCV_COLS + RAW_MARKET_COLS,
             "library_rule": "fixed:L1",
             "universe": "期货主连+外盘品种池 · L1 因子（量价/换手/波动等基础因子）",
+        },
+        "futures_factors": {
+            "label": "机构级期货因子库（期限结构/持仓/基差/库存/横截面）",
+            "dir_parts": ("6_ml_datasets", "futures_factors"),
+            "label_mode": "close_fwd",
+            # meta_* 是可得性标记（0/1），不是 alpha，进因子轴会把 IC 榜单刷成
+            # 「谁有库存数据」而不是「谁预测得准」。
+            "meta_cols": _ID_COLS + _OHLCV_COLS + _FUTURES_META_COLS,
+            "library_rule": "fixed:futures_institutional",
+            "universe": "期货主连品种池 · 机构级因子（期限结构/持仓/基差/库存/横截面）",
         },
     },
 }

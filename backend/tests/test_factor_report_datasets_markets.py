@@ -40,7 +40,10 @@ def test_supports_market_only_the_four_layered_markets():
 def test_market_registries_have_expected_datasets():
     assert set(ds.datasets_for_market("HK")) == {"l1_factors", "ccass_factors", "south_factors"}
     assert set(ds.datasets_for_market("US")) == {"l1_factors"}
-    assert set(ds.datasets_for_market("FUTURES")) == {"l1_factors"}
+    assert set(ds.datasets_for_market("FUTURES")) == {
+        "l1_factors",
+        "futures_factors",
+    }
 
 
 def test_unregistered_market_raises_instead_of_falling_back_to_cn():
@@ -103,6 +106,21 @@ def test_l1_meta_cols_exclude_raw_market_columns():
         for col in ("adj_factor", "turnover_rate", "pe_ttm", "pb", "roe", "bp",
                     "ep_ttm", "float_mv", "total_mv", "ln_mv_total"):
             assert col in meta, f"{market} l1 未剔除原始列 {col}"
+
+
+def test_futures_institutional_meta_flags_are_not_factors():
+    cfg = ds.DATASETS_BY_MARKET["FUTURES"]["futures_factors"]
+    meta = set(cfg["meta_cols"])
+    # 可得性标记进因子轴会让 IC 榜单变成「谁有库存数据」。
+    for col in ("meta_has_oi", "meta_has_basis", "meta_roll_adjusted"):
+        assert col in meta
+    for col in ("symbol", "date", "dt", "open", "close", "amount"):
+        assert col in meta
+    assert ds.library_of("futures_factors", "carry", market="FUTURES") == (
+        "futures_institutional"
+    )
+    # 缺省数据集保持 l1_factors，避免改变既有期货因子报告入口。
+    assert ds.DEFAULT_DATASET_BY_MARKET["FUTURES"] == "l1_factors"
 
 
 def test_disk_state_counts_only_factor_columns(tmp_path, monkeypatch):

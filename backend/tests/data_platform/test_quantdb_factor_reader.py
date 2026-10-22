@@ -177,7 +177,10 @@ def test_market_source_mapping_and_defaults():
     assert normalize_market("custom") == "CUSTOM"
     assert sources_for_market("HK") == ["l1_factors", "ccass_factors", "south_factors"]
     assert sources_for_market("US") == ["l1_factors"]
+    assert sources_for_market("FUTURES") == ["l1_factors", "futures_factors"]
     assert sources_for_market("CUSTOM") == ["l1_factors"]
+    # 缺省源保持 l1_factors：新增机构级库不改既有训练/推理入口。
+    assert default_source_for("FUTURES") == "l1_factors"
     assert default_source_for("HK") == "l1_factors"
     assert default_source_for("CN") == "l1_factors"
     assert default_source_for("CUSTOM") == "l1_factors"
