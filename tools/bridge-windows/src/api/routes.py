@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import sys
+import threading
 import time
 from datetime import datetime
 from aiohttp import web
@@ -22,10 +24,11 @@ TDX_CALL_TIMEOUT = 8.0
 
 # 交易/数据分槽（2026-10-22 实测：4 个并发全市场 pricevol 会把全局 Semaphore(4)
 # 占满，快照/下单要等 3.6s；TQ 17709 本身支持并发，堵点是桥槽）。
-# trade=2 保证下单/撤单/账户/委托查询永远有槽；data=2 给行情/采集/热集。
-# 总数 4 与实测 TQ 并发深度对齐；不要随意加到 3+3。
+# trade=2 保证下单/撤单/账户/委托查询永远有槽；data=1 只放一个数据调用进 TQ，
+# 配合采集器分块 500（~70ms/块），把数据对交易的影响压到单块级别。
+# TQ 并发深度实测约 4；2+1 留 1 个余量给健康检查/热集。
 TRADE_SEM_SLOTS = 2
-DATA_SEM_SLOTS = 2
+DATA_SEM_SLOTS = 1
 TRADE_CALL_TIMEOUT = 8.0
 DATA_CALL_TIMEOUT = 15.0
 
@@ -195,15 +198,111 @@ def _extract_symbol(method: str, params: dict) -> str:
     return symbol
 
 
+class _LogWriter:
+    """调用/交易日志的后台批量写入器（实盘事件循环绝不能被 SQLite 按住）。
+
+    事件循环只做 put_nowait；SQLite 写入在独立线程里批量 commit。
+    交易台账优先于调用日志：数据洪峰下先保证 trade_log 落库。
+    队列满时：调用日志可丢（计数），交易日志记 ERROR（需立即排查）。
+    """
+
+    def __init__(self, cache_db, max_calls: int = 20000, max_trades: int = 10000):
+        self.cache_db = cache_db
+        self._calls: queue.Queue = queue.Queue(maxsize=max_calls)
+        self._trades: queue.Queue = queue.Queue(maxsize=max_trades)
+        self._stop = threading.Event()
+        self.dropped_calls = 0
+        self.dropped_trades = 0
+        self._thread = threading.Thread(
+            target=self._run, name="bridge-log-writer", daemon=True)
+        self._thread.start()
+
+    def put_call(self, record: dict) -> None:
+        try:
+            self._calls.put_nowait(record)
+        except queue.Full:
+            self.dropped_calls += 1
+
+    def put_trade(self, record: dict) -> None:
+        try:
+            self._trades.put_nowait(record)
+        except queue.Full:
+            self.dropped_trades += 1
+            log.error("trade_log 队列已满，交易日志丢弃（需立即排查）")
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            trades = self._drain(self._trades, 100)
+            calls = self._drain(self._calls, 200)
+            if not trades and not calls:
+                self._stop.wait(0.2)
+                continue
+            try:
+                if trades:
+                    self.cache_db.log_trades_bulk(trades)
+                if calls:
+                    self.cache_db.log_calls_bulk(calls)
+            except Exception:  # noqa: BLE001 - 日志线程不能死
+                log.warning("日志批量写入失败（本批丢弃）", exc_info=True)
+                self._stop.wait(0.5)
+
+    @staticmethod
+    def _drain(q: queue.Queue, max_items: int) -> list:
+        out = []
+        while len(out) < max_items:
+            try:
+                out.append(q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def stats(self) -> dict:
+        return {
+            "dropped_calls": self.dropped_calls,
+            "dropped_trades": self.dropped_trades,
+            "queue_calls": self._calls.qsize(),
+            "queue_trades": self._trades.qsize(),
+        }
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+        # 收尾：把剩余记录补写一次（尽力而为）
+        trades = self._drain(self._trades, 10000)
+        calls = self._drain(self._calls, 20000)
+        try:
+            if trades:
+                self.cache_db.log_trades_bulk(trades)
+            if calls:
+                self.cache_db.log_calls_bulk(calls)
+        except Exception:  # noqa: BLE001
+            log.warning("日志收尾写入失败", exc_info=True)
+
+
+# 由 build_app 设置；事件循环里的记录函数只往队列里塞。
+_log_writer: _LogWriter | None = None
+
+
 def _record_call(cache_db, method: str, params: dict, result=None, duration_ms=None,
                  error: str = "", category: str = "", side: str = "", volume=None,
                  price=None, order_id="", status=""):
-    """精确记录一次桥调用到 SQLite (尽力而为)."""
+    """记录一次桥调用：入后台队列，绝不在这里写 SQLite。"""
     if not cache_db:
         return
+    record = {
+        "method": method, "symbol": _extract_symbol(method, params),
+        "params": params, "result": result, "duration_ms": duration_ms,
+        "error": error, "category": category, "side": side, "volume": volume,
+        "price": price, "order_id": order_id, "status": status,
+        "created_at": datetime.now().isoformat(timespec="milliseconds"),
+    }
+    writer = _log_writer
+    if writer is not None and writer.cache_db is cache_db:
+        writer.put_call(record)
+        return
+    # 启动早期/测试直连：走一次同步写（极少）
     try:
-        symbol = _extract_symbol(method, params)
-        cache_db.log_call(method, symbol, params, result, category=category,
+        cache_db.log_call(method, record["symbol"], params, result, category=category,
                           side=side, volume=volume, price=price,
                           order_id=order_id, status=status,
                           duration_ms=duration_ms, error=error)
@@ -213,8 +312,18 @@ def _record_call(cache_db, method: str, params: dict, result=None, duration_ms=N
 
 def _record_trade(cache_db, plan_id, event, symbol, side, volume, price,
                   order_id, status, message="", detail=None):
-    """精确记录一次交易事件到 SQLite."""
+    """记录一次交易事件：入交易优先队列，绝不在这里写 SQLite。"""
     if not cache_db:
+        return
+    record = {
+        "plan_id": plan_id, "event": event, "symbol": symbol, "side": side,
+        "volume": volume, "price": price, "order_id": order_id,
+        "status": status, "message": message, "detail": detail or {},
+        "created_at": datetime.now().isoformat(timespec="milliseconds"),
+    }
+    writer = _log_writer
+    if writer is not None and writer.cache_db is cache_db:
+        writer.put_trade(record)
         return
     try:
         cache_db.log_trade(plan_id, event, symbol, side, volume, price,
@@ -277,6 +386,12 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
               extra_tokens: list = None, rate_limiter=None,
               memory_cache=None) -> web.Application:
     app = web.Application()
+    # 后台日志写入器：事件循环只入队，SQLite 在独立线程批量 commit。
+    global _log_writer
+    writer = _LogWriter(cache_db) if cache_db is not None else None
+    _log_writer = writer
+    if writer is not None:
+        app.on_cleanup.append(lambda _app: writer.stop())
     # 支持多 token: 主 token + 扩展 tokens
     valid_tokens = [token] + [t for t in (extra_tokens or []) if t]
 
@@ -714,6 +829,8 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
                 stats_data["security"] = None
         # 交易/数据分槽观测：交易槽等待 >1s 已打 ERROR，这里给控制台/探针看
         stats_data["semaphores"] = semaphores_stats()
+        if _log_writer is not None:
+            stats_data["log_writer"] = _log_writer.stats()
         return web.json_response({"success": True, "data": stats_data})
 
     async def reset_token(request: web.Request):

@@ -235,6 +235,63 @@ class CacheDb:
                  datetime.now().isoformat(timespec="milliseconds")))
             self._conn.commit()
 
+    # ---- 批量写入（后台日志线程用；一次 commit，避免每请求 fsync） ----
+
+    def log_calls_bulk(self, records: list[dict]) -> int:
+        """批量写 tdx_log；records 由桥的后台日志线程聚合（含 created_at）。"""
+        if not records:
+            return 0
+        rows = []
+        for r in records:
+            try:
+                params_json = json.dumps(r.get("params") or {}, ensure_ascii=False,
+                                         default=str)[:2000]
+                result_json = json.dumps(r.get("result"), ensure_ascii=False,
+                                         default=str)[:4000]
+            except (TypeError, ValueError):
+                params_json, result_json = "", ""
+            rows.append((
+                r.get("method") or "", r.get("category") or "",
+                r.get("symbol") or "", r.get("side") or "",
+                r.get("volume"), r.get("price"), r.get("order_id") or "",
+                r.get("status") or "", params_json, result_json,
+                r.get("duration_ms"), r.get("error") or "",
+                r.get("created_at") or datetime.now().isoformat(timespec="milliseconds"),
+            ))
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO tdx_log (method, category, symbol, side, volume, price, "
+                "order_id, status, params, result, duration_ms, error, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            self._conn.commit()
+        return len(rows)
+
+    def log_trades_bulk(self, records: list[dict]) -> int:
+        """批量写 trade_log（交易台账，优先级高于调用日志）。"""
+        if not records:
+            return 0
+        rows = []
+        for r in records:
+            try:
+                detail_json = json.dumps(r.get("detail") or {}, ensure_ascii=False,
+                                         default=str)[:2000]
+            except (TypeError, ValueError):
+                detail_json = ""
+            rows.append((
+                r.get("plan_id") or "", r.get("event") or "",
+                r.get("symbol") or "", r.get("side") or "",
+                r.get("volume"), r.get("price"), r.get("order_id") or "",
+                r.get("status") or "", r.get("message") or "", detail_json,
+                r.get("created_at") or datetime.now().isoformat(timespec="milliseconds"),
+            ))
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO trade_log (plan_id, event, symbol, side, volume, price, "
+                "order_id, status, message, detail, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+            self._conn.commit()
+        return len(rows)
+
     def get_trade_logs(self, symbol: str = "", limit: int = 100) -> list[dict]:
         if symbol:
             return self._query(

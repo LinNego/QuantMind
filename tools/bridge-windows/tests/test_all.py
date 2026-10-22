@@ -347,11 +347,33 @@ def main():
     # 交易/数据分槽：4 个并发数据调用不能占满交易槽。
     print("\n=== 交易/数据双信号量 ===")
     assert "TRADE_SEM_SLOTS = 2" in _routes_src, "缺少 TRADE_SEM_SLOTS=2"
-    assert "DATA_SEM_SLOTS = 2" in _routes_src, "缺少 DATA_SEM_SLOTS=2"
+    assert "DATA_SEM_SLOTS = 1" in _routes_src, "缺少 DATA_SEM_SLOTS=1"
     assert "TRADE_METHODS" in _routes_src, "缺少交易方法分类表"
     assert "kind=call_kind(method)" in _routes_src, "/tdx/call 未按方法分类"
     assert "semaphores_stats()" in _routes_src, "缺少信号量观测"
-    print("  ✅ trade=2 / data=2 + 方法分类 + /health 观测")
+    print("  ✅ trade=2 / data=1 + 方法分类 + /health 观测")
+
+    # 调用/交易日志必须离开事件循环：后台队列 + 批量 commit。
+    print("\n=== 日志后台批量写入 ===")
+    assert "_LogWriter" in _routes_src and "put_nowait" in _routes_src
+    assert "log_calls_bulk" in _routes_src and "log_trades_bulk" in _routes_src
+    from src.db.cache_db import CacheDb as _CacheDb
+    _ldb = _CacheDb(os.path.join(tempfile.mkdtemp(), "log.db"))
+    _n = _ldb.log_calls_bulk([
+        {"method": "get_pricevol", "symbol": "600519.SH",
+         "params": {"stock_list": ["600519.SH"]}, "result": {"Value": {}},
+         "duration_ms": 1.2, "created_at": "2026-10-22T10:00:00.000"}
+        for _ in range(3)
+    ])
+    assert _n == 3 and _ldb.get_stats()["tdx_log"] == 3, _n
+    _n2 = _ldb.log_trades_bulk([{
+        "plan_id": "p1", "event": "order_execute", "symbol": "600519.SH",
+        "side": "buy", "volume": 100, "price": 10.0, "order_id": "W1",
+        "status": "submitted", "message": "", "detail": {},
+    }])
+    assert _n2 == 1 and _ldb.get_stats()["trade_log"] == 1, _n2
+    _ldb.close()
+    print("  ✅ 事件循环只入队，SQLite 批量提交")
 
     # 日志按大小滚动：bridge.log 曾无限增长到 1.5GB。
     print("\n=== bridge.log 按大小滚动 ===")

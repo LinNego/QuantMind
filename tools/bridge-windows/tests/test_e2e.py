@@ -183,7 +183,7 @@ async def run_tests():
             assert h["status"] == "ok"
         print("[PASS] 健康检查 GET OK")
 
-        # 交易/数据分槽：4 个慢数据调用（data 槽只有 2）不能堵住账户查询（trade 槽）。
+        # 交易/数据分槽：4 个慢数据调用（data 槽只有 1）不能堵住账户查询（trade 槽）。
         # 旧实现是全局 Semaphore(4)：4 个 pricevol 会占满，账户查询要等 0.8s。
         mock.pricevol_delay = 0.8
         slow = [asyncio.create_task(api(
@@ -202,7 +202,7 @@ async def run_tests():
         async with session.get(base + "/api/v1/health") as resp:
             h = await resp.json()
             assert h["semaphores"]["trade"]["slots"] == 2, h
-            assert h["semaphores"]["data"]["slots"] == 2, h
+            assert h["semaphores"]["data"]["slots"] == 1, h
         print(f"[PASS] 交易/数据分槽：数据慢调用期间账户查询 {trade_ms:.0f}ms")
 
         # 透传端点不得放行交易方法：side 经 JSON 构造不出 Side 枚举会买变卖，
