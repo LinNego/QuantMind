@@ -109,6 +109,9 @@ def load_kline(
     raw_close = raw_close.reindex(index=W["close"].index, columns=W["close"].columns)
     adj_factor = (W["close"] / raw_close).ffill(limit=10).fillna(1.0)
     W["adj_factor"] = adj_factor
+    # 名义收盘价单列留存：股息/派息类因子（f13_1239 / f13_1240）的分子是名义
+    # 元/股，分母必须同为名义价；用复权 close 会混入 1/adj(t) 因子（未来分红相关）。
+    W["close_raw"] = raw_close
     W["amount"] = W["amount"] * adj_factor  # 金额统一到复权基准
     # vwap 推算（单位契约核心）——复权基准
     W["vwap"] = W["amount"] / W["volume"]

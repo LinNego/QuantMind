@@ -11,6 +11,8 @@
 
 口径要点：
     - 价格用 daily_forward 前复权；volume=股；amount=万元（名义/未复权基准）
+    - alpha360 的 VWAP{d} 分子是名义价（amount/volume），分母用 daily_unadjusted
+      名义 close —— 否则会混入 1/adj(t) 复权因子（2026-10-22 审计）
     - JQ110 金额类用**名义成交额**（真实成交的钱）：money_flow = Σ amount×sign(ret)，
       成交额水平/TVMA/换手/流动性同基；β 用中证500 真实回归
     - 无未来函数（rolling/shift/ewm/cumsum 全因果）；严格窗口 min_periods=窗口
@@ -120,8 +122,13 @@ def _load_inputs(start: str):
     turnover = amount_yuan / (float_mv + 1e-12)
     # vwap（名义口径）：成交额 / 成交量
     vwap = amount_yuan / (daily["volume"] + 1e-12)
+    # 名义收盘价：alpha360 的 VWAP{d} 必须用名义/名义（见 alpha360.iter_partitions）
+    close_nominal = frdata.load_daily_panel(
+        start, "20991231", fields=("close",),
+        parts=("1_kline_data", "daily_unadjusted"),
+    )["close"].reindex(index=idx, columns=daily["close"].columns)
     print(f"      {len(idx)} 交易日 × {daily['close'].shape[1]} 只")
-    return daily, amount_yuan, turnover, vwap, market_ret
+    return daily, amount_yuan, turnover, vwap, market_ret, close_nominal
 
 
 def _meta(lib: str, n_factors: int, dates: pd.Index, n_syms: int, conv: str) -> dict:
@@ -183,13 +190,14 @@ def build_libraries(
     回看窗（见 LIB_UPDATE_LOOKBACK_DAYS）。
     """
     t0 = time.time()
-    daily, amount, turnover, vwap, market_ret = _load_inputs(start)
+    daily, amount, turnover, vwap, market_ret, close_nominal = _load_inputs(start)
     if max_symbols:
         syms = list(daily["close"].columns)[:max_symbols]
         for d_ in (daily,):
             for k in d_:
                 d_[k] = d_[k][syms]
         amount, turnover, vwap = amount[syms], turnover[syms], vwap[syms]
+        close_nominal = close_nominal[syms]
 
     written_by_lib: dict[str, int] = {}
     for lib in libs:
@@ -207,7 +215,10 @@ def build_libraries(
             ):  # 逐帧转 float32 并即时释放 float64（降内存峰值 ~6GB）
                 factors[k] = factors[k].astype(np.float32)
         conv = {
-            "alpha360": "字段 t−d 值/当日 close（VOLUME 除以当日 volume）；60 日回溯",
+            "alpha360": (
+                "字段 t−d 值/当日 close（VOLUME 除以当日 volume；"
+                "VWAP 分子为名义价，故分母用 daily_unadjusted 名义 close）；60 日回溯"
+            ),
             "tdxgs": "通达信/MyTT 口径（ddof=0、中国式 SMA、EMA=ewm span）；严格窗口 min_periods=窗口",
             "jq110": "聚宽口径；金额=名义成交额（元）、β=对中证500 真实回归；严格窗口",
         }[lib]
@@ -216,7 +227,9 @@ def build_libraries(
         out_root = _out_root(lib)
         if lib == "alpha360":
             written = 0
-            for i, (ts, day) in enumerate(alpha360.iter_partitions(daily, vwap)):
+            for i, (ts, day) in enumerate(
+                alpha360.iter_partitions(daily, vwap, close_nominal=close_nominal)
+            ):
                 if ts.strftime("%Y%m%d") < start:
                     continue
                 written += _write_day(out_root, ts, day, daily, i)
