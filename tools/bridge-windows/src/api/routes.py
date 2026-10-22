@@ -13,7 +13,8 @@ from ..core.trade_plan import TradePlan
 from ..core.types import OrderStatus, Side
 from ..executor.order_tracker import OrderTracker
 from ..executor.plan_executor import PlanExecutor
-from ..tdx.client import TdxClient, TdxError
+from ..security.trade_limits import TradeRateGuard
+from ..tdx.client import TdxClient, TdxError, TdxTimeoutError
 from ..tdx import parser
 from ..utils.auth import verify_token
 
@@ -29,7 +30,7 @@ TDX_CALL_TIMEOUT = 8.0
 # TQ 并发深度实测约 4；2+1 留 1 个余量给健康检查/热集。
 TRADE_SEM_SLOTS = 2
 DATA_SEM_SLOTS = 1
-TRADE_CALL_TIMEOUT = 8.0
+TRADE_CALL_TIMEOUT = 20.0
 DATA_CALL_TIMEOUT = 15.0
 
 # 只读/写入类交易方法：走 trade 槽，绝不被行情数据挤占。
@@ -138,6 +139,9 @@ _cache_stats_cache = {"ts": 0.0, "data": None}
 # 更危险的是：`order_stock` 的 `side` 参数经 JSON 传进来构造不出 Side 枚举，
 # `TdxClient.call` 会一律落到 STOCK_SELL（买变卖）。这里直接封死。
 FORBIDDEN_CALL_METHODS = frozenset({"order_stock", "cancel_order_stock", "call"})
+
+# 撤单硬上限：与下单独立计数（撤单是减风险动作，不被下单额度连坐）。
+_cancel_guard = TradeRateGuard()
 
 
 def json_error(status: int, code: str, message: str, details=None):
@@ -310,6 +314,15 @@ def _record_call(cache_db, method: str, params: dict, result=None, duration_ms=N
         log.warning("记录调用日志失败(忽略)", exc_info=True)
 
 
+async def _send_trade_warning_async(tdx, msg: str) -> None:
+    """撤单侧的 150 笔/日预警：日志 + 通达信弹消息；走 data 槽，不占交易槽。"""
+    log.warning(msg)
+    try:
+        await _call_tdx(tdx.send_message, "MSG," + msg, kind="data")
+    except Exception:
+        log.warning("发送撤单硬上限预警失败(忽略)", exc_info=True)
+
+
 def _record_trade(cache_db, plan_id, event, symbol, side, volume, price,
                   order_id, status, message="", detail=None):
     """记录一次交易事件：入交易优先队列，绝不在这里写 SQLite。"""
@@ -330,6 +343,15 @@ def _record_trade(cache_db, plan_id, event, symbol, side, volume, price,
                            order_id, status, message, detail)
     except Exception:
         log.warning("记录交易日志失败(忽略)", exc_info=True)
+
+
+_cache_write_sem = asyncio.Semaphore(2)
+
+
+async def _cache_result_async(*args) -> None:
+    """把 cache 写入丢进线程 + 限并发；失败不影响主流程。"""
+    async with _cache_write_sem:
+        await asyncio.to_thread(_cache_result, *args)
 
 
 def _cache_stats_sync(cache_db, memory_cache) -> dict | None:
@@ -456,6 +478,11 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             "server_time": datetime.now().isoformat(timespec="seconds"),
             # 交易/数据分槽的占用与等待：采集器/看门狗可用它判断是否该让路
             "semaphores": semaphores_stats(),
+            # 写死的交易硬上限余量（299/秒、1999/日）
+            "trade_limits": {
+                "orders": executor.order_guard.stats(),
+                "cancels": _cancel_guard.stats(),
+            },
         })
 
     async def execute_plan(request: web.Request):
@@ -545,6 +572,12 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         data = await request.json()
         stock_code = data.get("stock_code", "")
         order_id = data.get("order_id", "")
+        allowed, reason = _cancel_guard.allow()
+        if not allowed:
+            return json_error(429, "HARD_LIMIT", reason)
+        warning = _cancel_guard.consume_warning()
+        if warning:
+            asyncio.create_task(_send_trade_warning_async(tdx, warning))
         account_id = await _call_tdx(executor.resolve_account_id,
                                      data.get("account", ""), data.get("account_type", "stock"), kind="trade")
         try:
@@ -568,6 +601,21 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
                 resp["verified"] = True
                 resp["message"] = "撤单已生效（握手报失败系误报, 经委托终态复核确认）"
             return web.json_response(resp)
+        except TdxTimeoutError as e:
+            # 撤单超时=结果未知：按当日委托终态复核；绝不返回 502 让上游当失败重试
+            verified = await _verify_cancel_effective(account_id, stock_code, order_id)
+            executor.log_trade({"event": "cancel_timeout_unknown",
+                                "stock_code": stock_code, "order_id": order_id,
+                                "verified": verified, "error": str(e)})
+            if verified:
+                return web.json_response({
+                    "success": True, "verified": True,
+                    "message": "撤单已生效（超时后经委托终态复核确认）",
+                    "channel_used": "http"})
+            return web.json_response({
+                "success": False, "status": "unknown",
+                "message": "撤单请求超时，结果未知（已复核未确认；勿当失败重试）",
+                "channel_used": "http"})
         except TdxError as e:
             return json_error(502, "TDX_UNAVAILABLE", str(e))
 
@@ -673,18 +721,25 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             cache_key = f"{method}:{json.dumps(params, ensure_ascii=False, sort_keys=True)}" if cache_ttl else None
 
             if memory_cache and cache_key:
-                def _fetch():
-                    return _run_tdx_sync(tdx, method, params)
-                result = memory_cache.get_or_fetch(cache_key, cache_ttl, _fetch)
+                # 内存缓存路径也必须走 data 槽 + 线程：get_or_fetch 内部是
+                # 同步 urllib + Condition.wait，直接在事件循环里跑会把桥按住。
+                def _fetch_cached():
+                    return memory_cache.get_or_fetch(
+                        cache_key, cache_ttl, lambda: tdx.call(method, params))
+                result = await _call_tdx(_fetch_cached,
+                                         kind=call_kind(method))
             else:
-                result = await _call_tdx(tdx.call, method, params, kind=call_kind(method))
+                result = await _call_tdx(tdx.call, method, params,
+                                         kind=call_kind(method))
             _dur = round((_time.monotonic() - _t0) * 1000, 1)
             # 自动缓存常见查询到 SQLite (若启用缓存)
             if cache_db and method in ("get_market_data", "get_stock_info",
                                        "get_market_snapshot", "get_financial_data"):
                 symbol = _extract_symbol(method, params)
                 if symbol:
-                    _cache_result(cache_db, method, symbol, params, result)
+                    # best-effort 落 SQLite：绝不能在事件循环里同步写
+                    asyncio.create_task(_cache_result_async(
+                        cache_db, method, symbol, params, result))
             # 精确记录调用
             _record_call(cache_db, method, params, result=result, duration_ms=_dur,
                          category="query", status="ok")
@@ -829,6 +884,10 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
                 stats_data["security"] = None
         # 交易/数据分槽观测：交易槽等待 >1s 已打 ERROR，这里给控制台/探针看
         stats_data["semaphores"] = semaphores_stats()
+        stats_data["trade_limits"] = {
+            "orders": executor.order_guard.stats(),
+            "cancels": _cancel_guard.stats(),
+        }
         if _log_writer is not None:
             stats_data["log_writer"] = _log_writer.stats()
         return web.json_response({"success": True, "data": stats_data})

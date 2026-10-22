@@ -22,9 +22,16 @@ WRITE_PATHS = ("/api/v1/plans/execute", "/api/v1/orders/cancel",
 
 class RateLimiter:
     def __init__(self, per_minute: int = 60, write_per_minute: int = 10,
-                 fail_ban_threshold: int = 5, fail_ban_seconds: int = 30):
+                 fail_ban_threshold: int = 5, fail_ban_seconds: int = 30,
+                 local_per_minute: int = 6000,
+                 local_write_per_minute: int = 30000):
         self.per_minute = per_minute
         self.write_per_minute = write_per_minute
+        # 本机（127.0.0.1）是可信的本地采集器/测试，给独立高预算；
+        # 远程 IP 仍按 per_minute/write_per_minute。交易硬上限（299/1999）
+        # 由 security/trade_limits.py 独立强制，不依赖这里。
+        self.local_per_minute = local_per_minute
+        self.local_write_per_minute = local_write_per_minute
         self.fail_ban_threshold = fail_ban_threshold
         self.fail_ban_seconds = fail_ban_seconds
         # ip -> {window_start, count}
@@ -53,10 +60,14 @@ class RateLimiter:
                 return "IP 已被临时封禁"
             del self._banned[ip]
 
-        # 写操作单独限流
+        # 写操作单独限流；本机走独立预算
         is_write = any(path.startswith(p) for p in WRITE_PATHS)
+        is_local = ip in ("127.0.0.1", "::1")
         bucket = self._write_windows if is_write else self._windows
-        limit = self.write_per_minute if is_write else self.per_minute
+        if is_local:
+            limit = self.local_write_per_minute if is_write else self.local_per_minute
+        else:
+            limit = self.write_per_minute if is_write else self.per_minute
         if not self._check_window(bucket, ip, limit):
             return f"请求过于频繁 (限 {limit}/分钟)"
 

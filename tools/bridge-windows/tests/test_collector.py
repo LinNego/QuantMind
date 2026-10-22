@@ -75,7 +75,14 @@ def test_aggregator():
     assert out[0]["volume"] == 0.0, out
     # 价格为 0（停牌）忽略
     assert agg2.on_sample(code, 0.0, 1.0, now=datetime(2026, 10, 22, 10, 2, 0)) == []
-    print("  ✅ 1m 聚合（OHLC/量差/盘中启动/停牌）")
+    # 跨日：昨日累计量不能当今日基线，新一天首根量必须 > 0
+    agg3 = BarAggregator()
+    agg3.on_sample(code, 10.0, 1000.0, now=datetime(2026, 10, 22, 14, 59, 55))
+    agg3.on_sample(code, 11.0, 100.0, now=datetime(2026, 10, 23, 9, 30, 5))
+    _next_day = agg3.flush_stale(now=datetime(2026, 10, 23, 9, 31, 10))
+    _d2 = [b for b in _next_day if b["trade_date"] == "20261023"]
+    assert _d2 and _d2[0]["volume"] == 100.0, _next_day
+    print("  ✅ 1m 聚合（OHLC/量差/盘中启动/停牌/跨日）")
 
 
 def test_store():

@@ -238,13 +238,16 @@ class CollectorService:
             return
         sem = asyncio.Semaphore(2)
         while not self._stopping:
+            started = time.monotonic()
             now = datetime.now()
             if (self._is_trading_day(now) and is_trading_time(now)
                     and not self.hot_breaker.is_paused()):
                 await asyncio.gather(
                     *(self._collect_hot_one(code, sem) for code in self.config.hot_set),
                     return_exceptions=True)
-            await asyncio.sleep(self.config.hot_interval)
+            # 从本轮开始计时，避免「耗时 + interval」把周期拖成 2 倍
+            elapsed = time.monotonic() - started
+            await asyncio.sleep(max(0.5, self.config.hot_interval - elapsed))
 
     async def _collect_hot_one(self, code: str, sem: asyncio.Semaphore) -> None:
         async with sem:

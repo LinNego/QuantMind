@@ -32,6 +32,7 @@ class BarAggregator:
     def __init__(self) -> None:
         self._states: dict[str, _BarState] = {}
         self._prev_volume: dict[str, float] = {}
+        self._day = ""
 
     def on_sample(self, code: str, price: float,
                   cumulative_volume: float | None = None,
@@ -42,6 +43,10 @@ class BarAggregator:
             return []
         minute = now.strftime("%H%M")
         trade_date = now.strftime("%Y%m%d")
+        if trade_date != self._day:
+            # 跨日：昨日收盘累计量不能当今日基线，否则新一天首根量恒为 0
+            self._prev_volume.clear()
+            self._day = trade_date
         bars: list[dict] = []
         state = self._states.get(code)
         if state is not None and (state.minute != minute or state.trade_date != trade_date):

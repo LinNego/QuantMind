@@ -1,12 +1,16 @@
 import json
 import logging
 import os
+import threading
+import time
+from collections import OrderedDict
 from datetime import datetime
 
 from ..core.trade_plan import TradePlan
 from ..core.types import OrderStatus, PriceType, Side
+from ..security.trade_limits import TradeRateGuard, verify_hard_limits
 from ..tdx import parser
-from ..tdx.client import TdxClient, TdxError
+from ..tdx.client import TdxClient, TdxError, TdxTimeoutError
 
 log = logging.getLogger(__name__)
 
@@ -19,8 +23,14 @@ class PlanExecutor:
         self.tdx = tdx
         self.shared_report_dir = shared_report_dir
         self.trade_log_file = os.path.join(shared_report_dir, trade_log_file)
-        self._executed_plans = set()   # 内存去重 (重启后可从日志恢复)
+        # 幂等去重：check-then-add 必须原子（trade 槽 2 并发 + file_sync 同进程）
+        self._executed_plans: OrderedDict[str, bool] = OrderedDict()
+        self._dedup_lock = threading.Lock()
         self._account_id = -1          # 未显式指定则用 0
+        # 写死的交易硬上限：299/秒、1999/日（见 security/trade_limits.py）
+        verify_hard_limits()
+        self.order_guard = TradeRateGuard()
+        self._plan_deadline_s = 20.0
 
     def resolve_account_id(self, account: str, account_type: str) -> int:
         """用户指定账号则取句柄, 否则默认 0."""
@@ -47,12 +57,16 @@ class PlanExecutor:
     # ---- 主流程 ----
 
     def execute_plan(self, plan: TradePlan) -> dict:
-        if plan.plan_id in self._executed_plans:
-            return {"plan_id": plan.plan_id, "status": "duplicate",
-                    "message": "plan 已执行过"}
-        self._executed_plans.add(plan.plan_id)
+        with self._dedup_lock:
+            if plan.plan_id in self._executed_plans:
+                return {"plan_id": plan.plan_id, "status": "duplicate",
+                        "message": "plan 已执行过"}
+            self._executed_plans[plan.plan_id] = True
+            if len(self._executed_plans) > 100000:
+                self._executed_plans.popitem(last=False)
 
         self.log_trade({"event": "plan_received", "plan": plan.to_dict()})
+        deadline = time.monotonic() + self._plan_deadline_s
         account_id = self.resolve_account_id(plan.account, plan.account_type)
 
         orders_out = []
@@ -61,6 +75,11 @@ class PlanExecutor:
         sells = [o for o in plan.orders if o.side == Side.SELL.value]
         buys = [o for o in plan.orders if o.side == Side.BUY.value]
         for o in sells + buys:
+            if time.monotonic() > deadline:
+                orders_out.append(self._order_out(
+                    o, "error", None, "计划总超时，未执行（勿重试）"))
+                statuses.append("rejected")
+                continue
             result = self._execute_one(account_id, o, plan)
             orders_out.append(result)
             if result["status"] == "filled":
@@ -121,6 +140,17 @@ class PlanExecutor:
             PriceType.MANUAL if order.order_type == "limit" else PriceType.MARKET)
         price = order.price or 0.0
 
+        # 写死的硬上限：299 笔/秒、1999 笔/日（下单独立计数，撤单不连坐）
+        allowed, reason = self.order_guard.allow()
+        if not allowed:
+            self.log_trade({"event": "order_hard_limit", "stock": stock,
+                            "side": side.value, "volume": order.volume,
+                            "msg": reason})
+            return self._order_out(order, "rejected", None, reason)
+        warning = self.order_guard.consume_warning()
+        if warning:
+            self._send_trade_warning(warning)
+
         try:
             res = self.tdx.order_stock(account_id, stock, side, order.volume,
                                        price_type, price)
@@ -146,10 +176,26 @@ class PlanExecutor:
                                 "side": side.value, "volume": order.volume,
                                 "msg": msg, "value": value})
             return self._order_out(order, status, wtbh, msg, state)
+        except TdxTimeoutError as e:
+            # 超时=结果未知，可能已在柜台。按 submitted 报，绝不让上游当失败重试。
+            self.log_trade({"event": "order_timeout_unknown", "stock": stock,
+                            "side": side.value, "volume": order.volume,
+                            "error": str(e)})
+            return self._order_out(order, "submitted", None,
+                                   f"下单超时，结果未知（勿重试）: {e}",
+                                   OrderStatus.SUBMITTED)
         except TdxError as e:
             self.log_trade({"event": "order_error", "stock": stock, "side": side.value,
                             "volume": order.volume, "error": str(e)})
             return self._order_out(order, "error", None, str(e))
+
+    def _send_trade_warning(self, msg: str) -> None:
+        """150 笔/日预警：桥日志 + 通达信客户端弹消息（尽力而为）。"""
+        log.warning(msg)
+        try:
+            self.tdx.send_message("MSG," + msg)
+        except Exception:
+            log.warning("发送交易硬上限预警失败(忽略)", exc_info=True)
 
     def _order_out(self, order, status: str, order_id, message, state=None):
         out = {

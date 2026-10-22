@@ -1,5 +1,6 @@
 import json
 import logging
+import socket
 import time
 import urllib.request
 
@@ -12,6 +13,10 @@ class TdxError(Exception):
     """通达信 JSON-RPC 调用失败."""
 
 
+class TdxTimeoutError(TdxError):
+    """通达信调用超时：结果未知。交易方法绝不可重试/当失败。"""
+
+
 class TdxClient:
     """通达信 tqcenter HTTP 服务 (127.0.0.1:17709) 的同步 JSON-RPC 客户端."""
 
@@ -22,12 +27,14 @@ class TdxClient:
         self.max_retries = max_retries
         self._next_id = 1
 
-    def _call(self, method: str, params: dict) -> dict:
+    def _call(self, method: str, params: dict,
+              max_retries: int | None = None) -> dict:
         body = json.dumps({"id": self._next_id, "method": method,
                            "params": params}, ensure_ascii=False).encode("utf-8")
         self._next_id += 1
+        retries = self.max_retries if max_retries is None else max_retries
         last_err = None
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(retries + 1):
             try:
                 req = urllib.request.Request(
                     self.base_url, data=body,
@@ -44,9 +51,13 @@ class TdxClient:
                 return inner
             except (urllib.error.URLError, OSError, json.JSONDecodeError, TdxError) as e:
                 last_err = e
-                if attempt < self.max_retries:
+                if attempt < retries:
                     time.sleep(0.5 * (2 ** attempt))
-        raise TdxError(f"{method} 调用失败(重试{self.max_retries}次): {last_err}")
+        if isinstance(last_err, (TimeoutError, socket.timeout)) or \
+                "timed out" in str(last_err).lower() or "超时" in str(last_err):
+            raise TdxTimeoutError(
+                f"{method} 调用超时(重试{retries}次): {last_err}")
+        raise TdxError(f"{method} 调用失败(重试{retries}次): {last_err}")
 
     def health_check(self) -> bool:
         return self.health_check_fast()
@@ -95,14 +106,18 @@ class TdxClient:
                     volume: int, price_type: PriceType = PriceType.MANUAL,
                     price: float = 0.0) -> dict:
         order_type = STOCK_BUY if side == Side.BUY else STOCK_SELL
+        # 下单绝不重试：超时后订单可能已在柜台，重试=重复下单。
         return self._call("order_stock", {
             "account_id": account_id, "stock_code": stock_code,
             "order_type": order_type, "order_volume": int(volume),
-            "price_type": int(price_type.value), "price": float(price or 0)})
+            "price_type": int(price_type.value), "price": float(price or 0)},
+            max_retries=0)
 
     def cancel_order_stock(self, account_id: int, stock_code: str, order_id: str) -> dict:
+        # 撤单同样不重试：重复撤单会让终态/回执混乱，交给上层终态复核。
         return self._call("cancel_order_stock", {
-            "account_id": account_id, "stock_code": stock_code, "order_id": order_id})
+            "account_id": account_id, "stock_code": stock_code, "order_id": order_id},
+            max_retries=0)
 
     # ---- 推送 ----
 

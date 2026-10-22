@@ -30,6 +30,7 @@ class MockTdx:
         self.orders_placed = []
         self.port = None
         self.pricevol_delay = 0.0
+        self.messages = []
         self._httpd = None
         self._thread = None
 
@@ -96,6 +97,9 @@ class _MockHandler(BaseHTTPRequestHandler):
             codes = (body.get("params") or {}).get("stock_list", [])
             result["Value"] = {c: {"Now": f"{self.mock.price}", "LastClose": "10.00",
                                    "Volume": "1000"} for c in codes}
+        elif method == "send_message":
+            self.mock.messages.append((body.get("params") or {}).get("msg_str", ""))
+            result["Value"] = "1"
         else:
             result["ErrorId"] = "-1"
             result["Msg"] = f"unknown {method}"
@@ -266,6 +270,77 @@ async def run_tests():
         assert status == 200 and can4["success"] is False, f"在途委托被误报撤单成功: {status} {can4}"
         print("[PASS] 握手失败且委托仍在途 → 如实报失败")
         mock.orders_list = []
+
+        # C4: 同 plan_id 并发只执行一次（check-then-add 原子）
+        race_plan = TradePlan(plan_id="plan_race_001",
+                              orders=[Order(stock_code="600036.SH", side="buy",
+                                            volume=100, price=10.0)])
+        race_results = []
+
+        def _race():
+            race_results.append(executor.execute_plan(race_plan))
+
+        _t1 = threading.Thread(target=_race)
+        _t2 = threading.Thread(target=_race)
+        _t1.start(); _t2.start(); _t1.join(); _t2.join()
+        assert len(race_results) == 2
+        assert sum(1 for r in race_results if r["status"] != "duplicate") == 1, race_results
+        assert len([o for o in mock.orders_placed if o["stock"] == "600036.SH"]) == 1
+        print("[PASS] 同 plan_id 并发只执行一次")
+
+        # C3: 下单超时 → submitted（结果未知，绝不报 error 让上游重试）
+        from src.tdx.client import TdxTimeoutError
+        _orig_order = tdx.order_stock
+        tdx.order_stock = lambda *a, **k: (_ for _ in ()).throw(
+            TdxTimeoutError("timed out"))
+        try:
+            timeout_plan = TradePlan(plan_id="plan_timeout_001",
+                                     orders=[Order(stock_code="000001.SZ", side="buy",
+                                                   volume=100, price=10.0)])
+            timeout_report = executor.execute_plan(timeout_plan)
+            assert timeout_report["status"] == "executed", timeout_report
+            assert timeout_report["orders"][0]["status"] == "submitted", timeout_report
+        finally:
+            tdx.order_stock = _orig_order
+        print("[PASS] 下单超时映射为 submitted（勿重试）")
+
+        # 硬上限：预填 299 个本秒时间戳 → 下一笔拒绝且不落 TQ
+        import src.security.trade_limits as _tl
+        _before = len(mock.orders_placed)
+        executor.order_guard._recent.extend(
+            [time.monotonic()] * _tl.HARD_MAX_TRADES_PER_SEC)
+        cap_plan = TradePlan(plan_id="plan_cap_001",
+                             orders=[Order(stock_code="600519.SH", side="buy",
+                                           volume=100, price=10.0)])
+        cap_report = executor.execute_plan(cap_plan)
+        executor.order_guard._recent.clear()
+        assert cap_report["orders"][0]["status"] == "rejected", cap_report
+        assert "硬上限" in cap_report["orders"][0].get("message", ""), cap_report
+        assert len(mock.orders_placed) == _before
+        print("[PASS] 下单硬上限 299/秒拒绝且不落 TQ")
+
+        # 撤单硬上限：预填 299 → 429
+        import src.api.routes as _routes
+        _routes._cancel_guard._recent.extend(
+            [time.monotonic()] * _tl.HARD_MAX_TRADES_PER_SEC)
+        status, body = await api("/api/v1/orders/cancel",
+                                 {"stock_code": "600519.SH", "order_id": "x"})
+        _routes._cancel_guard._recent.clear()
+        assert status == 429, (status, body)
+        print("[PASS] 撤单硬上限 299/秒返回 429")
+
+        # 150 笔/日预警：预置 149，下一笔触发 send_message
+        mock.messages = []
+        executor.order_guard._day_count = 149
+        executor.order_guard._warned_150 = False
+        executor.order_guard._warning_pending = False
+        warn_plan = TradePlan(plan_id="plan_warn_001",
+                              orders=[Order(stock_code="600519.SH", side="buy",
+                                            volume=100, price=10.0)])
+        warn_report = executor.execute_plan(warn_plan)
+        assert warn_report["orders"][0]["status"] != "error", warn_report
+        assert any("150" in m for m in mock.messages), mock.messages
+        print("[PASS] 150 笔/日预警已弹出")
 
         # 7. 止损守护 (高价不触发)
         sltp = StopLossDaemon(tdx, os.path.join(tmp, "stop_loss_state.json"), poll_interval=0.1)

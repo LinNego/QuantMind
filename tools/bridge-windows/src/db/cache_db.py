@@ -306,21 +306,41 @@ class CacheDb:
         return self._query("SELECT * FROM tdx_log ORDER BY id DESC LIMIT ?", (limit,))
 
     def get_stats(self) -> dict:
-        """返回缓存统计."""
-        with self._lock:
-            cur = self._conn.cursor()
-            counts = {}
-            allowed_tables = {"kline", "stock_info", "market_snapshot", "financial",
-                              "sector_stocks", "tdx_log", "trade_log"}
+        """返回缓存统计（独立只读连接，不持有写入锁，不阻塞事件循环的写路径）。
+
+        旧实现 `with self._lock` 跑 7 个 COUNT(*)（tdx_log 曾 512 万行，3-52s），
+        期间所有 cache 写（快照/K线）都在事件循环里等锁。现在用独立连接，
+        WAL 下读写互不阻塞；连接失败再退回原路径。
+        """
+        allowed_tables = ("kline", "stock_info", "market_snapshot", "financial",
+                          "sector_stocks", "tdx_log", "trade_log")
+        counts = {}
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5)
+            cur = conn.cursor()
             for table in allowed_tables:
                 try:
-                    # 表名来自硬编码白名单, 双重校验防注入
-                    if table not in allowed_tables:
-                        continue
-                    counts[table] = cur.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    counts[table] = cur.execute(
+                        f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 except Exception:
                     counts[table] = 0
             return counts
+        except sqlite3.Error:
+            conn = None
+        finally:
+            if conn is not None:
+                conn.close()
+        # 极端兜底：独立连接打不开时才走共享连接
+        with self._lock:
+            cur = self._conn.cursor()
+            for table in allowed_tables:
+                try:
+                    counts[table] = cur.execute(
+                        f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                except Exception:
+                    counts[table] = 0
+        return counts
 
     def get_cache_disk(self) -> int:
         """缓存数据库文件大小 (字节)."""

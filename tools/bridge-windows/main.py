@@ -16,6 +16,7 @@ from src.executor.plan_executor import PlanExecutor
 from src.executor.stop_loss_daemon import StopLossDaemon
 from src.tdx.client import TdxClient
 from src.utils.config import Config
+from src.security.trade_limits import verify_hard_limits
 from src.utils.log_setup import build_handlers
 
 # Force UTF-8 on stdout/stderr for Chinese text (PowerShell codepage workaround)
@@ -48,6 +49,8 @@ log = logging.getLogger("bridge-windows")
 
 
 async def main():
+    # 交易硬上限（299/秒、1999/日）启动自检：被改动则拒绝启动
+    verify_hard_limits()
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--mode", default="auto", choices=["auto", "http", "file_sync"])

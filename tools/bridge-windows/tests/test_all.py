@@ -375,6 +375,44 @@ def main():
     _ldb.close()
     print("  ✅ 事件循环只入队，SQLite 批量提交")
 
+    # 交易硬上限：299/秒、1999/日，150 笔预警；改了就停机。
+    print("\n=== 交易硬上限 299/1999 + 150 预警 ===")
+    from src.security.trade_limits import (
+        HARD_MAX_TRADES_PER_SEC, HARD_MAX_TRADES_PER_DAY,
+        WARN_AT_TRADES_PER_DAY, TradeRateGuard, HardLimitTampered,
+        verify_hard_limits,
+    )
+    assert (HARD_MAX_TRADES_PER_SEC, HARD_MAX_TRADES_PER_DAY) == (299, 1999)
+    assert WARN_AT_TRADES_PER_DAY == 150
+    verify_hard_limits()
+    _now = datetime(2026, 1, 5, 9, 30, 0)
+    _g = TradeRateGuard()
+    for _i in range(299):
+        _ok, _ = _g.allow(_now, mono=1000.0)
+        assert _ok, _i
+    _ok, _reason = _g.allow(_now, mono=1000.0)
+    assert not _ok and "299" in _reason, _reason
+    _g2 = TradeRateGuard()
+    for _i in range(150):
+        _ok, _ = _g2.allow(_now, mono=2000.0)
+        assert _ok, _i
+    _warn = _g2.consume_warning()
+    assert _warn and "150" in _warn, _warn
+    assert _g2.consume_warning() == ""
+    _g3 = TradeRateGuard(max_per_sec=300)
+    try:
+        _g3._check_immutable()
+        raise AssertionError("篡改硬上限未被拒绝")
+    except HardLimitTampered:
+        pass
+    assert "verify_hard_limits()" in _main_src
+    _pe_src = open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "src", "executor", "plan_executor.py"), encoding="utf-8").read()
+    assert "_dedup_lock" in _pe_src and "TdxTimeoutError" in _pe_src
+    assert "consume_warning" in _pe_src
+    print("  ✅ 常量/启动自检/篡改停机/150 预警")
+
     # 日志按大小滚动：bridge.log 曾无限增长到 1.5GB。
     print("\n=== bridge.log 按大小滚动 ===")
     from src.utils.log_setup import build_handlers
