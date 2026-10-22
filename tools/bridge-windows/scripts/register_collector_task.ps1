@@ -13,8 +13,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$venv = Join-Path $root ".venv\Scripts\python.exe"
-$py = if (Test-Path $venv) { $venv } else { (Get-Command python).Source }
+# 优先用桥同款解释器；避免 Windows Store 的 python 别名
+$candidates = @(
+    (Join-Path $root ".venv\Scripts\python.exe"),
+    "C:\Program Files\Python312\python.exe"
+)
+$py = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $py) { $py = (Get-Command python).Source }
 if (-not $py) { throw "找不到 python.exe" }
 
 $arg = "`"$root\scripts\tdx_collector.py`" --config `"$root\config.yaml`" --port $Port"
