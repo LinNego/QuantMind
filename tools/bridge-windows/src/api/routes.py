@@ -28,8 +28,10 @@ TDX_CALL_TIMEOUT = 8.0
 # trade=2 保证下单/撤单/账户/委托查询永远有槽；data=1 只放一个数据调用进 TQ，
 # 配合采集器分块 500（~70ms/块），把数据对交易的影响压到单块级别。
 # TQ 并发深度实测约 4；2+1 留 1 个余量给健康检查/热集。
-TRADE_SEM_SLOTS = 2
-DATA_SEM_SLOTS = 1
+ORDER_SEM_SLOTS = 2   # 下单/撤单：独立高优先，绝不被账户/行情查询占用
+TRADE_SEM_SLOTS = 1   # 账户/持仓/委托查询（含 /stats）
+DATA_SEM_SLOTS = 1    # 行情/采集/推送
+ORDER_CALL_TIMEOUT = 20.0
 TRADE_CALL_TIMEOUT = 20.0
 DATA_CALL_TIMEOUT = 15.0
 
@@ -39,25 +41,28 @@ TRADE_METHODS = frozenset({
     "query_stock_positions", "query_stock_orders", "stock_account",
 })
 
+_order_semaphore = None
 _trade_semaphore = None
 _data_semaphore = None
 
 # 信号量观测（全部在事件循环内更新，无需加锁）
 _sem_stats = {
-    "trade": {"inflight": 0, "waiting": 0, "calls": 0, "timeouts": 0,
-              "wait_ms_last": 0.0, "wait_ms_max": 0.0},
-    "data": {"inflight": 0, "waiting": 0, "calls": 0, "timeouts": 0,
-             "wait_ms_last": 0.0, "wait_ms_max": 0.0},
+    k: {"inflight": 0, "waiting": 0, "calls": 0, "timeouts": 0,
+        "wait_ms_last": 0.0, "wait_ms_max": 0.0}
+    for k in ("order", "trade", "data")
 }
 
 
 def _get_semaphores():
-    global _trade_semaphore, _data_semaphore
+    global _order_semaphore, _trade_semaphore, _data_semaphore
+    if _order_semaphore is None:
+        _order_semaphore = asyncio.Semaphore(ORDER_SEM_SLOTS)
     if _trade_semaphore is None:
         _trade_semaphore = asyncio.Semaphore(TRADE_SEM_SLOTS)
     if _data_semaphore is None:
         _data_semaphore = asyncio.Semaphore(DATA_SEM_SLOTS)
-    return _trade_semaphore, _data_semaphore
+    return {"order": _order_semaphore, "trade": _trade_semaphore,
+            "data": _data_semaphore}
 
 
 def call_kind(method: str) -> str:
@@ -67,13 +72,11 @@ def call_kind(method: str) -> str:
 
 def semaphores_stats() -> dict:
     """给 /stats 用的信号量快照（含配额与在途/等待）。"""
-    trade_sem, data_sem = _get_semaphores()
-    return {
-        "trade": {**_sem_stats["trade"], "slots": TRADE_SEM_SLOTS,
-                  "available": trade_sem._value},
-        "data": {**_sem_stats["data"], "slots": DATA_SEM_SLOTS,
-                 "available": data_sem._value},
-    }
+    sems = _get_semaphores()
+    slots = {"order": ORDER_SEM_SLOTS, "trade": TRADE_SEM_SLOTS,
+             "data": DATA_SEM_SLOTS}
+    return {k: {**_sem_stats[k], "slots": slots[k],
+                "available": sems[k]._value} for k in slots}
 
 
 async def _call_tdx(func, *args, kind: str = "data", timeout: float | None = None):
@@ -83,10 +86,10 @@ async def _call_tdx(func, *args, kind: str = "data", timeout: float | None = Non
     kind="data" ：行情/财务/板块/采集，2 个槽（与热集/采集任务共享）。
     数据调用再忙，也不会占掉交易槽。
     """
-    if kind not in ("trade", "data"):
+    if kind not in ("order", "trade", "data"):
         raise ValueError(f"非法 kind: {kind}")
-    trade_sem, data_sem = _get_semaphores()
-    sem = trade_sem if kind == "trade" else data_sem
+    sems = _get_semaphores()
+    sem = sems[kind]
     stat = _sem_stats[kind]
     stat["calls"] += 1
     queued = sem.locked()
@@ -111,7 +114,9 @@ async def _call_tdx(func, *args, kind: str = "data", timeout: float | None = Non
                 return await asyncio.wait_for(
                     asyncio.to_thread(func, *args),
                     timeout=timeout if timeout is not None else (
-                        TRADE_CALL_TIMEOUT if kind == "trade" else DATA_CALL_TIMEOUT),
+                        ORDER_CALL_TIMEOUT if kind == "order"
+                        else TRADE_CALL_TIMEOUT if kind == "trade"
+                        else DATA_CALL_TIMEOUT),
                 )
             except asyncio.TimeoutError:
                 stat["timeouts"] += 1
@@ -139,6 +144,12 @@ _cache_stats_cache = {"ts": 0.0, "data": None}
 # 更危险的是：`order_stock` 的 `side` 参数经 JSON 传进来构造不出 Side 枚举，
 # `TdxClient.call` 会一律落到 STOCK_SELL（买变卖）。这里直接封死。
 FORBIDDEN_CALL_METHODS = frozenset({"order_stock", "cancel_order_stock", "call"})
+
+# 高频数据方法的审计只存摘要（不存 400KB 的 params/result 全文），
+# 否则 30-40 万行/日 × 2-3KB 会把 tdx_log 重新撑到 8-12GB。
+HIGH_FREQ_DATA_METHODS = frozenset(
+    {"get_pricevol", "get_market_snapshot", "get_market_data"})
+
 
 # 撤单硬上限：与下单独立计数（撤单是减风险动作，不被下单额度连坐）。
 _cancel_guard = TradeRateGuard()
@@ -287,14 +298,34 @@ class _LogWriter:
 _log_writer: _LogWriter | None = None
 
 
+def _compact_audit(method: str, params, result):
+    """高频数据方法只保留条数，避免审计表被大 JSON 撑爆。"""
+    if method not in HIGH_FREQ_DATA_METHODS:
+        return params, result
+    n = 0
+    if isinstance(params, dict):
+        sl = params.get("stock_list")
+        n = len(sl) if isinstance(sl, list) else (1 if params.get("stock_code") else 0)
+    count = 0
+    if isinstance(result, dict):
+        value = result.get("Value")
+        if isinstance(value, (list, dict)):
+            count = len(value)
+        elif isinstance(value, (int, float)):
+            count = int(value)
+    return {"n": n}, {"count": count}
+
+
 def _record_call(cache_db, method: str, params: dict, result=None, duration_ms=None,
                  error: str = "", category: str = "", side: str = "", volume=None,
                  price=None, order_id="", status=""):
     """记录一次桥调用：入后台队列，绝不在这里写 SQLite。"""
     if not cache_db:
         return
+    symbol = _extract_symbol(method, params)
+    params, result = _compact_audit(method, params, result)
     record = {
-        "method": method, "symbol": _extract_symbol(method, params),
+        "method": method, "symbol": symbol,
         "params": params, "result": result, "duration_ms": duration_ms,
         "error": error, "category": category, "side": side, "volume": volume,
         "price": price, "order_id": order_id, "status": status,
@@ -505,7 +536,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             if o.side not in ("buy", "sell"):
                 return json_error(400, "PLAN_VALIDATION_ERROR", f"非法方向: {o.side}")
         try:
-            report = await _call_tdx(executor.execute_plan, plan, kind="trade")
+            report = await _call_tdx(executor.execute_plan, plan, kind="order")
             if report["status"] == "duplicate":
                 return json_error(409, "DUPLICATE_PLAN", report.get("message", "重复计划"))
             report["channel_used"] = "http"
@@ -587,7 +618,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
                                      data.get("account", ""), data.get("account_type", "stock"), kind="trade")
         try:
             res = await _call_tdx(tdx.cancel_order_stock, account_id,
-                                  stock_code, order_id, kind="trade")
+                                  stock_code, order_id, kind="order")
             # 直连账号成功码为 "2" (下单路径 plan_executor 同样把 "2" 当成功),
             # 撤单只认 "1" 会把已受理的撤单报成失败 (2026-10-12 实盘假失败根因)
             ok = str(res.get("Value", "0")) in ("1", "2")
@@ -597,9 +628,11 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
                 # 假失败会被上层当"未撤"重试或放弃, 两头都是通道风险)
                 verified = await _verify_cancel_effective(account_id, stock_code, order_id)
                 ok = verified
-            executor.log_trade({"event": "cancel_order", "stock_code": stock_code,
-                                "order_id": order_id, "ok": ok, "verified": verified,
-                                "msg": res.get("Msg", "")})
+            # 共享盘写可能卡顿（CIFS）：撤单日志异步落，不阻塞事件循环
+            asyncio.create_task(asyncio.to_thread(executor.log_trade, {
+                "event": "cancel_order", "stock_code": stock_code,
+                "order_id": order_id, "ok": ok, "verified": verified,
+                "msg": res.get("Msg", "")}))
             resp = {"success": ok, "message": res.get("Msg", ""),
                     "channel_used": "http"}
             if verified:

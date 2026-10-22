@@ -78,6 +78,8 @@ def load_config(config_path: str, root_dir: str) -> CollectorConfig:
 
     hot_raw = os.environ.get("COLLECTOR_HOT_SET", "")
     hot_set = tuple(x.strip().upper() for x in hot_raw.split(",") if x.strip())
+    if len(hot_set) > 100:
+        raise ValueError("COLLECTOR_HOT_SET 不能超过 100 只（桥订阅/快照上限）")
 
     snapshot_interval = _env_float("COLLECTOR_SNAPSHOT_INTERVAL", 5.0)
     hot_interval = _env_float("COLLECTOR_HOT_INTERVAL", 3.0)
@@ -92,7 +94,9 @@ def load_config(config_path: str, root_dir: str) -> CollectorConfig:
     return CollectorConfig(
         bridge_url=bridge_url.rstrip("/"),
         bridge_token=bridge_token,
-        host=os.environ.get("COLLECTOR_HOST", "0.0.0.0"),
+        # H7：默认只绑本机；Linux 消费方接入时显式设 COLLECTOR_HOST=LAN_IP，
+        # 并配独立只读 token（Phase 2 的 token 分级）
+        host=os.environ.get("COLLECTOR_HOST", "127.0.0.1"),
         port=_env_int("COLLECTOR_PORT", 8560),
         token=token,
         db_path=os.environ.get("COLLECTOR_DB")

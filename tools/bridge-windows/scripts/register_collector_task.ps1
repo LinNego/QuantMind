@@ -21,11 +21,21 @@ $candidates = @(
 $py = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $py) { $py = (Get-Command python).Source }
 if (-not $py) { throw "找不到 python.exe" }
+if ($py -like "*WindowsApps*") {
+    throw "python 指向 Windows Store 别名 ($py)，请安装 Python 3.12 或使用 .venv"
+}
 
 $arg = "`"$root\scripts\tdx_collector.py`" --config `"$root\config.yaml`" --port $Port"
 if ($HotSet) { $arg += " --hot-set `"$HotSet`"" }
 
 $taskName = "TdxCollector"
+# 改 HotSet/Port 后必须重启旧实例，否则 IgnoreNew 会让新参数不生效
+Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
+$oldConns = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+foreach ($c in $oldConns) {
+    Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue
+}
 $action = New-ScheduledTaskAction -Execute $py -Argument $arg -WorkingDirectory $root
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet `
@@ -49,6 +59,10 @@ try {
     }
 } catch {
     Write-Warning "[collector] 防火墙规则失败: $($_.Exception.Message)"
+}
+$prof = Get-NetConnectionProfile -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($prof -and $prof.NetworkCategory -ne "Private") {
+    Write-Warning "[collector] 网络配置为 $($prof.NetworkCategory)，8560 防火墙规则仅对 Private 生效"
 }
 
 if ($Start) {

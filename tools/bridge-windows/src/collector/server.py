@@ -30,7 +30,7 @@ async def _guarded(handler, request):
         raise
     except Exception as exc:  # noqa: BLE001 - 读侧不能把进程打挂
         log.warning("HTTP 处理失败 %s: %s", request.path, exc, exc_info=True)
-        return _err(500, "INTERNAL", str(exc)[:240])
+        return _err(500, "INTERNAL", "采集器内部错误，详见日志")
 
 
 def build_app(service) -> web.Application:
@@ -50,6 +50,9 @@ def build_app(service) -> web.Application:
     app.middlewares.append(auth_middleware)
 
     async def health(request: web.Request):
+        return _ok(await service.health_public())
+
+    async def stats(request: web.Request):
         return _ok(await service.health())
 
     async def snapshot(request: web.Request):
@@ -74,6 +77,7 @@ def build_app(service) -> web.Application:
         return _ok({"count": len(data), "bars": data})
 
     app.router.add_get("/health", health)
+    app.router.add_get("/stats", stats)
     app.router.add_get("/snapshot", snapshot)
     app.router.add_get("/bars", bars)
     return app

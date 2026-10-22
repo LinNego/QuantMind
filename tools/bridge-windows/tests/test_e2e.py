@@ -205,7 +205,8 @@ async def run_tests():
         mock.pricevol_delay = 0.0
         async with session.get(base + "/api/v1/health") as resp:
             h = await resp.json()
-            assert h["semaphores"]["trade"]["slots"] == 2, h
+            assert h["semaphores"]["order"]["slots"] == 2, h
+            assert h["semaphores"]["trade"]["slots"] == 1, h
             assert h["semaphores"]["data"]["slots"] == 1, h
         print(f"[PASS] 交易/数据分槽：数据慢调用期间账户查询 {trade_ms:.0f}ms")
 

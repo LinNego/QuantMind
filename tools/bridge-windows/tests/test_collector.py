@@ -160,6 +160,9 @@ class _FakeService:
     async def health(self):
         return {"status": "ok", "version": "test"}
 
+    async def health_public(self):
+        return {"status": "ok", "version": "test", "tdx_connected": True}
+
     def snapshot_payload(self, codes=None, include_all=False):
         return {"ts": "2026-10-22T10:00:00+08:00", "count": 1,
                 "data": {"600519.SH": {"Now": "100"}}}
@@ -180,6 +183,11 @@ async def _http_checks():
         assert r.status == 200 and (await r.json())["data"]["status"] == "ok"
         r = await client.get("/snapshot")
         assert r.status == 401, r.status
+        r = await client.get("/stats")
+        assert r.status == 401, r.status
+        r = await client.get("/stats",
+                             headers={"Authorization": "Bearer " + fake.config.token})
+        assert r.status == 200, r.status
         r = await client.get("/snapshot", headers={"Authorization": "Bearer " + fake.config.token})
         assert r.status == 200
         body = await r.json()

@@ -354,12 +354,13 @@ def main():
 
     # 交易/数据分槽：4 个并发数据调用不能占满交易槽。
     print("\n=== 交易/数据双信号量 ===")
-    assert "TRADE_SEM_SLOTS = 2" in _routes_src, "缺少 TRADE_SEM_SLOTS=2"
+    assert "TRADE_SEM_SLOTS = 1" in _routes_src, "缺少 TRADE_SEM_SLOTS=1"
     assert "DATA_SEM_SLOTS = 1" in _routes_src, "缺少 DATA_SEM_SLOTS=1"
+    assert "ORDER_SEM_SLOTS = 2" in _routes_src, "缺少 ORDER_SEM_SLOTS=2"
     assert "TRADE_METHODS" in _routes_src, "缺少交易方法分类表"
     assert "kind=call_kind(method)" in _routes_src, "/tdx/call 未按方法分类"
     assert "semaphores_stats()" in _routes_src, "缺少信号量观测"
-    print("  ✅ trade=2 / data=1 + 方法分类 + /health 观测")
+    print("  ✅ order=2 / trade=1 / data=1 + 方法分类 + /health 观测")
 
     # 调用/交易日志必须离开事件循环：后台队列 + 批量 commit。
     print("\n=== 日志后台批量写入 ===")

@@ -91,6 +91,9 @@ class CollectorService:
         self.snapshot_ts: datetime | None = None
         self.bar_ts: datetime | None = None
         self.last_cycle_ms: float = 0.0
+        self.last_pricevol_count: int = 0
+        self.empty_cycles: int = 0
+        self._cycle_active = False
         self.breaker = CircuitBreaker(pause_s=config.error_pause_s)
         self.hot_breaker = CircuitBreaker(pause_s=config.error_pause_s)
         self._pending_bars: list[dict] = []
@@ -102,6 +105,7 @@ class CollectorService:
         self._bridge_health_ts = 0.0
         self._db_stats: dict = {}
         self._db_stats_ts = 0.0
+        self._db_stats_lock = asyncio.Lock()
         self._last_universe_day = ""
         self._last_prune_day = ""
         self.started_at = datetime.now().astimezone()
@@ -157,6 +161,12 @@ class CollectorService:
             codes = []
             log.warning("股票清单刷新失败: %s", exc)
         if codes:
+            # M4：任意非空短清单不得覆盖（TQ 抖动/权限变化时整天采集缩水）
+            if self.universe and (len(codes) < 1000
+                                  or len(codes) < int(len(self.universe) * 0.8)):
+                log.error("股票清单异常缩水: %d -> %d，拒绝替换",
+                          len(self.universe), len(codes))
+                return
             self.universe = codes
             await asyncio.to_thread(self.store.save_universe, codes)
             self._last_universe_day = datetime.now().strftime("%Y%m%d")
@@ -203,35 +213,48 @@ class CollectorService:
             await self._refresh_universe()
             if not self.universe:
                 return
-        now = datetime.now()
         started = time.monotonic()
         chunks = list(chunked(self.universe, self.config.snapshot_chunk))
-        for idx, chunk in enumerate(chunks):
-            data = await self.client.get_pricevol(chunk)
-            for code, info in data.items():
-                if not isinstance(info, dict):
-                    continue
-                try:
-                    price = float(info.get("Now") or 0)
-                except (TypeError, ValueError):
-                    continue
-                if price <= 0:
-                    continue
-                try:
-                    volume = float(info.get("Volume") or 0)
-                except (TypeError, ValueError):
-                    volume = None
-                record = dict(info)
-                record["_ts"] = now.astimezone().isoformat(timespec="seconds")
-                record["_source"] = "pricevol"
-                self.snapshots[code] = record
-                self._pending_bars.extend(
-                    self.aggregator.on_sample(code, price, volume, now=now))
-            if idx + 1 < len(chunks):
-                await asyncio.sleep(0.02)  # 让出事件循环/交易槽
-        self.snapshot_ts = datetime.now()
-        self.last_cycle_ms = round((time.monotonic() - started) * 1000.0, 1)
-        await self._flush_pending()
+        self._cycle_active = True
+        cycle_count = 0
+        try:
+            for idx, chunk in enumerate(chunks):
+                data = await self.client.get_pricevol(chunk)
+                # H3：空/残缺返回不能被当成功（否则熔断清零、/health 全绿）
+                if len(data) < max(1, int(len(chunk) * 0.5)):
+                    self.empty_cycles += 1
+                    raise BridgeError(
+                        f"pricevol 返回 {len(data)}/{len(chunk)}，低于 50%")
+                # H2：每块用真实采样时刻，不能用整轮起点
+                sample_now = datetime.now()
+                for code, info in data.items():
+                    if not isinstance(info, dict):
+                        continue
+                    try:
+                        price = float(info.get("Now") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if price <= 0:
+                        continue
+                    try:
+                        volume = float(info.get("Volume") or 0)
+                    except (TypeError, ValueError):
+                        volume = None
+                    record = dict(info)
+                    record["_ts"] = sample_now.astimezone().isoformat(timespec="seconds")
+                    record["_source"] = "pricevol"
+                    self.snapshots[code] = record
+                    cycle_count += 1
+                    self._pending_bars.extend(
+                        self.aggregator.on_sample(code, price, volume, now=sample_now))
+                if idx + 1 < len(chunks):
+                    await asyncio.sleep(0.02)  # 让出事件循环/交易槽
+            self.snapshot_ts = datetime.now()
+            self.last_pricevol_count = cycle_count
+            self.last_cycle_ms = round((time.monotonic() - started) * 1000.0, 1)
+            await self._flush_pending()
+        finally:
+            self._cycle_active = False
 
     async def _hot_loop(self) -> None:
         if not self.config.hot_set:
@@ -268,7 +291,9 @@ class CollectorService:
         while not self._stopping:
             await asyncio.sleep(5)
             try:
-                self._pending_bars.extend(self.aggregator.flush_stale())
+                # H2：整轮采集中禁止封口，避免残根在同一分钟键上覆盖完整 bar
+                if not self._cycle_active:
+                    self._pending_bars.extend(self.aggregator.flush_stale())
                 await self._flush_pending()
             except asyncio.CancelledError:
                 raise
@@ -285,6 +310,10 @@ class CollectorService:
         try:
             await asyncio.to_thread(self.store.upsert_bars, bars)
             self.bar_ts = datetime.now()
+        except asyncio.CancelledError:
+            # stop() 取消在途写：已取出的 bars 必须放回，否则整批丢失
+            self._pending_bars = (bars + self._pending_bars)[-20000:]
+            raise
         except Exception as exc:  # noqa: BLE001
             # 写失败放回缓冲，下一轮重试（有上限，避免无界增长）
             self._pending_bars = (bars + self._pending_bars)[-20000:]
@@ -327,20 +356,37 @@ class CollectorService:
 
     async def _db_stats_cached(self) -> dict:
         now = time.monotonic()
-        if now - self._db_stats_ts < 30.0 and self._db_stats:
+        if now - self._db_stats_ts < 300.0 and self._db_stats:
             return self._db_stats
-        try:
-            self._db_stats = await asyncio.to_thread(self.store.stats)
-        except Exception as exc:  # noqa: BLE001
-            self._db_stats = {"error": str(exc)}
-        self._db_stats_ts = now
-        return self._db_stats
+        async with self._db_stats_lock:
+            now = time.monotonic()
+            if now - self._db_stats_ts < 300.0 and self._db_stats:
+                return self._db_stats
+            try:
+                self._db_stats = await asyncio.to_thread(self.store.stats)
+            except Exception as exc:  # noqa: BLE001
+                self._db_stats = {"error": str(exc)}
+            self._db_stats_ts = now
+            return self._db_stats
 
     @staticmethod
     def _age_ms(ts: datetime | None) -> float | None:
         if ts is None:
             return None
         return round((datetime.now() - ts).total_seconds() * 1000.0, 1)
+
+    async def health_public(self) -> dict:
+        """匿名 /health 只暴露状态与新鲜度，不泄露地址/错误/库统计。"""
+        bridge = await self._bridge_health_cached()
+        return {
+            "status": "ok" if bridge.get("status") == "ok" else "degraded",
+            "version": self.config.version,
+            "server_time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "tdx_connected": bridge.get("tdx_connected"),
+            "snapshot_age_ms": self._age_ms(self.snapshot_ts),
+            "bar_age_ms": self._age_ms(self.bar_ts),
+            "universe_size": len(self.universe),
+        }
 
     async def health(self) -> dict:
         bridge = await self._bridge_health_cached()
@@ -363,6 +409,8 @@ class CollectorService:
             "snapshot_age_ms": self._age_ms(self.snapshot_ts),
             "bar_age_ms": self._age_ms(self.bar_ts),
             "last_cycle_ms": self.last_cycle_ms,
+            "last_pricevol_count": self.last_pricevol_count,
+            "empty_cycles": self.empty_cycles,
             "open_states": self.aggregator.open_states,
             "pending_bars": len(self._pending_bars),
             "paused": self.breaker.is_paused(),
@@ -402,7 +450,9 @@ class CollectorService:
         }
 
     def hot_payload(self, codes: list[str]) -> dict:
-        return {c: list(self.hot_history.get(c, ())) for c in codes[:100]}
+        # M7：最多 100 只 × 最近 60 条，避免单请求序列化几十 MB
+        return {c: list(self.hot_history.get(c, ()))[-60:]
+                for c in codes[:100]}
 
     async def bars_payload(self, codes: list[str] | None, start_date: str,
                            end_date: str, limit: int) -> list[dict]:

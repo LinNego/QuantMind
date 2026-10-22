@@ -69,6 +69,7 @@ class MarketStore:
                     close=excluded.close, volume=excluded.volume,
                     amount=excluded.amount, samples=excluded.samples,
                     source=excluded.source
+                WHERE excluded.samples >= bars_1m.samples
             """, rows)
             self._conn.commit()
         return len(rows)
@@ -77,19 +78,22 @@ class MarketStore:
                    start_date: str = "", end_date: str = "",
                    limit: int = 5000) -> list[dict]:
         limit = max(1, min(int(limit), 20000))
-        sql = ("SELECT trade_date, code, minute, open, high, low, close, "
-               "volume, amount, samples, source FROM bars_1m WHERE 1=1")
+        base = ("SELECT trade_date, code, minute, open, high, low, close, "
+                "volume, amount, samples, source FROM bars_1m WHERE 1=1")
         params: list = []
         if codes:
-            sql += f" AND code IN ({','.join('?' for _ in codes)})"
+            base += f" AND code IN ({','.join('?' for _ in codes)})"
             params.extend(codes)
         if start_date:
-            sql += " AND trade_date >= ?"
+            base += " AND trade_date >= ?"
             params.append(start_date)
         if end_date:
-            sql += " AND trade_date <= ?"
+            base += " AND trade_date <= ?"
             params.append(end_date)
-        sql += " ORDER BY trade_date, minute, code LIMIT ?"
+        # M6：先倒序取“最近 N 条”，再按时间正序返回；无日期区间也不会拿最旧数据
+        sql = ("SELECT * FROM (" + base +
+               " ORDER BY trade_date DESC, minute DESC, code DESC LIMIT ?) "
+               "ORDER BY trade_date, minute, code")
         params.append(limit)
         with self._lock:
             cur = self._conn.execute(sql, params)
@@ -130,19 +134,43 @@ class MarketStore:
         return deleted
 
     def stats(self) -> dict:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*), MIN(trade_date), MAX(trade_date) FROM bars_1m"
-            ).fetchone()
-            universe = self._conn.execute("SELECT COUNT(*) FROM universe").fetchone()[0]
+        """轻量统计：独立只读连接、不持写锁；行数用 MAX(rowid) 近似。
+
+        90 天 × 5,500 × 240 ≈ 1.18 亿行，COUNT(*) 会数秒到数十秒并阻塞
+        upsert_bars（桥侧 COUNT 事故在采集器复刻）。这里只取 O(1) 的
+        MAX(rowid) 与索引端点，精确行数不再对 /health 重要。
+        """
+        row = (0, None, None)
+        universe = 0
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5)
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT MAX(rowid), MIN(trade_date), MAX(trade_date) FROM bars_1m"
+            ).fetchone() or (0, None, None)
+            universe = cur.execute("SELECT COUNT(*) FROM universe").fetchone()[0]
+        except sqlite3.Error:
+            pass
+        finally:
+            if conn is not None:
+                conn.close()
         try:
             size = os.path.getsize(self.db_path)
         except OSError:
             size = 0
+        free = 0
+        try:
+            import shutil
+            free = shutil.disk_usage(os.path.dirname(self.db_path) or ".").free
+        except OSError:
+            pass
         return {
-            "rows": row[0] if row else 0,
-            "min_date": row[1] if row else None,
-            "max_date": row[2] if row else None,
+            "rows": row[0] or 0,
+            "rows_approx": True,
+            "min_date": row[1],
+            "max_date": row[2],
             "universe": universe,
             "disk_bytes": size,
+            "disk_free_bytes": free,
         }

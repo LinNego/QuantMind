@@ -17,6 +17,14 @@ from dataclasses import replace
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+# Windows 控制台/管道默认 GBK，中文日志会触发 logging UnicodeEncodeError
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 from src.collector.config import VERSION, load_config  # noqa: E402
 from src.collector.service import CollectorService  # noqa: E402
 from src.utils.log_setup import build_handlers  # noqa: E402
