@@ -90,12 +90,16 @@ class SystemMetrics:
         idle_v = _to_int(idle)
         total_v = _to_int(kernel) + _to_int(user)
 
-        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        # 伪句柄 GetCurrentProcess() 在部分 API 上拿不到计数；用 OpenProcess 真实句柄
+        real = ctypes.windll.kernel32.OpenProcess(0x0400 | 0x0010, False, os.getpid())
+        handle = real or ctypes.windll.kernel32.GetCurrentProcess()
         creation, exit_, ktime, utime = FILETIME(), FILETIME(), FILETIME(), FILETIME()
         ctypes.windll.kernel32.GetProcessTimes(
             handle, ctypes.byref(creation), ctypes.byref(exit_),
             ctypes.byref(ktime), ctypes.byref(utime))
         proc_v = (_to_int(ktime) + _to_int(utime)) / 10_000_000.0
+        if real:
+            ctypes.windll.kernel32.CloseHandle(real)
         return idle_v, total_v, proc_v
 
     @staticmethod
@@ -136,7 +140,8 @@ class SystemMetrics:
 
         counters = PROCESS_MEMORY_COUNTERS()
         counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
-        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        real = ctypes.windll.kernel32.OpenProcess(0x0400 | 0x0010, False, os.getpid())
+        handle = real or ctypes.windll.kernel32.GetCurrentProcess()
         ok = False
         try:
             psapi = ctypes.WinDLL("psapi.dll")
@@ -150,6 +155,8 @@ class SystemMetrics:
                     handle, ctypes.byref(counters), counters.cb))
             except Exception:
                 ok = False
+        if real:
+            ctypes.windll.kernel32.CloseHandle(real)
         return {
             "total": int(status.ullTotalPhys),
             "available": int(status.ullAvailPhys),
