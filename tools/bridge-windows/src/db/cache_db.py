@@ -15,7 +15,8 @@ import logging
 import os
 import sqlite3
 import threading
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
@@ -270,6 +271,136 @@ class CacheDb:
             return os.path.getsize(self.db_path)
         except OSError:
             return 0
+
+    # ---- 日志留存清理 ----
+
+    def count_prune_candidates(self, tdx_retention_days: int = 30,
+                               tdx_max_rows: int = 3_000_000,
+                               trade_retention_days: int = 365) -> dict:
+        """只统计会被清理的行数（dry-run 用，不删除任何数据）。"""
+        now = datetime.now()
+        tdx_cutoff = (now - timedelta(days=tdx_retention_days)).isoformat(
+            timespec="milliseconds")
+        trade_cutoff = (now - timedelta(days=trade_retention_days)).isoformat(
+            timespec="milliseconds")
+        with self._lock:
+            cur = self._conn.cursor()
+            tdx_total = cur.execute("SELECT COUNT(*) FROM tdx_log").fetchone()[0]
+            trade_total = cur.execute("SELECT COUNT(*) FROM trade_log").fetchone()[0]
+            tdx_old = cur.execute(
+                "SELECT COUNT(*) FROM tdx_log WHERE created_at < ?",
+                (tdx_cutoff,)).fetchone()[0]
+            trade_old = cur.execute(
+                "SELECT COUNT(*) FROM trade_log WHERE created_at < ?",
+                (trade_cutoff,)).fetchone()[0]
+        tdx_remaining = max(tdx_total - tdx_old, 0)
+        return {
+            "tdx_log": tdx_old + max(tdx_remaining - tdx_max_rows, 0),
+            "trade_log": trade_old,
+            "tdx_log_total": tdx_total,
+            "trade_log_total": trade_total,
+        }
+
+    def prune_logs(self, tdx_retention_days: int = 30,
+                   tdx_max_rows: int = 3_000_000,
+                   trade_retention_days: int = 365,
+                   batch_size: int = 5000,
+                   sleep_s: float = 0.01) -> dict:
+        """按保留策略清理审计日志，分批提交，避免长事务锁住桥的写路径。
+
+        策略：
+        - ``tdx_log``（每次桥调用的审计行）：默认保留 30 天，且最多保留最新
+          300 万行——生产曾到 777 万行 / 9.6GB，`COUNT(*)` 单次 12 秒；
+        - ``trade_log``（下单/成交/撤单台账）：默认保留 365 天。
+
+        **不在整个清理期间持有 self._lock**：每批单独加锁，让桥的
+        `log_call()` 可以插队，否则一次十分钟的清理会把事件循环一起按住。
+
+        按 id 而不是 created_at 建索引：大表建索引要长时间持锁；id 随插入
+        单调递增，先扫一次找出时间阈值对应的 id 边界，再按主键分批删除。
+        """
+        deleted = {"tdx_log": 0, "trade_log": 0}
+        now = datetime.now()
+        tdx_cutoff = (now - timedelta(days=tdx_retention_days)).isoformat(
+            timespec="milliseconds")
+        trade_cutoff = (now - timedelta(days=trade_retention_days)).isoformat(
+            timespec="milliseconds")
+
+        deleted["tdx_log"] += self._prune_by_time(
+            "tdx_log", tdx_cutoff, batch_size, sleep_s)
+        # 行数上限：找出第 max_rows+1 新的那一行，删除它及更旧的
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM tdx_log ORDER BY id DESC LIMIT 1 OFFSET ?",
+                (tdx_max_rows,)).fetchone()
+        if row is not None:
+            deleted["tdx_log"] += self._delete_upto_id(
+                "tdx_log", row[0], batch_size, sleep_s)
+
+        deleted["trade_log"] += self._prune_by_time(
+            "trade_log", trade_cutoff, batch_size, sleep_s)
+
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA optimize")
+                self._conn.commit()
+            except sqlite3.Error:
+                log.warning("PRAGMA optimize 失败(忽略)", exc_info=True)
+        return deleted
+
+    def _prune_by_time(self, table: str, cutoff: str, batch_size: int,
+                       sleep_s: float) -> int:
+        """删除 created_at 早于 cutoff 的行；返回删除行数。"""
+        self._check_log_table(table)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT MIN(id) FROM {table} WHERE created_at >= ?", (cutoff,)
+            ).fetchone()
+        boundary = row[0] if row else None
+        if boundary is None:
+            # 没有一行新于 cutoff ⇒ 全部已过期
+            return self._delete_upto_id(table, None, batch_size, sleep_s)
+        if boundary <= 1:
+            return 0
+        return self._delete_upto_id(table, boundary - 1, batch_size, sleep_s)
+
+    def _delete_upto_id(self, table: str, max_id, batch_size: int,
+                        sleep_s: float) -> int:
+        """按主键分批删除 id <= max_id 的行；max_id=None 表示全表。"""
+        self._check_log_table(table)
+        total = 0
+        while True:
+            with self._lock:
+                cur = self._conn.cursor()
+                if max_id is None:
+                    cur.execute(
+                        f"DELETE FROM {table} WHERE id IN "
+                        f"(SELECT id FROM {table} ORDER BY id LIMIT ?)",
+                        (batch_size,))
+                else:
+                    cur.execute(
+                        f"DELETE FROM {table} WHERE id IN "
+                        f"(SELECT id FROM {table} WHERE id <= ? ORDER BY id LIMIT ?)",
+                        (max_id, batch_size))
+                n = cur.rowcount
+                self._conn.commit()
+            total += max(n, 0)
+            if n < batch_size:
+                break
+            if sleep_s:
+                time.sleep(sleep_s)
+        return total
+
+    @staticmethod
+    def _check_log_table(table: str) -> None:
+        """表名白名单，防 SQL 注入（本模块唯一拼接表名的地方）。"""
+        if table not in ("tdx_log", "trade_log"):
+            raise ValueError(f"不允许清理表: {table}")
+
+    def vacuum(self) -> None:
+        """回收已删除页的磁盘空间。**需要独占锁，必须在桥停止后执行。**"""
+        with self._lock:
+            self._conn.execute("VACUUM")
 
     # ---- Token 管理 (SHA256 哈希存储, 不存明文) ----
 

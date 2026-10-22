@@ -10,14 +10,16 @@
 
 运行: cd bridge-windows && python3 tests/test_all.py
 """
+import json
+import logging
 import os
 import sys
+import tempfile
 import threading
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import json
 
 # ---- mock 通达信 17709 ----
 CAPTURED = []
@@ -308,6 +310,57 @@ def main():
     assert ".ui_opened_at" in _main_src, "main.py 的 _auto_open_ui 缺少去重节流时间戳"
     assert "min_interval_sec" in _main_src, "main.py 的 _auto_open_ui 缺少节流间隔参数"
     print("  ✅ 自动打开控制台已节流")
+
+    # 透传端点不得放行交易方法：绕过幂等/卖前校验/写限流，且 side 会买变卖。
+    print("\n=== 透传端点不得放行交易方法 ===")
+    assert "FORBIDDEN_CALL_METHODS" in _routes_src, \
+        "routes.py 缺少交易方法禁用名单 FORBIDDEN_CALL_METHODS"
+    _deny_block = _routes_src.split("FORBIDDEN_CALL_METHODS", 1)[1].split("}", 1)[0]
+    for _m in ("order_stock", "cancel_order_stock"):
+        assert _m in _deny_block, f"透传仍放行交易方法: {_m}"
+    print("  ✅ order_stock / cancel_order_stock 已封")
+
+    # 日志按大小滚动：bridge.log 曾无限增长到 1.5GB。
+    print("\n=== bridge.log 按大小滚动 ===")
+    from src.utils.log_setup import build_handlers
+    _logdir = tempfile.mkdtemp()
+    _handlers = build_handlers(_logdir, max_bytes=1024, backup_count=2)
+    _lg = logging.getLogger("bridge-rotate-test")
+    _lg.setLevel(logging.INFO)
+    _lg.propagate = False
+    for _h in _handlers:
+        _lg.addHandler(_h)
+    for _i in range(30):
+        _lg.info("x" * 100)
+    for _h in _handlers:
+        _h.close()
+        _lg.removeHandler(_h)
+    assert os.path.exists(os.path.join(_logdir, "bridge.log")), "bridge.log 未生成"
+    assert os.path.exists(os.path.join(_logdir, "bridge.log.1")), \
+        "bridge.log 未滚动——RotatingFileHandler 没生效"
+    print("  ✅ 超出 maxBytes 后已生成 bridge.log.1")
+
+    # 缓存日志留存清理：按时间 + 行数上限分批删除。
+    print("\n=== 缓存日志留存清理 ===")
+    from src.db.cache_db import CacheDb
+    _cdb = CacheDb(os.path.join(tempfile.mkdtemp(), "cache.db"))
+    _old_ts = (datetime.now() - timedelta(days=60)).isoformat(timespec="milliseconds")
+    for _i in range(20):
+        _cdb._conn.execute(
+            "INSERT INTO tdx_log (method, created_at) VALUES (?,?)", ("old", _old_ts))
+    for _i in range(5):
+        _cdb.log_call("new", "", {}, {})
+    _cdb._conn.commit()
+    _candidates = _cdb.count_prune_candidates(tdx_retention_days=30, tdx_max_rows=3,
+                                              trade_retention_days=365)
+    assert _candidates["tdx_log"] == 22, f"dry-run 候选数不对: {_candidates}"
+    _deleted = _cdb.prune_logs(tdx_retention_days=30, tdx_max_rows=3,
+                               trade_retention_days=365)
+    _stats = _cdb.get_stats()
+    assert _stats["tdx_log"] == 3, f"应只保留最新 3 行, 实际 {_stats['tdx_log']}"
+    assert _deleted["tdx_log"] == 22, f"应删除 22 行, 实际 {_deleted['tdx_log']}"
+    _cdb.close()
+    print("  ✅ 超期 + 超额日志已分批清理")
 
     srv.shutdown()
     print(f"\n=== 结果: {passed} 通过, {failed} 失败 ===")

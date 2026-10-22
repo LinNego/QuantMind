@@ -32,6 +32,13 @@ _cache_stats_cache = {"ts": 0.0, "data": None}
 # 通达信并发信号量: 延迟初始化 (绑定运行中的 event loop, 避免 loop 冲突)
 _tdx_semaphore = None
 
+# 交易方法只能走 /api/v1/plans/execute 与 /api/v1/orders/cancel。
+# 透传路径（/api/v1/tdx/call）不做幂等去重、不做卖前持仓校验，且被归入
+# **读**限流桶（600/min）——放行等于给每个 token 一条绕过交易闸的旁路。
+# 更危险的是：`order_stock` 的 `side` 参数经 JSON 传进来构造不出 Side 枚举，
+# `TdxClient.call` 会一律落到 STOCK_SELL（买变卖）。这里直接封死。
+FORBIDDEN_CALL_METHODS = frozenset({"order_stock", "cancel_order_stock", "call"})
+
 
 def _get_semaphore():
     global _tdx_semaphore
@@ -447,6 +454,10 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         params = data.get("params", {}) or {}
         if not method:
             return json_error(400, "MISSING_METHOD", "缺少 method 字段")
+        if method in FORBIDDEN_CALL_METHODS:
+            return json_error(
+                403, "METHOD_FORBIDDEN",
+                f"{method} 只能经 /api/v1/plans/execute 或 /api/v1/orders/cancel 调用")
         # 白名单: 只允许已定义的方法, 防止任意调用
         allowed = [m for m in dir(tdx) if not m.startswith("_") and callable(getattr(tdx, m))]
         if method not in allowed:

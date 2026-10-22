@@ -16,6 +16,7 @@ from src.executor.plan_executor import PlanExecutor
 from src.executor.stop_loss_daemon import StopLossDaemon
 from src.tdx.client import TdxClient
 from src.utils.config import Config
+from src.utils.log_setup import build_handlers
 
 # Force UTF-8 on stdout/stderr for Chinese text (PowerShell codepage workaround)
 for _stream in (sys.stdout, sys.stderr):
@@ -32,16 +33,13 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 日志同时输出到文件 (windowed 模式无控制台, 靠日志文件排查)
+# 滚动切割：生产曾出现 1.5GB 的 bridge.log（每个 HTTP 请求一行），见 log_setup。
 _log_dir = os.path.join(BASE_DIR, "data", "logs")
-os.makedirs(_log_dir, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler() if sys.stderr else logging.NullHandler(),
-        logging.FileHandler(os.path.join(_log_dir, "bridge.log"),
-                            encoding="utf-8", mode="a"),
-    ])
+    handlers=build_handlers(_log_dir),
+)
 log = logging.getLogger("bridge-windows")
 
 

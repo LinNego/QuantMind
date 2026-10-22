@@ -176,6 +176,18 @@ async def run_tests():
             assert h["status"] == "ok"
         print("[PASS] 健康检查 GET OK")
 
+        # 透传端点不得放行交易方法：side 经 JSON 构造不出 Side 枚举会买变卖，
+        # 且该路径被归入读限流桶，绕过计划级幂等与卖前持仓校验。
+        status, denied = await api("/api/v1/tdx/call",
+                                   {"method": "order_stock", "params": {}})
+        assert status == 403 and denied["error"]["code"] == "METHOD_FORBIDDEN", \
+            f"{status} {denied}"
+        print("[PASS] 透传 order_stock 被 403 拒绝")
+        status, denied = await api("/api/v1/tdx/call",
+                                   {"method": "cancel_order_stock", "params": {}})
+        assert status == 403, f"{status} {denied}"
+        print("[PASS] 透传 cancel_order_stock 被 403 拒绝")
+
         # 6. HTTP 下单 (新 plan_id 避免幂等冲突)
         http_plan = TradePlan(plan_id="plan_http_001",
                               orders=[Order(stock_code="600519.SH", side="buy", volume=100, price=1650.0)])
