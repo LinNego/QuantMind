@@ -53,6 +53,37 @@ def test_cn目录走存量候选表_零行为变化(tmp_path, monkeypatch):
     )  # 缺省即 CN
 
 
+def test_data层市场路径_CN走存量候选表_非CN走市场根(tmp_path, monkeypatch):
+    """``frdata.market_path`` 是脚本侧拼财务目录的唯一入口（2026-10-22 修断链）。"""
+    from backend.services.engine.factor_research import data as frdata
+
+    root = _cn_root(tmp_path)
+    hk = tmp_path / "quanthk"
+    monkeypatch.setenv("QM_QUANTDB_DATA_DIR", str(root))
+    monkeypatch.setenv("QM_QUANTHK_DATA_DIR", str(hk))
+
+    assert (
+        frdata.market_path(frdata.INCOME_PARTS) == root / "3_financial_data" / "income"
+    )
+    assert (
+        frdata.market_path(frdata.HOLDER_PARTS, "HK")
+        == hk / "3_financial_data" / "holder_num"
+    )
+
+
+def test_build_factor_research不引用已删的重导出():
+    """四市场分层删了 data 模块的 ``resolve_quantdb_subdir`` 重导出，构建脚本仍
+    ``frdata.resolve_quantdb_subdir(...)`` 动态取属性——静态检查看不见，构建跑到
+    财务因子才 AttributeError。钉死脚本源码不出现该名，且替代入口真实存在。"""
+    from backend.services.engine.factor_research import data as frdata
+
+    src = (
+        Path(__file__).resolve().parents[1] / "scripts" / "build_factor_research.py"
+    ).read_text(encoding="utf-8")
+    assert "frdata.resolve_quantdb_subdir" not in src
+    assert callable(frdata.market_path)
+
+
 def test_hk目录走市场根(tmp_path, monkeypatch):
     hk = tmp_path / "quanthk"
     monkeypatch.setenv("QM_QUANTHK_DATA_DIR", str(hk))

@@ -53,6 +53,18 @@ def _market_root(market: str) -> Path:
     return resolve_market_root(validate_market(market))
 
 
+def market_path(dir_parts: tuple[str, ...], market: str = "CN") -> Path:
+    """市场根下的目录（多市场分层后的唯一路径解析入口）。
+
+    2026-10-22 修：四市场分层（6ce32c4b）删掉了本模块的
+    ``resolve_quantdb_subdir`` 重导出，``build_factor_research.py`` 的
+    ``frdata.resolve_quantdb_subdir(...)`` 直到下一次财务因子构建才炸
+    （AttributeError，非导入期），属静默断链。凡需在数据层之外拼路径的脚本
+    一律走本函数，不要各自 import 旧 CN 专用解析器。
+    """
+    return _market_root(market).joinpath(*dir_parts)
+
+
 def amount_yi_factor(market: str) -> float:
     """成交额(列值) → 亿元 的换算系数：CN 万元→亿 = 1e-4；非 CN 元→亿 = 1e-8。
 

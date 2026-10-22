@@ -196,17 +196,17 @@ def main() -> int:
         print("[3/8] 财务类 + 行为类因子（PIT）...")
         syms = list(close.columns)
         fin_dirs = {
-            "income": frdata.resolve_quantdb_subdir(*frdata.INCOME_PARTS),
-            "balance": frdata.resolve_quantdb_subdir(*frdata.BALANCE_PARTS),
-            "cashflow": frdata.resolve_quantdb_subdir(*frdata.CASHFLOW_PARTS),
-            "pershare": frdata.resolve_quantdb_subdir(*frdata.PERSHARE_PARTS),
+            "income": frdata.market_path(frdata.INCOME_PARTS),
+            "balance": frdata.market_path(frdata.BALANCE_PARTS),
+            "cashflow": frdata.market_path(frdata.CASHFLOW_PARTS),
+            "pershare": frdata.market_path(frdata.PERSHARE_PARTS),
         }
         fin = financials.compute_financial_factors(
             syms, fin_dirs, dates, total_mv=val["total_mv"]
         )
         beh = financials.compute_behavior_factors(
             syms,
-            frdata.resolve_quantdb_subdir(*frdata.HOLDER_PARTS),
+            frdata.market_path(frdata.HOLDER_PARTS),
             dates,
             circ_cap=val["circulating_capital"],
         )
