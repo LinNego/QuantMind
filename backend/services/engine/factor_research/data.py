@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ DAILY_PARTS = ("1_kline_data", "daily_forward")
 INDEX_PARTS = ("1_kline_data", "index_daily")
 VALUATION_PARTS = ("5_technical_derived", "valuation")
 INSTRUMENT_PARTS = ("2_base_sector", "instrument_detail")
+ST_PIT_PARTS = ("2_base_sector", "st_pit")
 SECURITY_MASTER_PARTS = ("2_base_sector", "security_master", "data.parquet")
 SECTOR_PARTS = ("2_base_sector", "sector")
 INCOME_PARTS = ("3_financial_data", "income")
@@ -123,14 +125,18 @@ def load_daily_panel(
     end: str,
     fields: tuple[str, ...] = ("open", "high", "low", "close", "volume", "amount"),
     market: str = "CN",
+    parts: tuple[str, ...] = DAILY_PARTS,
 ) -> dict[str, pd.DataFrame]:
     """读取 daily_forward → {字段: 宽表(交易日 × symbol)}。前复权价格 + 股/成交额。
 
     成交额单位随市场（CN 万元 / 非 CN 元）——用 ``amount_yi_factor(market)`` 换算。
+
+    ``parts`` 可指向其他 K 线库（如 ``("1_kline_data", "daily_unadjusted")``）；
+    需要**名义价格**与复权价格混算的调用方（alpha360 的 VWAP 基准）用它取原始价。
     """
-    files = _partition_files(DAILY_PARTS, start, end, market)
+    files = _partition_files(parts, start, end, market)
     if not files:
-        raise FileNotFoundError(f"daily_forward 无分区: {start}~{end}")
+        raise FileNotFoundError(f"{'/'.join(parts)} 无分区: {start}~{end}")
     cols = ["time", "symbol", *fields]
     df = _read_files(files, columns=cols)
     df["symbol"] = df["symbol"].astype("category")
@@ -146,7 +152,8 @@ def load_daily_panel(
             logger.warning("daily_forward 索引存在重复日期，已去重（keep=last）")
             out[fld] = df_[~df_.index.duplicated(keep="last")]
     logger.info(
-        "daily_forward 载入 %d 交易日 × %d 只 (%s~%s)",
+        "%s 载入 %d 交易日 × %d 只 (%s~%s)",
+        parts[-1],
         len(out["close"]),
         out["close"].shape[1],
         start,
@@ -307,32 +314,106 @@ def month_end_dates(index: pd.DatetimeIndex) -> list[pd.Timestamp]:
     return dates
 
 
+def load_st_pit(market: str = "CN") -> pd.DataFrame | None:
+    """PIT ST 稀疏表（``symbol,time,is_st``）；表缺失/非 CN → None。
+
+    数据面由 ``backend/scripts/build_st_pit.py`` 生成（baostock 逐日 ``isST``）。
+    ``IsSTGP`` 快照回答的是「**现在**是不是 ST」，拿它当历史过滤条件就是前视
+    （2026-10-22 审计：预测 top decile 的 ST 占比 8.5%，全市场 4.0%）。
+    """
+    from backend.shared.feature_source import validate_market
+
+    mk = validate_market(market)
+    if mk != "CN":
+        return None
+    f = _market_root(mk).joinpath(*ST_PIT_PARTS) / "st_pit.parquet"
+    if not f.exists():
+        return None
+    return pd.read_parquet(f)[["symbol", "time", "is_st"]]
+
+
+def st_mask_over(dates: pd.Index, symbols, st_pit: pd.DataFrame | None) -> pd.DataFrame:
+    """(交易日 × symbol) 的 PIT ST 布尔掩码；稀疏表未命中 = 非 ST。
+
+    这是全仓唯一实现（构建脚本与本模块共用），避免两处口径漂移。
+    ``dates`` 可以是 datetime64 或 ``YYYYMMDD`` 字符串。
+    """
+    idx = pd.Index(dates)
+    cols = list(symbols)
+    mask = pd.DataFrame(False, index=idx, columns=cols, dtype=bool)
+    if st_pit is None or st_pit.empty or mask.empty:
+        return mask
+    row_pos = {pd.Timestamp(d).strftime("%Y%m%d"): i for i, d in enumerate(idx)}
+    col_pos = {s: i for i, s in enumerate(cols)}
+    sparse = st_pit[st_pit["symbol"].isin(col_pos)]
+    sparse = sparse[sparse["time"].astype(str).isin(row_pos)]
+    if sparse.empty:
+        return mask
+    values = np.zeros(mask.shape, dtype=bool)  # pandas 3 CoW：to_numpy 只读
+    values[
+        sparse["time"].astype(str).map(row_pos).to_numpy(),
+        sparse["symbol"].map(col_pos).to_numpy(),
+    ] = True
+    return pd.DataFrame(values, index=idx, columns=cols)
+
+
+# 哨兵：区分「调用方没提 PIT」与「提了但表缺失」——后者必须炸，不能静默退回
+# 有前视的静态口径。
+_PIT_UNSET = object()
+
+
 def build_universe(
-    instr: pd.DataFrame | None, close: pd.DataFrame, min_hist: int = 120
+    instr: pd.DataFrame | None,
+    close: pd.DataFrame,
+    min_hist: int = 120,
+    *,
+    st_pit=_PIT_UNSET,
 ) -> pd.DataFrame:
     """股票池布尔掩码（交易日 × symbol）。
 
-    CN：非 ST、非退市（instrument 快照，非 PIT——demo 同口径）；
-    非 CN 传 ``instr=None``：ST/退市口径是 A 股专属（instrument_detail），本市场
-    无对应物 → 只做历史过滤（缺哪层过滤的事实由构建器写入快照 meta，绝不冒充）。
+    两种口径，**按显式参数切换**，不会悄悄混用：
+
+    - ``st_pit`` 未传（遗留）：ST/退市用 ``instrument_detail`` **静态快照**
+      （有前视，仅供旧口径对照/回归）；
+    - ``st_pit`` 传 PIT 稀疏表：按**逐日** ST 状态过滤；``is_quit`` 静态列
+      **不参与**——「现在已退市」套到全历史就是幸存者偏差，当日在市与否由
+      close 是否有价格决定；
+    - ``st_pit=None``（显式要 PIT 但表缺失）：抛 ``FileNotFoundError``，绝不
+      静默退回有前视的口径。
+
+    非 CN 传 ``instr=None``：ST/退市口径是 A 股专属，本市场无对应物 → 只做
+    历史过滤（缺哪层过滤的事实由构建器写入快照 meta，绝不冒充）。
     通用规则：当日有价格、近 min_hist 日有效历史 ≥ min_hist*0.6（滤新股/长停）。
     """
     syms = close.columns
-    if instr is None:
-        base_ok = pd.Series(True, index=syms)
+    if instr is not None and len(instr) == 0:
+        # 反例锁死：把 instr 误传成空表必须全拒，不能当成「全部合格」
+        return pd.DataFrame(False, index=close.index, columns=syms)
+    if st_pit is _PIT_UNSET:
+        if instr is None:
+            base_ok = pd.Series(True, index=syms)
+        else:
+            meta = instr.set_index("symbol").reindex(syms)
+            base_ok = (
+                (
+                    (meta["is_st"].astype(str) == "0")
+                    & (meta["is_quit"].astype(str) == "0")
+                )
+                .reindex(syms)
+                .fillna(False)
+            )
     else:
-        meta = instr.set_index("symbol").reindex(syms)
-        base_ok = (
-            ((meta["is_st"].astype(str) == "0") & (meta["is_quit"].astype(str) == "0"))
-            .reindex(syms)
-            .fillna(False)
-        )
+        if st_pit is None:
+            raise FileNotFoundError(
+                "PIT ST 表缺失：先跑 backend/scripts/build_st_pit.py --apply 生成 "
+                "2_base_sector/st_pit/st_pit.parquet"
+            )
+        base_ok = pd.Series(True, index=syms)
     valid = close.notna()
     hist = valid.rolling(min_hist, min_periods=min_hist).sum() >= int(min_hist * 0.6)
-    mask = hist.copy()
-    for col in mask.columns:
-        if not bool(base_ok.get(col, False)):
-            mask[col] = False
+    mask = hist & base_ok.reindex(syms).fillna(False)
+    if st_pit is not _PIT_UNSET:
+        mask = mask & ~st_mask_over(close.index, syms, st_pit)
     return mask
 
 
