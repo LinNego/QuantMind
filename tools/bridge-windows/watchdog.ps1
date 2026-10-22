@@ -78,13 +78,40 @@ Write-Log "检查地址: $BridgeUrl"
 Write-Log "检查间隔: ${CheckIntervalSec}s"
 Write-Log "============================================"
 
-# 首次启动桥
+# 首次启动桥（已在运行则跳过，避免重复实例抢 8550）
 Start-Sleep -Seconds $StartupDelaySec
-Start-Bridge
+if (Test-BridgeAlive) {
+    Write-Log "桥已在运行, 跳过首次启动"
+} else {
+    Start-Bridge
+}
 
 $deadCount = 0
 while ($true) {
     Start-Sleep -Seconds $CheckIntervalSec
+
+    # Linux 侧「重启桥」信号：消费 flag → 杀桥 → 重启 → 删除 flag。
+    # 顺序必须是「重启完成之后才 Remove-Item」，否则重启失败会无限循环。
+    $restartFlag = Join-Path $ScriptDir "restart_bridge.flag"
+    if (Test-Path $restartFlag) {
+        Write-Log "收到 Linux 侧重启信号, 正在重启桥..."
+        try {
+            $conns = Get-NetTCPConnection -LocalPort 8550 -State Listen -ErrorAction SilentlyContinue
+            foreach ($c in $conns) {
+                $proc = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
+                if ($proc) {
+                    Write-Log "杀掉旧桥进程 PID=$($proc.Id)"
+                    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
+        } catch {}
+        Start-Sleep -Seconds 3
+        Start-Bridge
+        Remove-Item $restartFlag -Force -ErrorAction SilentlyContinue
+        $deadCount = 0
+        continue
+    }
+
     $alive = Test-BridgeAlive
     if ($alive) {
         if ($deadCount -gt 0) {
