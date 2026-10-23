@@ -206,7 +206,7 @@
   <main>
     <div id="authBanner" style="display:none;margin:0 0 14px;padding:10px 14px;border-radius:10px;background:rgba(255,190,80,.12);border:1px solid rgba(255,190,80,.45);color:#ffd479;font-size:13px;line-height:1.6">
       未填写「桥访问 token」——所有带锁的接口（数据服务 / 订阅 / 日志）都不会工作。<br>
-      请在<b>右上角</b>或下方「数据服务」面板里输入。它和数据服务 Key（TDX-…）是<b>两个不同的东西</b>。
+      请在<b>右上角</b>或下方「数据服务」面板里输入（填一次会自动记住，刷新后仍保留）。它和数据服务 Key（TDX-…）是<b>两个不同的东西</b>。
     </div>
     <section class="grid kpi-grid">
       <div class="kpi" id="kpiOrders">
@@ -1031,6 +1031,12 @@ function toggleTheme(){
   applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
 }
 
+function saveToken(v){
+  try {
+    if (v) localStorage.setItem('tdx-token', v);
+    else localStorage.removeItem('tdx-token');
+  } catch (e) {}
+}
 function setTokenEverywhere(v){
   ['tokenTop', 'tokenPanel', 'tokenInput'].forEach(id => {
     const el = document.getElementById(id);
@@ -1046,12 +1052,18 @@ function updateAuthBanner(){
   if (!el) return;
   el.addEventListener('input', () => {
     setTokenEverywhere(el.value);
+    saveToken(el.value.trim());
     updateAuthBanner();
     clearTimeout(window.__tokenTimer);
     window.__tokenTimer = setTimeout(() => { loadAidata(); loadSubscription(); }, 400);
   });
 });
+try {
+  const savedToken = localStorage.getItem('tdx-token');
+  if (savedToken) setTokenEverywhere(savedToken);
+} catch (e) {}
 updateAuthBanner();
+if (getToken()) { loadAidata(); loadSubscription(); }
 if ($('#subSearch')) {
   $('#subSearch').addEventListener('input', () => {
     clearTimeout(subSearchTimer);
