@@ -449,6 +449,16 @@
           <button class="btn ghost" onclick="importCodes('orders')">一键导入委托</button>
           <button class="btn ghost" onclick="clearSubCodes()">清空列表</button>
         </div>
+        <div class="row" style="gap:10px;align-items:center;margin-bottom:8px">
+          <label style="display:flex;gap:6px;align-items:center;font-size:13px">
+            <input type="checkbox" id="subAuto" onchange="toggleAutoSubscribe()">
+            自动跟随实盘持仓（免费 tq，≤100）
+          </label>
+          <input id="subAutoSec" type="number" min="15" max="3600" value="60"
+                 style="width:80px" onchange="toggleAutoSubscribe()">
+          <span class="hint">秒</span>
+          <span class="hint" id="subAutoHint">--</span>
+        </div>
         <div class="field">
           <label>订阅代码（可手输 / 搜索添加 / 一键导入，换行或逗号分隔，最多 100 只）</label>
           <textarea id="subCodes" placeholder="600519.SH&#10;000001.SZ"></textarea>
@@ -563,6 +573,7 @@
       </div>
       <div class="row" style="gap:8px;margin-bottom:10px">
         <input id="thsLiveCodes" placeholder="实时关注：600519.SH,600760.SH" style="flex:1">
+        <button class="btn ghost" onclick="thsFollowPositions()">跟随持仓</button>
         <button class="btn ghost" id="thsLiveBtn" onclick="thsLiveToggle()">开启实时</button>
         <span class="hint" id="thsLiveHint">--</span>
       </div>
@@ -1017,8 +1028,32 @@ async function loadSubscription(){
       <td>${escapeHtml(r.mode || '')}</td>
       <td class="mono muted">${escapeHtml((r.payload || '').slice(0, 90))}</td></tr>`);
     $('#subTable tbody').innerHTML = rows.join('') || '<tr><td colspan="4" class="empty">暂无推送</td></tr>';
+    const au = d.auto || {};
+    $('#subAuto').checked = !!au.enabled;
+    if (au.interval_s) $('#subAutoSec').value = au.interval_s;
+    $('#subAutoHint').textContent = au.enabled
+      ? ('上次 ' + ((au.last_at || '').slice(11) || '--') + ' · 导入 ' + (au.last_count || 0) + ' 只'
+         + (au.truncated ? (' · 截断 ' + au.truncated) : '')
+         + (au.last_error ? (' · ' + au.last_error) : ''))
+      : '未开启（开启后按持仓自动订阅）';
     $('#subMsg').textContent = d.error ? ('错误：' + d.error) : '';
   } catch (e) { $('#subMsg').textContent = '读取失败：' + e.message; }
+}
+async function toggleAutoSubscribe(){
+  const enabled = $('#subAuto').checked;
+  const interval = Math.max(15, Math.min(3600,
+    parseInt($('#subAutoSec').value || '60', 10) || 60));
+  $('#subAutoSec').value = interval;
+  $('#subAutoHint').textContent = enabled ? '正在开启…' : '正在关闭…';
+  try {
+    const { body } = await fetchJSON('/api/v1/subscription/auto', {
+      method: 'POST', headers: { ...authHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled, source: 'positions', include_orders: false,
+                             interval_s: interval, mode: 'merge' })
+    }, 30000);
+    if (!body.success) { $('#subAutoHint').textContent = errText(body); return; }
+    loadSubscription();
+  } catch (e) { $('#subAutoHint').textContent = '操作失败：' + e.message; }
 }
 async function applySubscription(enabled){
   const codes = $('#subCodes').value.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean);
@@ -1654,6 +1689,20 @@ async function thsQrPoll(){
       }
     }
   } catch (e) { /* 忽略瞬时错误 */ }
+}
+
+async function thsFollowPositions(){
+  if (!authHeader()['Authorization']) { $('#thsLiveHint').textContent = '请先输入访问 token'; return; }
+  try {
+    const { body } = await fetchJSON('/api/v1/subscription/live-codes?limit=50',
+                                     { headers: authHeader() }, 20000);
+    if (!body.success) { $('#thsLiveHint').textContent = errText(body); return; }
+    const codes = (body.data && body.data.codes) || [];
+    if (!codes.length) { $('#thsLiveHint').textContent = '账户暂无可跟随代码'; return; }
+    $('#thsLiveCodes').value = codes.join(',');
+    $('#thsLiveHint').textContent = '已载入 ' + codes.length + ' 只';
+    if (!thsLiveTimer) thsLiveToggle();
+  } catch (e) { $('#thsLiveHint').textContent = '读取失败：' + e.message; }
 }
 
 function thsLiveToggle(){

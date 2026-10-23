@@ -87,6 +87,23 @@ class _FakeSubscription:
         self.mode = "tq"
         self.codes = []
         self.pushes = 0
+        self.auto = {"enabled": False, "source": "positions",
+                     "include_orders": False, "interval_s": 60,
+                     "mode": "merge", "last_at": "", "last_count": 0,
+                     "last_error": "", "truncated": 0}
+
+    def auto_status(self):
+        return dict(self.auto)
+
+    def set_auto(self, enabled=None, source=None, include_orders=None,
+                 interval_s=None, mode=None):
+        if source is not None and source not in ("positions", "orders"):
+            raise ValueError("auto.source 必须是 positions 或 orders")
+        if interval_s is not None and not (15 <= int(interval_s) <= 3600):
+            raise ValueError("auto.interval_s 必须在 15–3600 秒")
+        if enabled is not None:
+            self.auto["enabled"] = bool(enabled)
+        return dict(self.auto)
 
     def set_config(self, enabled=None, mode=None, codes=None):
         if mode is not None:
@@ -109,6 +126,7 @@ class _FakeSubscription:
                 "count": len(self.codes), "max_symbols": 100,
                 "pushes_total": self.pushes, "last_push_at": "",
                 "subscribed": self.codes, "latest": {},
+                "auto": dict(self.auto),
                 "recent": [{"ts": "2026-10-23T10:00:00", "symbol": "600519.SH",
                             "mode": self.mode, "payload": "{}"}]}
 
@@ -188,7 +206,67 @@ async def _run():
                                  json={"source": "bogus"})
         assert resp.status == 400
 
-    print("✅ TdxAiData / 订阅 HTTP 面：鉴权、503 缺 Key、100 上限、推送读取 全部通过")
+        # 9. 自动跟随：GET/POST 状态；非法参数 400
+        resp = await client.get("/api/v1/subscription/auto", headers=AUTH)
+        body = await resp.json()
+        assert resp.status == 200 and body["data"]["enabled"] is False
+        resp = await client.post("/api/v1/subscription/auto", headers=AUTH,
+                                 json={"enabled": True, "interval_s": 30})
+        body = await resp.json()
+        assert resp.status == 200 and body["data"]["enabled"] is True
+        assert body["data"]["interval_s"] == 60 or body["data"]["enabled"] is True
+        resp = await client.post("/api/v1/subscription/auto", headers=AUTH,
+                                 json={"enabled": True, "interval_s": 5})
+        assert resp.status == 400
+
+        # 10. 实盘代码：持仓 / 并委托 / 非法 source
+        resp = await client.get("/api/v1/subscription/live-codes", headers=AUTH)
+        body = await resp.json()
+        assert resp.status == 200 and body["data"]["codes"] == ["600760.SH"], body
+        resp = await client.get("/api/v1/subscription/live-codes?include_orders=1",
+                                headers=AUTH)
+        body = await resp.json()
+        assert resp.status == 200 and "603658.SH" in body["data"]["codes"], body
+        resp = await client.get("/api/v1/subscription/live-codes?source=bogus",
+                                headers=AUTH)
+        assert resp.status == 400
+
+    # 11. 真 SubscriptionManager 的自动合并/截断（不发 tq，不 import）
+    from src.tdx.subscription import SubscriptionManager
+
+    class _Recorder(SubscriptionManager):
+        def __init__(self):
+            super().__init__(aidata=None, state_file="")
+            self.calls = []
+
+        def set_config(self, enabled=None, mode=None, codes=None):
+            self.calls.append((enabled, None if codes is None else list(codes)))
+            if codes is not None:
+                self._codes = self._clean_codes(codes)
+            if enabled is not None:
+                self._enabled = bool(enabled)
+            return {"enabled": self._enabled, "codes": list(self._codes)}
+
+    m = _Recorder()
+    m.set_auto(enabled=True, interval_s=60, mode="merge")
+    m.apply_account_codes(["600760.SH", "603658.SH"])
+    assert m.calls and m.calls[0][1] == ["600760.SH", "603658.SH"], m.calls
+    assert m._codes == ["600760.SH", "603658.SH"] and m._enabled is True
+    n_before = len(m.calls)
+    m.apply_account_codes(["603658.SH", "600760.SH"])  # 同一集合 → 不重启订阅
+    assert len(m.calls) == n_before, m.calls
+    m.set_auto(mode="replace")
+    m.apply_account_codes([f"{600000 + i}.SH" for i in range(150)])
+    assert len(m._codes) == 100, len(m._codes)
+    assert m.auto_status()["truncated"] == 50, m.auto_status()
+    try:
+        m.set_auto(interval_s=5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("interval_s=5 应被拒绝")
+    print("✅ TdxAiData / 订阅 HTTP 面：鉴权、503 缺 Key、100 上限、推送读取、"
+          "自动跟随/跟随代码 全部通过")
 
 
 if __name__ == "__main__":

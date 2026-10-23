@@ -185,6 +185,16 @@ async def main():
         # 恢复上次订阅（tq.initialize 阻塞，放后台线程，不挡启动）
         threading.Thread(target=subscription.autostart,
                          name="sub-autostart", daemon=True).start()
+        # 自动跟随实盘持仓/委托（默认关；网页订阅面板可开，免费 tq ≤100）
+        try:
+            from src.tdx.account_codes import fetch_account_codes
+            from src.tdx.subscription_sync import SubscriptionAutoSync
+            SubscriptionAutoSync(
+                subscription,
+                lambda source, include: fetch_account_codes(
+                    tdx, executor, source=source, include_orders=include)).start()
+        except Exception as e:
+            log.warning(f"自动订阅同步初始化失败: {e}")
     except Exception as e:
         log.warning(f"TdxAiData/订阅初始化失败: {e}")
 

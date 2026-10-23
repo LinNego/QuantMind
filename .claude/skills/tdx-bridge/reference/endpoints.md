@@ -119,7 +119,9 @@
 | GET/POST | `/api/v1/subscription` | 实时订阅状态/配置（tq 免费 ≤100；aidata 付费默认禁） |
 | GET | `/api/v1/subscription/pushes` | 最近推送 |
 | GET | `/api/v1/subscription/search?q=` | 代码模糊搜索 |
-| POST | `/api/v1/subscription/import` | 一键导入持仓/委托 |
+| POST | `/api/v1/subscription/import` | 一键导入持仓/委托（手动） |
+| GET/POST | `/api/v1/subscription/auto` | 自动跟随实盘：GET 状态 / POST `{enabled,interval_s,mode,include_orders}` |
+| GET | `/api/v1/subscription/live-codes?include_orders=1&limit=100` | 当前实盘代码（供订阅/同花顺跟随） |
 | GET | `/api/v1/health` | 匿名；桥/TQ 健康 + 分槽占用 |
 | GET | `/api/v1/stats` | **需鉴权**；账户/缓存/安全计数 |
 | GET | `/api/v1/system` | **需鉴权**；CPU/内存/磁盘/线程/分槽 |

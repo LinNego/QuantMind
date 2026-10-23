@@ -62,6 +62,12 @@ class SubscriptionManager:
         self._last_push_ts = 0.0
         self._recent: deque = deque(maxlen=200)
         self._latest: dict[str, dict] = {}
+        # 自动跟随实盘（免费 tq 通道，≤100）：默认关，网页可开
+        self._auto = {
+            "enabled": False, "source": "positions", "include_orders": False,
+            "interval_s": 60, "mode": "merge",
+            "last_at": "", "last_count": 0, "last_error": "", "truncated": 0,
+        }
         self._tq = None
         self._thread: threading.Thread | None = None
         # 启动超时后可能「其实已订阅成功」的孤儿订阅：(mode, codes)。
@@ -85,6 +91,12 @@ class SubscriptionManager:
         self._enabled = bool(data.get("enabled"))
         self._mode = str(data.get("mode") or "tq")
         self._codes = self._clean_codes(data.get("codes") or [])
+        auto = data.get("auto")
+        if isinstance(auto, dict):
+            for key in ("enabled", "source", "include_orders", "interval_s", "mode",
+                        "last_at", "last_count", "last_error", "truncated"):
+                if key in auto:
+                    self._auto[key] = auto[key]
 
     def _persist(self) -> None:
         if not self.state_file:
@@ -92,7 +104,7 @@ class SubscriptionManager:
         os.makedirs(os.path.dirname(self.state_file) or ".", exist_ok=True)
         tmp = self.state_file + ".tmp"
         payload = {"enabled": self._enabled, "mode": self._mode,
-                   "codes": self._codes,
+                   "codes": self._codes, "auto": dict(self._auto),
                    "updated_at": datetime.now().isoformat(timespec="seconds")}
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False)
@@ -107,6 +119,10 @@ class SubscriptionManager:
                 else self.max_symbols_aidata)
 
     def _clean_codes(self, codes, mode: str | None = None) -> list[str]:
+        return self._dedupe_codes(codes)[: self._limit_for(mode)]
+
+    @staticmethod
+    def _dedupe_codes(codes) -> list[str]:
         out: list[str] = []
         seen = set()
         for raw in codes or []:
@@ -115,7 +131,7 @@ class SubscriptionManager:
                 continue
             seen.add(code)
             out.append(code)
-        return out[: self._limit_for(mode)]
+        return out
 
     @property
     def max_symbols(self) -> int:
@@ -165,6 +181,97 @@ class SubscriptionManager:
             if enabled_now:
                 self.start()
         return {"enabled": enabled_now, "mode": mode_now, "codes": codes_now}
+
+    # ---- 自动跟随实盘（免费 tq ≤100） ----
+
+    def auto_status(self) -> dict:
+        with self._lock:
+            return dict(self._auto)
+
+    def _record_auto(self, *, count: int, error: str = "",
+                     truncated: int = 0) -> None:
+        with self._lock:
+            self._auto.update({
+                "last_at": datetime.now().isoformat(timespec="seconds"),
+                "last_count": int(count), "last_error": error,
+                "truncated": int(truncated),
+            })
+            self._persist()
+
+    def set_auto(self, enabled=None, source=None, include_orders=None,
+                 interval_s=None, mode=None) -> dict:
+        """开/关自动跟随。校验全部通过才落状态（与 set_config 同纪律）。"""
+        with self._lock:
+            current = dict(self._auto)
+            new_enabled = current["enabled"] if enabled is None else bool(enabled)
+            new_source = current["source"] if source is None else str(source)
+            if new_source not in ("positions", "orders"):
+                raise ValueError("auto.source 必须是 positions 或 orders")
+            new_incl = (current["include_orders"] if include_orders is None
+                        else bool(include_orders))
+            new_interval = (current["interval_s"] if interval_s is None
+                            else int(interval_s))
+            if not (15 <= new_interval <= 3600):
+                raise ValueError("auto.interval_s 必须在 15–3600 秒")
+            new_mode = current["mode"] if mode is None else str(mode)
+            if new_mode not in ("merge", "replace"):
+                raise ValueError("auto.mode 必须是 merge 或 replace")
+            was_enabled = current["enabled"]
+            self._auto.update({"enabled": new_enabled, "source": new_source,
+                               "include_orders": new_incl,
+                               "interval_s": new_interval, "mode": new_mode,
+                               "last_error": ""})
+            self._persist()
+            codes = list(self._codes)
+        # 开启时立即同步一次由 sync 线程负责；这里只保证“有列表且开启”时开始订阅
+        if new_enabled and not was_enabled and codes:
+            try:
+                self.set_config(True, None, codes)
+            except Exception as exc:  # noqa: BLE001
+                self._record_auto(count=len(codes),
+                                  error=f"{type(exc).__name__}: {exc}")
+        return self.auto_status()
+
+    def record_auto_error(self, error: str) -> None:
+        with self._lock:
+            count = len(self._codes)
+        self._record_auto(count=count, error=str(error)[:300])
+
+    def apply_account_codes(self, codes: list[str]) -> dict:
+        """把账户代码并入订阅；列表变化才真正重启订阅。"""
+        incoming = self._dedupe_codes(codes)
+        with self._lock:
+            auto = dict(self._auto)
+            current = list(self._codes)
+            limit = self._limit_for()
+        if not incoming:
+            self._record_auto(count=len(current), error="账户暂无可订阅代码")
+            return self.auto_status()
+        if auto["mode"] == "replace":
+            merged = incoming
+        else:
+            seen = set(incoming)
+            merged = incoming + [c for c in current if c not in seen]
+        unique: list[str] = []
+        seen = set()
+        for code in merged:
+            if code not in seen:
+                seen.add(code)
+                unique.append(code)
+        truncated = max(0, len(unique) - limit)
+        target = unique[:limit]
+        # 纯顺序变化不算变化：订阅顺序无意义，避免无谓地重启订阅
+        if set(target) == set(current):
+            target = current
+        error = ""
+        if target != current or (auto["enabled"] and not self._enabled):
+            try:
+                self.set_config(True if auto["enabled"] else None, None, target)
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}: {exc}"
+                log.warning("自动订阅同步失败: %s", error)
+        self._record_auto(count=len(target), error=error, truncated=truncated)
+        return self.auto_status()
 
     # ---- 启停 ----
 
@@ -403,4 +510,5 @@ class SubscriptionManager:
                 "subscribed": subscribed,
                 "latest": dict(self._latest),
                 "recent": list(self._recent)[:50],
+                "auto": dict(self._auto),
             }

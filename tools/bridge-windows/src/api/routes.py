@@ -21,6 +21,7 @@ from ..ths.client import ThsClient
 from ..market.quote_hub import PREFERENCE, QuoteHub
 from ..market.schema import FIELD_DEFS, SOURCE_DEFS, normalize_tdx, normalize_ths
 from ..tdx import parser
+from ..tdx.account_codes import fetch_account_codes
 from ..tdx.aidata import AidataUnavailable
 from ..utils.auth import verify_token
 from ..utils.system_metrics import SystemMetrics
@@ -1362,6 +1363,55 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         return web.json_response({"success": True, "data": {
             **data, "imported": len(codes)}})
 
+    async def subscription_auto(request: web.Request):
+        """自动跟随实盘：GET 状态 / POST 开关（免费 tq ≤100）。"""
+        if subscription is None:
+            return json_error(503, "SUBSCRIPTION_DISABLED", "订阅未启用")
+        if request.method == "GET":
+            data = await asyncio.to_thread(subscription.auto_status)
+            return web.json_response({"success": True, "data": data})
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return json_error(400, "BAD_JSON", "请求体必须是 JSON")
+        body = body or {}
+        loop = asyncio.get_running_loop()
+        try:
+            data = await loop.run_in_executor(
+                _SUB_EXECUTOR,
+                lambda: subscription.set_auto(
+                    body.get("enabled"), body.get("source"),
+                    body.get("include_orders"), body.get("interval_s"),
+                    body.get("mode")))
+        except ValueError as exc:
+            return json_error(400, "BAD_AUTO", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return json_error(502, "AUTO_FAILED", f"{type(exc).__name__}: {exc}")
+        return web.json_response({"success": True, "data": data})
+
+    async def subscription_live_codes(request: web.Request):
+        """当前实盘代码（持仓/委托），供订阅面板与同花顺「跟随持仓」使用。"""
+        if subscription is None:
+            return json_error(503, "SUBSCRIPTION_DISABLED", "订阅未启用")
+        source = str(request.query.get("source") or "positions")
+        if source not in ("positions", "orders"):
+            return json_error(400, "BAD_SOURCE", "source 必须是 positions 或 orders")
+        include_orders = request.query.get("include_orders") == "1"
+        try:
+            limit = max(1, min(int(request.query.get("limit", "100")), 100))
+        except (TypeError, ValueError):
+            limit = 100
+        try:
+            codes = await _call_tdx(
+                fetch_account_codes, tdx, executor, source, include_orders,
+                kind="trade")
+        except Exception as exc:  # noqa: BLE001
+            return json_error(502, "ACCOUNT_UNAVAILABLE",
+                              f"{type(exc).__name__}: {exc}")
+        return web.json_response({"success": True, "data": {
+            "codes": codes[:limit], "count": len(codes),
+            "truncated": max(0, len(codes) - limit)}})
+
     # ---- 桥状态 / 网页控制台 ----
 
     async def system(request: web.Request):
@@ -1532,6 +1582,9 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     app.router.add_get("/api/v1/subscription", subscription_get)
     app.router.add_post("/api/v1/subscription", subscription_set)
     app.router.add_get("/api/v1/subscription/pushes", subscription_pushes)
+    app.router.add_get("/api/v1/subscription/auto", subscription_auto)
+    app.router.add_post("/api/v1/subscription/auto", subscription_auto)
+    app.router.add_get("/api/v1/subscription/live-codes", subscription_live_codes)
     # ---- 多源行情聚合（动态平衡：并行拉取 + 按字段合并 + 源归属） ----
 
     async def _tdx_quote_fetch(code: str) -> dict:

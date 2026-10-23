@@ -177,6 +177,30 @@ def cmd_dxjl(args) -> None:
                                    params={"limit": args.limit}, timeout=30)))
 
 
+def cmd_live_codes(args) -> None:
+    params = {"limit": args.limit}
+    if args.include_orders:
+        params["include_orders"] = "1"
+    if args.source:
+        params["source"] = args.source
+    print_json(call_or_die(request("GET", "/api/v1/subscription/live-codes",
+                                   params=params, timeout=30)))
+
+
+def cmd_auto(args) -> None:
+    if args.enable or args.disable:
+        payload = {"enabled": bool(args.enable and not args.disable)}
+        if args.interval:
+            payload["interval_s"] = args.interval
+        if args.mode:
+            payload["mode"] = args.mode
+        print_json(call_or_die(request("POST", "/api/v1/subscription/auto",
+                                       payload=payload, timeout=40)))
+    else:
+        print_json(call_or_die(request("GET", "/api/v1/subscription/auto",
+                                       timeout=15)))
+
+
 def cmd_status(_args) -> None:
     print_json(request("GET", "/api/v1/ths/status", timeout=15))
 
@@ -207,6 +231,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("gates", help="THS worker 闸门/自愈状态").set_defaults(func=cmd_gates)
     sub.add_parser("status", help="桥侧 THS 状态").set_defaults(func=cmd_status)
     sub.add_parser("boards", help="全部板块").set_defaults(func=cmd_boards)
+
+    lc = sub.add_parser("live-codes", help="实盘持仓/委托代码")
+    lc.add_argument("--include-orders", action="store_true")
+    lc.add_argument("--source", choices=["positions", "orders"], default="positions")
+    lc.add_argument("--limit", type=int, default=100)
+    lc.set_defaults(func=cmd_live_codes)
+
+    au = sub.add_parser("auto", help="自动跟随实盘订阅（tq ≤100）")
+    au.add_argument("--enable", action="store_true")
+    au.add_argument("--disable", action="store_true")
+    au.add_argument("--interval", type=int, default=0)
+    au.add_argument("--mode", choices=["merge", "replace"], default="")
+    au.set_defaults(func=cmd_auto)
 
     d = sub.add_parser("dxjl", help="短线精灵异动")
     d.add_argument("--limit", type=int, default=20)

@@ -90,7 +90,21 @@ python3 scripts/bridge.py aidata get_minute_data --params '{"stock_code":"002415
 > 每日硬预算默认 500 词元；`GET /api/v1/aidata/status` 看 `usage`。
 > `wantnum=0` = 不限行，可能一次几十词元，批量抓取前先估算。
 
-## 7. 对账
+## 7. 自动跟随实盘持仓（免费 tq ≤100）
+
+```bash
+python3 scripts/bridge.py live-codes                 # 持仓代码
+python3 scripts/bridge.py live-codes --include-orders
+python3 scripts/bridge.py auto                       # 查看自动跟随状态
+python3 scripts/bridge.py auto --enable --interval 30 --mode merge
+python3 scripts/bridge.py auto --disable
+```
+开启后桥每 `interval` 秒读一次账户，代码集合变化才重启订阅（纯顺序变化不重启）；
+`merge` 保留手动添加的代码，`replace` 只留账户代码；超过通道上限（tq=100）时截断并在
+`auto.truncated` 报告。网页「实时订阅」面板有同名开关；同花顺面板「跟随持仓」按钮
+用 `/subscription/live-codes` 载入代码并开启 5s 实时轮询。
+
+## 7.5 对账
 
 ```bash
 python3 scripts/bridge.py compare 600519.SH
