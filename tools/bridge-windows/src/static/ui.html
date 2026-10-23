@@ -334,6 +334,74 @@
 
     <section class="grid grid-2">
       <div class="panel">
+        <div class="panel-head"><h2>数据服务 · TdxAiData</h2><span class="hint" id="adVersion">--</span></div>
+        <div class="metrics" style="border-top:none;margin-top:0;padding-top:0">
+          <div class="m"><span>状态</span><strong id="adState">--</strong></div>
+          <div class="m"><span>付费 Key</span><strong id="adToken">--</strong></div>
+          <div class="m"><span>方法数</span><strong id="adMethods">--</strong></div>
+          <div class="m"><span>已订阅</span><strong id="adSub">--</strong></div>
+        </div>
+        <div class="hint mono" id="adIni" style="margin:6px 0 10px">--</div>
+        <div class="field">
+          <label>数据服务 Key（写入 TdxAiData.ini [Token]，保存后不回显）</label>
+          <input id="adTokenInput" type="password" placeholder="商城 → 我的订单 → 积分和Key管理" autocomplete="off">
+        </div>
+        <div class="row">
+          <button class="btn primary" onclick="saveAidataToken()">保存 Key</button>
+          <button class="btn ghost" onclick="clearAidataToken()">清除 Key</button>
+          <button class="btn ghost" onclick="loadAidata()">刷新状态</button>
+        </div>
+        <div class="msg" id="adMsg"></div>
+        <div class="field">
+          <label>接口（需要付费 Key 生效）</label>
+          <select id="adMethod"></select>
+        </div>
+        <div class="field">
+          <label>参数 JSON</label>
+          <textarea id="adParams">{}</textarea>
+        </div>
+        <div class="row">
+          <button class="btn primary" onclick="callAidata()">执行</button>
+          <button class="btn ghost" onclick="clearAidataResult()">清空</button>
+        </div>
+        <div class="result-box" id="adResult"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>实时订阅</h2><span class="hint" id="subHint">最多 100 只 · SDK 硬上限</span></div>
+        <div class="metrics" style="border-top:none;margin-top:0;padding-top:0">
+          <div class="m"><span>状态</span><strong id="subState">--</strong></div>
+          <div class="m"><span>通道</span><strong id="subMode">--</strong></div>
+          <div class="m"><span>已订阅</span><strong id="subCount">--</strong></div>
+          <div class="m"><span>推送总数</span><strong id="subPushes">--</strong></div>
+          <div class="m"><span>最近推送</span><strong id="subLast">--</strong></div>
+          <div class="m"><span>后端订阅</span><strong id="subBackend">--</strong></div>
+        </div>
+        <div class="field">
+          <label>通道</label>
+          <select id="subModeSel">
+            <option value="tq">tq · 免费（需 TdxW，通知后拉快照）</option>
+            <option value="aidata">aidata · 付费（完整盘口推送）</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>订阅代码（换行或逗号分隔，最多 100 只）</label>
+          <textarea id="subCodes" placeholder="600519.SH&#10;000001.SZ"></textarea>
+        </div>
+        <div class="row">
+          <button class="btn primary" onclick="applySubscription(true)">保存并启用</button>
+          <button class="btn ghost" onclick="applySubscription(false)">停止订阅</button>
+          <button class="btn ghost" onclick="loadSubscription()">刷新</button>
+        </div>
+        <div class="msg" id="subMsg"></div>
+        <table id="subTable" style="margin-top:10px">
+          <thead><tr><th>时间</th><th>代码</th><th>通道</th><th>推送</th></tr></thead>
+          <tbody><tr><td colspan="4" class="empty">暂无推送</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="grid grid-2">
+      <div class="panel">
         <div class="panel-head"><h2>接口测试</h2><span class="hint">通用 JSON-RPC 透传（交易方法已封）</span></div>
         <div class="field">
           <label>访问 token</label>
@@ -644,6 +712,105 @@ function showResult(text, tone){
 }
 function clearResult(){ const b = $('#resultBox'); b.style.display = 'none'; b.textContent = ''; }
 
+// ---- TdxAiData（独立数据接口） / 实时订阅 ----
+function authHeader(){ const t = $('#tokenInput').value.trim(); return t ? { 'Authorization': 'Bearer ' + t } : {}; }
+function errText(body){ return (body && body.error && body.error.message) || '请求失败'; }
+function escapeHtml(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function loadAidata(){
+  if (!authHeader()['Authorization']) return;
+  try {
+    const { body } = await fetchJSON('/api/v1/aidata/status', { headers: authHeader() });
+    if (!body.success) { $('#adMsg').textContent = errText(body); return; }
+    const d = body.data;
+    $('#adVersion').textContent = d.available ? ('v' + (d.version || '?')) : '未加载';
+    $('#adState').textContent = !d.available ? '不可用' : (d.token_configured ? '就绪' : '待配置 Key');
+    $('#adState').style.color = (d.available && d.token_configured) ? '#7fe3a8' : '#ffd479';
+    $('#adToken').textContent = d.token_configured ? ('已配置 ' + d.token_len + ' 位') : '未配置';
+    $('#adMethods').textContent = (d.methods || []).length;
+    $('#adSub').textContent = (d.subscribed || []).length;
+    $('#adIni').textContent = d.ini_path || '--';
+    const sel = $('#adMethod');
+    if (!sel.options.length) {
+      const pref = ['get_minute_data','get_tick_data','get_market_snapshot','get_call_auction',
+                    'get_global_data','formula_by_src','get_stock_mark','get_zzgz_stocklist'];
+      const avail = d.methods || [];
+      const ordered = pref.filter(m => avail.includes(m)).concat(avail.filter(m => !pref.includes(m)));
+      sel.innerHTML = ordered.map(m => `<option>${m}</option>`).join('');
+    }
+    $('#adMsg').textContent = d.load_error ? ('加载失败：' + d.load_error) : '';
+  } catch (e) { $('#adMsg').textContent = '读取失败：' + e.message; }
+}
+async function saveAidataToken(){
+  const token = $('#adTokenInput').value.trim();
+  if (!token) { $('#adMsg').textContent = '请先输入 Key'; return; }
+  await pushAidataToken(token, '已保存');
+}
+async function clearAidataToken(){ await pushAidataToken('', '已清除'); }
+async function pushAidataToken(token, okText){
+  try {
+    const { body } = await fetchJSON('/api/v1/aidata/token', {
+      method: 'POST', headers: { ...authHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token })
+    }, 15000);
+    $('#adMsg').textContent = body.success ? okText : errText(body);
+    if (body.success) { $('#adTokenInput').value = ''; loadAidata(); }
+  } catch (e) { $('#adMsg').textContent = '保存失败：' + e.message; }
+}
+async function callAidata(){
+  const method = $('#adMethod').value;
+  let params;
+  try { params = JSON.parse($('#adParams').value || '{}'); }
+  catch (e) { $('#adMsg').textContent = '参数 JSON 解析失败：' + e.message; return; }
+  const box = $('#adResult');
+  box.style.display = 'block'; box.textContent = '执行中…'; box.style.color = '#c9d7e8';
+  try {
+    const { body } = await fetchJSON('/api/v1/aidata/call', {
+      method: 'POST', headers: { ...authHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method, params })
+    }, 60000);
+    box.textContent = JSON.stringify(body, null, 2);
+    box.style.color = body.success ? '#b7f7d3' : '#ffd0d0';
+  } catch (e) { box.textContent = '调用失败：' + e.message; box.style.color = '#ffd0d0'; }
+}
+function clearAidataResult(){ const b = $('#adResult'); b.style.display = 'none'; b.textContent = ''; }
+
+async function loadSubscription(){
+  if (!authHeader()['Authorization']) return;
+  try {
+    const { body } = await fetchJSON('/api/v1/subscription', { headers: authHeader() });
+    if (!body.success) { $('#subMsg').textContent = errText(body); return; }
+    const d = body.data;
+    $('#subState').textContent = d.state;
+    $('#subMode').textContent = d.mode;
+    $('#subCount').textContent = d.count + ' / ' + d.max_symbols;
+    $('#subPushes').textContent = fmtInt(d.pushes_total);
+    $('#subLast').textContent = d.last_push_at || '--';
+    $('#subBackend').textContent = (d.subscribed || []).length;
+    $('#subModeSel').value = d.mode;
+    if (document.activeElement !== $('#subCodes')) $('#subCodes').value = (d.codes || []).join('\n');
+    const rows = (d.recent || []).slice(0, 20).map(r => `<tr>
+      <td class="mono">${escapeHtml((r.ts || '').slice(11))}</td>
+      <td>${escapeHtml(r.symbol || '--')}</td>
+      <td>${escapeHtml(r.mode || '')}</td>
+      <td class="mono muted">${escapeHtml((r.payload || '').slice(0, 90))}</td></tr>`);
+    $('#subTable tbody').innerHTML = rows.join('') || '<tr><td colspan="4" class="empty">暂无推送</td></tr>';
+    $('#subMsg').textContent = d.error ? ('错误：' + d.error) : '';
+  } catch (e) { $('#subMsg').textContent = '读取失败：' + e.message; }
+}
+async function applySubscription(enabled){
+  const codes = $('#subCodes').value.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean);
+  const mode = $('#subModeSel').value;
+  try {
+    const { body } = await fetchJSON('/api/v1/subscription', {
+      method: 'POST', headers: { ...authHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled, mode, codes })
+    }, 30000);
+    $('#subMsg').textContent = body.success ? (enabled ? '已启用' : '已停止') : errText(body);
+    loadSubscription();
+  } catch (e) { $('#subMsg').textContent = '操作失败：' + e.message; }
+}
+
 function adminToken(){ return $('#tokenInput').value.trim(); }
 async function loadTokens(){
   const token = adminToken();
@@ -759,10 +926,11 @@ function buildSlots(){
 
 function startPolling(){
   stopPolling();
-  S.timers = [setInterval(loadLive, 5000), setInterval(loadStats, 15000)];
+  S.timers = [setInterval(loadLive, 5000), setInterval(loadStats, 15000),
+              setInterval(() => { loadAidata(); loadSubscription(); }, 15000)];
 }
 function stopPolling(){ S.timers.forEach(clearInterval); S.timers = []; }
-function refreshAll(){ loadLive(); loadStats(); loadLogs(); }
+function refreshAll(){ loadLive(); loadStats(); loadLogs(); loadAidata(); loadSubscription(); }
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { stopPolling(); }

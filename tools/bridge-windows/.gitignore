@@ -1,0 +1,9 @@
+# 第三方依赖隔离安装目录（tdxaidata 等）
+# 部署时: python -m pip install -U tdxaidata --target vendor -i <镜像>
+# 不入库：体积大且与客户端/版本绑定
+vendor/
+
+# 运行时产物
+data/
+__pycache__/
+*.pyc

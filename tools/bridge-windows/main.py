@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 import webbrowser
 
@@ -143,6 +144,42 @@ async def main():
         except Exception as e:
             log.warning(f"SQLite 缓存启用失败: {e}")
 
+    # TdxAiData 独立数据接口 + 实时订阅（≤100）
+    # aidata: 付费 Key，不走 TdxW；订阅: tq=免费通知 / aidata=付费完整盘口
+    aidata = None
+    subscription = None
+    try:
+        from src.tdx.aidata import AidataService
+        from src.tdx.subscription import SubscriptionManager
+        vendor_dir = cfg.get("aidata.vendor_dir", "./vendor") or ""
+        if vendor_dir and not os.path.isabs(vendor_dir):
+            vendor_dir = os.path.join(base_dir, vendor_dir)
+        aidata = AidataService(
+            vendor_dir=vendor_dir,
+            ini_path=cfg.get("aidata.ini_path", "") or "",
+            enabled=bool(cfg.get("aidata.enabled", True)))
+        sub_state = cfg.get("subscription.state_file", "") or os.path.join(
+            data_dir, "subscription.json")
+        if not os.path.isabs(sub_state):
+            sub_state = os.path.join(base_dir, sub_state)
+        tq_sys = cfg.get("subscription.tq_sys_path", "") or os.path.join(
+            os.path.dirname(base_dir), "sys")
+        subscription = SubscriptionManager(
+            aidata=aidata,
+            tq_sys_path=tq_sys,
+            state_file=sub_state,
+            snapshot_fetcher=tdx.get_market_snapshot,
+            max_symbols=int(cfg.get("aidata.max_symbols", 100) or 100))
+        a_status = aidata.status()
+        log.info("TdxAiData: available=%s token=%s ini=%s",
+                 a_status.get("available"), a_status.get("token_configured"),
+                 a_status.get("ini_path"))
+        # 恢复上次订阅（tq.initialize 阻塞，放后台线程，不挡启动）
+        threading.Thread(target=subscription.autostart,
+                         name="sub-autostart", daemon=True).start()
+    except Exception as e:
+        log.warning(f"TdxAiData/订阅初始化失败: {e}")
+
     # 安全加固: IP 限流 + 内存缓存
     rate_limiter = None
     memory_cache = None
@@ -168,7 +205,8 @@ async def main():
             runner = await start_http_server(host, port, token, tdx, executor, tracker, sltp,
                                              cache_db=cache_db, rate_limiter=rate_limiter,
                                              memory_cache=memory_cache,
-                                             trade_limits_dir=data_dir)
+                                             trade_limits_dir=data_dir,
+                                             aidata=aidata, subscription=subscription)
             tasks.append(asyncio.create_task(_wait_forever(runner)))
             log.info(f"通达信桥控制台: http://127.0.0.1:{port}/ui")
             # 自动打开网页控制台 (延迟确保服务已监听)

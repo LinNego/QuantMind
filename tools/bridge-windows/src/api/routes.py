@@ -29,6 +29,10 @@ _TQ_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tq-call")
 _HEALTH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tq-health")
 _CACHE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cache-write")
 _PROBE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="probe")
+# TdxAiData(tqs) 是进程级单例 + 阻塞 DLL 调用：独占 1 个 worker 串行化，
+# 绝不进事件循环、也不与行情/交易槽抢线程。
+_AIDATA_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aidata")
+_SUB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="subscribe")
 _system_metrics = SystemMetrics()
 _BRIDGE_STARTED_AT = datetime.now().astimezone().isoformat(timespec="seconds")
 _collector_cache = {"ts": 0.0, "data": None}
@@ -251,6 +255,35 @@ def json_error(status: int, code: str, message: str, details=None):
                               "error": {"code": code, "message": message,
                                         "details": details or {}}},
                              status=status)
+
+
+def _jsonable(value):
+    """把 tqs 返回值（dict/list/DataFrame/标量）转成可 JSON 序列化的结构。"""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return _jsonable(to_dict(orient="records"))
+        except TypeError:
+            return _jsonable(to_dict())
+    return str(value)
+
+
+def _aidata_error(exc: Exception):
+    """TdxAiData 异常 → 结构化 HTTP 错误（Key 缺失单独 503，便于 UI 提示）。"""
+    name = type(exc).__name__
+    if name == "AidataTokenRequired":
+        return json_error(503, "AIDATA_TOKEN_REQUIRED", str(exc))
+    if name == "AidataUnavailable":
+        return json_error(503, "AIDATA_UNAVAILABLE", str(exc))
+    if isinstance(exc, ValueError):
+        return json_error(400, "BAD_REQUEST", str(exc))
+    return json_error(500, "AIDATA_ERROR", f"{name}: {exc}")
 
 
 def _cache_result(cache_db, method: str, symbol: str, params: dict, result: dict):
@@ -611,7 +644,8 @@ def _cache_stats_sync(cache_db, memory_cache) -> dict | None:
 def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
               tracker: OrderTracker, sltp, cache_db=None, port: int = 8550,
               extra_tokens: list = None, rate_limiter=None,
-              memory_cache=None, trade_limits_dir: str = "") -> web.Application:
+              memory_cache=None, trade_limits_dir: str = "",
+              aidata=None, subscription=None) -> web.Application:
     app = web.Application()
     if trade_limits_dir:
         # 撤单日计数独立持久化；桥重启不清零
@@ -1050,6 +1084,100 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     app.router.add_get("/api/v1/cache/trades", cache_trades)
     app.router.add_get("/api/v1/cache/get", cache_get)
 
+    # ---- TdxAiData：通达信独立数据接口（付费 Key，不依赖 TdxW） ----
+    # 全部需鉴权：status 暴露 ini 路径/token 长度，call 可拉逐笔与全市场快照。
+
+    async def aidata_status(request: web.Request):
+        if aidata is None:
+            return json_error(503, "AIDATA_DISABLED", "TdxAiData 未启用")
+        data = await asyncio.get_running_loop().run_in_executor(
+            _AIDATA_EXECUTOR, aidata.status)
+        return web.json_response({"success": True, "data": data})
+
+    async def aidata_set_token(request: web.Request):
+        if aidata is None:
+            return json_error(503, "AIDATA_DISABLED", "TdxAiData 未启用")
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return json_error(400, "BAD_JSON", "请求体必须是 JSON")
+        token_value = str((body or {}).get("token") or "")
+        try:
+            res = await asyncio.get_running_loop().run_in_executor(
+                _AIDATA_EXECUTOR, aidata.set_token, token_value)
+        except Exception as exc:  # noqa: BLE001
+            return _aidata_error(exc)
+        return web.json_response({"success": True, "data": res})
+
+    async def aidata_call(request: web.Request):
+        if aidata is None:
+            return json_error(503, "AIDATA_DISABLED", "TdxAiData 未启用")
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return json_error(400, "BAD_JSON", "请求体必须是 JSON")
+        method = str((body or {}).get("method") or "")
+        params = (body or {}).get("params") or {}
+        if not isinstance(params, dict):
+            return json_error(400, "BAD_PARAMS", "params 必须是对象")
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                _AIDATA_EXECUTOR, lambda: aidata.call(method, params))
+        except Exception as exc:  # noqa: BLE001
+            return _aidata_error(exc)
+        return web.json_response({"success": True, "data": {
+            "method": method, "result": _jsonable(result)}})
+
+    # ---- 实时订阅（≤100 只；tq=免费通知 / aidata=付费完整盘口） ----
+
+    async def subscription_get(request: web.Request):
+        if subscription is None:
+            return json_error(503, "SUBSCRIPTION_DISABLED", "订阅未启用")
+        data = await asyncio.get_running_loop().run_in_executor(
+            _SUB_EXECUTOR, subscription.status)
+        return web.json_response({"success": True, "data": data})
+
+    async def subscription_set(request: web.Request):
+        if subscription is None:
+            return json_error(503, "SUBSCRIPTION_DISABLED", "订阅未启用")
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return json_error(400, "BAD_JSON", "请求体必须是 JSON")
+        body = body or {}
+        codes = body.get("codes")
+        if codes is not None and not isinstance(codes, list):
+            return json_error(400, "BAD_CODES", "codes 必须是数组")
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                _SUB_EXECUTOR,
+                lambda: subscription.set_config(
+                    body.get("enabled"), body.get("mode"), codes))
+        except ValueError as exc:
+            return json_error(400, "BAD_CONFIG", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return json_error(502, "SUBSCRIBE_FAILED",
+                              f"{type(exc).__name__}: {exc}")
+        data = await loop.run_in_executor(_SUB_EXECUTOR, subscription.status)
+        return web.json_response({"success": True, "data": data})
+
+    async def subscription_pushes(request: web.Request):
+        if subscription is None:
+            return json_error(503, "SUBSCRIPTION_DISABLED", "订阅未启用")
+        try:
+            limit = max(1, min(int(request.query.get("limit", "50")), 200))
+        except (TypeError, ValueError):
+            limit = 50
+        data = await asyncio.get_running_loop().run_in_executor(
+            _SUB_EXECUTOR, subscription.status)
+        return web.json_response({"success": True, "data": {
+            "recent": data.get("recent", [])[:limit],
+            "latest": data.get("latest", {}),
+            "pushes_total": data.get("pushes_total", 0),
+            "last_push_at": data.get("last_push_at", ""),
+        }})
+
     # ---- 桥状态 / 网页控制台 ----
 
     async def system(request: web.Request):
@@ -1209,6 +1337,13 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     app.router.add_post("/api/v1/auth/reset-token", reset_token)
     app.router.add_get("/api/v1/auth/tokens", list_tokens)
     app.router.add_post("/api/v1/auth/tokens", add_token)
+    # TdxAiData 独立数据接口（付费 Key） + 实时订阅（≤100）
+    app.router.add_get("/api/v1/aidata/status", aidata_status)
+    app.router.add_post("/api/v1/aidata/token", aidata_set_token)
+    app.router.add_post("/api/v1/aidata/call", aidata_call)
+    app.router.add_get("/api/v1/subscription", subscription_get)
+    app.router.add_post("/api/v1/subscription", subscription_set)
+    app.router.add_get("/api/v1/subscription/pushes", subscription_pushes)
     app.router.add_delete("/api/v1/auth/tokens/{token_hash}", delete_token_route)
     app.router.add_get("/ui", ui_page)
 

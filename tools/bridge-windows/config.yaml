@@ -55,3 +55,20 @@ sltp_daemon:
 order_tracking:
   state_file: "./data/active_orders.json"
   sync_interval_seconds: 15
+
+# 通达信独立数据接口（tdxaidata / tqs）：不依赖 TdxW，需商城付费 Key。
+# Key 在网页控制台「数据服务」里填，写入 <vendor>/tdxaidata/lib/TdxAiData.ini。
+aidata:
+  enabled: true
+  vendor_dir: "./vendor"
+  ini_path: ""            # 空 = <vendor>/tdxaidata/lib/TdxAiData.ini
+  max_symbols: 100        # 通达信 SDK 单次订阅硬上限（累计并集）
+
+# 实时订阅：tq = 免费（客户端通知，桥再拉快照）；aidata = 付费（完整盘口推送）。
+# 订阅列表在网页控制台「实时订阅」里维护，最多 100 只。
+subscription:
+  enabled: false
+  mode: "tq"
+  state_file: "./data/subscription.json"
+  tq_sys_path: ""         # 空 = <bridge 父目录>/sys（通达信 PYPlugins\sys）
+

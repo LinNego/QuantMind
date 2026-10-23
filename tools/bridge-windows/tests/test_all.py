@@ -539,6 +539,83 @@ def main():
             os.environ["BRIDGE_AUTH_TOKEN"] = _old_env
     print("  ✅ 环境变量优先，缺失时 fail-fast")
 
+    # TdxAiData 封装：包不可用时不炸；Token 写 ini 保留其余配置；方法白名单。
+    print("\n=== TdxAiData 封装 ===")
+    from src.tdx.aidata import AidataService, AidataUnavailable
+    _adir = tempfile.mkdtemp()
+    _aini = os.path.join(_adir, "TdxAiData.ini")
+    with open(_aini, "w", encoding="utf-8") as _fh:
+        _fh.write("[Token]\ntoken=\n\n[TcHqHost]\nHostNum=1\n")
+    _svc = AidataService(vendor_dir=os.path.join(_adir, "nope"), ini_path=_aini)
+    _ast = _svc.status()
+    assert set(_ast) >= {"available", "token_configured", "ini_path", "methods"}
+    assert _ast["token_configured"] is False
+    _svc.set_token("K" * 32)
+    assert _svc.read_token() == "K" * 32, "token 未写入"
+    assert "HostNum=1" in open(_aini, encoding="utf-8").read(), "其余配置被覆盖"
+    _svc.set_token("")
+    assert _svc.read_token() == ""
+    _off = AidataService(enabled=False, ini_path=_aini)
+    assert _off.status()["available"] is False
+    try:
+        _off.call("get_minute_data", {})
+        raise AssertionError("未启用时 call 应抛错")
+    except AidataUnavailable:
+        pass
+    try:
+        _off.call("order_stock", {})
+        raise AssertionError("非白名单方法应被拒")
+    except ValueError:
+        pass
+    print("  ✅ 状态 / Token 写入 / 白名单校验")
+
+    # 实时订阅：去重大写、100 上限、无 Key 拒绝 aidata 模式、启动失败置 error。
+    print("\n=== 实时订阅管理 ===")
+    from src.tdx.subscription import SubscriptionManager
+
+    class _FakeAidata:
+        def __init__(self, token=False):
+            self.token = token
+            self.subscribed = []
+
+        def status(self):
+            return {"available": True, "token_configured": self.token,
+                    "subscribed": list(self.subscribed), "load_error": ""}
+
+        def subscribe(self, codes, cb):
+            self.subscribed = list(codes)
+
+        def unsubscribe(self, codes):
+            self.subscribed = []
+
+    _sdir = tempfile.mkdtemp()
+    _mgr = SubscriptionManager(
+        aidata=_FakeAidata(token=False),
+        state_file=os.path.join(_sdir, "sub.json"),
+        snapshot_fetcher=None, max_symbols=100)
+    _mgr.set_config(codes=["600519.SH", "600519.sh", "000001.sz"])
+    assert _mgr.status()["codes"] == ["600519.SH", "000001.SZ"], "去重/大写失败"
+    try:
+        _mgr.set_config(enabled=True, mode="aidata")
+        raise AssertionError("无 Key 启用 aidata 模式应被拒")
+    except ValueError as _exc:
+        assert "Key" in str(_exc)
+    _mgr.set_config(codes=[f"{i:06d}.SZ" for i in range(150)])
+    assert _mgr.status()["count"] == 100, "未截断到 100 只"
+    try:
+        _mgr.set_config(enabled=True, mode="tq")
+    except Exception:
+        pass
+    assert _mgr.status()["state"] in ("error", "stopped")
+    _mgr2 = SubscriptionManager(aidata=_FakeAidata(token=True),
+                                state_file=os.path.join(_sdir, "sub2.json"))
+    try:
+        _mgr2.set_config(enabled=True)
+        raise AssertionError("空列表启用应被拒")
+    except ValueError:
+        pass
+    print("  ✅ 去重大写 / 100 上限 / 无 Key 拒绝 / 空列表拒绝")
+
     srv.shutdown()
     print(f"\n=== 结果: {passed} 通过, {failed} 失败 ===")
     return 1 if failed else 0
