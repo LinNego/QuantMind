@@ -35,6 +35,28 @@ DEFAULT_BENCHMARK = BENCHMARK_SYMBOL
 DEFAULT_REGIME_INDEX = "000300.SH"
 MIN_CURVE_DAYS = 30  # 曲线点 < 此值连回归都做不了，直接跳过（不产垃圾报告）
 
+# 策略留档跳过原因（写入 result_json.health.ledger，门禁/运维按此判断）
+LEDGER_SKIP_NO_STRATEGY = "no_strategy_id"
+LEDGER_SKIP_NON_NUMERIC = "non_numeric_strategy_id"
+LEDGER_SKIP_WRITE_FAILED = "ledger_write_failed"
+
+
+def ledger_target(strategy_id: str | None) -> tuple[bool, str]:
+    """策略留档判定（纯函数）：只有 ``strategies.id``（纯数字）才挂 eval_scores。
+
+    模板/构造器 key（``StopLoss``、``standard_topk``…）在 strategies 表没有行，
+    不挂留档是**设计**而非失败；返回的 reason 由调用方落日志与
+    ``result_json.health.ledger``，避免"体检 A/88 存在、留档 0 行、全链无报错"
+    的静默形态（2026-10 报告实锤）。
+    """
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return False, LEDGER_SKIP_NO_STRATEGY
+    if not sid.isdigit():
+        return False, LEDGER_SKIP_NON_NUMERIC
+    return True, ""
+
+
 # 晋级门槛（T-P3-05 门槛总表唯一事实源——改这里即改全平台口径）
 SIM_REQUIRED_VERDICTS = ("A", "B")  # B 允许晋级但须在门禁信息中标注收益来源
 SIM_MIN_SAMPLES_DAYS = 60  # 体检曲线至少 60 个点，否则无从判 A/B
@@ -160,8 +182,9 @@ def promotion_gate(
     mode_key = str(mode or "").strip().upper()
     if health is None:
         return False, (
-            "策略尚未完成回测体检：请在本页重跑一次回测，"
-            "回测完成后自动生成体检报告，结论 A/B 方可晋级。"
+            "策略尚未完成回测体检：请到「回测中心 → 策略管理 → 回测验证」"
+            "对该策略重跑一次回测，回测完成后自动生成体检报告，结论 A/B 方可晋级。"
+            "（在回测中心直接跑模板不会挂到策略上——模板与用户策略是两张表。）"
         )
     verdict = str(health.get("verdict") or "").strip().upper()
     confidence = health.get("confidence")
@@ -387,23 +410,55 @@ async def attach_backtest_health(
         return None
     report["inputs"]["n_trials_source"] = trials_source
 
-    await _store_on_run(backtest_id=backtest_id, report=report)
+    # 策略留档：只有 strategies.id（纯数字）有行可挂；模板/构造器 key 跳过是设计，
+    # 但**必须留痕**（日志 + 证据卡 ledger），否则"证据卡有体检、门禁读不到"无从排查。
     sid = str(strategy_id or "").strip()
-    if sid.isdigit():
-        await record_strategy_health(
-            strategy_id=sid,
-            backtest_id=backtest_id,
-            report=report,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            evidence_source="backtest",
+    should_ledger, skip_reason = ledger_target(sid)
+    ledger: dict[str, Any] = {"written": False}
+    if should_ledger:
+        try:
+            written = await record_strategy_health(
+                strategy_id=sid,
+                backtest_id=backtest_id,
+                report=report,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                evidence_source="backtest",
+            )
+        except Exception as exc:  # noqa: BLE001 - 留档失败不阻断证据卡
+            written = False
+            logger.warning(
+                "[BacktestHealth] %s 策略留档写入异常（证据卡照写）: %s",
+                backtest_id,
+                exc,
+            )
+        if written:
+            ledger["written"] = True
+        else:
+            ledger["reason"] = LEDGER_SKIP_WRITE_FAILED
+            logger.warning(
+                "[BacktestHealth] %s 策略留档写入失败（取证卡存在但门禁读不到）: "
+                "strategy=%s",
+                backtest_id,
+                sid,
+            )
+    else:
+        ledger["reason"] = skip_reason
+        logger.info(
+            "[BacktestHealth] %s 体检已生成但未留档：strategy_id=%r 不是 "
+            "strategies.id（模板/构造器 key 无策略行可挂）；晋级门禁不会读到本次结论。",
+            backtest_id,
+            sid or None,
         )
+    report["ledger"] = ledger
+    await _store_on_run(backtest_id=backtest_id, report=report)
     logger.info(
-        "[BacktestHealth] %s 体检完成：%s（可信度 %s）strategy=%s",
+        "[BacktestHealth] %s 体检完成：%s（可信度 %s）strategy=%s ledger=%s",
         backtest_id,
         report.get("verdict"),
         report.get("confidence"),
         sid or "-",
+        "written" if ledger["written"] else f"skipped:{ledger.get('reason')}",
     )
     return report
 

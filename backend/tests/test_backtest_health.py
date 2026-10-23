@@ -706,3 +706,93 @@ async def test_degradation_notification_e2e_real_db(monkeypatch):
                 {"m": f"%{marker}%"},
             )
         await close_database()
+
+
+# ── 策略留档判定（2026-10-23）────────────────────────────────────────
+# 背景：模板/构造器 key（StopLoss、standard_topk…）在 strategies 表没有行，
+# `if sid.isdigit()` 静默跳过 → 证据卡有体检、门禁读不到、运维无从判断。
+# 修复口径：跳过仍是设计（模板本来不能挂策略），但**必须留痕**——日志 + 证据卡
+# `ledger` 标记，让「这份体检挂没挂到策略」一眼可判。
+
+
+@pytest.mark.unit
+def test_ledger_target_only_numeric_strategy_id_is_written():
+    from backend.shared.backtest_health import ledger_target
+
+    assert ledger_target("13") == (True, "")
+    assert ledger_target(13) == (True, "")
+    assert ledger_target("StopLoss") == (False, "non_numeric_strategy_id")
+    assert ledger_target("standard_topk") == (False, "non_numeric_strategy_id")
+    assert ledger_target(None) == (False, "no_strategy_id")
+    assert ledger_target("  ") == (False, "no_strategy_id")
+
+
+def _stub_health_deps(monkeypatch, *, record_calls: list[dict]) -> None:
+    """把体检评估/证据卡/留档三处 IO 换成桩（判 ledger 分支，不碰真库）。"""
+    import backend.shared.backtest_health as bh
+
+    report = {"verdict": "A", "confidence": 88, "tests": {}, "inputs": {}}
+
+    async def fake_evaluate(*args, **kwargs):
+        return dict(report)
+
+    async def fake_store(**kwargs):
+        return True
+
+    async def fake_record(**kwargs):
+        record_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(bh, "evaluate_for_window", fake_evaluate)
+    monkeypatch.setattr(bh, "_store_on_run", fake_store)
+    monkeypatch.setattr(bh, "record_strategy_health", fake_record)
+
+
+@pytest.mark.asyncio
+async def test_attach_health_marks_ledger_skipped_for_template_key(monkeypatch):
+    """模板 key：证据卡照写，策略留档跳过，报告里留下 skip 原因（不再静默）。"""
+    import backend.shared.backtest_health as bh
+
+    calls: list[dict] = []
+    _stub_health_deps(monkeypatch, record_calls=calls)
+    rows = [{"date": "2024-01-01", "value": 1.0}] * bh.MIN_CURVE_DAYS
+
+    out = await bh.attach_backtest_health(
+        backtest_id="pytest_ledger_skip",
+        equity_rows=rows,
+        tenant_id="default",
+        user_id="00000001",
+        strategy_id="StopLoss",
+        n_trials=1,
+    )
+    assert out is not None
+    assert out["ledger"] == {"written": False, "reason": "non_numeric_strategy_id"}
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_attach_health_writes_ledger_for_numeric_strategy_id(monkeypatch):
+    import backend.shared.backtest_health as bh
+
+    calls: list[dict] = []
+    _stub_health_deps(monkeypatch, record_calls=calls)
+    rows = [{"date": "2024-01-01", "value": 1.0}] * bh.MIN_CURVE_DAYS
+
+    out = await bh.attach_backtest_health(
+        backtest_id="pytest_ledger_write",
+        equity_rows=rows,
+        tenant_id="default",
+        user_id="00000001",
+        strategy_id="13",
+        n_trials=1,
+    )
+    assert out is not None
+    assert out["ledger"] == {"written": True}
+    assert calls and calls[0]["strategy_id"] == "13"
+
+
+@pytest.mark.unit
+def test_health_ledger_skip_is_never_silent_in_source():
+    src = (_BACKEND / "shared/backtest_health.py").read_text(encoding="utf-8")
+    assert "体检已生成但未留档" in src
+    assert 'report["ledger"]' in src

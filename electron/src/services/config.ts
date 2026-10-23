@@ -35,7 +35,6 @@ export const API_ENDPOINTS = {
   STRATEGY_START: (id: string) => `${API_PATHS.V1}/strategies/${id}/start`,
   STRATEGY_STOP: (id: string) => `${API_PATHS.V1}/strategies/${id}/stop`,
   STRATEGY_GENERATE: `${API_PATHS.V1}/strategy/generate`,
-  STRATEGY_BACKTEST: (id: string) => `${API_PATHS.V1}/strategies/${id}/backtest`,
 
   // 回测数据 (Note: Qlib service might need separate client if on different port, but assuming gateway proxies it)
   BACKTEST_HISTORY: `${API_PATHS.V1}/qlib/history`,

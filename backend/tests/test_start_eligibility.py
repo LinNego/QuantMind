@@ -69,6 +69,10 @@ def test_health_missing_blocks_sim_with_actionable_next_step() -> None:
     assert items["lifecycle"]["passed"] is True
     assert items["health"]["passed"] is False
     assert "回测" in items["health"]["next_step"]
+    # 2026-10-23：文案必须指向**真实存在**的入口——策略详情页没有重跑控件，
+    # 真实入口是 回测中心 → 策略管理 → 回测验证。
+    assert "策略管理" in items["health"]["next_step"]
+    assert "策略详情" not in items["health"]["next_step"]
 
 
 @pytest.mark.unit

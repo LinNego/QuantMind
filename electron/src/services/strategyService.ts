@@ -273,23 +273,6 @@ class StrategyService {
             throw error;
         }
     }
-
-    /**
-     * 获取回测历史
-     */
-    async getBacktestHistory(id: string): Promise<ApiResponse<BacktestRecord[]>> {
-        return await apiClient.get<ApiResponse<BacktestRecord[]>>(API_ENDPOINTS.STRATEGY_BACKTEST(id));
-    }
-
-    /**
-     * 运行回测
-     */
-    async runBacktest(id: string, config: BacktestConfig): Promise<ApiResponse<BacktestResult>> {
-        return await apiClient.post<ApiResponse<BacktestResult>>(
-            API_ENDPOINTS.STRATEGY_BACKTEST(id),
-            config as unknown as Record<string, unknown>,
-        );
-    }
 }
 
 export const strategyService = new StrategyService();

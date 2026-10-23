@@ -95,7 +95,7 @@ def _health_item(
         passed=ok,
         value=value,
         reason=note,
-        next_step="回到策略详情重跑一次回测，体检结论 A/B 后方可晋级",
+        next_step="到「回测中心 → 策略管理 → 回测验证」重跑一次该策略的回测，体检结论 A/B 后方可晋级",
     )
 
 
