@@ -136,4 +136,19 @@ await report('1920x1080 + insights');
 await page.screenshot({ path: '/tmp/position_monitor_1920_insights.png', fullPage: false });
 
 console.log(JSON.stringify({ at1440, at1920, delta: at1920 - at1440 }));
+
+// 交易历史：拒单是否显示原因
+await click(/交易记录/);
+await page.waitForTimeout(5000);
+await dismiss();
+await click(/拒绝\/过期/, 'div');
+await page.waitForTimeout(2500);
+const history = await page.evaluate(() =>
+  Array.from(document.querySelectorAll('tbody tr'))
+    .slice(0, 4)
+    .map((r) => (r.textContent || '').replace(/\s+/g, ' ').slice(0, 220)),
+);
+console.log(JSON.stringify({ history }));
+await page.screenshot({ path: '/tmp/trading_history_rejected.png', fullPage: false });
+
 await browser.close();

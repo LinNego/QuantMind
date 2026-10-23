@@ -5,7 +5,7 @@
  * 用户看不到为什么；后端 `remarks` 里其实有完整拒因。
  */
 import { describe, it, expect } from 'vitest';
-import { displayReason } from '../orderReason';
+import { displayReason, displayReasonSummary } from '../orderReason';
 
 describe('displayReason', () => {
   it('剥掉 mark_rejected 的 Execution rejected 前缀', () => {
@@ -24,5 +24,25 @@ describe('displayReason', () => {
     expect(displayReason(null)).toBe('');
     expect(displayReason(undefined)).toBe('');
     expect(displayReason(123)).toBe('123');
+  });
+});
+
+describe('displayReasonSummary（状态列短原因）', () => {
+  it('取拒因冒号后的尾巴', () => {
+    expect(
+      displayReasonSummary(
+        'Execution rejected: 风控拒单[l3.stale_quote]（派发复检）: 行情陈旧',
+      ),
+    ).toBe('行情陈旧');
+  });
+
+  it('无冒号的拒因保留并截断', () => {
+    expect(
+      displayReasonSummary('Execution rejected: Insufficient holdings for sell order'),
+    ).toBe('Insufficient holdings fo…');
+  });
+
+  it('空值 → 空串', () => {
+    expect(displayReasonSummary(null)).toBe('');
   });
 });

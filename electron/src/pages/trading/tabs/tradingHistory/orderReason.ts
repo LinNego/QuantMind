@@ -11,3 +11,18 @@ export function displayReason(raw: unknown): string {
     .trim()
     .replace(/^Execution rejected:\s*/i, '');
 }
+
+/**
+ * 状态列用的短原因：`风控拒单[l3.stale_quote]（派发复检）: 行情陈旧` → `行情陈旧`。
+ *
+ * 状态列只有 ~12% 宽，全文放不下；完整拒因仍由 `displayReason` 进 title 与导出。
+ * 没有冒号的技术性拒因（`Insufficient holdings for sell order`）原样保留并截断。
+ */
+export function displayReasonSummary(raw: unknown, maxChars = 24): string {
+  const text = displayReason(raw);
+  if (!text) return '';
+  const parts = text.split(/[:：]/);
+  const tail = parts.length > 1 ? parts[parts.length - 1].trim() : text;
+  const source = tail || text;
+  return source.length > maxChars ? `${source.slice(0, maxChars)}…` : source;
+}

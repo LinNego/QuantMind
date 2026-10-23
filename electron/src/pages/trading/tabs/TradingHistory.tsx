@@ -18,7 +18,7 @@ import {
     type ColumnFilterState,
 } from './tradingHistory/columnFilters';
 import ExcelFilterDropdown from './tradingHistory/ExcelFilterDropdown';
-import { displayReason } from './tradingHistory/orderReason';
+import { displayReason, displayReasonSummary } from './tradingHistory/orderReason';
 
 interface TradingHistoryProps {
     userId: string;
@@ -43,6 +43,8 @@ interface TradeRow {
     status: string;
     /** 拒单/撤单原因（后端 `remarks`；v1 台账由 mark_rejected 写入） */
     reason: string;
+    /** 状态列短原因（拒因冒号后的尾巴）；全文进 title 与导出 */
+    reasonSummary: string;
     tradeAction: string;      // buy_to_open / sell_to_close 等
     exchangeOrderId: string;  // 交易所委托号
     commission: number;       // 手续费
@@ -221,6 +223,9 @@ const TradingHistory: React.FC<TradingHistoryProps> = ({ userId, isActive, tradi
                     close: '平仓',
                 };
                 const rawAction = String(order.trade_action || '').toLowerCase();
+                // 拒因：v1 台账在 remarks（mark_rejected 加 `Execution rejected:` 前缀），
+                // 投影行另有 rejected_reason。全文进 title/导出，短原因进状态列。
+                const rawReason = order.remarks ?? (order as any).rejected_reason;
 
                 return {
                     id: order.id.toString(),
@@ -237,7 +242,8 @@ const TradingHistory: React.FC<TradingHistoryProps> = ({ userId, isActive, tradi
                     amount: order.order_value,
                     filledValue: isFilled || isPartial ? filledValue : 0,
                     status: displayStatus,
-                    reason: displayReason(order.remarks ?? (order as any).rejected_reason),
+                    reason: displayReason(rawReason),
+                    reasonSummary: displayReasonSummary(rawReason),
                     tradeAction: actionMap[rawAction] || rawAction,
                     exchangeOrderId: order.exchange_order_id || '',
                     commission: Number((order as any).commission ?? (order as any).fee ?? 0),
@@ -531,13 +537,13 @@ const TradingHistory: React.FC<TradingHistoryProps> = ({ userId, isActive, tradi
                                     </span>
                                 </th>
                                 <th className="px-3 py-2 text-center font-semibold text-gray-600 w-[8%] whitespace-nowrap">时间</th>
-                                <th className="px-3 py-2 text-center font-semibold text-gray-600 w-[7%]">
+                                <th className="px-3 py-2 text-center font-semibold text-gray-600 w-[6%]">
                                     <span className="inline-flex items-center justify-center gap-1">
                                         方向
                                         <ExcelFilterDropdown title="方向" options={filterOptions.direction} selected={columnFilters.direction} onApply={(next) => setColumnFilter('direction', next)} />
                                     </span>
                                 </th>
-                                <th className="px-3 py-2 text-center font-semibold text-gray-600 w-[7%]">
+                                <th className="px-3 py-2 text-center font-semibold text-gray-600 w-[6%]">
                                     <span className="inline-flex items-center justify-center gap-1">
                                         操作
                                         <ExcelFilterDropdown title="操作" options={filterOptions.action} selected={columnFilters.action} onApply={(next) => setColumnFilter('action', next)} />
@@ -548,8 +554,8 @@ const TradingHistory: React.FC<TradingHistoryProps> = ({ userId, isActive, tradi
                                 <th className="px-3 py-2 text-center font-semibold text-gray-600 w-[12%]">成交量/委托量</th>
                                 <th className="px-3 py-2 text-center font-semibold text-gray-600 w-[10%]">成交均价</th>
                                 <th className="px-3 py-2 text-center font-semibold text-gray-600 w-[10%]">成交金额</th>
-                                <th className="px-3 py-2 text-center font-semibold text-gray-600 w-[8%]">手续费</th>
-                                <th className="px-3 py-2 text-center font-semibold text-gray-600 w-[9%]">
+                                <th className="px-3 py-2 text-center font-semibold text-gray-600 w-[7%]">手续费</th>
+                                <th className="px-3 py-2 text-center font-semibold text-gray-600 w-[12%]">
                                     <span className="inline-flex items-center justify-center gap-1">
                                         状态
                                         <ExcelFilterDropdown title="状态" options={filterOptions.status} selected={columnFilters.status} onApply={(next) => setColumnFilter('status', next)} />
@@ -640,14 +646,14 @@ const TradingHistory: React.FC<TradingHistoryProps> = ({ userId, isActive, tradi
                                             </div>
                                             {/* 拒单/撤单原因常驻一行（title 给全文）：历史记录只写「已拒绝」
                                                 不写为什么，用户只能去日志里翻（2026-10-22 实证）。 */}
-                                            {!isFilled && trade.reason && (
+                                            {!isFilled && trade.reasonSummary && (
                                                 <div
                                                     className={`mt-0.5 truncate text-[10px] leading-3 ${
                                                         trade.status === 'rejected' ? 'text-red-500' : 'text-gray-400'
                                                     }`}
                                                     title={trade.reason}
                                                 >
-                                                    {trade.reason}
+                                                    {trade.reasonSummary}
                                                 </div>
                                             )}
                                         </td>
