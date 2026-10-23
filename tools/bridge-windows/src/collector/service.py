@@ -221,11 +221,19 @@ class CollectorService:
         try:
             for idx, chunk in enumerate(chunks):
                 data = await self.client.get_pricevol(chunk)
-                # H3：空/残缺返回不能被当成功（否则熔断清零、/health 全绿）
-                if len(data) < max(1, int(len(chunk) * 0.5)):
+                # H3：空/残缺/全零价返回不能被当成功（否则熔断清零、/health 全绿）
+                positive = 0
+                for info in data.values():
+                    try:
+                        if float(info.get("Now") or 0) > 0:
+                            positive += 1
+                    except (TypeError, ValueError):
+                        pass
+                if positive < max(1, int(len(chunk) * 0.5)):
                     self.empty_cycles += 1
                     raise BridgeError(
-                        f"pricevol 返回 {len(data)}/{len(chunk)}，低于 50%")
+                        f"pricevol 有效价 {positive}/{len(chunk)}，低于 50%"
+                        f"（行情源可能未更新）")
                 # H2：每块用真实采样时刻，不能用整轮起点
                 sample_now = datetime.now()
                 for code, info in data.items():

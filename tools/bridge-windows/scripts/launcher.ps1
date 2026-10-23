@@ -4,6 +4,7 @@
 #  双击 启动交易台.cmd，或：
 #      .\scripts\launcher.ps1              # 缺谁起谁，已在跑不动
 #      .\scripts\launcher.ps1 -Restart     # 强制重启桥 + 采集器
+#      .\scripts\launcher.ps1 -RestartCollector   # 盘中只重启采集器（不动桥）
 #      .\scripts\launcher.ps1 -HotSet "600519.SH,000001.SZ"
 #      .\scripts\launcher.ps1 -NoCollector -NoPause
 #
@@ -12,6 +13,7 @@
 # ============================================================
 param(
     [switch]$Restart,
+    [switch]$RestartCollector,
     [switch]$NoCollector,
     [switch]$NoWatchdog,
     [string]$HotSet = "",
@@ -92,7 +94,7 @@ if (-not $NoWatchdog) {
 # ---------- 4. 采集器 8560 ----------
 if (-not $NoCollector) {
     # -HotSet 是显式意图：即使采集器在跑也要按新热集重启（只重启采集器，不动桥）
-    $colRestart = $Restart -or [bool]$HotSet
+    $colRestart = $Restart -or $RestartCollector -or [bool]$HotSet
     $col = if (-not $colRestart) { Get-Json "http://127.0.0.1:8560/health" } else { $null }
     if ($colRestart -or -not $col) {
         if ($colRestart -or (Test-Port 8560)) {
