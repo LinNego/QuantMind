@@ -16,6 +16,7 @@ param(
     [switch]$RestartCollector,
     [switch]$NoCollector,
     [switch]$NoWatchdog,
+    [switch]$NoThs,
     [string]$HotSet = "",
     [switch]$NoPause
 )
@@ -53,28 +54,28 @@ Write-Host ""
 
 # ---------- 1. TQ 17709 ----------
 $tqOk = Test-Port 17709
-if ($tqOk) { Write-Host "[1/4] TQ 17709       OK" -ForegroundColor Green }
-else { Write-Host "[1/4] TQ 17709       未监听：请先启动 TdxW 并登录，再运行 TQ 常驻策略" -ForegroundColor Yellow }
+if ($tqOk) { Write-Host "[1/5] TQ 17709       OK" -ForegroundColor Green }
+else { Write-Host "[1/5] TQ 17709       未监听：请先启动 TdxW 并登录，再运行 TQ 常驻策略" -ForegroundColor Yellow }
 
 # ---------- 2. 桥 8550 ----------
 $bridge = if (-not $Restart) { Get-Json "http://127.0.0.1:8550/api/v1/health" } else { $null }
 if ($Restart -or -not $bridge) {
     if ($Restart -or (Test-Port 8550)) {
-        Write-Host "[2/4] 桥 8550        停止旧进程..." -ForegroundColor DarkGray
+        Write-Host "[2/5] 桥 8550        停止旧进程..." -ForegroundColor DarkGray
         # 先停看门狗：否则它会把刚杀掉的桥/采集器抢着拉起来，形成双实例
         Stop-ScheduledTask -TaskName "TDXBridgeWatchdog" -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 1
         Stop-Port 8550
         Start-Sleep -Seconds 2
     }
-    Write-Host "[2/4] 桥 8550        启动中..." -ForegroundColor DarkGray
+    Write-Host "[2/5] 桥 8550        启动中..." -ForegroundColor DarkGray
     # 防 token 静默轮换：config 依赖 ${BRIDGE_AUTH_TOKEN} 而本会话又没注入时，
     # main.py 会自动生成新 token 并写回 config，平台/采集器立刻全员 401
     # （2026-10-23 实盘事故）。宁可拒绝启动，也不静默换 token。
     if (-not $env:BRIDGE_AUTH_TOKEN) {
         $cfgText = Get-Content (Join-Path $root "config.yaml") -Raw -ErrorAction SilentlyContinue
         if ($cfgText -match '(?m)^\s*token:\s*["'']?\$\{BRIDGE_AUTH_TOKEN\}') {
-            Write-Host "[2/4] 桥 8550        拒绝启动：config.yaml 的 auth.token 依赖 BRIDGE_AUTH_TOKEN，本会话未设置" -ForegroundColor Red
+            Write-Host "[2/5] 桥 8550        拒绝启动：config.yaml 的 auth.token 依赖 BRIDGE_AUTH_TOKEN，本会话未设置" -ForegroundColor Red
             Write-Host "      先执行:  `$env:BRIDGE_AUTH_TOKEN = '<与 Linux .env 相同的 64 位 hex>'" -ForegroundColor Yellow
             Write-Host "      否则桥会生成新 token 并写回 config，平台与采集器会全部 401。" -ForegroundColor Yellow
             if (-not $NoPause) { Read-Host "按回车关闭" | Out-Null }
@@ -88,9 +89,9 @@ if ($Restart -or -not $bridge) {
     $bridge = Get-Json "http://127.0.0.1:8550/api/v1/health"
 }
 if ($bridge -and $bridge.status -eq "ok") {
-    Write-Host ("[2/4] 桥 8550        OK  tdx_connected={0}" -f $bridge.tdx_connected) -ForegroundColor Green
+    Write-Host ("[2/5] 桥 8550        OK  tdx_connected={0}" -f $bridge.tdx_connected) -ForegroundColor Green
 } else {
-    Write-Host "[2/4] 桥 8550        启动失败（看 data\logs\bridge.log）" -ForegroundColor Red
+    Write-Host "[2/5] 桥 8550        启动失败（看 data\logs\bridge.log）" -ForegroundColor Red
 }
 
 # ---------- 3. 看门狗 ----------
@@ -98,13 +99,13 @@ if (-not $NoWatchdog) {
     $wd = Get-ScheduledTask -TaskName "TDXBridgeWatchdog" -ErrorAction SilentlyContinue
     if ($wd) {
         if ($wd.State -ne "Running") { Start-ScheduledTask -TaskName "TDXBridgeWatchdog" }
-        Write-Host "[3/4] 看门狗         OK（计划任务）" -ForegroundColor Green
+        Write-Host "[3/5] 看门狗         OK（计划任务）" -ForegroundColor Green
     } else {
         Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$root\watchdog.ps1`"" -WorkingDirectory $root -WindowStyle Hidden | Out-Null
-        Write-Host "[3/4] 看门狗         已临时启动；建议跑 scripts\fix_watchdog.ps1 注册" -ForegroundColor Yellow
+        Write-Host "[3/5] 看门狗         已临时启动；建议跑 scripts\fix_watchdog.ps1 注册" -ForegroundColor Yellow
     }
 } else {
-    Write-Host "[3/4] 看门狗         跳过（-NoWatchdog）" -ForegroundColor DarkGray
+    Write-Host "[3/5] 看门狗         跳过（-NoWatchdog）" -ForegroundColor DarkGray
 }
 
 # ---------- 4. 采集器 8560 ----------
@@ -119,7 +120,7 @@ if (-not $NoCollector) {
         # 采集器就再也起不来（2026-10-23 实报）。
         if ($colTask) { Stop-ScheduledTask -TaskName "TdxCollector" -ErrorAction SilentlyContinue }
         if ($colRestart -or (Test-Port 8560)) {
-            Write-Host "[4/4] 采集器 8560    停止旧进程..." -ForegroundColor DarkGray
+            Write-Host "[4/5] 采集器 8560    停止旧进程..." -ForegroundColor DarkGray
             Stop-Port 8560
             Start-Sleep -Seconds 2
         }
@@ -134,12 +135,45 @@ if (-not $NoCollector) {
         $col = Get-Json "http://127.0.0.1:8560/health"
     }
     if ($col -and $col.success -and $col.data.status -eq "ok") {
-        Write-Host ("[4/4] 采集器 8560    OK  universe={0}" -f $col.data.universe_size) -ForegroundColor Green
+        Write-Host ("[4/5] 采集器 8560    OK  universe={0}" -f $col.data.universe_size) -ForegroundColor Green
     } else {
-        Write-Host "[4/4] 采集器 8560    启动失败（看 data\logs\collector.log）" -ForegroundColor Red
+        Write-Host "[4/5] 采集器 8560    启动失败（看 data\logs\collector.log）" -ForegroundColor Red
     }
 } else {
-    Write-Host "[4/4] 采集器         跳过（-NoCollector）" -ForegroundColor DarkGray
+    Write-Host "[4/5] 采集器         跳过（-NoCollector）" -ForegroundColor DarkGray
+}
+
+# ---------- 5. 同花顺 worker 8765（可选） ----------
+if (-not $NoThs) {
+    $thsTask = Get-ScheduledTask -TaskName "TdxThsWorker" -ErrorAction SilentlyContinue
+    $thsRestart = $Restart
+    $ths = if (-not $thsRestart) { Get-Json "http://127.0.0.1:8765/api/status" } else { $null }
+    if ($thsRestart -or -not $ths) {
+        if ($thsRestart -or (Test-Port 8765)) {
+            Write-Host "[5/5] 同花顺       停止旧进程..." -ForegroundColor DarkGray
+            if ($thsTask) { Stop-ScheduledTask -TaskName "TdxThsWorker" -ErrorAction SilentlyContinue }
+            Stop-Port 8765
+            Start-Sleep -Seconds 2
+        }
+        Write-Host "[5/5] 同花顺       启动中..." -ForegroundColor DarkGray
+        if ($thsTask) {
+            Start-ScheduledTask -TaskName "TdxThsWorker"
+        } else {
+            Start-Process -FilePath $py `
+                -ArgumentList "-u `"$root\scripts\ths_worker.py`" --host 127.0.0.1 --port 8765" `
+                -WorkingDirectory $root -WindowStyle Hidden | Out-Null
+        }
+        Start-Sleep -Seconds 8
+        $ths = Get-Json "http://127.0.0.1:8765/api/status"
+    }
+    if ($ths) {
+        Write-Host ("[5/5] 同花顺       OK  connected={0} credentials={1}" -f `
+            $ths.connected, $ths.credentials) -ForegroundColor Green
+    } else {
+        Write-Host "[5/5] 同花顺       未启动（可选；查 data\ths.env 与 vendor\ths）" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "[5/5] 同花顺       跳过（-NoThs）" -ForegroundColor DarkGray
 }
 
 # ---------- 汇总 ----------
@@ -156,6 +190,9 @@ $limText = if ($lim) { "{0}/{1}（本秒 {2}/{3}）" -f $lim.day_count, $lim.day
 Write-Host ("  TQ 17709    {0}" -f $tqText)
 Write-Host ("  桥 8550     {0}" -f $bridgeText)
 Write-Host ("  采集器 8560 {0}" -f $colText)
+$thsSum = Get-Json "http://127.0.0.1:8765/api/status"
+$thsText = if ($thsSum) { "ok / connected=" + $thsSum.connected } else { "未启动" }
+Write-Host ("  同花顺 8765 {0}" -f $thsText)
 Write-Host ("  硬上限      {0}" -f $limText)
 Write-Host "  --------------------------------------------------------" -ForegroundColor DarkGray
 Write-Host ""

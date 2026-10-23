@@ -272,6 +272,46 @@ class ThsClient:
         self._failures = 0
         return value
 
+    async def request_raw(self, http_method: str, path: str,
+                          params: Optional[dict] = None,
+                          timeout_s: Optional[float] = None) -> tuple[int, str, bytes]:
+        """原始透传（只给固定路径的旁路端点用：扫码 PNG / JSON）。
+
+        与 `call()` 共享熔断与统计，但不走方法白名单——调用方必须是桥内部的
+        固定路径，绝不接受用户传入的 path。
+        """
+        if not self.enabled:
+            raise ThsDisabled("同花顺旁路未启用（config: ths.enabled=false）")
+        now = time.monotonic()
+        if self._open_until > now:
+            raise ThsCircuitOpen(
+                f"同花顺熔断中，{self._open_until - now:.0f}s 后重试")
+        t0 = time.monotonic()
+        self._stats["calls"] += 1
+        try:
+            session = self._get_session()
+            timeout = (aiohttp.ClientTimeout(total=timeout_s)
+                       if timeout_s else None)
+            async with session.request(http_method, self.base_url + path,
+                                       params=params, timeout=timeout) as resp:
+                body = await resp.read()
+                ctype = resp.headers.get("Content-Type", "application/octet-stream")
+                if resp.status >= 400:
+                    raise ThsUnavailable(
+                        f"worker HTTP {resp.status}: {body[:200]!r}")
+        except ThsError:
+            self._fail(f"{http_method} {path}")
+            raise
+        except asyncio.TimeoutError:
+            self._fail(f"{http_method} {path} 超时")
+            raise ThsUnavailable(f"worker 超时（{self.timeout_s:.0f}s）") from None
+        except aiohttp.ClientError as exc:
+            self._fail(f"{http_method} {path}: {exc}")
+            raise ThsUnavailable(f"worker 不可达: {exc}") from None
+        self._stats["last_ms"] = round((time.monotonic() - t0) * 1000.0, 1)
+        self._failures = 0
+        return resp.status, ctype, body
+
     def _fail(self, message: str) -> None:
         self._stats["errors"] += 1
         self._stats["last_error"] = message[:200]

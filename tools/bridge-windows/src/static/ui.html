@@ -512,6 +512,18 @@
         <button class="btn ghost" onclick="thsQuery('compare')">对照 TDX</button>
         <button class="btn ghost" onclick="loadThs()">刷新状态</button>
       </div>
+      <div class="row" style="gap:10px;margin-bottom:10px;align-items:center">
+        <button class="btn primary" onclick="thsQrStart()">扫码登录</button>
+        <span class="hint" id="thsQrState">未扫码</span>
+        <img id="thsQrImg" alt="同花顺登录二维码"
+             style="display:none;width:150px;height:150px;border-radius:10px;background:#fff;padding:6px">
+      </div>
+      <div class="row" style="gap:8px;margin-bottom:10px">
+        <input id="thsLiveCodes" placeholder="实时关注：600519.SH,600760.SH" style="flex:1">
+        <button class="btn ghost" id="thsLiveBtn" onclick="thsLiveToggle()">开启实时</button>
+        <span class="hint" id="thsLiveHint">--</span>
+      </div>
+      <div id="thsLive"></div>
       <div class="msg" id="thsMsg"></div>
       <div class="result-box" id="thsResult"></div>
     </section>
@@ -1312,6 +1324,103 @@ async function loadThs(){
     $('#thsHint').textContent = hint;
     $('#thsMsg').textContent = d.worker_error ? ('worker 探测失败：' + d.worker_error) : '';
   } catch (e) { $('#thsHint').textContent = '读取失败：' + e.message; }
+}
+
+let thsQrTimer = null;
+let thsLiveTimer = null;
+
+async function thsQrStart(){
+  if (!authHeader()['Authorization']) { $('#thsMsg').textContent = '请先输入访问 token'; return; }
+  $('#thsQrState').textContent = '生成二维码…';
+  try {
+    const { body } = await fetchJSON('/api/v1/ths/qr/start', {
+      method: 'POST',
+      headers: { ...authHeader(), 'Content-Type': 'application/json' },
+      body: '{}'
+    }, 30000);
+    if (!body.qrid) {
+      $('#thsQrState').textContent = '生成失败：' + (body.error || body.detail || JSON.stringify(body).slice(0, 80));
+      return;
+    }
+    await thsQrLoadImage(body.qrid);
+    $('#thsQrState').textContent = '等待扫码（手机同花顺 APP 扫图）';
+    clearInterval(thsQrTimer);
+    thsQrTimer = setInterval(() => thsQrPoll(), 2000);
+  } catch (e) { $('#thsQrState').textContent = '失败：' + e.message; }
+}
+
+async function thsQrLoadImage(qrid){
+  try {
+    const res = await fetch('/api/v1/ths/qr.png?qrid=' + encodeURIComponent(qrid),
+                            { headers: authHeader() });
+    if (!res.ok) { $('#thsQrState').textContent = '二维码图片不可用（可重试）'; return; }
+    const blob = await res.blob();
+    const img = $('#thsQrImg');
+    if (img.src && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+    img.src = URL.createObjectURL(blob);
+    img.style.display = 'block';
+  } catch (e) { /* 图片失败不影响轮询 */ }
+}
+
+async function thsQrPoll(){
+  try {
+    const { body } = await fetchJSON('/api/v1/ths/qr/status', { headers: authHeader() });
+    const st = (body && body.state !== undefined) ? body : (body.data || {});
+    const s = st.state || 'unknown';
+    const text = s === 'waiting' ? '等待扫码…'
+      : s === 'scanned' ? '已扫码，请在手机上确认'
+      : s === 'connecting' ? '登录中…'
+      : s === 'ok' ? '登录成功'
+      : s === 'error' ? ('失败：' + (st.error || '')) : s;
+    $('#thsQrState').textContent = text;
+    if (s === 'ok' || s === 'error') {
+      clearInterval(thsQrTimer);
+      thsQrTimer = null;
+      if (s === 'ok') { $('#thsQrImg').style.display = 'none'; loadThs(); }
+    }
+  } catch (e) { /* 忽略瞬时错误 */ }
+}
+
+function thsLiveToggle(){
+  if (thsLiveTimer) {
+    clearInterval(thsLiveTimer);
+    thsLiveTimer = null;
+    $('#thsLiveBtn').textContent = '开启实时';
+    $('#thsLiveHint').textContent = '已停止';
+    return;
+  }
+  const codes = ($('#thsLiveCodes').value || '').trim();
+  if (!codes) { $('#thsLiveHint').textContent = '先填代码（逗号分隔）'; return; }
+  if (!authHeader()['Authorization']) { $('#thsLiveHint').textContent = '请先输入访问 token'; return; }
+  $('#thsLiveBtn').textContent = '停止实时';
+  const tick = async () => {
+    try {
+      const { body } = await fetchJSON(
+        '/api/v1/ths/quote?codes=' + encodeURIComponent(codes),
+        { headers: authHeader() }, 15000);
+      if (!body.success) { $('#thsLiveHint').textContent = errText(body); return; }
+      const rows = (body.data || []).map(q => {
+        const last = (q.price !== undefined) ? q.price : (q.now !== undefined ? q.now : q.Now);
+        const pre = (q.pre_close !== undefined) ? q.pre_close
+          : (q.LastClose !== undefined ? q.LastClose : q.preclose);
+        let pct = '--';
+        if (last !== undefined && pre !== undefined && Number(pre)) {
+          pct = ((Number(last) - Number(pre)) / Number(pre) * 100).toFixed(2) + '%';
+        }
+        return '<tr><td class="mono">' + escapeHtml(String(q.code || '')) + '</td><td>'
+          + (last === undefined ? '--' : last) + '</td><td>' + pct + '</td><td>'
+          + (q.volume === undefined ? '--' : q.volume) + '</td></tr>';
+      });
+      $('#thsLive').innerHTML = '<table><thead><tr><th>代码</th><th>最新</th>'
+        + '<th>涨跌</th><th>量</th></tr></thead><tbody>'
+        + (rows.join('') || '<tr><td colspan="4" class="empty">无数据</td></tr>')
+        + '</tbody></table>';
+      $('#thsLiveHint').textContent = '每 2s 刷新 · '
+        + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    } catch (e) { $('#thsLiveHint').textContent = '刷新失败：' + e.message; }
+  };
+  tick();
+  thsLiveTimer = setInterval(tick, 2000);
 }
 
 async function thsQuery(kind){

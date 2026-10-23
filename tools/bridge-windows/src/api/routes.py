@@ -1551,6 +1551,37 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             return err
         return web.json_response({"success": True, "data": _jsonable(data)})
 
+    async def ths_qr_start(request: web.Request):
+        if ths is None:
+            return json_error(503, "THS_DISABLED", "同花顺旁路未配置")
+        try:
+            # 扫码要访问同花顺 passport，慢于普通行情：单独放宽到 30s
+            _st, ctype, body = await ths.request_raw(
+                "POST", "/api/qr/start", timeout_s=30.0)
+        except Exception as exc:  # noqa: BLE001
+            return _ths_error(exc)
+        return web.Response(body=body, content_type=ctype.split(";")[0])
+
+    async def ths_qr_status(request: web.Request):
+        if ths is None:
+            return json_error(503, "THS_DISABLED", "同花顺旁路未配置")
+        try:
+            _st, ctype, body = await ths.request_raw("GET", "/api/qr/status")
+        except Exception as exc:  # noqa: BLE001
+            return _ths_error(exc)
+        return web.Response(body=body, content_type=ctype.split(";")[0])
+
+    async def ths_qr_png(request: web.Request):
+        if ths is None:
+            return json_error(503, "THS_DISABLED", "同花顺旁路未配置")
+        qrid = (request.query.get("qrid") or "").strip()
+        try:
+            _st, _ctype, body = await ths.request_raw(
+                "GET", "/api/qr.png", {"qrid": qrid} if qrid else None)
+        except Exception as exc:  # noqa: BLE001
+            return _ths_error(exc)
+        return web.Response(body=body, content_type="image/png")
+
     async def ths_compare(request: web.Request):
         """TDX 与 THS 同尺对照：同一只股票的最新价/量。"""
         code = (request.query.get("code") or "").strip()
@@ -1598,6 +1629,9 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     app.router.add_get("/api/v1/ths/boards", ths_boards)
     app.router.add_post("/api/v1/ths/connect", ths_connect)
     app.router.add_get("/api/v1/ths/compare", ths_compare)
+    app.router.add_post("/api/v1/ths/qr/start", ths_qr_start)
+    app.router.add_get("/api/v1/ths/qr/status", ths_qr_status)
+    app.router.add_get("/api/v1/ths/qr.png", ths_qr_png)
     app.router.add_delete("/api/v1/auth/tokens/{token_hash}", delete_token_route)
     app.router.add_get("/ui", ui_page)
 
