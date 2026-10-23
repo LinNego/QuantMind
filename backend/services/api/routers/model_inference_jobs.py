@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from backend.services.api.user_app.middleware.auth import get_current_user
 from backend.services.engine.services.model_inference_job_service import (
+    MAX_REQUESTED_MODELS,
     REAP_TIMEOUT_SECONDS,
     JobValidationError,
     build_preview,
@@ -36,7 +37,8 @@ router = APIRouter(
 
 
 class PreviewRequest(BaseModel):
-    model_ids: list[str] = Field(default_factory=list, max_length=50)
+    # 与 service 层同一上限：请求可携带全选原始勾选（含归档），可补推上限在预览里再判
+    model_ids: list[str] = Field(default_factory=list, max_length=MAX_REQUESTED_MODELS)
 
 
 class CreateJobRequest(PreviewRequest):

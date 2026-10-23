@@ -362,9 +362,54 @@ def test_normalize_model_ids_dedupes_and_validates():
     with pytest.raises(js.JobValidationError) as few:
         js.normalize_model_ids(["m1"])
     assert few.value.code == "too_few_models"
+    # 2026-10-23：请求上限与**可补推**上限分离——勾选全表（含归档）不再 400，
+    # 归档/未就绪在预览里排除后只按 eligible 计 20 个。
     with pytest.raises(js.JobValidationError) as many:
-        js.normalize_model_ids([f"m{i}" for i in range(js.MAX_MODELS + 1)])
+        js.normalize_model_ids([f"m{i}" for i in range(js.MAX_REQUESTED_MODELS + 1)])
     assert many.value.code == "too_many_models"
+
+
+def test_build_preview_allows_raw_selection_beyond_job_cap(monkeypatch, tmp_path):
+    """勾选 MAX_MODELS+1（1 个归档）→ 可补推仍只有 MAX_MODELS 个，预览必须成功。
+
+    事故口径（2026-10-23）：模型治理「全选」50 行（多为归档）直接撞
+    `最多选择 20 个模型`，用户看到 [object Object] + 空预览。
+    """
+    rows = [_model_row(tmp_path, f"m{i}") for i in range(js.MAX_MODELS)]
+    rows.append(_model_row(tmp_path, "old", status="archived"))
+    _patch_registry(monkeypatch, rows)
+    monkeypatch.setattr(js, "estimate_seconds_by_model", _async_none)
+    monkeypatch.setattr(js, "compute_coverage", lambda model: _coverage(["2026-10-13"]))
+
+    preview = _run(
+        js.build_preview(
+            tenant_id="default",
+            user_id="u1",
+            model_ids=[f"m{i}" for i in range(js.MAX_MODELS)] + ["old"],
+        )
+    )
+    assert len(preview.eligible_entries) == js.MAX_MODELS
+    assert any(entry.reason == "archived" for entry in preview.entries)
+
+
+def test_build_preview_rejects_more_than_max_eligible(monkeypatch, tmp_path):
+    """真正可补推 >20 才拒，并给出可执行文案（分批）。"""
+    rows = [_model_row(tmp_path, f"m{i}") for i in range(js.MAX_MODELS + 1)]
+    _patch_registry(monkeypatch, rows)
+    monkeypatch.setattr(js, "estimate_seconds_by_model", _async_none)
+    monkeypatch.setattr(js, "compute_coverage", lambda model: _coverage(["2026-10-13"]))
+
+    with pytest.raises(js.JobValidationError) as exc:
+        _run(
+            js.build_preview(
+                tenant_id="default",
+                user_id="u1",
+                model_ids=[f"m{i}" for i in range(js.MAX_MODELS + 1)],
+            )
+        )
+    assert exc.value.code == "too_many_models"
+    assert f"可补推模型最多 {js.MAX_MODELS} 个" in exc.value.message
+    assert "分批" in exc.value.message
 
 
 def test_estimate_seconds_by_model_uses_median(monkeypatch):
@@ -490,6 +535,13 @@ def test_build_preview_warns_gap_too_large_and_multi_market(monkeypatch, tmp_pat
     warnings = "\n".join(preview.warnings)
     assert "缺口超过" in warnings
     assert "跨市场" in warnings
+    # 个别模型违规只排除自己，不拖死整批：reason 在表格里可见
+    entries = {entry.model.model_id: entry for entry in preview.entries}
+    assert entries["m1"].eligible is False
+    assert entries["m1"].reason == "gap_too_large"
+    assert entries["m2"].eligible is False
+    assert entries["m2"].reason == "market_mismatch"
+    assert preview.eligible_entries == []
 
 
 class _FakePersistenceForCreate:

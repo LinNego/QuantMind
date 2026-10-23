@@ -102,6 +102,8 @@ export const BACKFILL_REASON_LABELS: Record<string, string> = {
   coverage_failed: '覆盖读取失败',
   not_found: '模型不存在',
   skipped_busy: '该模型正在别处推理',
+  market_mismatch: '其他市场（本任务不含）',
+  gap_too_large: '缺口过大',
 };
 
 export function backfillReasonLabel(reason: string | null | undefined): string {

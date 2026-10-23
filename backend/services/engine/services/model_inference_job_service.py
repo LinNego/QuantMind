@@ -50,7 +50,13 @@ from backend.shared.utc_datetime import to_utc_iso, utc_now
 logger = logging.getLogger(__name__)
 
 MIN_MODELS = 2
-MAX_MODELS = 20
+#: 单个任务最多串行补推的**可补推**模型数（归档/未就绪在预览里排除后计数）。
+#: 2026-10-23 用户口径「选中了就要能一键全部推理至最新」：上限放到 100，
+#: 覆盖模型治理分页全选（50/100/200 页长）；任务串行、可取消、有 ETA。
+MAX_MODELS = 100
+#: 请求里允许的原始勾选上限（模型治理「全选」含归档行；先收进来再过滤，
+#: 否则全选会直接撞闸——2026-10-23 实证）
+MAX_REQUESTED_MODELS = 200
 HEARTBEAT_SECONDS = 30
 PROGRESS_WRITE_INTERVAL_SECONDS = 1.0
 REAP_TIMEOUT_SECONDS = 600
@@ -248,8 +254,10 @@ def normalize_model_ids(
         cleaned.append(model_id)
     if len(cleaned) < min_models:
         raise JobValidationError("too_few_models", f"至少选择 {min_models} 个模型")
-    if len(cleaned) > MAX_MODELS:
-        raise JobValidationError("too_many_models", f"最多选择 {MAX_MODELS} 个模型")
+    if len(cleaned) > MAX_REQUESTED_MODELS:
+        raise JobValidationError(
+            "too_many_models", f"最多选择 {MAX_REQUESTED_MODELS} 个模型"
+        )
     return cleaned
 
 
@@ -289,6 +297,39 @@ async def build_preview(
     )
     result.entries = list(entries)
 
+    # 同一任务只能补推一个市场 + 单模型缺口不能超上限。
+    # 2026-10-23 用户口径「选中了就要能一键全部」：把违规的**个别模型**标为不可补推
+    # （表格里可见原因），其余正常模型继续跑；不再让 1~2 个模型把整批任务拖死。
+    eligible = result.eligible_entries
+    market_counts: dict[str, int] = {}
+    for entry in eligible:
+        market_counts[entry.model.market] = market_counts.get(entry.model.market, 0) + 1
+    dominant_market = (
+        max(market_counts.items(), key=lambda item: item[1])[0] if market_counts else ""
+    )
+    dropped_market: list[str] = []
+    dropped_gap: list[str] = []
+    for entry in eligible:
+        if entry.model.market != dominant_market:
+            entry.eligible = False
+            entry.reason = "market_mismatch"
+            entry.estimated_seconds = 0.0
+            dropped_market.append(entry.model.model_id)
+        elif entry.coverage.gap_count > MAX_GAP_DAYS_PER_MODEL:
+            entry.eligible = False
+            entry.reason = "gap_too_large"
+            entry.estimated_seconds = 0.0
+            dropped_gap.append(entry.model.model_id)
+
+    # 上限按**可补推**模型计：勾选全表（含归档/未就绪）不应被闸拦下，
+    # 只有真正要串行补推的模型数超限才拒绝（并给出分批的可执行文案）。
+    eligible_count = len(result.eligible_entries)
+    if eligible_count > MAX_MODELS:
+        raise JobValidationError(
+            "too_many_models",
+            f"可补推模型最多 {MAX_MODELS} 个（当前 {eligible_count} 个）；请分批补推",
+        )
+
     reasons = {entry.reason for entry in result.entries if entry.reason}
     if "system_readonly" in {
         item["reason"] for item in result.excluded
@@ -296,19 +337,16 @@ async def build_preview(
         result.warnings.append("系统模型只读，已排除")
     if reasons & {"missing_storage", "not_ready", "archived"}:
         result.warnings.append("部分模型未就绪或无产物，已排除")
-    gap_too_large = [
-        entry.model.model_id
-        for entry in result.eligible_entries
-        if entry.coverage.gap_count > MAX_GAP_DAYS_PER_MODEL
-    ]
-    if gap_too_large:
+    if dropped_gap:
         result.warnings.append(
-            f"缺口超过 {MAX_GAP_DAYS_PER_MODEL} 天：{', '.join(gap_too_large)}；"
+            f"缺口超过 {MAX_GAP_DAYS_PER_MODEL} 天，已排除：{', '.join(dropped_gap)}；"
             "请先按区间补推或拆分"
         )
-    markets = {entry.model.market for entry in result.eligible_entries}
-    if len(markets) > 1:
-        result.warnings.append("所选模型跨市场，无法在同一任务内串行补推")
+    if dropped_market:
+        result.warnings.append(
+            f"所选模型跨市场：已排除 {len(dropped_market)} 个其他市场模型"
+            f"（同一任务只能补推 {dominant_market}）：{', '.join(dropped_market)}"
+        )
     if result.eligible_entries:
         total = result.estimated_seconds
         result.warnings.insert(

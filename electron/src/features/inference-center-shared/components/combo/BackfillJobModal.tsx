@@ -290,7 +290,8 @@ export const BackfillJobModal: React.FC<BackfillJobModalProps> = ({
                 : 'font-mono text-[11px] text-slate-300'
             }
           >
-            {row.eligible ? `${v} 日` : '—'}
+            {/* 缺口过大被排除的行仍要显示真实缺口——否则用户看不出为什么被排除 */}
+            {row.eligible || row.reason === 'gap_too_large' ? `${v} 日` : '—'}
           </span>
         ),
       },

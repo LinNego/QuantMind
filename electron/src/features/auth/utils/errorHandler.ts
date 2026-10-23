@@ -37,6 +37,32 @@ export interface StandardError {
 }
 
 /**
+ * 从错误载荷里取可读文案（字符串或 `{message}` / `{detail}` 对象）。
+ *
+ * FastAPI 的 `detail` 可能是对象（`{code, message}`）；直接 `data.detail` 当
+ * message 会在上层模板拼接时变成 `[object Object]`（2026-10-23 补推弹窗实证）。
+ */
+function asText(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) return value;
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const messageText = record.message;
+    if (typeof messageText === 'string' && messageText.trim()) return messageText;
+    const detailText = record.detail;
+    if (typeof detailText === 'string' && detailText.trim()) return detailText;
+  }
+  return undefined;
+}
+
+function objectCode(value: unknown): string | undefined {
+  if (value && typeof value === 'object') {
+    const code = (value as Record<string, unknown>).code;
+    if (typeof code === 'string' && code.trim()) return code;
+  }
+  return undefined;
+}
+
+/**
  * 错误处理器类
  */
 export class ErrorHandler {
@@ -67,11 +93,13 @@ export class ErrorHandler {
     // 解析HTTP状态码错误（优先处理存在响应的情况）
     if (error.response) {
       const status = error.response.status;
-      const data = error.response.data || {};
+      const data = (error.response.data || {}) as Record<string, unknown>;
+      const detailText = asText(data.detail);
+      const envelopeText = asText(data.error);
       const msg =
-        data.message ||
-        data.detail ||
-        data.error ||
+        asText(data.message) ||
+        detailText ||
+        envelopeText ||
         error.response.statusText ||
         this.getDefaultMessageByStatus(status);
 
@@ -79,8 +107,17 @@ export class ErrorHandler {
         type: this.getErrorTypeByStatus(status),
         level: this.getErrorLevelByStatus(status),
         message: msg,
-        details: data.details || data.detail || error.message,
-        code: data.error_code || data.code || status,
+        // details 必须是字符串：上层会用模板字符串拼接（`${message}：${details}`）
+        details:
+          asText(data.details) ||
+          detailText ||
+          (typeof error.message === 'string' ? error.message : undefined),
+        code:
+          (typeof data.error_code === 'string' ? data.error_code : undefined) ||
+          objectCode(data.detail) ||
+          objectCode(data.error) ||
+          (typeof data.code === 'string' ? data.code : undefined) ||
+          status,
         timestamp,
         context: { url: error.config?.url, method: error.config?.method }
       };
