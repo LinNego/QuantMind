@@ -61,6 +61,9 @@ $bridge = if (-not $Restart) { Get-Json "http://127.0.0.1:8550/api/v1/health" } 
 if ($Restart -or -not $bridge) {
     if ($Restart -or (Test-Port 8550)) {
         Write-Host "[2/4] 桥 8550        停止旧进程..." -ForegroundColor DarkGray
+        # 先停看门狗：否则它会把刚杀掉的桥/采集器抢着拉起来，形成双实例
+        Stop-ScheduledTask -TaskName "TDXBridgeWatchdog" -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
         Stop-Port 8550
         Start-Sleep -Seconds 2
     }
@@ -109,13 +112,17 @@ if (-not $NoCollector) {
     # -HotSet 是显式意图：即使采集器在跑也要按新热集重启（只重启采集器，不动桥）
     $colRestart = $Restart -or $RestartCollector -or [bool]$HotSet
     $col = if (-not $colRestart) { Get-Json "http://127.0.0.1:8560/health" } else { $null }
+    $colTask = Get-ScheduledTask -TaskName "TdxCollector" -ErrorAction SilentlyContinue
     if ($colRestart -or -not $col) {
+        # 关键：必须同时停计划任务。只杀端口进程时任务仍算 Running，
+        # 之后 Start-ScheduledTask 会被 MultipleInstances=IgnoreNew 静默忽略，
+        # 采集器就再也起不来（2026-10-23 实报）。
+        if ($colTask) { Stop-ScheduledTask -TaskName "TdxCollector" -ErrorAction SilentlyContinue }
         if ($colRestart -or (Test-Port 8560)) {
             Write-Host "[4/4] 采集器 8560    停止旧进程..." -ForegroundColor DarkGray
             Stop-Port 8560
-            Start-Sleep -Seconds 1
+            Start-Sleep -Seconds 2
         }
-        $colTask = Get-ScheduledTask -TaskName "TdxCollector" -ErrorAction SilentlyContinue
         if ($colTask -and -not $HotSet) {
             Start-ScheduledTask -TaskName "TdxCollector"
         } else {
