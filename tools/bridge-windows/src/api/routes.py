@@ -18,6 +18,8 @@ from ..executor.plan_executor import PlanExecutor
 from ..security.trade_limits import TradeRateGuard
 from ..tdx.client import TdxClient, TdxError, TdxTimeoutError
 from ..ths.client import ThsClient
+from ..market.quote_hub import PREFERENCE, QuoteHub
+from ..market.schema import FIELD_DEFS, SOURCE_DEFS, normalize_tdx, normalize_ths
 from ..tdx import parser
 from ..utils.auth import verify_token
 from ..utils.system_metrics import SystemMetrics
@@ -1439,6 +1441,64 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     app.router.add_get("/api/v1/subscription", subscription_get)
     app.router.add_post("/api/v1/subscription", subscription_set)
     app.router.add_get("/api/v1/subscription/pushes", subscription_pushes)
+    # ---- 多源行情聚合（动态平衡：并行拉取 + 按字段合并 + 源归属） ----
+
+    async def _tdx_quote_fetch(code: str) -> dict:
+        raw = await _call_tdx(tdx.get_market_snapshot, code, kind="data")
+        return normalize_tdx(raw or {})
+
+    async def _aidata_quote_fetch(code: str) -> dict:
+        if aidata is None:
+            raise RuntimeError("TdxAiData 未配置")
+        raw = await asyncio.get_running_loop().run_in_executor(
+            _AIDATA_EXECUTOR,
+            lambda: aidata.call("get_market_snapshot", {"stock_code": code}))
+        return normalize_tdx(raw or {})
+
+    async def _ths_quote_fetch(code: str) -> dict:
+        if ths is None:
+            raise RuntimeError("同花顺旁路未配置")
+        q, d, e = await asyncio.gather(
+            ths.call("quote", {"codes": code}),
+            ths.call("depth", {"code": code, "levels": 10}),
+            ths.call("quotes_ext", {"codes": code}),
+            return_exceptions=True)
+        if isinstance(q, Exception) or not q:
+            raise RuntimeError(f"ths quote 失败: {q!r}"[:180])
+        q0 = q[0] if isinstance(q, list) and q else (q if isinstance(q, dict) else {})
+        d0 = d if isinstance(d, dict) else {}
+        e0 = e[0] if isinstance(e, list) and e else (e if isinstance(e, dict) else {})
+        return normalize_ths(q0, d0, e0)
+
+    quote_hub = QuoteHub({"tdx": _tdx_quote_fetch,
+                          "aidata": _aidata_quote_fetch,
+                          "ths": _ths_quote_fetch})
+
+    async def market_quote(request: web.Request):
+        code = (request.query.get("code") or "").strip()
+        if not code:
+            return json_error(400, "BAD_REQUEST", "缺少 code")
+        prefer_raw = (request.query.get("prefer") or "").strip()
+        prefer = [x.strip() for x in prefer_raw.split(",") if x.strip()] or None
+        try:
+            data = await quote_hub.quote(code, prefer)
+        except Exception as exc:  # noqa: BLE001
+            return json_error(502, "MARKET_UNAVAILABLE",
+                              f"{type(exc).__name__}: {exc}")
+        return web.json_response({"success": True, "data": data})
+
+    async def market_fields(request: web.Request):
+        return web.json_response({"success": True, "data": {
+            "fields": [{"name": n, "label": label, "unit": unit,
+                        "desc": desc, "sources": list(srcs)}
+                       for n, label, unit, desc, srcs in FIELD_DEFS],
+            "sources": SOURCE_DEFS,
+            "preference": list(PREFERENCE),
+        }})
+
+    async def market_sources(request: web.Request):
+        return web.json_response({"success": True, "data": quote_hub.stats()})
+
     # ---- 同花顺旁路（独立 worker；桥只管鉴权/缓存/熔断/审计） ----
 
     def _ths_error(exc: Exception):
@@ -1472,10 +1532,11 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         if ths is None:
             return json_error(503, "THS_DISABLED", "同花顺旁路未配置")
         data = ths.status()
-        try:
-            data["worker"] = await ths.call("status", {}, use_cache=False)
-        except Exception as exc:  # noqa: BLE001
-            data["worker_error"] = f"{type(exc).__name__}: {exc}"
+        if ths.enabled:
+            try:
+                data["worker"] = await ths.call("status", {}, use_cache=False)
+            except Exception as exc:  # noqa: BLE001
+                data["worker_error"] = f"{type(exc).__name__}: {exc}"
         return web.json_response({"success": True, "data": data})
 
     async def ths_call(request: web.Request):
@@ -1632,6 +1693,10 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     app.router.add_post("/api/v1/ths/qr/start", ths_qr_start)
     app.router.add_get("/api/v1/ths/qr/status", ths_qr_status)
     app.router.add_get("/api/v1/ths/qr.png", ths_qr_png)
+    # 多源行情聚合（字段字典 + 动态平衡 + 源统计）
+    app.router.add_get("/api/v1/market/quote", market_quote)
+    app.router.add_get("/api/v1/market/fields", market_fields)
+    app.router.add_get("/api/v1/market/sources", market_sources)
     app.router.add_delete("/api/v1/auth/tokens/{token_hash}", delete_token_route)
     app.router.add_get("/ui", ui_page)
 

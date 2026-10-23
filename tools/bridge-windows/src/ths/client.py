@@ -88,6 +88,19 @@ THS_METHODS: dict[str, tuple[str, str, float]] = {
 }
 
 
+#: 慢接口：worker 侧允许 45s（板块成分/大 K 线/超级盘口），桥侧必须放宽，
+#: 否则会被 8s 全局超时误杀成 502。
+THS_SLOW_METHODS = frozenset({
+    "kline", "history_timeline", "auction", "closing_auction", "intraday_auctions",
+    "board_constituents", "board_quotes", "board_timeline", "board_kline",
+    "board_auction", "superorder", "superorder_bse", "superorder_window",
+    "superorder_replay", "superorder_replay_snapshot", "order_details",
+    "order_queues", "stocks", "stocks2", "stock_list_ranked", "hot", "dde_rank",
+    "market_snapshot", "boards", "group",
+})
+THS_SLOW_TIMEOUT_S = 30.0
+
+
 class ThsError(RuntimeError):
     """同花顺旁路的基础异常。"""
 
@@ -225,7 +238,9 @@ class ThsClient:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._inflight[key] = fut
         try:
-            value = await self._do_call(http_method, path, query)
+            slow = method in THS_SLOW_METHODS
+            value = await self._do_call(http_method, path, query,
+                                        timeout_s=THS_SLOW_TIMEOUT_S if slow else None)
             if self.cache_enabled and ttl > 0:
                 self._cache[key] = (time.monotonic(), value)
                 if len(self._cache) > 512:  # 简单容量上限
@@ -234,6 +249,12 @@ class ThsClient:
             if not fut.done():
                 fut.set_result(value)
             return value
+        except asyncio.CancelledError:
+            # 首调用者被取消时，必须把单飞 future 一起取消，否则并发等待者
+            # 会永久挂起（CancelledError 是 BaseException，不走下面的分支）
+            if not fut.done():
+                fut.cancel()
+            raise
         except Exception as exc:
             if not fut.done():
                 fut.set_exception(exc)
@@ -244,16 +265,25 @@ class ThsClient:
         finally:
             self._inflight.pop(key, None)
 
-    async def _do_call(self, http_method: str, path: str, query: dict) -> Any:
+    async def _do_call(self, http_method: str, path: str, query: dict,
+                       timeout_s: Optional[float] = None) -> Any:
         url = self.base_url + path
         t0 = time.monotonic()
         self._stats["calls"] += 1
         try:
             session = self._get_session()
-            async with session.request(http_method, url, params=query) as resp:
+            timeout = (aiohttp.ClientTimeout(total=timeout_s)
+                       if timeout_s else None)
+            async with session.request(http_method, url, params=query,
+                                       timeout=timeout) as resp:
                 body = await resp.text()
-                if resp.status >= 400:
+                # 4xx 是调用方参数问题，**不能**算进熔断（否则几次错参就把整条
+                # 旁路熔断 30s）；只有 5xx/传输异常才是上游故障。
+                if resp.status >= 500:
                     raise ThsUnavailable(
+                        f"worker HTTP {resp.status}: {body[:200]}")
+                if resp.status >= 400:
+                    raise ThsBadArgument(
                         f"worker HTTP {resp.status}: {body[:200]}")
                 try:
                     value = await resp.json(content_type=None)
@@ -296,8 +326,11 @@ class ThsClient:
                                        params=params, timeout=timeout) as resp:
                 body = await resp.read()
                 ctype = resp.headers.get("Content-Type", "application/octet-stream")
-                if resp.status >= 400:
+                if resp.status >= 500:
                     raise ThsUnavailable(
+                        f"worker HTTP {resp.status}: {body[:200]!r}")
+                if resp.status >= 400:
+                    raise ThsBadArgument(
                         f"worker HTTP {resp.status}: {body[:200]!r}")
         except ThsError:
             self._fail(f"{http_method} {path}")

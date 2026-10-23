@@ -492,6 +492,27 @@
       <div class="msg" id="tkMsg"></div>
     </section>
 
+    <section class="panel" id="marketPanel">
+      <div class="panel-head">
+        <h2>多源行情 · 动态平衡</h2>
+        <span class="hint" id="mktHint">THS + TDX 并行合并；付费通道按需加入</span>
+      </div>
+      <div class="row" style="gap:8px;margin-bottom:10px">
+        <input id="mktCode" placeholder="代码，如 600519.SH" style="flex:0 0 190px">
+        <input id="mktPrefer" placeholder="优先级（可选，如 ths,aidata,tdx）" style="flex:1">
+        <button class="btn primary" onclick="mktQuote()">取统一行情</button>
+        <button class="btn ghost" onclick="mktFields()">字段字典</button>
+        <button class="btn ghost" onclick="mktSources()">源统计</button>
+      </div>
+      <div class="msg" id="mktMsg"></div>
+      <div class="hint mono" id="mktTimings" style="margin-bottom:8px"></div>
+      <table id="mktTable">
+        <thead id="mktHead"><tr><th>字段</th><th>值</th><th>来源</th></tr></thead>
+        <tbody><tr><td colspan="3" class="empty">点「取统一行情」或「字段字典」</td></tr></tbody>
+      </table>
+      <div class="result-box" id="mktResult"></div>
+    </section>
+
     <section class="panel" id="thsPanel">
       <div class="panel-head">
         <h2>同花顺 · 资金/盘口</h2>
@@ -516,7 +537,9 @@
         <button class="btn primary" onclick="thsQrStart()">扫码登录</button>
         <span class="hint" id="thsQrState">未扫码</span>
         <img id="thsQrImg" alt="同花顺登录二维码"
-             style="display:none;width:150px;height:150px;border-radius:10px;background:#fff;padding:6px">
+             style="display:none;flex:0 0 auto;width:190px;height:190px;border-radius:10px;
+                    background:#fff;padding:8px;object-fit:contain;image-rendering:pixelated">
+        <span class="hint mono" id="thsQrUrl" style="max-width:420px;word-break:break-all"></span>
       </div>
       <div class="row" style="gap:8px;margin-bottom:10px">
         <input id="thsLiveCodes" placeholder="实时关注：600519.SH,600760.SH" style="flex:1">
@@ -1326,6 +1349,75 @@ async function loadThs(){
   } catch (e) { $('#thsHint').textContent = '读取失败：' + e.message; }
 }
 
+function mktFmt(v){
+  if (v === null || v === undefined) return '--';
+  if (Array.isArray(v)) {
+    return v.slice(0, 6).map(x => (x.level !== undefined ? x.level + ':' : '')
+      + x.price + '×' + (x.volume === null || x.volume === undefined ? '-' : x.volume)).join(' ');
+  }
+  if (typeof v === 'number') {
+    return (Math.abs(v) >= 1000) ? v.toFixed(0) : v.toFixed(2);
+  }
+  return String(v);
+}
+
+async function mktQuote(){
+  const code = ($('#mktCode').value || '').trim();
+  const prefer = ($('#mktPrefer').value || '').trim();
+  if (!code) { $('#mktMsg').textContent = '先填代码'; return; }
+  if (!authHeader()['Authorization']) { $('#mktMsg').textContent = '请先输入访问 token'; return; }
+  $('#mktMsg').textContent = '合并中…';
+  try {
+    const url = '/api/v1/market/quote?code=' + encodeURIComponent(code)
+      + (prefer ? '&prefer=' + encodeURIComponent(prefer) : '');
+    const { body } = await fetchJSON(url, { headers: authHeader() }, 30000);
+    if (!body.success) { $('#mktMsg').textContent = errText(body); return; }
+    const d = body.data;
+    $('#mktHead').innerHTML = '<tr><th>字段</th><th>值</th><th>来源</th></tr>';
+    const t = Object.entries(d.timings || {}).map(([k, v]) =>
+      k + (v.ok ? ' ✓ ' : ' ✗ ') + v.ms + 'ms'
+      + (v.error ? ('(' + String(v.error).slice(0, 40) + ')') : '')).join('  |  ');
+    $('#mktTimings').textContent = t + '  → 最快: ' + (d.fastest || '--');
+    const rows = Object.entries(d.data || {}).map(([f, v]) =>
+      '<tr><td class="mono">' + f + '</td><td>' + mktFmt(v)
+      + '</td><td>' + (d.source[f] || '--') + '</td></tr>');
+    if ((d.missing || []).length) {
+      rows.push('<tr><td colspan="3" class="empty">缺失：' + d.missing.join(', ') + '</td></tr>');
+    }
+    $('#mktTable tbody').innerHTML = rows.join('')
+      || '<tr><td colspan="3" class="empty">无数据</td></tr>';
+    $('#mktMsg').textContent = '优先序 ' + (d.prefer || []).join(' > ') + ' · ' + (d.ts || '');
+  } catch (e) { $('#mktMsg').textContent = '失败：' + e.message; }
+}
+
+async function mktFields(){
+  if (!authHeader()['Authorization']) { $('#mktMsg').textContent = '请先输入访问 token'; return; }
+  try {
+    const { body } = await fetchJSON('/api/v1/market/fields', { headers: authHeader() });
+    if (!body.success) { $('#mktMsg').textContent = errText(body); return; }
+    const d = body.data;
+    $('#mktHead').innerHTML = '<tr><th>字段</th><th>中文（单位）</th><th>可用源</th></tr>';
+    $('#mktTable tbody').innerHTML = (d.fields || []).map(f =>
+      '<tr><td class="mono">' + f.name + '</td><td>' + f.label + '（' + f.unit
+      + '）</td><td>' + (f.sources || []).join(' / ') + '</td></tr>').join('');
+    const srcLines = Object.entries(d.sources || {}).map(([k, v]) =>
+      k + '：' + v.label + ' · ' + (v.cost || '') + ' · ' + (v.notes || ''));
+    $('#mktResult').style.display = 'block';
+    $('#mktResult').textContent = '字段说明见上表。源：\n' + srcLines.join('\n');
+    $('#mktMsg').textContent = '共 ' + (d.fields || []).length + ' 个字段 · 默认优先级 '
+      + (d.preference || []).join(' > ') + '（aidata 按次计费，默认不参与）';
+  } catch (e) { $('#mktMsg').textContent = '失败：' + e.message; }
+}
+
+async function mktSources(){
+  if (!authHeader()['Authorization']) { $('#mktMsg').textContent = '请先输入访问 token'; return; }
+  try {
+    const { body } = await fetchJSON('/api/v1/market/sources', { headers: authHeader() });
+    $('#mktResult').style.display = 'block';
+    $('#mktResult').textContent = JSON.stringify(body, null, 2);
+  } catch (e) { $('#mktMsg').textContent = '失败：' + e.message; }
+}
+
 let thsQrTimer = null;
 let thsLiveTimer = null;
 
@@ -1373,10 +1465,15 @@ async function thsQrPoll(){
       : s === 'ok' ? '登录成功'
       : s === 'error' ? ('失败：' + (st.error || '')) : s;
     $('#thsQrState').textContent = text;
+    if (st.url) { $('#thsQrUrl').textContent = st.url; }
     if (s === 'ok' || s === 'error') {
       clearInterval(thsQrTimer);
       thsQrTimer = null;
-      if (s === 'ok') { $('#thsQrImg').style.display = 'none'; loadThs(); }
+      if (s === 'ok') {
+        $('#thsQrImg').style.display = 'none';
+        $('#thsQrUrl').textContent = '';
+        loadThs();
+      }
     }
   } catch (e) { /* 忽略瞬时错误 */ }
 }
