@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from backend.shared.redis_unwrap import raw_redis_client
 from backend.shared.stock_utils import StockCodeUtil
 
 _SH_TZ = ZoneInfo("Asia/Shanghai")
@@ -89,7 +90,9 @@ class RiskLocks:
 
 
 def _raw_redis(redis: Any):
-    return getattr(redis, "client", redis)
+    # redis-py 8 原生 client 自带 client() 方法，`getattr(..., redis)` 会返回
+    # bound method（2026-10-23 评分 worker 同款故障）；统一走共享解包。
+    return raw_redis_client(redis)
 
 
 def load_risk_locks(redis: Any, tenant_id: str, user_id: object, trade_date: date | str) -> RiskLocks:

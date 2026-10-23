@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from backend.shared.redis_unwrap import redis_like_client
 from backend.shared.risk.registry import get_rule
 
 logger = logging.getLogger(__name__)
@@ -370,14 +371,14 @@ def parse_tier_doc(
 def _client(redis: Any):
     """兼容 RedisClient 包装（.client）与原生 redis 客户端（与风控同款）。
 
-    `callable` 那半句是必需的：**原生 `redis.Redis` 自己有一个 `client()` 方法**
-    （redis-py 的连接工厂），裸 `getattr(redis, "client", redis)` 会把这个方法当成
-    包装拆出来，调用方随后在方法对象上 `.hset` → `'function' object has no
-    attribute 'hset'`（2026-09-23 定档首次真跑踩中）。包装的 `.client` 是实例
-    属性（真客户端对象，不可调用），据此区分。
+    `callable` 判据已收口到 `redis_unwrap.raw_redis_client`：**原生
+    `redis.Redis` 自己有一个 `client()` 方法**（redis-py 的连接工厂），裸
+    `getattr(redis, "client", redis)` 会把这个方法当成包装拆出来，调用方随后在
+    方法对象上 `.hset` → `'function' object has no attribute 'hset'`
+    （2026-09-23 定档首次真跑踩中；2026-10-23 评分 worker 再次踩中）。
+    包装的 `.client` 是实例属性（真客户端对象，不可调用），据此区分。
     """
-    client = getattr(redis, "client", None)
-    return client if client is not None and not callable(client) else redis
+    return redis_like_client(redis)
 
 
 def load_tier(

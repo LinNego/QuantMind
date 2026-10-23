@@ -29,6 +29,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from backend.shared import eval_trigger
+from backend.shared.redis_unwrap import raw_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -83,13 +84,13 @@ def parse_eval_time(raw: str) -> tuple[int, int]:
 
 
 def _raw_client(redis) -> object | None:
-    """兼容 RedisClient 包装器（``.client``）与原生 client（同影子对照纪律）。"""
-    if redis is None:
-        return None
-    client = getattr(redis, "client", None)
-    if client is not None:
-        return client
-    return redis if hasattr(redis, "set") else None
+    """兼容 RedisClient 包装器（``.client``）与原生 client（同影子对照纪律）。
+
+    统一走 `redis_unwrap.raw_redis_client`——redis-py 8 的原生 client 自带
+    `client()` 方法，旧的 ``getattr(redis, "client", None)`` 会返回 bound method
+    而不是客户端（2026-10-23 ``'function' object has no attribute 'set'``）。
+    """
+    return raw_redis_client(redis)
 
 
 def _settle_done_marker(

@@ -24,6 +24,8 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from backend.shared.redis_unwrap import raw_redis_client
+
 EVAL_RUN_REQUEST_KEY = "eval:run:request"
 EVAL_RUN_STATUS_KEY = "eval:run:status"
 EVAL_RUN_LOCK_KEY = "eval:run:lock"
@@ -55,15 +57,15 @@ class EvalRunBusy(RuntimeError):
 def _raw(redis: Any) -> Any:
     """兼容 `RedisClient` 包装器（`.client`）与原生 client（同 worker 既有纪律）。
 
-    带 `.client` 属性的对象**一律**按包装器处理：`.client is None` 表示连接失败，
-    必须返回 None 让调用方报「不可用」；不能回退到包装器自己的 `set`——它的签名
-    是 `(key, value, ttl=None)`，收到 `nx/ex` 会 TypeError 而不是明确失败。
+    统一走 `redis_unwrap.raw_redis_client`：redis-py 8 的原生 client 自带
+    `client()` 方法，旧 `hasattr(redis, "client")` 会把它误判成包装器并返回
+    bound method（2026-10-23 `'function' object has no attribute 'set'` 故障）。
+
+    包装器 `.client is None` 表示连接失败，必须返回 None 让调用方报「不可用」；
+    不能回退到包装器自己的 `set`——它的签名是 `(key, value, ttl=None)`，
+    收到 `nx/ex` 会 TypeError 而不是明确失败。
     """
-    if redis is None:
-        return None
-    if hasattr(redis, "client"):
-        return getattr(redis, "client", None)
-    return redis if hasattr(redis, "set") else None
+    return raw_redis_client(redis)
 
 
 def _now_utc(now: datetime | None = None) -> datetime:

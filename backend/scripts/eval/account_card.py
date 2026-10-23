@@ -53,6 +53,7 @@ from backend.shared.eval_scoring import (  # noqa: E402
     score_from_thresholds,
 )
 from backend.shared.eval_series import is_series_id, save_series  # noqa: E402
+from backend.shared.redis_unwrap import raw_redis_client  # noqa: E402
 
 WEIGHTS = {
     "exposure": 30.0,
@@ -330,7 +331,11 @@ def list_accounts(client) -> list[dict[str, Any]]:
     """扫描 Redis 在册模拟账户 → [{tenant,user,market,key}]（按 key 排序去重）。"""
     from backend.shared.simulation_account_keys import parse_account_key
 
-    raw = getattr(client, "client", client)
+    # redis-py 8 原生 client 自带 client() 方法：旧的 `getattr(..., client)` 会
+    # 返回 bound method（2026-10-23 评分 worker 同款故障）。
+    raw = raw_redis_client(client)
+    if raw is None:
+        return []
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for key in raw.scan_iter("simulation:account:*", count=200):

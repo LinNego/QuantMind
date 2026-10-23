@@ -70,6 +70,7 @@ from backend.services.live_trading.services.trading_session import (
     trade_date_str,
 )
 from backend.shared.exit_rules import ratchet_stop_price
+from backend.shared.redis_unwrap import raw_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -609,8 +610,12 @@ def _raw_client(redis: Any) -> Any:
     吞掉：``get`` 失败返回 ``None``、``set`` 失败静默不写。对执行器的轮询这只是
     「本轮空转」，但对**读-改-写**的写侧是致命的——「Redis 抖了」被伪装成
     「配置是空的」，接着整表写回就等于把所有规则（含人工挂的）一起抹掉。
+
+    统一走 `redis_unwrap.raw_redis_client`：redis-py 8 的原生 client 自带
+    `client()` 方法，旧 `hasattr(redis, "client")` 会返回 bound method
+    （2026-10-23 评分 worker 同款故障）。
     """
-    return redis.client if hasattr(redis, "client") else redis
+    return raw_redis_client(redis)
 
 
 def read_key_strict(redis: Any, key: str) -> Any | None:

@@ -96,7 +96,7 @@ async def _record_risk_rejection(db, req: OrderRequest, message: str) -> None:
     （``direct_real``）不建模拟腿；无 db 的单元路径直接跳过。best-effort——
     补记失败只告警，绝不影响拒单结论。
     """
-    if db is None or req.direct_real:
+    if db is None or getattr(req, "direct_real", False):
         return
     try:
         from backend.services.simulation.models.order import (
@@ -179,7 +179,7 @@ async def submit_order(db, redis, req: OrderRequest) -> RouterOutcome:
             message=message,
         )
 
-    if req.direct_real:
+    if getattr(req, "direct_real", False):
         # 真实轮：**没有模拟腿**（用户 2026-10-19 口径）。风控照过，真单链直连；
         # 归属随 ``agent`` 落 ``orders.agent``，成交回报照旧记进分账账本。
         return await _submit_direct_real(redis, req)

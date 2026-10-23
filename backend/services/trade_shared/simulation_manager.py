@@ -10,6 +10,7 @@ from typing import Any
 
 from backend.services.trade_shared.redis_client import RedisClient, redis_client
 from backend.services.trade_shared.trade_config import settings
+from backend.shared.redis_unwrap import raw_redis_client
 from backend.shared.simulation_account_keys import normalize_tenant
 from backend.shared.trade_account_cache import read_json_cache, write_json_cache
 
@@ -388,12 +389,15 @@ return cjson.encode({success=true, cash=new_cash})
 
     def _ensure_client(self):
         """空 RedisClient（未 connect）时接到 trade 共享连接，避免 bootstrap 读不到账户。"""
-        client = getattr(self.redis, "client", None) if self.redis is not None else None
+        client = raw_redis_client(self.redis)
         if client is not None:
             return client
         shared = _shared_redis()
         if shared is not None and self.redis is not None:
-            self.redis.client = shared
+            inner = getattr(self.redis, "client", None)
+            # 只给包装器挂连接：原生 redis-py 8 的 .client 是方法，覆盖会破坏客户端
+            if hasattr(self.redis, "client") and not callable(inner):
+                self.redis.client = shared
             return shared
         return shared
 

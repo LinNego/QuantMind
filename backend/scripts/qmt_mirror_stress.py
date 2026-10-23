@@ -621,8 +621,10 @@ DAILY_KEY = "mirror:daily:{date}:{field}"
 
 
 def _raw(redis):
-    """原始 redis-py 客户端（decode_responses=True）。"""
-    return getattr(redis, "client", None)
+    """原始 redis-py 客户端（decode_responses=True；兼容 redis-py 8 的 client() 方法）。"""
+    from backend.shared.redis_unwrap import raw_redis_client
+
+    return raw_redis_client(redis)
 
 
 def _raw_get(redis, key: str) -> str:

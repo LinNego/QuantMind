@@ -82,7 +82,9 @@ def _broker_redis_client() -> Any:
     """
     global _broker_redis, _broker_redis_last_try
     with _broker_redis_lock:
-        client = getattr(_broker_redis, "client", None)
+        from backend.shared.redis_unwrap import raw_redis_client
+
+        client = raw_redis_client(_broker_redis)
         if client is not None:
             return client
         now = time.monotonic()
@@ -97,7 +99,7 @@ def _broker_redis_client() -> Any:
         rc = RedisClient()
         rc.connect()  # 失败自己记 error 日志并把 .client 置 None
         _broker_redis = rc
-        return getattr(rc, "client", None)
+        return raw_redis_client(rc)
 
 
 def _read_selected_broker() -> str | None:

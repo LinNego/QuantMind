@@ -24,6 +24,7 @@ from backend.services.live_trading.services.real_mirror_service import (
     mirror_virtual_fill,
 )
 from backend.shared.live_trading_gate import ensure_real_trading_allowed
+from backend.shared.redis_unwrap import raw_redis_client
 from backend.shared.order_contract import normalize_agent, normalize_source
 
 logger = logging.getLogger(__name__)
@@ -132,7 +133,7 @@ def _mirror_reason_cn(reason: str) -> str:
 
 def _mirror_notice_allowed(redis: Any, symbol: str, reason: str, ttl: int = 1800) -> bool:
     """同一标的同一原因 30 分钟内只通知一次（急跌日避免刷屏）。"""
-    client = getattr(redis, "client", None)
+    client = raw_redis_client(redis)
     if client is None:
         return True
     try:

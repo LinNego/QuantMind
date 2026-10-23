@@ -6,6 +6,7 @@ from typing import Any, Optional
 from collections.abc import Callable
 
 from backend.services.trade_shared.redis_client import redis_client
+from backend.shared.redis_unwrap import redis_like_client
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,9 @@ def invalidate_user_cache(
     返回删除的键数量（失败返回 0，永不抛异常）。
     """
     try:
-        client = getattr(redis_client, "client", None) or redis_client
+        # redis-py 8 原生 client 的 client() 方法会被 `getattr(...) or redis_client`
+        # 误当成包装器拆出来（返回 bound method）；统一走共享解包。
+        client = redis_like_client(redis_client)
         if client is None:
             return 0
         tenant = str(tenant_id or "default").strip() or "default"

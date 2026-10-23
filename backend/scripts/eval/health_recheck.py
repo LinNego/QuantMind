@@ -37,6 +37,7 @@ from backend.shared.backtest_health import (  # noqa: E402
     record_strategy_health,
     resolve_sweep_evidence,
 )
+from backend.shared.redis_unwrap import redis_like_client  # noqa: E402
 from backend.shared.simulation_account_keys import active_strategy_key  # noqa: E402
 
 logger = logging.getLogger("eval.health_recheck")
@@ -162,7 +163,7 @@ def _redis_client():
 def _active_strategy_id(redis_like, tenant_id: str, user_id: str) -> str | None:
     """当前活跃策略 id（Redis trade:active_strategy，payload.strategy_id）。"""
     try:
-        raw_client = getattr(redis_like, "client", None) or redis_like
+        raw_client = redis_like_client(redis_like)
         raw = raw_client.get(active_strategy_key(tenant_id, user_id))
         if not raw:
             return None
@@ -361,7 +362,7 @@ def _write_alert(
 ) -> None:
     """退化告警落 Redis（best-effort；通知中心接线留待前端批次）。"""
     try:
-        raw_client = getattr(redis_like, "client", None) or redis_like
+        raw_client = redis_like_client(redis_like)
         key = f"health:recheck:alert:{tenant_id}:{user_id}:{strategy_id}"
         raw_client.set(
             key,

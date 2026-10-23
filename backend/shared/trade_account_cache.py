@@ -4,6 +4,7 @@ import json
 import logging
 from typing import Any
 
+from backend.shared.redis_unwrap import redis_like_client
 from backend.shared.trade_redis_keys import (
     build_trade_account_key,
     build_trade_agent_heartbeat_key,
@@ -13,10 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_redis_client(redis_like: Any):
-    if redis_like is None:
-        return None
-    client = getattr(redis_like, "client", None)
-    return client or redis_like
+    # redis-py 8：原生 client 自带 client() 方法，旧的 `getattr(...) or redis_like`
+    # 会返回 bound method（2026-10-23 同款故障）；统一走共享解包。
+    return redis_like_client(redis_like)
 
 
 def write_json_cache(redis_like: Any, key: str, payload: dict[str, Any]) -> str:
