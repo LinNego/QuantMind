@@ -84,12 +84,80 @@ def is_duplicate_message(message: str | None) -> bool:
     return str(message or "").startswith("duplicate client_order_id")
 
 
+async def _record_risk_rejection(db, req: OrderRequest, message: str) -> None:
+    """风控前置拒单补记台账（审计：拒单不能只活在运行日志里）。
+
+    2026-10-22 实证：托管模拟盘一轮 20 张卖单全被 ``l3.stale_quote`` 拒，
+    ``sim_orders`` / ``simulation_orders`` 两表 0 行——用户翻「历史记录」看不到
+    任何拒绝记录。风控卡点在**建单之前**（T-RC-02），所以必须在这里补一条
+    rejected 台账（v1 台账 + V2 投影同写）。
+
+    边界：只记**风控**拒单（参数错误属调用方 bug，不产生业务事件）；实盘直连
+    （``direct_real``）不建模拟腿；无 db 的单元路径直接跳过。best-effort——
+    补记失败只告警，绝不影响拒单结论。
+    """
+    if db is None or req.direct_real:
+        return
+    try:
+        from backend.services.simulation.models.order import (
+            OrderSide,
+            OrderStatus,
+            OrderType,
+        )
+        from backend.services.simulation.schemas.order import SimOrderCreate
+        from backend.services.simulation.services.order_service import SimOrderService
+        from backend.shared.order_contract import ensure_order_contract_columns_async
+
+        await ensure_order_contract_columns_async()
+        service = SimOrderService(db)
+        order = await service.create_order(
+            req.tenant_id,
+            str(req.user_id),
+            SimOrderCreate(
+                portfolio_id=max(0, int(req.portfolio_id or 0)),
+                strategy_id=req.strategy_id,
+                client_order_id=req.client_order_id,
+                symbol=req.symbol,
+                side=OrderSide(str(req.side or "").strip().lower()),
+                order_type=OrderType(str(req.order_type or "").strip().lower()),
+                quantity=float(req.quantity),
+                price=float(req.price) if req.price and float(req.price) > 0 else None,
+                remarks=req.remarks,
+                position_side=str(req.position_side or "long").strip().lower(),
+                is_margin_trade=bool(req.is_margin_trade),
+                agent=req.agent,
+            ),
+            trigger_source=req.source,
+        )
+        order.status = OrderStatus.REJECTED
+        order.remarks = f"Execution rejected: {message}"[:500]
+        await service.sync_order_projection(order, rejected_reason=message[:500])
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 - 审计补记失败不得改变拒单结论
+        from backend.services.simulation.services.order_service import (
+            DuplicateSimOrderError,
+        )
+
+        if isinstance(exc, DuplicateSimOrderError):
+            # 同一幂等键已有台账行（含此前被接受/拒绝的那一笔）——不重复写、不覆盖
+            return
+        logger.warning(
+            "[OrderRouter] 风控拒单落台账失败（不影响拒单） %s %s: %s",
+            req.symbol,
+            req.side,
+            exc,
+        )
+
+
 async def submit_order(db, redis, req: OrderRequest) -> RouterOutcome:
     """唯一入口。db=AsyncSession；redis=交易 Redis 客户端（SimulationAccountManager 用）。
 
     **风控卡点（T-RC-02）**：参数校验后、任何建单动作前，一律过 `risk_gate_service.check_order`
     ——影子模式只留痕不拦单；强制模式 REJECT/HALT 即拒（消息含 rule_id，可解释）。
     判定异常/配置不可读 = fail-closed 拒单（见 risk_gate_service 文档）。
+
+    **拒单留痕**：风控拒单在建单之前，必须显式补记 rejected 台账（`_record_risk_rejection`），
+    否则历史记录里查不到（2026-10-22 托管模拟盘 20 张卖单全拒却 0 行）。
     """
     from backend.services.trade.services.risk_gate_service import check_order as _risk_check
     from backend.services.trade_shared.simulation_manager import SimulationAccountManager
@@ -104,9 +172,11 @@ async def submit_order(db, redis, req: OrderRequest) -> RouterOutcome:
 
     risk = await _risk_check(req, db=db, redis=redis)
     if not risk.passed:
+        message = f"风控拒单[{risk.rule_id or 'risk'}]：{risk.reason}"[:300]
+        await _record_risk_rejection(db, req, message)
         return RouterOutcome(
             success=False,
-            message=f"风控拒单[{risk.rule_id or 'risk'}]：{risk.reason}"[:300],
+            message=message,
         )
 
     if req.direct_real:

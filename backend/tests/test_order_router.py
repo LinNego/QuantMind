@@ -174,6 +174,7 @@ async def test_risk_gate_rejection_short_circuits_delegation(monkeypatch):
     存在的意义是防止上面那个 `risk_gate_passes` 桩把「风控确实被咨询、且拦在执行之前」
     这条契约一并桩没 —— 只桩掉、不验证，就是「验收假通过」。
     """
+    from backend.services.simulation.services import order_router
     from backend.services.trade.services import risk_gate_service
 
     class _Rejected:
@@ -184,7 +185,13 @@ async def test_risk_gate_rejection_short_circuits_delegation(monkeypatch):
     async def _reject(req, db=None, redis=None):  # noqa: ARG001
         return _Rejected()
 
+    recorded: list[str] = []
+
+    async def _record(db, req, message):  # noqa: ARG001
+        recorded.append(message)
+
     monkeypatch.setattr(risk_gate_service, "check_order", _reject)
+    monkeypatch.setattr(order_router, "_record_risk_rejection", _record)
     monkeypatch.setattr(
         "backend.services.simulation.services.order_submission_service."
         "SimulationOrderSubmissionService",
@@ -203,6 +210,125 @@ async def test_risk_gate_rejection_short_circuits_delegation(monkeypatch):
     assert out.success is False
     assert _FakeSubmissionService.captured == {}, "风控拒单后仍走到了撮合"
     assert "l1.position_limit" in out.message and "单票持仓超限" in out.message
+    # 拒单必须补记台账（否则只在运行日志里，用户翻历史记录看不到）
+    assert recorded and "l1.position_limit" in recorded[0]
+
+
+# --- 风控拒单落台账（2026-10-22 审计缺口） -----------------------------------
+
+
+@pytest.fixture
+def fake_order_service(monkeypatch):
+    """桩掉建单/投影两条 IO，捕获落库形状；DDL 自愈也桩掉。"""
+    from backend.services.simulation.services import order_service as order_service_mod
+
+    captured: dict = {}
+
+    class _FakeService:
+        def __init__(self, db):
+            self.db = db
+
+        async def create_order(self, tenant_id, user_id, data, **kwargs):
+            captured["create"] = {
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "data": data,
+                "kwargs": kwargs,
+            }
+            return SimpleNamespace(status=None, remarks=None)
+
+        async def sync_order_projection(self, order, rejected_reason=None, **kwargs):
+            captured["projection"] = {
+                "order": order,
+                "rejected_reason": rejected_reason,
+                "kwargs": kwargs,
+            }
+
+    async def _ensure():
+        return None
+
+    monkeypatch.setattr(order_service_mod, "SimOrderService", _FakeService)
+    monkeypatch.setattr(
+        "backend.shared.order_contract.ensure_order_contract_columns_async", _ensure
+    )
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_risk_rejection_is_written_to_order_history(fake_order_service):
+    """2026-10-22 实证：托管模拟盘一轮 20 张卖单全被 l3.stale_quote 拒，
+    sim_orders / simulation_orders 两表 0 行 —— 用户翻「历史记录」什么都看不到。
+    风控前置拒单必须补记一条 rejected 台账（含拒因与策略归属）。"""
+    from backend.services.simulation.services import order_router
+
+    class _Db:
+        committed = 0
+
+        async def commit(self):
+            self.committed += 1
+
+    db = _Db()
+    req = order_router.OrderRequest(
+        tenant_id="default",
+        user_id=7,
+        symbol="600036.SH",
+        side="sell",
+        quantity=100,
+        client_order_id="cid-risk-reject",
+        strategy_id=13,
+        source="rebalance",
+    )
+
+    await order_router._record_risk_rejection(
+        db, req, "风控拒单[l3.stale_quote]：行情陈旧"
+    )
+
+    created = fake_order_service["create"]
+    assert created["data"].client_order_id == "cid-risk-reject"
+    assert created["data"].strategy_id == 13
+    assert created["kwargs"]["trigger_source"] == "rebalance"
+
+    order = fake_order_service["projection"]["order"]
+    assert order.status.value == "rejected"
+    assert "l3.stale_quote" in order.remarks
+    assert (
+        fake_order_service["projection"]["rejected_reason"]
+        == "风控拒单[l3.stale_quote]：行情陈旧"
+    )
+    assert db.committed == 1
+
+
+@pytest.mark.asyncio
+async def test_risk_rejection_not_recorded_without_target_ledger(monkeypatch):
+    """无 db（单元路径）或实盘直连（不建模拟腿）时不补记。"""
+    from backend.services.simulation.services import order_router
+    from backend.services.simulation.services import order_service as order_service_mod
+
+    calls: list[str] = []
+
+    class _ExplodingService:
+        def __init__(self, db):  # noqa: ARG002
+            calls.append("constructed")
+
+    monkeypatch.setattr(order_service_mod, "SimOrderService", _ExplodingService)
+
+    req = order_router.OrderRequest(
+        tenant_id="default", user_id=7, symbol="600036.SH", side="sell", quantity=100
+    )
+    await order_router._record_risk_rejection(None, req, "风控拒单[x]：y")
+    await order_router._record_risk_rejection(
+        object(),
+        order_router.OrderRequest(
+            tenant_id="default",
+            user_id=7,
+            symbol="600036.SH",
+            side="sell",
+            quantity=100,
+            direct_real=True,
+        ),
+        "风控拒单[x]：y",
+    )
+    assert calls == []
 
 
 # --- 五路径接线源断言 --------------------------------------------------------
