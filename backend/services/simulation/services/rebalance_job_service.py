@@ -11,6 +11,19 @@ from sqlalchemy import select
 from backend.services.simulation.models.rebalance_job import SimulationRebalanceJob
 from backend.shared.database_manager_v2 import get_session
 
+# 跳过只对「尚未开跑」的作业有意义（2026-10-22 实证）
+_SKIPPABLE_STATUSES = frozenset({"pending", "ready"})
+
+
+def skip_allowed(current_status: str) -> bool:
+    """当前状态是否允许改写成 skipped。
+
+    触发窗口 90s、托管调度每 30s 轮询：第一次 tick 抢到锁并开跑
+    （running → succeeded），第二次抢锁失败会走 `mark_skipped`；若不设门，
+    已完成的同名作业会被改写成 skipped，台账与真实执行相反。
+    """
+    return str(current_status or "").strip().lower() in _SKIPPABLE_STATUSES
+
 
 class SimulationRebalanceJobService:
     @staticmethod
@@ -104,6 +117,9 @@ class SimulationRebalanceJobService:
                 )
             ).scalar_one_or_none()
             if row is None:
+                return
+            if not skip_allowed(row.status):
+                # 已开跑/已结束的作业不接受「跳过」改写（窗口内第二次 tick 抢锁失败）
                 return
             row.status = "skipped"
             row.finished_at = datetime.utcnow()

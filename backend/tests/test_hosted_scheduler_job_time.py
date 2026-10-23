@@ -171,3 +171,26 @@ async def test_run_once_expires_with_naive_shanghai(monkeypatch):
 
     assert captured["now"].tzinfo is None
     assert captured["now"] == datetime(2026, 10, 19, 9, 35, 10)
+
+
+# --- 作业状态机：窗口内第二次 tick 不得改写已开跑的作业 ---------------------
+
+
+@pytest.mark.unit
+def test_skip_transition_only_covers_pre_start_statuses():
+    """2026-10-22 实证：触发窗口 90s、轮询 30s。
+
+    第一次 tick 抢到锁 → running → succeeded；第二次 tick 抢锁失败走
+    ``mark_skipped``，把已完成的同名作业改写成 skipped（台账写「跳过」，实际
+    已经跑完 20 单）。跳过只对 pending/ready 有意义。
+    """
+    from backend.services.simulation.services.rebalance_job_service import (
+        skip_allowed,
+    )
+
+    assert skip_allowed("pending") is True
+    assert skip_allowed("ready") is True
+    assert skip_allowed("running") is False
+    assert skip_allowed("succeeded") is False
+    assert skip_allowed("failed") is False
+    assert skip_allowed("skipped") is False
