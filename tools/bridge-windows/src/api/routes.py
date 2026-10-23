@@ -1456,19 +1456,24 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         return normalize_tdx(raw or {})
 
     async def _ths_quote_fetch(code: str) -> dict:
+        """THS 取数：quotes_ext（标量+资金面，主）+ depth 5 档（盘口，可选）。
+
+        注意：10 档需要 **L2 账号**，普通号会 403（账号不具备能力
+        l2_snapshot_push）；depth 失败不影响标量字段。
+        """
         if ths is None:
             raise RuntimeError("同花顺旁路未配置")
-        q, d, e = await asyncio.gather(
-            ths.call("quote", {"codes": code}),
-            ths.call("depth", {"code": code, "levels": 10}),
-            ths.call("quotes_ext", {"codes": code}),
-            return_exceptions=True)
-        if isinstance(q, Exception) or not q:
-            raise RuntimeError(f"ths quote 失败: {q!r}"[:180])
-        q0 = q[0] if isinstance(q, list) and q else (q if isinstance(q, dict) else {})
-        d0 = d if isinstance(d, dict) else {}
-        e0 = e[0] if isinstance(e, list) and e else (e if isinstance(e, dict) else {})
-        return normalize_ths(q0, d0, e0)
+        ext = await ths.call("quotes_ext", {"codes": code})
+        item = ext[0] if isinstance(ext, list) and ext else (
+            ext if isinstance(ext, dict) else {})
+        try:
+            depth = await ths.call("depth", {"code": code, "levels": 5},
+                                   timeout_s=6.0)
+        except Exception:  # noqa: BLE001
+            depth = {}
+        if not item and not depth:
+            raise RuntimeError("ths 无数据（未登录 / 非 L2 / 代码格式）")
+        return normalize_ths(item, depth if isinstance(depth, dict) else {}, item)
 
     quote_hub = QuoteHub({"tdx": _tdx_quote_fetch,
                           "aidata": _aidata_quote_fetch,
@@ -1480,12 +1485,52 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             return json_error(400, "BAD_REQUEST", "缺少 code")
         prefer_raw = (request.query.get("prefer") or "").strip()
         prefer = [x.strip() for x in prefer_raw.split(",") if x.strip()] or None
+        # aidata=1：付费通道**只补缺**——追加到优先序末尾，前面源有值的字段
+        # 不会被覆盖（按次计费，默认关闭；测试台可显式打开）。
+        if request.query.get("aidata") == "1":
+            base = list(prefer or PREFERENCE)
+            if "aidata" not in base:
+                base.append("aidata")
+            prefer = base
         try:
             data = await quote_hub.quote(code, prefer)
         except Exception as exc:  # noqa: BLE001
             return json_error(502, "MARKET_UNAVAILABLE",
                               f"{type(exc).__name__}: {exc}")
         return web.json_response({"success": True, "data": data})
+
+    async def market_raw(request: web.Request):
+        """三源原始返回（测试台用）。aidata 仅在 ?aidata=1 时查询。"""
+        code = (request.query.get("code") or "").strip()
+        if not code:
+            return json_error(400, "BAD_REQUEST", "缺少 code")
+        out: dict = {}
+        errors: dict = {}
+        try:
+            out["tdx"] = await _call_tdx(tdx.get_market_snapshot, code, kind="data")
+        except Exception as exc:  # noqa: BLE001
+            errors["tdx"] = f"{type(exc).__name__}: {exc}"
+        if request.query.get("aidata") == "1" and aidata is not None:
+            try:
+                out["aidata"] = await asyncio.get_running_loop().run_in_executor(
+                    _AIDATA_EXECUTOR,
+                    lambda: aidata.call("get_market_snapshot", {"stock_code": code}))
+            except Exception as exc:  # noqa: BLE001
+                errors["aidata"] = f"{type(exc).__name__}: {exc}"
+        if ths is not None and ths.enabled:
+            q, d, e = await asyncio.gather(
+                ths.call("quote", {"codes": code}, timeout_s=8.0),
+                ths.call("depth", {"code": code, "levels": 5}, timeout_s=6.0),
+                ths.call("quotes_ext", {"codes": code}, timeout_s=8.0),
+                return_exceptions=True)
+            for name, value in (("quote", q), ("depth", d), ("quotes_ext", e)):
+                if isinstance(value, Exception):
+                    errors[f"ths.{name}"] = f"{type(value).__name__}: {value}"
+                else:
+                    out[f"ths.{name}"] = value
+        return web.json_response({"success": True,
+                                  "data": {"code": code, "raw": _jsonable(out),
+                                           "errors": errors}})
 
     async def market_fields(request: web.Request):
         return web.json_response({"success": True, "data": {
@@ -1696,6 +1741,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     # 多源行情聚合（字段字典 + 动态平衡 + 源统计）
     app.router.add_get("/api/v1/market/quote", market_quote)
     app.router.add_get("/api/v1/market/fields", market_fields)
+    app.router.add_get("/api/v1/market/raw", market_raw)
     app.router.add_get("/api/v1/market/sources", market_sources)
     app.router.add_delete("/api/v1/auth/tokens/{token_hash}", delete_token_route)
     app.router.add_get("/ui", ui_page)

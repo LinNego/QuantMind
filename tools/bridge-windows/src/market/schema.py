@@ -26,7 +26,8 @@ FIELD_DEFS: list[tuple[str, str, str, str, tuple[str, ...]]] = [
     ("low", "最低", "元", "当日最低价", ("ths", "aidata", "tdx")),
     ("volume", "成交量", "手（源而异）", "当日累计成交量；三源单位可能不同，跨源比较前先对齐",
      ("ths", "aidata", "tdx")),
-    ("amount", "成交额", "元", "当日累计成交金额", ("ths", "aidata", "tdx")),
+    ("amount", "成交额", "元", "当日累计成交金额；TDX 原始为万元，聚合层已 ×10000 归一为元",
+     ("ths", "aidata", "tdx")),
     ("change_pct", "涨跌幅", "%", "相对昨收；源内直取或本地计算", ("ths", "tdx")),
     ("bids", "买盘", "档位数组", "[{level,price,volume}]；TDX 5 档，THS 可 10 档",
      ("ths", "aidata", "tdx")),
@@ -88,7 +89,7 @@ def normalize_tdx(raw: dict) -> dict:
 
     def levels(prices, volumes):
         out = []
-        for i, (p, v) in enumerate(zip(prices or [], volumes or []), 1):
+        for i, (p, v) in enumerate(zip(prices or [], volumes or [], strict=False), 1):
             price, volume = _f(p), _f(v)
             if price is None:
                 continue
@@ -100,6 +101,11 @@ def normalize_tdx(raw: dict) -> dict:
     change_pct = None
     if last is not None and prev:
         change_pct = round((last - prev) / prev * 100, 4)
+    # TDX 快照的 Amount 单位是**万元**（实测 600519：509327万元 ≈ 50.9亿元），
+    # 统一字段一律用元，这里 ×10000 归一；THS 侧 quotes_ext.amount 本身是元。
+    amount = _f(raw.get("Amount"))
+    if amount is not None:
+        amount *= 10000.0
     return {
         "last": last,
         "prev_close": prev,
@@ -107,7 +113,7 @@ def normalize_tdx(raw: dict) -> dict:
         "high": _f(raw.get("Max")),
         "low": _f(raw.get("Min")),
         "volume": _f(raw.get("Volume")),
-        "amount": _f(raw.get("Amount")),
+        "amount": amount,
         "change_pct": change_pct,
         "bids": levels(raw.get("Buyp"), raw.get("Buyv")),
         "asks": levels(raw.get("Sellp"), raw.get("Sellv")),
@@ -123,7 +129,15 @@ def normalize_ths(quote: dict | None, depth: dict | None,
     d = depth or {}
     e = ext or {}
 
+    _level_map = {"买一": 1, "买二": 2, "买三": 3, "买四": 4, "买五": 5,
+                  "买六": 6, "买七": 7, "买八": 8, "买九": 9, "买十": 10,
+                  "卖一": 1, "卖二": 2, "卖三": 3, "卖四": 4, "卖五": 5,
+                  "卖六": 6, "卖七": 7, "卖八": 8, "卖九": 9, "卖十": 10}
+
     def levels(items):
+        # 实测（2026-10-23）worker 的 depth 返回：
+        #   {"buy":[{"level":"买一","price":1333.7,"qty":200,"amount":...}], "sell":[...]}
+        # 兼容 bids/asks + volume 的旧形态。
         out = []
         for item in items or []:
             if not isinstance(item, dict):
@@ -131,13 +145,17 @@ def normalize_ths(quote: dict | None, depth: dict | None,
             price = _f(item.get("price"))
             if price is None:
                 continue
-            out.append({"level": item.get("level"),
-                        "price": price,
-                        "volume": _f(item.get("volume"))})
+            lv = item.get("level")
+            if isinstance(lv, str):
+                lv = _level_map.get(lv.strip(), lv)
+            out.append({"level": lv, "price": price,
+                        "volume": _f(item.get("volume", item.get("qty")))})
         return out or None
 
+    # `/api/quotes_ext`（统一列表字段）是标量的主来源：price/chg_pct/amount/
+    # 资金面都在这里；`/api/quote` 返回的是协议原始 dt* 字段，只作兜底。
     return {
-        "last": _f(q.get("price")),
+        "last": _f(e.get("price", q.get("price"))),
         "prev_close": _f(q.get("pre_close")),
         "open": _f(q.get("open")),
         "high": _f(q.get("high")),
@@ -145,8 +163,8 @@ def normalize_ths(quote: dict | None, depth: dict | None,
         "volume": _f(q.get("volume")),
         "amount": _f(e.get("amount", q.get("amount"))),
         "change_pct": _f(e.get("chg_pct")),
-        "bids": levels(d.get("bids")),
-        "asks": levels(d.get("asks")),
+        "bids": levels(d.get("bids") or d.get("buy")),
+        "asks": levels(d.get("asks") or d.get("sell")),
         "main_inflow": _f(e.get("main_inflow")),
         "dde_main": _f(e.get("dde_main")),
         "market_cap": _f(e.get("market_cap")),

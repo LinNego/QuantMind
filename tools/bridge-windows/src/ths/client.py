@@ -185,6 +185,12 @@ class ThsClient:
         return code
 
     @staticmethod
+    def _bare(code: str) -> str:
+        """worker 的行情接口要 6 位裸码（实测 600519 11ms 有数据、
+        600519.SH 32s 空列表）；板块码同理（880081.SH → 880081）。"""
+        return str(code or "").strip().upper().split(".")[0]
+
+    @staticmethod
     def _check_date(value: str) -> str:
         value = str(value or "").strip()
         if not _DATE_RE.match(value):
@@ -199,9 +205,12 @@ class ThsClient:
         http_method, template, _ttl = spec
         path = template
         query = dict(params or {})
+        if "codes" in query and query["codes"]:
+            query["codes"] = ",".join(
+                self._bare(c) for c in str(query["codes"]).split(",") if c.strip())
         if "{code}" in path:
             code = self._check_code(query.pop("code", ""))
-            path = path.replace("{code}", code)
+            path = path.replace("{code}", self._bare(code))
         if "{name}" in path:
             name = str(query.pop("name", "") or "").strip()
             if not name or len(name) > 64 or "/" in name or "\\" in name:
@@ -216,7 +225,8 @@ class ThsClient:
     # ---- 调用 ----
 
     async def call(self, method: str, params: Optional[dict] = None,
-                   use_cache: bool = True) -> Any:
+                   use_cache: bool = True,
+                   timeout_s: Optional[float] = None) -> Any:
         if not self.enabled:
             raise ThsDisabled("同花顺旁路未启用（config: ths.enabled=false）")
         now = time.monotonic()
@@ -239,8 +249,9 @@ class ThsClient:
         self._inflight[key] = fut
         try:
             slow = method in THS_SLOW_METHODS
+            eff_timeout = timeout_s or (THS_SLOW_TIMEOUT_S if slow else None)
             value = await self._do_call(http_method, path, query,
-                                        timeout_s=THS_SLOW_TIMEOUT_S if slow else None)
+                                        timeout_s=eff_timeout)
             if self.cache_enabled and ttl > 0:
                 self._cache[key] = (time.monotonic(), value)
                 if len(self._cache) > 512:  # 简单容量上限
@@ -272,10 +283,12 @@ class ThsClient:
         self._stats["calls"] += 1
         try:
             session = self._get_session()
-            timeout = (aiohttp.ClientTimeout(total=timeout_s)
-                       if timeout_s else None)
-            async with session.request(http_method, url, params=query,
-                                       timeout=timeout) as resp:
+            # 注意：aiohttp 里 timeout=None = **关闭超时**（不是用 session 默认值）。
+            # 所以只有显式给了 timeout_s 才传该参数，否则沿用 session 的 8s。
+            kwargs = {"params": query}
+            if timeout_s:
+                kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout_s)
+            async with session.request(http_method, url, **kwargs) as resp:
                 body = await resp.text()
                 # 4xx 是调用方参数问题，**不能**算进熔断（否则几次错参就把整条
                 # 旁路熔断 30s）；只有 5xx/传输异常才是上游故障。
@@ -288,7 +301,8 @@ class ThsClient:
                 try:
                     value = await resp.json(content_type=None)
                 except Exception:  # noqa: BLE001
-                    raise ThsUnavailable(f"worker 返回非 JSON: {body[:200]}")
+                    raise ThsUnavailable(
+                        f"worker 返回非 JSON: {body[:200]}") from None
         except ThsError:
             self._fail(f"{http_method} {path}")
             raise
@@ -320,10 +334,11 @@ class ThsClient:
         self._stats["calls"] += 1
         try:
             session = self._get_session()
-            timeout = (aiohttp.ClientTimeout(total=timeout_s)
-                       if timeout_s else None)
+            kwargs = {"params": params}
+            if timeout_s:
+                kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout_s)
             async with session.request(http_method, self.base_url + path,
-                                       params=params, timeout=timeout) as resp:
+                                       **kwargs) as resp:
                 body = await resp.read()
                 ctype = resp.headers.get("Content-Type", "application/octet-stream")
                 if resp.status >= 500:

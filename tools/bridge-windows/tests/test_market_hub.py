@@ -11,6 +11,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.market.quote_hub import QuoteHub  # noqa: E402
+from src.market.schema import normalize_tdx  # noqa: E402
 
 
 async def _run():
@@ -57,7 +58,11 @@ async def _run():
     assert st["aidata"]["err"] >= 1 and st["aidata"]["last_error"], st
     assert st["tdx"]["ok"] >= 2
 
-    print("✅ 多源聚合：字段合并 / 源归属 / 回落 / 缺失 / prefer / 统计 全部通过")
+    # 单位归一：TDX Amount 原始万元 → 统一字段为元
+    norm = normalize_tdx({"Now": "100", "LastClose": "99", "Amount": "12.34",
+                          "Volume": "5"})
+    assert norm["amount"] == 123400.0, norm
+    print("✅ 多源聚合：字段合并 / 源归属 / 回落 / 缺失 / prefer / 统计 / 单位归一 全部通过")
 
 
 if __name__ == "__main__":
