@@ -277,6 +277,8 @@ def _jsonable(value):
 def _aidata_error(exc: Exception):
     """TdxAiData 异常 → 结构化 HTTP 错误（Key 缺失单独 503，便于 UI 提示）。"""
     name = type(exc).__name__
+    if name == "AidataBudgetExceeded":
+        return json_error(429, "AIDATA_BUDGET_EXCEEDED", str(exc))
     if name == "AidataTokenRequired":
         return json_error(503, "AIDATA_TOKEN_REQUIRED", str(exc))
     if name == "AidataUnavailable":

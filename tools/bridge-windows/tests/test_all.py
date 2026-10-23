@@ -606,7 +606,19 @@ def main():
     _svc_b._record_usage("get_minute_data", {"Time": [1] * 10})
     _cal = _svc_b.usage_status()["calibration"]
     assert _cal["since_rows"] == 10 and _cal["since_calls"] == 1
-    print("  ✅ 用量台账（按方法/按天）+ 余额校准 + 单次行数上限")
+    # 计费：每 200 条 1 词元，向上取整，最低 1（实测 3000 只=15）
+    assert _svc_b._tokens_for(0) == 1 and _svc_b._tokens_for(200) == 1
+    assert _svc_b._tokens_for(201) == 2 and _svc_b._tokens_for(3000) == 15
+    # 每日硬预算：已用 >= 预算即拒绝
+    _svc_b.daily_token_budget = 2   # 已用 2（两次记录各 1）
+    try:
+        _svc_b._check_daily_budget()
+        raise AssertionError("超预算应被拒")
+    except Exception as _e:
+        assert type(_e).__name__ == "AidataBudgetExceeded", type(_e).__name__
+    _svc_b.daily_token_budget = 1000
+    _svc_b._check_daily_budget()
+    print("  ✅ 用量台账 + 余额校准 + 200条/词元 + 每日硬预算")
 
     # 实时订阅：去重大写、100 上限、无 Key 拒绝 aidata 模式、启动失败置 error。
     print("\n=== 实时订阅管理 ===")

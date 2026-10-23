@@ -171,7 +171,34 @@
   .empty{padding:18px;text-align:center;color:var(--muted);font-size:12.5px}
   .sparkline{height:3px;border-radius:999px;background:#16243a;margin-top:8px;overflow:hidden}
   .sparkline i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:0;transition:width .4s}
-  footer{padding:18px 2px 0;border-top:1px solid var(--line);margin-top:18px;font-size:11.5px;color:var(--muted);
+  /* ===== 专业对齐 / 折叠 / Token 面板 ===== */
+  main{counter-reset:panel}
+  .grid-2{align-items:stretch}
+  .panel{display:flex;flex-direction:column}
+  .panel-body{display:flex;flex-direction:column;flex:1;min-height:0}
+  .panel-head{align-items:center;min-height:30px}
+  .panel-head h2{counter-increment:panel;display:flex;align-items:center;gap:8px}
+  .panel-head h2::before{content:counter(panel,decimal-leading-zero);font:600 10.5px var(--mono);
+    color:var(--accent);opacity:.75;letter-spacing:.5px}
+  .panel-toggle{margin-left:auto;flex:0 0 auto;width:24px;height:24px;border-radius:7px;
+    border:1px solid var(--line2);background:#101c2e;color:#9fb4cd;font:600 14px/1 var(--mono);
+    cursor:pointer;transition:.15s}
+  .panel-toggle:hover{border-color:var(--accent);color:var(--accent)}
+  .panel.collapsed .panel-body{display:none}
+  .panel.collapsed{padding-bottom:14px}
+  .tk-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}
+  @media(max-width:900px){.tk-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  .tk-bars{display:flex;align-items:flex-end;gap:8px;height:96px;padding:10px 4px 0;
+    border-top:1px dashed var(--line);margin-top:8px}
+  .tk-bar{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;
+    gap:3px;height:100%;min-width:0}
+  .tk-bar i{width:100%;max-width:44px;background:linear-gradient(180deg,var(--accent),var(--accent2));
+    border-radius:5px 5px 0 0;min-height:3px;transition:height .4s ease}
+  .tk-bar span{font-size:10px;color:var(--muted);white-space:nowrap}
+  .tk-bar b{font:600 10.5px var(--mono);color:#cfe0f3}
+  .panel table{margin-top:2px}
+  .panel .metrics .m strong,.panel .kpi .value{font-variant-numeric:tabular-nums}
+    footer{padding:18px 2px 0;border-top:1px solid var(--line);margin-top:18px;font-size:11.5px;color:var(--muted);
     display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
   .dot{width:6px;height:6px;border-radius:50%;display:inline-block;background:var(--muted)}
   .dot.green{background:var(--green)} .dot.red{background:var(--red)} .dot.amber{background:var(--amber)}
@@ -437,6 +464,32 @@
           <tbody><tr><td colspan="4" class="empty">暂无推送</td></tr></tbody>
         </table>
       </div>
+    </section>
+
+    <section class="panel" id="tokenPanel">
+      <div class="panel-head">
+        <h2>Token 用量 · TdxAiData</h2>
+        <span class="hint" id="tkHint">按 200 条/词元计费 · 需付费 Key</span>
+      </div>
+      <div class="tk-kpis">
+        <div class="kpi"><div class="label">今日调用</div><div class="value" id="tkCalls">--</div><div class="sub">次</div></div>
+        <div class="kpi"><div class="label">今日词元</div><div class="value" id="tkTokens">--</div><div class="sub" id="tkBudget">未设预算</div></div>
+        <div class="kpi"><div class="label">今日数据行</div><div class="value" id="tkRows">--</div><div class="sub" id="tkBytes">--</div></div>
+        <div class="kpi"><div class="label">账户余额</div><div class="value" id="tkBalance">--</div><div class="sub" id="tkBalanceSub">未记账</div></div>
+      </div>
+      <div class="tk-bars" id="tkBars"></div>
+      <table id="tkTable" style="margin-top:12px">
+        <thead><tr><th>方法</th><th>次数</th><th>数据行</th><th>词元</th></tr></thead>
+        <tbody><tr><td colspan="4" class="empty">今日暂无付费调用</td></tr></tbody>
+      </table>
+      <div class="field" style="margin-top:12px">
+        <label>余额记账（商城当前词元数，用于对账/校准）</label>
+        <div class="row" style="gap:8px">
+          <input id="tkBalanceInput" type="number" min="0" placeholder="如 19673" style="flex:1">
+          <button class="btn ghost" onclick="saveBalanceFromPanel()">记账</button>
+        </div>
+      </div>
+      <div class="msg" id="tkMsg"></div>
     </section>
 
     <section class="grid grid-2">
@@ -777,6 +830,7 @@ async function loadAidata(){
     $('#adSub').textContent = (d.subscribed || []).length;
     $('#adIni').textContent = d.ini_path || '--';
     renderAidataUsage(d);
+    renderTokenStats(d);
     const sel = $('#adMethod');
     if (!sel.options.length) {
       const pref = ['get_minute_data','get_tick_data','get_market_snapshot','get_call_auction',
@@ -793,9 +847,9 @@ async function renderAidataUsage(d){
   const t = u.today || {};
   const bal = u.balance;
   const kb = ((t.bytes || 0) / 1024);
-  const est = (t.calls || 0) * (d.usage?.tokens_per_call || 1);
+  const est = (t.tokens || 0);
   let line = '今日：' + (t.calls || 0) + ' 次 / ' + kb.toFixed(1) + ' KB / '
-    + (t.rows || 0) + ' 行 ≈ ' + est.toFixed(1) + ' 词元（1/次）× 单次上限 '
+    + (t.rows || 0) + ' 行 ≈ ' + est + ' 词元（200 条/词元）· 单次上限 '
     + (d.max_rows_per_call || '--') + ' 行';
   if (bal) {
     line += ' | 上次记账 ' + bal.value + ' @ ' + (bal.ts || '').slice(5, 16);
@@ -810,12 +864,14 @@ async function renderAidataUsage(d){
   $('#adUsage').textContent = line;
   const rows = Object.entries((t.by_method) || {}).map(([m, v]) =>
     `<tr><td class="mono">${escapeHtml(m)}</td><td>${v.calls}</td><td>${v.rows}</td>`
-    + `<td>${(v.calls * 1).toFixed(0)}</td></tr>`);
+    + `<td>${v.tokens || 0}</td></tr>`);
   $('#adUsageTable tbody').innerHTML = rows.join('')
     || '<tr><td colspan="4" class="empty">今日暂无付费调用</td></tr>';
 }
-async function saveBalance(){
-  const v = parseInt($('#adBalance').value, 10);
+async function saveBalance(inputId){
+  const id = inputId || 'adBalance';
+  const el = document.getElementById(id);
+  const v = parseInt(el ? el.value : '', 10);
   if (!(v >= 0)) { $('#adMsg').textContent = '请输入当前余额（整数）'; return; }
   try {
     const { body } = await fetchJSON('/api/v1/aidata/balance', {
@@ -823,7 +879,7 @@ async function saveBalance(){
       body: JSON.stringify({ value: v })
     }, 15000);
     $('#adMsg').textContent = body.success ? ('已记账：' + v) : errText(body);
-    if (body.success) { $('#adBalance').value = ''; loadAidata(); }
+    if (body.success) { if (el) el.value = ''; loadAidata(); }
   } catch (e) { $('#adMsg').textContent = '记账失败：' + e.message; }
 }
 async function saveAidataToken(){
@@ -1128,7 +1184,83 @@ if ($('#subSearch')) {
     if (ev.key === 'Enter') { clearTimeout(subSearchTimer); searchStocks(); }
   });
 }
+function initCollapsibles(){
+  document.querySelectorAll('.panel').forEach(panel => {
+    const head = panel.querySelector(':scope > .panel-head');
+    if (!head || panel.querySelector(':scope > .panel-body')) return;
+    const title = ((head.querySelector('h2') || {}).textContent || '').trim();
+    const body = document.createElement('div');
+    body.className = 'panel-body';
+    [...panel.children].forEach(ch => { if (ch !== head) body.appendChild(ch); });
+    panel.appendChild(body);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'panel-toggle';
+    btn.title = '折叠 / 展开';
+    let saved = '0';
+    try { saved = localStorage.getItem('tdx-collapse:' + title) || '0'; } catch (e) {}
+    const apply = (collapsed) => {
+      panel.classList.toggle('collapsed', collapsed);
+      btn.textContent = collapsed ? '+' : '−';
+    };
+    apply(saved === '1');
+    btn.addEventListener('click', () => {
+      const collapsed = !panel.classList.contains('collapsed');
+      apply(collapsed);
+      try { localStorage.setItem('tdx-collapse:' + title, collapsed ? '1' : '0'); } catch (e) {}
+    });
+    head.appendChild(btn);
+  });
+}
+
+function fmtBytesShort(b){
+  b = Number(b) || 0;
+  if (b >= 1048576) return (b / 1048576).toFixed(2) + ' MB';
+  return (b / 1024).toFixed(1) + ' KB';
+}
+
+function renderTokenStats(d){
+  const u = d.usage || {};
+  const t = u.today || {};
+  $('#tkCalls').textContent = fmtInt(t.calls || 0);
+  $('#tkTokens').textContent = fmtInt(t.tokens || 0);
+  $('#tkRows').textContent = fmtInt(t.rows || 0);
+  $('#tkBytes').textContent = fmtBytesShort(t.bytes) + ' · ' + (t.rows || 0) + ' 行';
+  const budget = u.daily_token_budget || 0;
+  const used = t.tokens || 0;
+  $('#tkBudget').textContent = budget
+    ? ('预算 ' + budget + ' · 剩余 ' + Math.max(budget - used, 0))
+    : '未设预算（config: aidata.daily_token_budget）';
+  $('#tkBudget').style.color = (budget && used >= budget) ? '#ff9b9b' : '';
+  const bal = u.balance;
+  if (bal) {
+    $('#tkBalance').textContent = fmtInt(bal.value);
+    $('#tkBalanceSub').textContent = '上次记账 ' + String(bal.ts || '').slice(5, 16);
+  } else {
+    $('#tkBalance').textContent = '--';
+    $('#tkBalanceSub').textContent = '未记账（下方填入商城余额）';
+  }
+  const days = Object.entries(u.days || {}).sort((a, b) => String(a[0]).localeCompare(String(b[0]))).slice(-7);
+  const maxTok = Math.max(1, ...days.map(([, v]) => v.tokens || 0));
+  $('#tkBars').innerHTML = days.length ? days.map(([day, v]) => {
+    const h = Math.max(3, Math.round(100 * (v.tokens || 0) / maxTok));
+    return '<div class="tk-bar" title="' + day + '：' + (v.tokens || 0) + ' 词元 / '
+      + (v.calls || 0) + ' 次"><b>' + (v.tokens || 0) + '</b>'
+      + '<i style="height:' + h + '%"></i><span>' + String(day).slice(4) + '</span></div>';
+  }).join('') : '<div class="empty">近 7 天暂无数据</div>';
+  const rows = Object.entries(t.by_method || {}).map(([m, v]) =>
+    '<tr><td class="mono">' + escapeHtml(m) + '</td><td>' + fmtInt(v.calls || 0)
+    + '</td><td>' + fmtInt(v.rows || 0) + '</td><td>' + fmtInt(v.tokens || 0) + '</td></tr>');
+  $('#tkTable tbody').innerHTML = rows.join('')
+    || '<tr><td colspan="4" class="empty">今日暂无付费调用</td></tr>';
+  $('#tkHint').textContent = '按 ' + (u.rows_per_token || 200) + ' 条/词元 · 最低 '
+    + (u.min_tokens_per_call || 1) + ' 词元/次';
+}
+
+async function saveBalanceFromPanel(){ await saveBalance('tkBalanceInput'); }
+
 applyTheme(document.documentElement.dataset.theme || 'dark');
+initCollapsibles();
 buildSlots();
 initMethods();
 loadLive();

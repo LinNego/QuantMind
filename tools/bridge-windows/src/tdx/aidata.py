@@ -61,13 +61,19 @@ class AidataTokenRequired(RuntimeError):
     """未配置付费 Key，或 Key 无效。"""
 
 
+class AidataBudgetExceeded(RuntimeError):
+    """今日词元预算已用尽（硬闸）。"""
+
+
 class AidataService:
     """tdxaidata 的门面：状态、Token 管理、只读查询、订阅。"""
 
     def __init__(self, vendor_dir: str = "", ini_path: str = "",
                  enabled: bool = True, usage_path: str = "",
                  max_rows_per_call: int = 0,
-                 tokens_per_call: float = 1.0):
+                 rows_per_token: int = 200,
+                 min_tokens_per_call: int = 1,
+                 daily_token_budget: int = 0):
         self.enabled = enabled
         self.vendor_dir = vendor_dir or ""
         self._ini_override = ini_path or ""
@@ -75,7 +81,11 @@ class AidataService:
         # 实测（2026-10-23 商城明细）：**1 词元/次**，与返回行数无关。
         # max_rows_per_call 只作安全阀（防一次拉几十万行卡死），0=不限制。
         self.max_rows_per_call = max(0, int(max_rows_per_call or 0))
-        self.tokens_per_call = float(tokens_per_call or 1.0)
+        # 实测（商城明细 11:29:52 数量=15，对应一次 3000 只批量快照）：
+        # **每 200 条返回数据 = 1 词元，向上取整，最低 1**。
+        self.rows_per_token = max(1, int(rows_per_token or 200))
+        self.min_tokens_per_call = max(1, int(min_tokens_per_call or 1))
+        self.daily_token_budget = max(0, int(daily_token_budget or 0))
         self._usage_lock = threading.Lock()
         self._usage = self._load_usage()
         self._lock = threading.Lock()
@@ -210,6 +220,11 @@ class AidataService:
         except OSError as exc:
             log.warning("aidata 用量落盘失败(忽略): %s", exc)
 
+    def _tokens_for(self, rows: int) -> int:
+        import math as _math
+        return max(self.min_tokens_per_call,
+                   int(_math.ceil(max(rows, 0) / self.rows_per_token)))
+
     @staticmethod
     def _count_rows(result: Any) -> int:
         """估算返回的“数据行”数：分时/逐笔=数组长度；批量快照=证券只数。"""
@@ -230,14 +245,16 @@ class AidataService:
         except (TypeError, ValueError):
             size = 0
         rows = self._count_rows(result)
+        tokens = self._tokens_for(rows)
         with self._usage_lock:
             day = self._today()
             for target in (day, day["by_method"].setdefault(
-                    method, {"calls": 0, "bytes": 0, "rows": 0}),
+                    method, {"calls": 0, "bytes": 0, "rows": 0, "tokens": 0}),
                     self._usage["totals"]):
-                target["calls"] += 1
-                target["bytes"] += size
-                target["rows"] += rows
+                target["calls"] = target.get("calls", 0) + 1
+                target["bytes"] = target.get("bytes", 0) + size
+                target["rows"] = target.get("rows", 0) + rows
+                target["tokens"] = target.get("tokens", 0) + tokens
             self._persist_usage()
 
     def record_balance(self, value: int) -> dict:
@@ -279,9 +296,21 @@ class AidataService:
             "days": data["days"],
             "balance": balance,
             "calibration": calibration,
-            "est_tokens_today": round(day["calls"] * self.tokens_per_call, 1),
-            "tokens_per_call": self.tokens_per_call,
+            "est_tokens_today": int(day.get("tokens", 0)),
+            "rows_per_token": self.rows_per_token,
+            "min_tokens_per_call": self.min_tokens_per_call,
+            "daily_token_budget": self.daily_token_budget,
         }
+
+    def _check_daily_budget(self) -> None:
+        """每日词元硬预算（按 200 条/词元估算）。0=不限。"""
+        if self.daily_token_budget <= 0:
+            return
+        with self._usage_lock:
+            used = int(self._today().get("tokens", 0))
+        if used >= self.daily_token_budget:
+            raise AidataBudgetExceeded(
+                f"TdxAiData 今日预算已用尽（{used}/{self.daily_token_budget} 词元）")
 
     def _check_row_budget(self, params: dict) -> None:
         """安全阀：单次返回行数上限（按次计费，行数不额外收费；0=不限）。"""
@@ -361,11 +390,12 @@ class AidataService:
         if fn is None:
             raise AidataUnavailable(f"tdxaidata v{self._version} 无 {method}")
         self._check_row_budget(params or {})
+        self._check_daily_budget()
         buffer = io.StringIO()
         try:
             with self._lock, contextlib.redirect_stdout(buffer):
                 result = fn(**(params or {}))
-        except AidataTokenRequired:
+        except (AidataTokenRequired, AidataBudgetExceeded):
             raise
         except Exception as exc:  # noqa: BLE001
             self._last_error = f"{method}: {type(exc).__name__}: {exc}"

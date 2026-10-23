@@ -64,7 +64,9 @@ aidata:
   vendor_dir: "./vendor"
   ini_path: ""            # 空 = <vendor>/tdxaidata/lib/TdxAiData.ini
   max_rows_per_call: 0    # 安全阀：单次返回行数上限，0=不限（按次计费，行数不额外收费）
-  tokens_per_call: 1.0    # 实测口径：每次调用/每条付费推送 = 1 词元（仅用于估算）
+  rows_per_token: 200     # 实测：每 200 条返回数据 = 1 词元（向上取整，最低 1）
+  min_tokens_per_call: 1
+  daily_token_budget: 0   # 每日词元硬预算（0=不限）；超预算的调用直接 429 拒绝
   max_symbols: 100        # 通达信 SDK 单次订阅硬上限（累计并集）
 
 # 实时订阅：tq = 免费（客户端通知，桥再拉快照）；aidata = 付费（完整盘口推送）。

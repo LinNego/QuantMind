@@ -160,7 +160,9 @@ async def main():
             enabled=bool(cfg.get("aidata.enabled", True)),
             usage_path=os.path.join(data_dir, "aidata_usage.json"),
             max_rows_per_call=int(cfg.get("aidata.max_rows_per_call", 0) or 0),
-            tokens_per_call=float(cfg.get("aidata.tokens_per_call", 1.0) or 1.0))
+            rows_per_token=int(cfg.get("aidata.rows_per_token", 200) or 200),
+            min_tokens_per_call=int(cfg.get("aidata.min_tokens_per_call", 1) or 1),
+            daily_token_budget=int(cfg.get("aidata.daily_token_budget", 0) or 0))
         sub_state = cfg.get("subscription.state_file", "") or os.path.join(
             data_dir, "subscription.json")
         if not os.path.isabs(sub_state):
