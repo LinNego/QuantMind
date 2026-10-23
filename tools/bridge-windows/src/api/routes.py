@@ -1109,6 +1109,21 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             return _aidata_error(exc)
         return web.json_response({"success": True, "data": res})
 
+    async def aidata_balance(request: web.Request):
+        """人工记一次商城余额：之后可用真实差值校准词元/行。"""
+        if aidata is None:
+            return json_error(503, "AIDATA_DISABLED", "TdxAiData 未启用")
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return json_error(400, "BAD_JSON", "请求体必须是 JSON")
+        try:
+            res = await asyncio.get_running_loop().run_in_executor(
+                _AIDATA_EXECUTOR, aidata.record_balance, (body or {}).get("value"))
+        except Exception as exc:  # noqa: BLE001
+            return _aidata_error(exc)
+        return web.json_response({"success": True, "data": res})
+
     async def aidata_call(request: web.Request):
         if aidata is None:
             return json_error(503, "AIDATA_DISABLED", "TdxAiData 未启用")
@@ -1417,6 +1432,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     app.router.add_get("/api/v1/aidata/status", aidata_status)
     app.router.add_post("/api/v1/aidata/token", aidata_set_token)
     app.router.add_post("/api/v1/aidata/call", aidata_call)
+    app.router.add_post("/api/v1/aidata/balance", aidata_balance)
     app.router.add_get("/api/v1/subscription", subscription_get)
     app.router.add_post("/api/v1/subscription", subscription_set)
     app.router.add_get("/api/v1/subscription/pushes", subscription_pushes)

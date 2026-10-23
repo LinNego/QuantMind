@@ -36,7 +36,8 @@ class SubscriptionManager:
     def __init__(self, aidata=None, tq_sys_path: str = "",
                  state_file: str = "", snapshot_fetcher=None,
                  max_symbols: int = MAX_SUBSCRIBE_SYMBOLS,
-                 max_symbols_aidata: int = DEFAULT_AIDATA_MAX_SYMBOLS):
+                 max_symbols_aidata: int = DEFAULT_AIDATA_MAX_SYMBOLS,
+                 allow_paid_pushes: bool = False):
         self.aidata = aidata
         self.tq_sys_path = tq_sys_path or ""
         self.state_file = state_file or ""
@@ -48,6 +49,9 @@ class SubscriptionManager:
                                   MAX_SUBSCRIBE_SYMBOLS)
         self.max_symbols_aidata = max(1, int(max_symbols_aidata or
                                              DEFAULT_AIDATA_MAX_SYMBOLS))
+        # 付费推送按条计费（实测 1 词元/条，2-3 条/秒 ≈ 9000 词元/小时），
+        # 默认硬禁；需要时在 config 显式打开 subscription.allow_paid_pushes。
+        self.allow_paid_pushes = bool(allow_paid_pushes)
         self._lock = threading.Lock()
         self._enabled = False
         self._mode = "tq"
@@ -127,6 +131,10 @@ class SubscriptionManager:
         check_mode = str(mode) if mode is not None else self._mode
         will_enable = self._enabled if enabled is None else bool(enabled)
         if will_enable and check_mode == "aidata":
+            if not self.allow_paid_pushes:
+                raise ValueError(
+                    "付费推送按条计费（实测 1 词元/条，约 9000 词元/小时），默认禁用；"
+                    "要用请在 config.yaml 打开 subscription.allow_paid_pushes")
             if self.aidata is None or not self.aidata.status().get("token_configured"):
                 raise ValueError("aidata 模式需要先配置 TdxAiData 付费 Key")
         with self._lock:

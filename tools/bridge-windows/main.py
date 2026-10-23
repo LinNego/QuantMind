@@ -159,7 +159,8 @@ async def main():
             ini_path=cfg.get("aidata.ini_path", "") or "",
             enabled=bool(cfg.get("aidata.enabled", True)),
             usage_path=os.path.join(data_dir, "aidata_usage.json"),
-            max_rows_per_call=int(cfg.get("aidata.max_rows_per_call", 1000) or 1000))
+            max_rows_per_call=int(cfg.get("aidata.max_rows_per_call", 0) or 0),
+            tokens_per_call=float(cfg.get("aidata.tokens_per_call", 1.0) or 1.0))
         sub_state = cfg.get("subscription.state_file", "") or os.path.join(
             data_dir, "subscription.json")
         if not os.path.isabs(sub_state):
@@ -173,7 +174,8 @@ async def main():
             snapshot_fetcher=tdx.get_market_snapshot,
             max_symbols=int(cfg.get("subscription.max_symbols_tq",
                                     cfg.get("aidata.max_symbols", 100)) or 100),
-            max_symbols_aidata=int(cfg.get("subscription.max_symbols_aidata", 500) or 500))
+            max_symbols_aidata=int(cfg.get("subscription.max_symbols_aidata", 500) or 500),
+            allow_paid_pushes=bool(cfg.get("subscription.allow_paid_pushes", False)))
         a_status = aidata.status()
         log.info("TdxAiData: available=%s token=%s ini=%s",
                  a_status.get("available"), a_status.get("token_configured"),

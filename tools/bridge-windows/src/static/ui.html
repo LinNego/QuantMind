@@ -368,6 +368,17 @@
         </div>
         <div class="msg" id="adMsg"></div>
         <div class="field">
+          <label>余额记账（商城当前词元数，用于校准单价）</label>
+          <div class="row" style="gap:8px">
+            <input id="adBalance" type="number" min="0" placeholder="如 19934" style="flex:1">
+            <button class="btn ghost" onclick="saveBalance()">记账</button>
+          </div>
+        </div>
+        <table id="adUsageTable" style="margin-top:6px">
+          <thead><tr><th>方法</th><th>次数</th><th>行数</th><th>≈词元</th></tr></thead>
+          <tbody><tr><td colspan="4" class="empty">今日暂无付费调用</td></tr></tbody>
+        </table>
+        <div class="field">
           <label>接口（需要付费 Key 生效）</label>
           <select id="adMethod"></select>
         </div>
@@ -395,7 +406,7 @@
           <label>通道</label>
           <select id="subModeSel">
             <option value="tq">tq · 免费（需 TdxW，通知后拉快照）</option>
-            <option value="aidata">aidata · 付费（完整盘口推送）</option>
+            <option value="aidata">aidata · 付费推送（⚠ 1 词元/条 ≈ 9000/小时，默认禁用）</option>
           </select>
         </div>
         <div class="field">
@@ -765,14 +776,7 @@ async function loadAidata(){
     $('#adMethods').textContent = (d.methods || []).length;
     $('#adSub').textContent = (d.subscribed || []).length;
     $('#adIni').textContent = d.ini_path || '--';
-    const u = d.usage || {};
-    const kb = ((u.bytes || 0) / 1024);
-    // 实测口径：约 0.025 词元/行（两次抽样 0.024 / 0.025）
-    const est = (u.rows || 0) * 0.025;
-    $('#adUsage').textContent = '今日用量：' + (u.calls || 0) + ' 次 / '
-      + kb.toFixed(1) + ' KB / ' + (u.rows || 0) + ' 行 ≈ '
-      + est.toFixed(1) + ' 词元（按 0.025/行）· 单次上限 '
-      + (d.max_rows_per_call || '--') + ' 行';
+    renderAidataUsage(d);
     const sel = $('#adMethod');
     if (!sel.options.length) {
       const pref = ['get_minute_data','get_tick_data','get_market_snapshot','get_call_auction',
@@ -783,6 +787,44 @@ async function loadAidata(){
     }
     $('#adMsg').textContent = d.load_error ? ('加载失败：' + d.load_error) : '';
   } catch (e) { $('#adMsg').textContent = '读取失败：' + e.message; }
+}
+async function renderAidataUsage(d){
+  const u = d.usage || {};
+  const t = u.today || {};
+  const bal = u.balance;
+  const kb = ((t.bytes || 0) / 1024);
+  const est = (t.calls || 0) * (d.usage?.tokens_per_call || 1);
+  let line = '今日：' + (t.calls || 0) + ' 次 / ' + kb.toFixed(1) + ' KB / '
+    + (t.rows || 0) + ' 行 ≈ ' + est.toFixed(1) + ' 词元（1/次）× 单次上限 '
+    + (d.max_rows_per_call || '--') + ' 行';
+  if (bal) {
+    line += ' | 上次记账 ' + bal.value + ' @ ' + (bal.ts || '').slice(5, 16);
+    const cal = u.calibration || {};
+    if (cal.since_rows > 0) {
+      const cost = (bal.value - (u.now_value || bal.value));
+      line += ' · 之后 ' + cal.since_calls + ' 次/' + cal.since_rows + ' 行';
+    }
+  } else {
+    line += ' | 填一次商城余额可校准';
+  }
+  $('#adUsage').textContent = line;
+  const rows = Object.entries((t.by_method) || {}).map(([m, v]) =>
+    `<tr><td class="mono">${escapeHtml(m)}</td><td>${v.calls}</td><td>${v.rows}</td>`
+    + `<td>${(v.calls * 1).toFixed(0)}</td></tr>`);
+  $('#adUsageTable tbody').innerHTML = rows.join('')
+    || '<tr><td colspan="4" class="empty">今日暂无付费调用</td></tr>';
+}
+async function saveBalance(){
+  const v = parseInt($('#adBalance').value, 10);
+  if (!(v >= 0)) { $('#adMsg').textContent = '请输入当前余额（整数）'; return; }
+  try {
+    const { body } = await fetchJSON('/api/v1/aidata/balance', {
+      method: 'POST', headers: { ...authHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: v })
+    }, 15000);
+    $('#adMsg').textContent = body.success ? ('已记账：' + v) : errText(body);
+    if (body.success) { $('#adBalance').value = ''; loadAidata(); }
+  } catch (e) { $('#adMsg').textContent = '记账失败：' + e.message; }
 }
 async function saveAidataToken(){
   const token = $('#adTokenInput').value.trim();

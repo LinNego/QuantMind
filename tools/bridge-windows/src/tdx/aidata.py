@@ -66,12 +66,16 @@ class AidataService:
 
     def __init__(self, vendor_dir: str = "", ini_path: str = "",
                  enabled: bool = True, usage_path: str = "",
-                 max_rows_per_call: int = 1000):
+                 max_rows_per_call: int = 0,
+                 tokens_per_call: float = 1.0):
         self.enabled = enabled
         self.vendor_dir = vendor_dir or ""
         self._ini_override = ini_path or ""
         self.usage_path = usage_path or ""
-        self.max_rows_per_call = max(1, int(max_rows_per_call or 1000))
+        # 实测（2026-10-23 商城明细）：**1 词元/次**，与返回行数无关。
+        # max_rows_per_call 只作安全阀（防一次拉几十万行卡死），0=不限制。
+        self.max_rows_per_call = max(0, int(max_rows_per_call or 0))
+        self.tokens_per_call = float(tokens_per_call or 1.0)
         self._usage_lock = threading.Lock()
         self._usage = self._load_usage()
         self._lock = threading.Lock()
@@ -161,22 +165,36 @@ class AidataService:
         return {"ini_path": path, "token_configured": bool(token),
                 "token_len": len(token)}
 
-    # ---- 用量计量（按数据量估算，防无感烧词元） ----
+    # ---- 用量台账（按天/按方法 + 余额校准） ----
+
+    def _empty_usage(self) -> dict:
+        return {"days": {}, "totals": {"calls": 0, "bytes": 0, "rows": 0},
+                "balance": None}
 
     def _load_usage(self) -> dict:
-        today = datetime.now().strftime("%Y%m%d")
-        default = {"day": today, "calls": 0, "bytes": 0, "rows": 0, "by_method": {}}
         if not self.usage_path or not os.path.exists(self.usage_path):
-            return default
+            return self._empty_usage()
         try:
             with open(self.usage_path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except (OSError, ValueError):
-            return default
-        if str(data.get("day")) != today:
-            return default
-        data.setdefault("by_method", {})
+            return self._empty_usage()
+        if not isinstance(data, dict):
+            return self._empty_usage()
+        data.setdefault("days", {})
+        data.setdefault("totals", {"calls": 0, "bytes": 0, "rows": 0})
+        data.setdefault("balance", None)
         return data
+
+    def _today(self) -> dict:
+        today = datetime.now().strftime("%Y%m%d")
+        day = self._usage["days"].setdefault(
+            today, {"calls": 0, "bytes": 0, "rows": 0, "by_method": {}})
+        day.setdefault("by_method", {})
+        # 只保留最近 14 天
+        keys = sorted(self._usage["days"])[-14:]
+        self._usage["days"] = {k: self._usage["days"][k] for k in keys}
+        return day
 
     def _persist_usage(self) -> None:
         if not self.usage_path:
@@ -194,34 +212,81 @@ class AidataService:
 
     @staticmethod
     def _count_rows(result: Any) -> int:
+        """估算返回的“数据行”数：分时/逐笔=数组长度；批量快照=证券只数。"""
         if isinstance(result, dict):
-            return max((len(v) for v in result.values() if isinstance(v, list)), default=1)
+            lists = [len(v) for v in result.values() if isinstance(v, list)]
+            if lists:
+                return max(lists)
+            if result and all(isinstance(v, dict) for v in result.values()):
+                return len(result)  # 批量快照：{code: {...}}
+            return 1
         if isinstance(result, list):
             return len(result)
         return 1
 
     def _record_usage(self, method: str, result: Any) -> None:
-        today = datetime.now().strftime("%Y%m%d")
         try:
             size = len(json.dumps(result, ensure_ascii=False, default=str).encode("utf-8"))
         except (TypeError, ValueError):
             size = 0
         rows = self._count_rows(result)
         with self._usage_lock:
-            if str(self._usage.get("day")) != today:
-                self._usage = {"day": today, "calls": 0, "bytes": 0, "rows": 0,
-                               "by_method": {}}
-            self._usage["calls"] += 1
-            self._usage["bytes"] += size
-            self._usage["rows"] += rows
-            m = self._usage["by_method"].setdefault(method, {"calls": 0, "bytes": 0, "rows": 0})
-            m["calls"] += 1
-            m["bytes"] += size
-            m["rows"] += rows
+            day = self._today()
+            for target in (day, day["by_method"].setdefault(
+                    method, {"calls": 0, "bytes": 0, "rows": 0}),
+                    self._usage["totals"]):
+                target["calls"] += 1
+                target["bytes"] += size
+                target["rows"] += rows
             self._persist_usage()
 
+    def record_balance(self, value: int) -> dict:
+        """人工记一次商城余额（词元）。之后即可用真实差值校准单价。"""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("余额必须是整数") from None
+        if value < 0:
+            raise ValueError("余额不能为负")
+        with self._usage_lock:
+            totals = self._usage["totals"]
+            self._usage["balance"] = {
+                "value": value,
+                "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "calls": totals["calls"],
+                "rows": totals["rows"],
+                "bytes": totals["bytes"],
+            }
+            self._persist_usage()
+        return self._usage["balance"]
+
+    def usage_status(self) -> dict:
+        with self._usage_lock:
+            day = self._today()
+            data = json.loads(json.dumps(self._usage, ensure_ascii=False))
+        balance = data.get("balance") or None
+        calibration = None
+        if balance:
+            d_calls = data["totals"]["calls"] - int(balance.get("calls", 0))
+            d_rows = data["totals"]["rows"] - int(balance.get("rows", 0))
+            if d_rows > 0 or d_calls > 0:
+                calibration = {"since_calls": d_calls, "since_rows": d_rows}
+        today_key = datetime.now().strftime("%Y%m%d")
+        return {
+            "day": today_key,
+            "today": data["days"].get(today_key, day),
+            "totals": data["totals"],
+            "days": data["days"],
+            "balance": balance,
+            "calibration": calibration,
+            "est_tokens_today": round(day["calls"] * self.tokens_per_call, 1),
+            "tokens_per_call": self.tokens_per_call,
+        }
+
     def _check_row_budget(self, params: dict) -> None:
-        """单次拉取行数上限：逐笔/分时最容易一把拉爆余额（2000 笔≈40 词元）。"""
+        """安全阀：单次返回行数上限（按次计费，行数不额外收费；0=不限）。"""
+        if self.max_rows_per_call <= 0:
+            return
         for key in ("wantnum", "count", "limit", "stock_page_size"):
             raw = params.get(key)
             if raw is None:
@@ -265,7 +330,7 @@ class AidataService:
             "last_error": self._last_error,
             "vendor_dir": self.vendor_dir,
             "max_rows_per_call": self.max_rows_per_call,
-            "usage": dict(self._usage),
+            "usage": self.usage_status(),
         }
 
     # ---- 调用 ----

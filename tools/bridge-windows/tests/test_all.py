@@ -596,12 +596,17 @@ def main():
     _svc_b._check_row_budget({"wantnum": 100})
     assert AidataService._count_rows({"Time": [1, 2, 3]}) == 3
     assert AidataService._count_rows([{"a": 1}, {"a": 2}]) == 2
-    _svc_b._usage = {"day": "20260101", "calls": 0, "bytes": 0, "rows": 0,
-                     "by_method": {}}
+    _svc_b._usage = _svc_b._empty_usage()
     _svc_b.usage_path = ""
     _svc_b._record_usage("get_tick_data", {"Time": [1, 2, 3], "Price": [1, 2, 3]})
-    assert _svc_b._usage["calls"] == 1 and _svc_b._usage["rows"] == 3
-    print("  ✅ 用量计量 + 单次行数上限")
+    _u = _svc_b.usage_status()
+    assert _u["today"]["calls"] == 1 and _u["today"]["rows"] == 3
+    assert _u["today"]["by_method"]["get_tick_data"]["rows"] == 3
+    _svc_b.record_balance(20000)
+    _svc_b._record_usage("get_minute_data", {"Time": [1] * 10})
+    _cal = _svc_b.usage_status()["calibration"]
+    assert _cal["since_rows"] == 10 and _cal["since_calls"] == 1
+    print("  ✅ 用量台账（按方法/按天）+ 余额校准 + 单次行数上限")
 
     # 实时订阅：去重大写、100 上限、无 Key 拒绝 aidata 模式、启动失败置 error。
     print("\n=== 实时订阅管理 ===")
@@ -631,7 +636,15 @@ def main():
     assert _mgr.status()["codes"] == ["600519.SH", "000001.SZ"], "去重/大写失败"
     try:
         _mgr.set_config(enabled=True, mode="aidata")
-        raise AssertionError("无 Key 启用 aidata 模式应被拒")
+        raise AssertionError("默认应拒绝付费推送")
+    except ValueError as _exc:
+        assert "付费推送" in str(_exc) or "Key" in str(_exc)
+    _mgr_paid = SubscriptionManager(aidata=_FakeAidata(token=False),
+                                    state_file=os.path.join(_sdir, "sub_paid.json"),
+                                    allow_paid_pushes=True)
+    try:
+        _mgr_paid.set_config(enabled=True, mode="aidata", codes=["600519.SH"])
+        raise AssertionError("无 Key 启用 aidata 应被拒")
     except ValueError as _exc:
         assert "Key" in str(_exc)
     _mgr.set_config(codes=[f"{i:06d}.SZ" for i in range(150)])
