@@ -13,6 +13,8 @@ export interface NormalizedHolding {
     code: string;
     name: string;
     shares: number;
+    /** 可用股数（T+1 可卖量）。上游没给 → null：渲染层出 `—`，**不拿持仓量冒充可用量**。 */
+    availableShares?: number | null;
     cost: number;
     current: number;
     profit: number;
@@ -82,6 +84,18 @@ export const buildNormalizedHoldings = (
         .map(({ key, pos }) => {
             const code = resolveCode(key, pos);
             const shares = toFiniteNumber(pos.volume ?? pos.qty ?? pos.quantity ?? pos.total_volume, 0);
+            // 可用股数：模拟账是 available_volume，QMT/通达信是 can_use_volume / can_use。
+            // 上游没给就是 null（渲染层出 `—`）——用持仓量兜底会把 T+1 锁定读成可卖。
+            const availableRaw =
+                pos.available_volume ?? pos.can_use_volume ?? pos.can_use ?? null;
+            const availableNum = Number(availableRaw);
+            const availableShares =
+                availableRaw === null ||
+                availableRaw === undefined ||
+                !Number.isFinite(availableNum) ||
+                availableNum < 0
+                    ? null
+                    : availableNum;
             const rawValue = toFiniteNumber(pos.market_value, 0);
             const derivedCurrent = shares > 0 ? rawValue / shares : 0;
             const current = toPositiveNumber(
@@ -124,6 +138,7 @@ export const buildNormalizedHoldings = (
                 code,
                 name: resolveName(code, pos, stockNames),
                 shares,
+                availableShares,
                 cost,
                 current,
                 profit,

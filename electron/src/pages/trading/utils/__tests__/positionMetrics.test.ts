@@ -99,3 +99,35 @@ describe('getPositionSummary 在缺价时回落账户口径', () => {
         expect(summary.positionValue).toBe(4006);
     });
 });
+
+describe('availableShares（T+1 可卖量）', () => {
+    it('模拟账 available_volume 优先', () => {
+        const [h] = buildNormalizedHoldings(
+            account([
+                { symbol: '600036.SH', volume: 200, available_volume: 120, cost_price: 19.886, price: 20.03, market_value: 4006 },
+            ]),
+        );
+
+        expect(h.availableShares).toBe(120);
+    });
+
+    it('QMT/通达信 can_use_volume 兼容，0 是可卖量 0 而不是缺失', () => {
+        const [h] = buildNormalizedHoldings(
+            account([
+                { symbol: '600036.SH', volume: 200, can_use_volume: 0, cost_price: 19.886, price: 20.03, market_value: 4006 },
+            ]),
+        );
+
+        expect(h.availableShares).toBe(0);
+    });
+
+    it('上游没给 → null（渲染出 —，不拿持仓量冒充可用量）', () => {
+        const [h] = buildNormalizedHoldings(
+            account([
+                { symbol: '600036.SH', volume: 200, cost_price: 19.886, price: 20.03, market_value: 4006 },
+            ]),
+        );
+
+        expect(h.availableShares).toBeNull();
+    });
+});

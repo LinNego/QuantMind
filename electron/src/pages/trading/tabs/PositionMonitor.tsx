@@ -63,8 +63,19 @@ interface LiveQuote {
     };
 }
 
-/** 窄屏（不足 2xl 并排）时主卡的高度：主卡内部要有个确定高度才能自己滚动 */
-const STACKED_BOARD_MIN_H = 'h-[560px]';
+/** 窄屏（不足 2xl 并排）时主卡的高度：明细优先，760px 可容纳 ~12 行（旧版 560px ≈ 5–7 行） */
+const STACKED_BOARD_MIN_H = 'h-[760px]';
+
+/** 右栏折叠偏好（localStorage；读失败按展开处理） */
+const RAIL_COLLAPSED_KEY = 'qm.position.rail.collapsed';
+
+const readRailCollapsed = (): boolean => {
+    try {
+        return window.localStorage.getItem(RAIL_COLLAPSED_KEY) === '1';
+    } catch {
+        return false;
+    }
+};
 
 /** 持仓明细叠加实时价：现价/市值/盈亏全部按 live price 重算 */
 const mergeLivePrices = (holdings: NormalizedHolding[], live: Record<string, QuoteMeta>): NormalizedHolding[] => {
@@ -88,6 +99,17 @@ const mergeLivePrices = (holdings: NormalizedHolding[], live: Record<string, Quo
 
 const PositionMonitor: React.FC<PositionMonitorProps> = ({ userId: _userId, isActive, accountInfo, accountMode = 'simulation', railPanels, highlightSymbol }) => {
     const currentMarket = useAppSelector(selectCurrentMarket);
+    // 右栏（风险与情报）可折叠：默认展开，折叠后明细表拿满整行宽度；偏好跨会话保留。
+    const [railCollapsed, setRailCollapsed] = useState<boolean>(readRailCollapsed);
+    const toggleRail = () => {
+        const next = !railCollapsed;
+        setRailCollapsed(next);
+        try {
+            window.localStorage.setItem(RAIL_COLLAPSED_KEY, next ? '1' : '0');
+        } catch {
+            /* localStorage 不可用不影响展示 */
+        }
+    };
     const [stockNames, setStockNames] = useState<Record<string, string>>({});
     // 键 = 前缀式代码；值是带元信息的最后一条行情（价 + 服务端新鲜度 + 源 + 行情时刻，T6-1）
     const [liveQuotes, setLiveQuotes] = useState<Record<string, QuoteMeta>>({});
@@ -221,19 +243,19 @@ const PositionMonitor: React.FC<PositionMonitorProps> = ({ userId: _userId, isAc
                 这两块原本挂在「系统健康」页脚：它们讲的全是**持仓**的风险与盘中情报，
                 跟持仓明细分在两页看，等于风险永远和平仓对不上号；且刻意不按市场门控——
                 切到港股/美股页签时 A 股持仓的风险并不会消失。
-                **2026-10-09 用户要求「一半一半」（右侧哨兵/风控与风险锁太挤、很重要）**：
-                ≥2xl 两栏 1:1 —— 两边都是 `flex-1`（flex-basis 0%），右栏拿掉原 380px
-                固定宽。右栏各卡因此约翻倍宽（哨兵列表/风控四指标/副驾驶都吃到），
-                左板在 1536~1920 仍有 ~630~820px，明细列的最窄口径据此复核过（探针量过
-                价格/盈亏列不截断）。不足 2xl 时右栏落到下方、xl 两卡并排 —— 形态不变。 */}
+                **2026-10-23 明细优先重设计**：≥2xl 右栏由 1:1 改为固定 380px 且可折叠
+                （折叠后明细拿满整行）；不足 2xl 时右栏仍落下方、xl 两卡并排。
+                左板固定高度由 560 → 760px（窄屏首屏明细 ~12 行，旧版 5–7 行）。 */}
             <div className="flex-1 min-h-0 flex flex-col 2xl:flex-row gap-2 overflow-y-auto 2xl:overflow-hidden custom-scrollbar">
                 <div className={`${STACKED_BOARD_MIN_H} shrink-0 min-w-0 flex flex-col gap-2 2xl:h-auto 2xl:min-h-0 2xl:flex-1 2xl:shrink`}>
-                    {/* 持仓可视化主卡（2026-09-17 重设计：KPI + 市值占比条形列表，替代 分布饼图+宽表格 两块） */}
+                    {/* 持仓主卡（2026-10-23：KPI + 虚拟滚动明细 + 折叠分析抽屉） */}
                     <PositionVisualBoard
                         holdings={holdings}
                         summary={summary}
                         quoteFreshness={quoteFreshness}
                         highlightSymbol={highlightSymbol}
+                        railCollapsed={railCollapsed}
+                        onToggleRail={toggleRail}
                         defaultChannels={
                             // 实盘开关关闭时恒为模拟盘：这里是实盘关闭后最容易漏的一处——
                             // 账户态仍可能是 real（历史数据），默认通道若不跟着收敛，
@@ -245,25 +267,27 @@ const PositionMonitor: React.FC<PositionMonitorProps> = ({ userId: _userId, isAc
                     <ExecutionStrip />
                 </div>
 
-                {/* 右栏：风险与情报。grid 让「不足 2xl」时两卡并排（4 列 → 2 列），
-                    ≥2xl 与左板 1:1（`flex-1` basis 0% vs 左列同为 flex-1），整栏自己
-                    滚动（不撑破页面高度）。 */}
-                <aside
-                    data-testid="position-rail"
-                    aria-label="持仓风险与情报"
-                    className="shrink-0 min-h-0 grid content-start grid-cols-1 xl:grid-cols-2 2xl:grid-cols-1 gap-2 2xl:flex-1 2xl:shrink 2xl:min-w-0 2xl:overflow-y-auto custom-scrollbar"
-                >
-                    <HoldingAlertPanel />
-                    {/* 追加区块（调用方注入，缺省时不产出节点） */}
-                    {railPanels}
-                    <CopilotPanel />
-                    {/* 悬浮 Dock 是覆盖层不占布局（memory: dock-overlay-bottom-clearance）：
-                        窄屏时右栏铺满整行、底部会被 Dock 吞掉，滚动末端补实体占位块。 */}
-                    <div
-                        aria-hidden
-                        className="h-[max(12px,calc(var(--dock-height)-12px))] shrink-0 2xl:hidden"
-                    />
-                </aside>
+                {/* 右栏：风险与情报（2026-10-23 重设计：2xl 固定 380px 且可折叠）。
+                    旧版与明细 1:1，明细表只剩半屏宽；现在折叠后明细拿满整行。
+                    不足 2xl 时仍在下方堆叠（xl 两卡并排），整栏自己滚动。 */}
+                {!railCollapsed && (
+                    <aside
+                        data-testid="position-rail"
+                        aria-label="持仓风险与情报"
+                        className="shrink-0 min-h-0 grid content-start grid-cols-1 xl:grid-cols-2 2xl:grid-cols-1 gap-2 2xl:w-[380px] 2xl:flex-none 2xl:min-w-0 2xl:overflow-y-auto custom-scrollbar"
+                    >
+                        <HoldingAlertPanel />
+                        {/* 追加区块（调用方注入，缺省时不产出节点） */}
+                        {railPanels}
+                        <CopilotPanel />
+                        {/* 悬浮 Dock 是覆盖层不占布局（memory: dock-overlay-bottom-clearance）：
+                            窄屏时右栏铺满整行、底部会被 Dock 吞掉，滚动末端补实体占位块。 */}
+                        <div
+                            aria-hidden
+                            className="h-[max(12px,calc(var(--dock-height)-12px))] shrink-0 2xl:hidden"
+                        />
+                    </aside>
+                )}
             </div>
         </div>
     );

@@ -11,8 +11,8 @@
  * 同一条口径在本仓已有明文：研究评分「缺失一律 `—`，绝不显示成 0」。
  */
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 
 import { PositionVisualBoard, ExecutionStrip } from '../PositionVisualBoard';
 import type { NormalizedHolding, PositionSummary } from '../../utils/positionMetrics';
@@ -33,6 +33,10 @@ vi.mock('../../../../features/desk/services/deskService', () => ({
 }));
 
 afterEach(cleanup);
+
+beforeEach(() => {
+  window.localStorage.clear(); // 分析与密度偏好跨用例隔离
+});
 
 /** 明细行：货架马赛克块与「卖出」按钮的 title 也带股票名，只有明细行的 title
  *  是 `名称（代码） 持仓 N 股 · 市值 …` 这个形状（马赛克块在 `）` 后换行）。 */
@@ -106,15 +110,17 @@ describe('PositionVisualBoard · 缺价行', () => {
     expect(kpi).toHaveTextContent('浮动盈亏 +28.80');
   });
 
-  it('缺价行：现价 / 市值占比 / 盈亏一律出 —，成本照常显示', () => {
+  it('缺价行：现价 / 市值 / 盈亏一律出 —，成本照常显示', () => {
     render(<PositionVisualBoard holdings={[missing()]} summary={summaryOf(0)} />);
 
     const row = rowOf('国药一致');
 
     expect(row).toHaveTextContent('成本 19.89');
     expect(row).toHaveTextContent('缺现价');
-    // 占比 / 现价 / 盈亏金额 三处 `—`
-    expect((row.textContent?.match(/—/g) ?? []).length).toBe(3);
+    // 缺价三要素逐格核对（新增列后总数不再是 3，按单元格断言更精确）
+    expect(within(row).getByTestId('cell-price')).toHaveTextContent('—');
+    expect(within(row).getByTestId('cell-market-value')).toHaveTextContent('—');
+    expect(within(row).getByTestId('cell-profit')).toHaveTextContent('—');
     // 旧口径的两个特征：现价画成 ¥0.00、盈亏画成 −3,977.20 与 −100.00%
     expect(row).not.toHaveTextContent('0.00');
     expect(row).not.toHaveTextContent('100.00%');
@@ -130,6 +136,101 @@ describe('PositionVisualBoard · 缺价行', () => {
     expect(row).toHaveTextContent('+28.80');
     expect(row).toHaveTextContent('+0.72%');
     expect(screen.queryByText('缺价')).toBeNull();
+  });
+});
+
+/**
+ * 2026-10-23 明细优先重设计：SIM 账户 78 只持仓，旧版首屏只能看 5–7 行。
+ * 这些用例钉住三件事：虚拟列表真的渲染多行、分析图表默认不占明细高度、
+ * 右栏可折叠（折叠后明细拿满整行）。
+ */
+describe('PositionVisualBoard · 明细优先布局', () => {
+  const many = (n: number): NormalizedHolding[] =>
+    Array.from({ length: n }, (_, i) =>
+      priced({
+        code: `SH60${String(i).padStart(4, '0')}`,
+        name: `股票${i}`,
+        shares: 100 * (i + 1),
+        value: 100000 - i * 100,
+        profit: i - 5,
+        profitPercent: i / 10,
+      }),
+    );
+
+  it('虚拟滚动首屏渲染多行（不再只显示 3–5 行）', () => {
+    render(<PositionVisualBoard holdings={many(80)} summary={summaryOf(8000000)} />);
+
+    expect(screen.getAllByTestId('position-row').length).toBeGreaterThanOrEqual(8);
+  });
+
+  it('粘性表头与固定合计行始终在场', () => {
+    render(<PositionVisualBoard holdings={many(20)} summary={summaryOf(2000000)} />);
+
+    expect(screen.getByTestId('position-table-header')).toBeTruthy();
+    expect(screen.getByTestId('position-total-row')).toHaveTextContent('总盈亏');
+  });
+
+  it('分析图表默认折叠（不占明细高度），点开才渲染', () => {
+    render(<PositionVisualBoard holdings={many(10)} summary={summaryOf(1000000)} />);
+
+    const drawer = screen.getByTestId('position-insights');
+    expect(drawer.getAttribute('data-open')).toBe('false');
+    expect(screen.queryByTestId('echarts-mock')).toBeNull();
+
+    fireEvent.click(within(drawer).getByRole('button'));
+
+    expect(screen.getByTestId('position-insights').getAttribute('data-open')).toBe('true');
+    expect(screen.getAllByTestId('echarts-mock').length).toBeGreaterThan(0);
+  });
+
+  it('可用量缺失出 —，不拿持仓量冒充', () => {
+    render(<PositionVisualBoard holdings={[priced()]} summary={summaryOf(4006)} />);
+
+    expect(within(rowOf('招商银行')).getByTestId('cell-shares')).toHaveTextContent('可用 —');
+  });
+
+  it('右栏折叠按钮回调（由 PositionMonitor 注入）', () => {
+    const onToggle = vi.fn();
+    render(
+      <PositionVisualBoard
+        holdings={[priced()]}
+        summary={summaryOf(4006)}
+        railCollapsed={false}
+        onToggleRail={onToggle}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText('折叠风险与情报栏'));
+
+    expect(onToggle).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('PositionVisualBoard · 现金占比口径', () => {
+  // 2026-10-23 实测：getPositionSummary 返回的 cashRatio 已是百分数（2.52 = 2.52%），
+  // KPI 旧实现用 fmtPct（×100）并按 >1.5 判异常 → 2.52 被当成 252% 直接显示 —。
+  it('cashRatio 百分数直出：2.52 → 2.52%', () => {
+    render(
+      <PositionVisualBoard
+        holdings={[priced()]}
+        summary={{ ...summaryOf(4006), cashRatio: 2.52 }}
+      />,
+    );
+
+    expect(screen.getByText('现金占比')).toHaveTextContent('2.52%');
+  });
+
+  it('口径异常（>150%）出 — 并说明原因', () => {
+    render(
+      <PositionVisualBoard
+        holdings={[priced()]}
+        summary={{ ...summaryOf(4006), cashRatio: 200 }}
+      />,
+    );
+
+    const pill = screen.getByText('现金占比');
+    expect(pill).toHaveTextContent('—');
+    expect(pill.getAttribute('title')).toContain('账户口径数据异常');
   });
 });
 

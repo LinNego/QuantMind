@@ -18,6 +18,7 @@ import {
     type ColumnFilterState,
 } from './tradingHistory/columnFilters';
 import ExcelFilterDropdown from './tradingHistory/ExcelFilterDropdown';
+import { displayReason } from './tradingHistory/orderReason';
 
 interface TradingHistoryProps {
     userId: string;
@@ -40,6 +41,8 @@ interface TradeRow {
     amount: number;           // 委托金额
     filledValue: number;      // 成交金额
     status: string;
+    /** 拒单/撤单原因（后端 `remarks`；v1 台账由 mark_rejected 写入） */
+    reason: string;
     tradeAction: string;      // buy_to_open / sell_to_close 等
     exchangeOrderId: string;  // 交易所委托号
     commission: number;       // 手续费
@@ -69,6 +72,8 @@ const STATUS_TEXT: Record<string, string> = {
 };
 
 const statusDisplayText = (status: string): string => STATUS_TEXT[status] ?? status;
+
+/** 拒单/撤单原因人话化（实现见 `tradingHistory/orderReason.ts`，已单测） */
 
 /**
  * Excel 表头筛选按**显示值**取值（用户筛的是看到的那一列文本，不是内部状态码）。
@@ -232,6 +237,7 @@ const TradingHistory: React.FC<TradingHistoryProps> = ({ userId, isActive, tradi
                     amount: order.order_value,
                     filledValue: isFilled || isPartial ? filledValue : 0,
                     status: displayStatus,
+                    reason: displayReason(order.remarks ?? (order as any).rejected_reason),
                     tradeAction: actionMap[rawAction] || rawAction,
                     exchangeOrderId: order.exchange_order_id || '',
                     commission: Number((order as any).commission ?? (order as any).fee ?? 0),
@@ -357,6 +363,7 @@ const TradingHistory: React.FC<TradingHistoryProps> = ({ userId, isActive, tradi
         委托金额: trade.amount.toFixed(2),
         成交金额: trade.filledValue.toFixed(2),
         状态: getStatusText(trade.status),
+        备注: trade.reason,
         交易所委托号: trade.exchangeOrderId,
     })), [getStatusText]);
 
@@ -631,6 +638,18 @@ const TradingHistory: React.FC<TradingHistoryProps> = ({ userId, isActive, tradi
                                                     {getStatusText(trade.status)}
                                                 </span>
                                             </div>
+                                            {/* 拒单/撤单原因常驻一行（title 给全文）：历史记录只写「已拒绝」
+                                                不写为什么，用户只能去日志里翻（2026-10-22 实证）。 */}
+                                            {!isFilled && trade.reason && (
+                                                <div
+                                                    className={`mt-0.5 truncate text-[10px] leading-3 ${
+                                                        trade.status === 'rejected' ? 'text-red-500' : 'text-gray-400'
+                                                    }`}
+                                                    title={trade.reason}
+                                                >
+                                                    {trade.reason}
+                                                </div>
+                                            )}
                                         </td>
                                     </tr>
                                 );
