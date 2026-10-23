@@ -15,8 +15,20 @@ param(
 $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 $taskName = "TdxThsWorker"
-$py = "C:\Program Files\Python312\python.exe"
+$venvPy = Join-Path $root ".venv\Scripts\python.exe"
+$py = if (Test-Path $venvPy) { $venvPy }
+      elseif (Test-Path "C:\Program Files\Python312\python.exe") { "C:\Program Files\Python312\python.exe" }
+      else { (Get-Command python).Source }
+if (-not $py -or $py -like "*WindowsApps*") {
+    Write-Host "[ths] 找不到可用的 Python（拒绝 WindowsApps 别名）" -ForegroundColor Red
+    exit 1
+}
 $scriptPath = Join-Path $root "scripts\ths_worker.py"
+$vendorDir = Join-Path $root "vendor\ths"
+if (-not (Test-Path $vendorDir)) {
+    Write-Host "[ths] 未安装同花顺上游：先运行 scripts\install.ps1 -WithThs" -ForegroundColor Yellow
+    exit 1
+}
 
 if (-not (Test-Path $scriptPath)) {
     Write-Host "[ths] 找不到 $scriptPath" -ForegroundColor Red

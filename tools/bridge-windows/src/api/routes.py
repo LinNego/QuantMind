@@ -1678,6 +1678,17 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
                 data["worker"] = await ths.call("status", {}, use_cache=False)
             except Exception as exc:  # noqa: BLE001
                 data["worker_error"] = f"{type(exc).__name__}: {exc}"
+            # 扫码登录后 worker 的 credentials 可能为 false（账号只在内存/缓存里），
+            # 页面刷新会误显示「未配置账号」。把 QR 状态与账号并进状态面。
+            try:
+                qr = await ths.call("qr_status", {}, use_cache=False)
+                data["qr"] = qr
+                if isinstance(qr, dict) and qr.get("account"):
+                    worker = data.get("worker")
+                    if isinstance(worker, dict):
+                        worker["account"] = qr["account"]
+            except Exception:  # noqa: BLE001
+                pass
         return web.json_response({"success": True, "data": data})
 
     async def ths_call(request: web.Request):

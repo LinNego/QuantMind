@@ -40,6 +40,7 @@ _DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 THS_METHODS: dict[str, tuple[str, str, float]] = {
     # 连接/状态
     "status": ("GET", "/api/status", 0.0),
+    "qr_status": ("GET", "/api/qr/status", 0.0),
     "connect": ("POST", "/api/connect", 0.0),
     # 行情
     "quote": ("GET", "/api/quote", 1.0),

@@ -170,7 +170,12 @@ if (-not $NoThs) {
         Write-Host ("[5/5] 同花顺       OK  connected={0} credentials={1}" -f `
             $ths.connected, $ths.credentials) -ForegroundColor Green
     } else {
-        Write-Host "[5/5] 同花顺       未启动（可选；查 data\ths.env 与 vendor\ths）" -ForegroundColor Yellow
+        $thsVendor = Join-Path $root "vendor\ths"
+        if (-not (Test-Path $thsVendor)) {
+            Write-Host "[5/5] 同花顺       未安装（可选）：先运行 scripts\install.ps1 -WithThs" -ForegroundColor Yellow
+        } else {
+            Write-Host "[5/5] 同花顺       未启动（查 data\ths.env 与 data\logs）" -ForegroundColor Yellow
+        }
     }
 } else {
     Write-Host "[5/5] 同花顺       跳过（-NoThs）" -ForegroundColor DarkGray

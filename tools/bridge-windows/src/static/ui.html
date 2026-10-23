@@ -1345,11 +1345,27 @@ async function loadThs(){
     if (!body.success) { $('#thsHint').textContent = errText(body); return; }
     const d = body.data || {};
     const w = d.worker || {};
-    $('#thsConn').textContent = w.connected ? '已连接' : (d.enabled ? '未连接' : '未启用');
+    const qr = d.qr || {};
+    const account = w.account || qr.account || '';
+    $('#thsConn').textContent = w.connected ? '已登录' : (d.enabled ? '未连接' : '未启用');
     $('#thsConn').style.color = w.connected ? '#7fe3a8' : '#ffd479';
-    $('#thsAcct').textContent = w.account_kind || ((w.credentials === false) ? '未配置账号' : '--');
-    $('#thsCred').textContent = w.credentials ? '已配置' : '缺失';
-    $('#thsCred').style.color = w.credentials ? '#7fe3a8' : '#ff9b9b';
+    $('#thsAcct').textContent = account || w.account_kind || (w.connected ? '--' : '');
+    // 扫码登录时 credentials(账号文件) 可能为 false，但会话已连接——不能显示成「未登录」
+    if (w.connected) {
+      $('#thsCred').textContent = w.credentials ? '已配置' : '扫码会话';
+      $('#thsCred').style.color = '#7fe3a8';
+    } else {
+      $('#thsCred').textContent = '未登录';
+      $('#thsCred').style.color = '#ff9b9b';
+    }
+    if (qr.state === 'ok' && account) {
+      $('#thsQrState').textContent = '已登录 · ' + account;
+      $('#thsQrState').style.color = '#7fe3a8';
+    } else if (qr.state && qr.state !== 'idle') {
+      const qrText = { waiting: '等待扫码…', scanned: '已扫码，请在手机上确认',
+                       connecting: '登录中…' }[qr.state] || qr.state;
+      $('#thsQrState').textContent = qrText;
+    }
     const c = d.circuit || {};
     $('#thsCircuit').textContent = c.open ? ('熔断 ' + c.open_for_s + 's') : '正常';
     $('#thsCircuit').style.color = c.open ? '#ff9b9b' : '';
@@ -1363,7 +1379,7 @@ async function loadThs(){
       : '未启用（config: ths.enabled）';
     const pre = (w.preheat || {}).error;
     if (pre) hint += ' · ' + String(pre).slice(0, 60);
-    if (w.credentials === false) hint += ' · 在 data/ths.env 填 THS_USERNAME/THS_PASSWORD 后重启 TdxThsWorker';
+    if (w.credentials === false && !w.connected) hint += ' · 在 data/ths.env 填 THS_USERNAME/THS_PASSWORD 后重启 TdxThsWorker';
     $('#thsHint').textContent = hint;
     $('#thsMsg').textContent = d.worker_error ? ('worker 探测失败：' + d.worker_error) : '';
   } catch (e) { $('#thsHint').textContent = '读取失败：' + e.message; }
@@ -1632,6 +1648,8 @@ async function thsQrPoll(){
       if (s === 'ok') {
         $('#thsQrImg').style.display = 'none';
         $('#thsQrUrl').textContent = '';
+        $('#thsQrState').textContent = '已登录 · ' + (st.account || '');
+        $('#thsQrState').style.color = '#7fe3a8';
         loadThs();
       }
     }
