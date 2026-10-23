@@ -80,6 +80,11 @@ class Config:
         return self._resolve(cur)
 
     def token(self) -> str:
+        # 环境变量优先：部署脚本/看门狗/一键启动器只需注入 BRIDGE_AUTH_TOKEN，
+        # 不必把明文 token 写进 config.yaml（也避免改配置时误轮换 token）。
+        env_token = os.environ.get("BRIDGE_AUTH_TOKEN", "").strip()
+        if env_token:
+            return env_token
         tok = self.get("auth.token", "")
         if not tok:
             raise ValueError("auth.token 未配置(通过 BRIDGE_AUTH_TOKEN 环境变量注入)")

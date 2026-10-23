@@ -80,6 +80,52 @@ async def _loop_lag_task() -> None:
         _loop_lag["max_ms"] = max(_loop_lag["max_ms"], round(lag, 1))
 
 
+# 缓存库维护：每日收盘后清理 tdx_log；盘中超过 2GB 也强制清一次。
+# 生产 2026-10-23：tdx_cache.db 长到 9.7GB 后页损坏（malformed），
+# 缓存与调用审计全部写失败且每笔调用刷一条 traceback。缓存必须自我设限。
+CACHE_PRUNE_HOUR = 15
+CACHE_PRUNE_MINUTE = 5
+CACHE_MAX_BYTES = 2 * 1024 ** 3
+CACHE_MAINTENANCE_INTERVAL_S = 60
+CACHE_FORCE_PRUNE_COOLDOWN_S = 3600
+
+
+async def _cache_maintenance_task(cache_db) -> None:
+    """缓存库日清 + 超限强制清理（在独立线程跑，绝不占用事件循环）。"""
+    last_prune_day = ""
+    last_force = 0.0
+    integrity_checked = False
+    while True:
+        try:
+            await asyncio.sleep(CACHE_MAINTENANCE_INTERVAL_S)
+            if not integrity_checked:
+                integrity_checked = True
+                if await asyncio.to_thread(cache_db.heal_if_corrupt):
+                    log.critical("缓存库自检发现损坏，已隔离重建")
+            now = datetime.now()
+            day = now.strftime("%Y%m%d")
+            after_close = (now.hour > CACHE_PRUNE_HOUR or
+                           (now.hour == CACHE_PRUNE_HOUR
+                            and now.minute >= CACHE_PRUNE_MINUTE))
+            size = cache_db.get_cache_disk()
+            if after_close and last_prune_day != day:
+                reason = "每日收盘清理"
+            elif (size > CACHE_MAX_BYTES
+                  and time.time() - last_force > CACHE_FORCE_PRUNE_COOLDOWN_S):
+                reason = f"缓存超限 {size / 1024 ** 3:.2f}GB"
+            else:
+                continue
+            deleted = await asyncio.to_thread(cache_db.prune_logs)
+            last_prune_day = day
+            last_force = time.time()
+            log.info("缓存清理(%s): 删除 %s，剩余 %.2fGB", reason, deleted,
+                     cache_db.get_cache_disk() / 1024 ** 3)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("缓存维护失败(下轮重试)", exc_info=True)
+
+
 def _pct(vals, p: float) -> float:
     if not vals:
         return 0.0
@@ -591,6 +637,18 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         app.on_cleanup.append(_cancel_lag)
     except RuntimeError:
         pass
+    # 缓存库日清（后台线程，收盘后清理 tdx_log；超 2GB 盘中也会清）
+    if cache_db is not None:
+        try:
+            maint_task = asyncio.get_running_loop().create_task(
+                _cache_maintenance_task(cache_db))
+
+            async def _cancel_maint(_app):
+                maint_task.cancel()
+
+            app.on_cleanup.append(_cancel_maint)
+        except RuntimeError:
+            pass
     # 支持多 token: 主 token + 扩展 tokens
     valid_tokens = [token] + [t for t in (extra_tokens or []) if t]
 

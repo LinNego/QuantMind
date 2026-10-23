@@ -80,11 +80,22 @@ class _Tdx:
         return True
 
 
+class _OrderGuard:
+    def stats(self) -> dict:
+        return {"day_count": 0, "day_limit": 1999}
+
+
+class _Executor:
+    """/stats 会读 executor.order_guard.stats()；其余字段本测试不关心。"""
+
+    order_guard = _OrderGuard()
+
+
 def _app(cache_db):
     return build_app(
         TOKEN,
         _Tdx(),
-        object(),          # executor: /stats 不用
+        _Executor(),       # executor: /stats 只读 order_guard
         object(),          # tracker
         object(),          # sltp
         cache_db=cache_db,

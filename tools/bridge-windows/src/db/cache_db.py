@@ -29,9 +29,123 @@ class CacheDb:
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self.db_path = db_path
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn = None
+        try:
+            self._conn = self._connect()
+        except sqlite3.DatabaseError as exc:
+            log.critical("缓存数据库无法打开(%s)，隔离重建: %s", exc, self.db_path)
+        # 启动自检：缓存库是可丢弃的数据，损坏就隔离重建，绝不允许带着
+        # "database disk image is malformed" 一直跑到收盘（2026-10-23 生产
+        # 9.7GB 库损坏，所有缓存/审计写失败，每笔调用刷一条 traceback）。
+        # 这里只做**廉价**检查（连接 + sqlite_master）；全量 quick_check 会
+        # 扫整库，9GB 要几分钟，绝不能挡启动——交给后台维护线程
+        # （heal_if_corrupt）和写入路径的 malformed 自愈。
+        if self._conn is None or not self._quick_schema_ok():
+            if self._conn is not None:
+                log.critical("缓存数据库损坏，隔离旧文件并重建: %s", self.db_path)
+            self._quarantine_locked()
         self._create_tables()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        # 空闲页自动回收（新库生效；旧库需 VACUUM 才能切换模式，保持原样即可）
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        # WAL 到 64MB 就 checkpoint，避免 -wal 无限增长
+        conn.execute("PRAGMA journal_size_limit=67108864")
+        conn.execute("PRAGMA wal_autocheckpoint=2000")
+        return conn
+
+    def _quick_schema_ok(self) -> bool:
+        """廉价可用性检查（不扫全库）：能读 sqlite_master 即认为结构可用。"""
+        if self._conn is None:
+            return False
+        try:
+            self._conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            return True
+        except sqlite3.DatabaseError:
+            return False
+
+    def _integrity_ok(self) -> bool:
+        if self._conn is None:
+            return False
+        try:
+            row = self._conn.execute("PRAGMA quick_check(1)").fetchone()
+            return bool(row) and str(row[0]).lower() == "ok"
+        except sqlite3.DatabaseError:
+            return False
+
+    def heal_if_corrupt(self) -> bool:
+        """全量 quick_check（慢，仅后台线程调用）；损坏则隔离重建。
+
+        返回 True 表示刚做过重建。启动阶段不调用，避免 9GB 库把桥挡在门外。
+        检查期间**不持锁**（9GB 扫库几分钟，持锁会冻结所有缓存写）；
+        重建前再确认连接没被其它线程换过，避免误隔离新库。
+        """
+        with self._lock:
+            conn = self._conn
+        if conn is None:
+            return False
+        try:
+            row = conn.execute("PRAGMA quick_check(1)").fetchone()
+            ok = bool(row) and str(row[0]).lower() == "ok"
+        except sqlite3.DatabaseError:
+            ok = False
+        if ok:
+            return False
+        with self._lock:
+            if self._conn is not conn:
+                return False
+            self._quarantine_locked()
+        return True
+
+    @staticmethod
+    def _is_malformed(exc: sqlite3.DatabaseError) -> bool:
+        return "malformed" in str(exc).lower()
+
+    def _quarantine_locked(self) -> None:
+        """隔离损坏库并重建空库。**调用方必须已持有 self._lock**。
+
+        缓存/审计库损坏时唯一正确的动作：关连接 → 改名留证 → 新库。
+        由人工事后 `scripts/prune_cache.py` 或 forensic 工具处理旧文件。
+        """
+        try:
+            if self._conn is not None:
+                self._conn.close()
+        except sqlite3.Error:
+            pass
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        for suffix in ("", "-wal", "-shm"):
+            src = self.db_path + suffix
+            if os.path.exists(src):
+                try:
+                    os.replace(src, f"{src}.corrupt-{stamp}")
+                except OSError as exc:
+                    log.warning("隔离缓存文件失败 %s: %s", src, exc)
+        self._conn = self._connect()
+        self._create_tables_locked()
+
+    def _recover(self, exc: sqlite3.DatabaseError) -> None:
+        """写/读遇到 malformed：隔离重建，调用方随后重试一次。"""
+        log.critical("缓存数据库损坏(%s)，隔离重建: %s", exc, self.db_path)
+        with self._lock:
+            self._quarantine_locked()
+
+    def _write(self, fn) -> None:
+        """执行一次写操作；malformed 时隔离重建并重试一次。"""
+        try:
+            with self._lock:
+                fn(self._conn)
+                self._conn.commit()
+        except sqlite3.DatabaseError as exc:
+            if not self._is_malformed(exc):
+                raise
+            self._recover(exc)
+            with self._lock:
+                fn(self._conn)
+                self._conn.commit()
 
     def close(self):
         with self._lock:
@@ -41,8 +155,11 @@ class CacheDb:
 
     def _create_tables(self):
         with self._lock:
-            cur = self._conn.cursor()
-            cur.executescript("""
+            self._create_tables_locked()
+
+    def _create_tables_locked(self):
+        cur = self._conn.cursor()
+        cur.executescript("""
             CREATE TABLE IF NOT EXISTS kline (
                 symbol TEXT NOT NULL,
                 period TEXT NOT NULL,
@@ -112,7 +229,7 @@ class CacheDb:
                 created_at TEXT
             );
             """)
-            self._conn.commit()
+        self._conn.commit()
 
     # ---- 通用 upsert ----
 
@@ -123,15 +240,23 @@ class CacheDb:
         updates = ",".join(f"{c}=excluded.{c}" for c in cols if c not in conflict_cols)
         sql = (f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders}) "
                f"ON CONFLICT({conflict}) DO UPDATE SET {updates}")
-        with self._lock:
-            self._conn.execute(sql, [row[c] for c in cols])
-            self._conn.commit()
+        values = [row[c] for c in cols]
+        self._write(lambda conn: conn.execute(sql, values))
 
     def _query(self, sql: str, params: tuple = ()) -> list[dict]:
-        with self._lock:
-            self._conn.row_factory = sqlite3.Row
-            rows = self._conn.execute(sql, params).fetchall()
-            return [dict(r) for r in rows]
+        try:
+            with self._lock:
+                self._conn.row_factory = sqlite3.Row
+                rows = self._conn.execute(sql, params).fetchall()
+                return [dict(r) for r in rows]
+        except sqlite3.DatabaseError as exc:
+            if not self._is_malformed(exc):
+                raise
+            self._recover(exc)
+            with self._lock:
+                self._conn.row_factory = sqlite3.Row
+                rows = self._conn.execute(sql, params).fetchall()
+                return [dict(r) for r in rows]
 
     # ---- K线 ----
 
@@ -207,33 +332,29 @@ class CacheDb:
                  price: float = None, order_id: str = "", status: str = "",
                  duration_ms: float = None, error: str = ""):
         """记录所有桥调用 (查询/下单/推送), 精确到耗时/状态/结果."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO tdx_log (method, category, symbol, side, volume, price, "
-                "order_id, status, params, result, duration_ms, error, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (method, category, symbol or "", side or "", volume, price,
-                 order_id or "", status or "",
-                 json.dumps(params, ensure_ascii=False, default=str)[:2000],
-                 json.dumps(result, ensure_ascii=False, default=str)[:4000],
-                 duration_ms, error or "",
-                 datetime.now().isoformat(timespec="milliseconds")))
-            self._conn.commit()
+        values = (method, category, symbol or "", side or "", volume, price,
+                  order_id or "", status or "",
+                  json.dumps(params, ensure_ascii=False, default=str)[:2000],
+                  json.dumps(result, ensure_ascii=False, default=str)[:4000],
+                  duration_ms, error or "",
+                  datetime.now().isoformat(timespec="milliseconds"))
+        self._write(lambda conn: conn.execute(
+            "INSERT INTO tdx_log (method, category, symbol, side, volume, price, "
+            "order_id, status, params, result, duration_ms, error, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", values))
 
     def log_trade(self, plan_id: str, event: str, symbol: str, side: str,
                   volume: float, price: float, order_id: str, status: str,
                   message: str = "", detail: dict = None):
         """记录交易事件 (下单/成交/撤单/失败), 精确到委托号/状态."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO trade_log (plan_id, event, symbol, side, volume, price, "
-                "order_id, status, message, detail, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (plan_id or "", event, symbol or "", side or "", volume, price,
-                 order_id or "", status or "", message or "",
-                 json.dumps(detail or {}, ensure_ascii=False, default=str)[:2000],
-                 datetime.now().isoformat(timespec="milliseconds")))
-            self._conn.commit()
+        values = (plan_id or "", event, symbol or "", side or "", volume, price,
+                  order_id or "", status or "", message or "",
+                  json.dumps(detail or {}, ensure_ascii=False, default=str)[:2000],
+                  datetime.now().isoformat(timespec="milliseconds"))
+        self._write(lambda conn: conn.execute(
+            "INSERT INTO trade_log (plan_id, event, symbol, side, volume, price, "
+            "order_id, status, message, detail, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", values))
 
     # ---- 批量写入（后台日志线程用；一次 commit，避免每请求 fsync） ----
 
@@ -258,12 +379,10 @@ class CacheDb:
                 r.get("duration_ms"), r.get("error") or "",
                 r.get("created_at") or datetime.now().isoformat(timespec="milliseconds"),
             ))
-        with self._lock:
-            self._conn.executemany(
-                "INSERT INTO tdx_log (method, category, symbol, side, volume, price, "
-                "order_id, status, params, result, duration_ms, error, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
-            self._conn.commit()
+        self._write(lambda conn: conn.executemany(
+            "INSERT INTO tdx_log (method, category, symbol, side, volume, price, "
+            "order_id, status, params, result, duration_ms, error, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows))
         return len(rows)
 
     def log_trades_bulk(self, records: list[dict]) -> int:
@@ -284,12 +403,10 @@ class CacheDb:
                 r.get("status") or "", r.get("message") or "", detail_json,
                 r.get("created_at") or datetime.now().isoformat(timespec="milliseconds"),
             ))
-        with self._lock:
-            self._conn.executemany(
-                "INSERT INTO trade_log (plan_id, event, symbol, side, volume, price, "
-                "order_id, status, message, detail, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
-            self._conn.commit()
+        self._write(lambda conn: conn.executemany(
+            "INSERT INTO trade_log (plan_id, event, symbol, side, volume, price, "
+            "order_id, status, message, detail, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows))
         return len(rows)
 
     def get_trade_logs(self, symbol: str = "", limit: int = 100) -> list[dict]:
@@ -352,7 +469,7 @@ class CacheDb:
     # ---- 日志留存清理 ----
 
     def count_prune_candidates(self, tdx_retention_days: int = 30,
-                               tdx_max_rows: int = 3_000_000,
+                               tdx_max_rows: int = 1_500_000,
                                trade_retention_days: int = 365) -> dict:
         """只统计会被清理的行数（dry-run 用，不删除任何数据）。"""
         now = datetime.now()
@@ -379,7 +496,7 @@ class CacheDb:
         }
 
     def prune_logs(self, tdx_retention_days: int = 30,
-                   tdx_max_rows: int = 3_000_000,
+                   tdx_max_rows: int = 1_500_000,
                    trade_retention_days: int = 365,
                    batch_size: int = 5000,
                    sleep_s: float = 0.01) -> dict:
@@ -387,7 +504,7 @@ class CacheDb:
 
         策略：
         - ``tdx_log``（每次桥调用的审计行）：默认保留 30 天，且最多保留最新
-          300 万行——生产曾到 777 万行 / 9.6GB，`COUNT(*)` 单次 12 秒；
+          150 万行——生产曾到 777 万行 / 9.6GB，`COUNT(*)` 单次 12 秒；
         - ``trade_log``（下单/成交/撤单台账）：默认保留 365 天。
 
         **不在整个清理期间持有 self._lock**：每批单独加锁，让桥的
@@ -423,6 +540,14 @@ class CacheDb:
                 self._conn.commit()
             except sqlite3.Error:
                 log.warning("PRAGMA optimize 失败(忽略)", exc_info=True)
+        # 回收空闲页：新库在建表前已设 auto_vacuum=INCREMENTAL，无需整库 VACUUM。
+        # 旧库（auto_vacuum=0）只会白白执行，不做全量重写，零风险。
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA incremental_vacuum(4000)")
+                self._conn.commit()
+            except sqlite3.Error:
+                log.warning("incremental_vacuum 失败(忽略)", exc_info=True)
         return deleted
 
     def _prune_by_time(self, table: str, cutoff: str, batch_size: int,

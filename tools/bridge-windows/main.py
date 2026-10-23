@@ -74,6 +74,9 @@ async def main():
         token = cfg.token()
     except ValueError:
         # token 未配置: 自动生成一个并写回 config.yaml (exe 开箱即用)
+        # ⚠️ 2026-10-23 生产事故：桥在无 BRIDGE_AUTH_TOKEN 的会话里被拉起，
+        # token 被静默轮换，平台/采集器立刻全员 401。因此这里必须 CRITICAL，
+        # 且**绝不把 token 明文写进日志**。
         import secrets
         token = secrets.token_hex(32)
         try:
@@ -84,12 +87,17 @@ async def main():
                 raw.setdefault("auth", {})["token"] = token
                 with open(args.config, "w", encoding="utf-8") as f:
                     _yaml.safe_dump(raw, f, allow_unicode=True)
-                log.info(f"[安全] 已自动生成 token 并写入 {args.config}")
+                log.critical(
+                    "[安全] auth.token 未配置且未设置 BRIDGE_AUTH_TOKEN——"
+                    "已自动生成新 token 并写回 %s。所有既有客户端（平台/采集器）"
+                    "将立即鉴权失败；生产环境请注入 BRIDGE_AUTH_TOKEN 或写入固定 token。",
+                    args.config)
             else:
-                log.info(f"[安全] 已自动生成 token: {token}")
+                log.critical(
+                    "[安全] 配置不存在，已自动生成临时 token（重启即变）；"
+                    "部署端请设置 BRIDGE_AUTH_TOKEN")
         except Exception as e:
-            log.warning(f"[安全] 写入 token 失败: {e}, 临时 token: {token}")
-        log.info(f"[安全] 桥访问 token: {token}")
+            log.warning(f"[安全] 写入 token 失败: {e}, 本进程使用临时 token")
 
     shared_dir = cfg.get("channels.file_sync.shared_dir", "")
     if not shared_dir:

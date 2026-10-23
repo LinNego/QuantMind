@@ -11,6 +11,7 @@
 运行: cd bridge-windows && python3 tests/test_all.py
 """
 import json
+import glob
 import logging
 import os
 import sys
@@ -492,6 +493,51 @@ def main():
     assert _deleted["tdx_log"] == 22, f"应删除 22 行, 实际 {_deleted['tdx_log']}"
     _cdb.close()
     print("  ✅ 超期 + 超额日志已分批清理")
+
+    # 缓存库损坏自愈：malformed/非库文件时隔离旧文件并重建，绝不带病运行。
+    print("\n=== 缓存库损坏自愈 ===")
+    _dir = tempfile.mkdtemp()
+    _dbp = os.path.join(_dir, "cache.db")
+    _db1 = CacheDb(_dbp)
+    _db1.log_call("probe", "", {}, {})
+    _db1.close()
+    with open(_dbp, "r+b") as _fh:  # 写坏文件头，模拟断电/页损坏
+        _fh.seek(0)
+        _fh.write(b"NOT-A-SQLITE-DB" * 8)
+    _db2 = CacheDb(_dbp)
+    _db2.log_call("after_heal", "", {}, {})
+    _rows = _db2.get_logs(limit=10)
+    assert any(r["method"] == "after_heal" for r in _rows), "重建后写入失败"
+    assert glob.glob(_dbp + ".corrupt-*"), "损坏库未被隔离留证"
+    _db2.close()
+    print("  ✅ 损坏库已隔离重建，写入恢复")
+
+    # token 优先级：BRIDGE_AUTH_TOKEN 环境变量 > config.yaml 明文。
+    # 2026-10-23 实盘事故：启动会话里没有该环境变量 ⇒ 桥自动生成新 token
+    # 并写回 config，平台/采集器全员 401。环境变量必须优先。
+    print("\n=== token 环境变量优先 ===")
+    import yaml as _yaml
+    from src.utils.config import Config
+    _tokdir = tempfile.mkdtemp()
+    _cfgpath = os.path.join(_tokdir, "config.yaml")
+    with open(_cfgpath, "w", encoding="utf-8") as _fh:
+        _yaml.safe_dump({"auth": {"token": "${BRIDGE_AUTH_TOKEN}"}}, _fh)
+    _old_env = os.environ.get("BRIDGE_AUTH_TOKEN")
+    try:
+        os.environ["BRIDGE_AUTH_TOKEN"] = "A" * 64
+        assert Config(_cfgpath).token() == "A" * 64, "环境变量未优先"
+        os.environ.pop("BRIDGE_AUTH_TOKEN", None)
+        try:
+            Config(_cfgpath).token()
+            raise AssertionError("token 为空时应抛 ValueError")
+        except ValueError:
+            pass
+    finally:
+        if _old_env is None:
+            os.environ.pop("BRIDGE_AUTH_TOKEN", None)
+        else:
+            os.environ["BRIDGE_AUTH_TOKEN"] = _old_env
+    print("  ✅ 环境变量优先，缺失时 fail-fast")
 
     srv.shutdown()
     print(f"\n=== 结果: {passed} 通过, {failed} 失败 ===")

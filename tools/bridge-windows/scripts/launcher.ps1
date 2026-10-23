@@ -65,6 +65,19 @@ if ($Restart -or -not $bridge) {
         Start-Sleep -Seconds 2
     }
     Write-Host "[2/4] 桥 8550        启动中..." -ForegroundColor DarkGray
+    # 防 token 静默轮换：config 依赖 ${BRIDGE_AUTH_TOKEN} 而本会话又没注入时，
+    # main.py 会自动生成新 token 并写回 config，平台/采集器立刻全员 401
+    # （2026-10-23 实盘事故）。宁可拒绝启动，也不静默换 token。
+    if (-not $env:BRIDGE_AUTH_TOKEN) {
+        $cfgText = Get-Content (Join-Path $root "config.yaml") -Raw -ErrorAction SilentlyContinue
+        if ($cfgText -match '(?m)^\s*token:\s*["'']?\$\{BRIDGE_AUTH_TOKEN\}') {
+            Write-Host "[2/4] 桥 8550        拒绝启动：config.yaml 的 auth.token 依赖 BRIDGE_AUTH_TOKEN，本会话未设置" -ForegroundColor Red
+            Write-Host "      先执行:  `$env:BRIDGE_AUTH_TOKEN = '<与 Linux .env 相同的 64 位 hex>'" -ForegroundColor Yellow
+            Write-Host "      否则桥会生成新 token 并写回 config，平台与采集器会全部 401。" -ForegroundColor Yellow
+            if (-not $NoPause) { Read-Host "按回车关闭" | Out-Null }
+            exit 1
+        }
+    }
     Start-Process -FilePath $py `
         -ArgumentList "-m main --mode auto --config config.yaml" `
         -WorkingDirectory $root -WindowStyle Hidden | Out-Null
