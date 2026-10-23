@@ -569,6 +569,23 @@ def main():
         pass
     print("  ✅ 状态 / Token 写入 / 白名单校验")
 
+    # tqs 失败方式是「打印」不是抛异常：必须转成明确异常，不能只回 result:null
+    class _PrintFailTqs:
+        @staticmethod
+        def get_minute_data(**kwargs):
+            print("[错误] TokenKey Insufficient Or Key Error")
+            return None
+
+    _svc_err = AidataService(enabled=False, ini_path=_aini)
+    _svc_err._tqs = _PrintFailTqs()
+    try:
+        _svc_err.call("get_minute_data", {})
+        raise AssertionError("应抛 AidataTokenRequired")
+    except Exception as _exc:  # noqa: BLE001
+        assert type(_exc).__name__ == "AidataTokenRequired", type(_exc).__name__
+    assert "TokenKey" in _svc_err.status()["last_error"]
+    print("  ✅ tqs 打印式失败→明确异常（Key 被拒）")
+
     # 实时订阅：去重大写、100 上限、无 Key 拒绝 aidata 模式、启动失败置 error。
     print("\n=== 实时订阅管理 ===")
     from src.tdx.subscription import SubscriptionManager

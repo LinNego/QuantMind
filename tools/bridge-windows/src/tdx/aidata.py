@@ -16,6 +16,8 @@
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
 import os
 import re
@@ -186,21 +188,37 @@ class AidataService:
         return result
 
     def call(self, method: str, params: Optional[dict] = None) -> Any:
-        """只读方法直通。method 必须在白名单且当前版本存在。"""
+        """只读方法直通。method 必须在白名单且当前版本存在。
+
+        tqs 的失败方式是**打印**而不是抛异常（例如 ``[错误] TokenKey Insufficient``），
+        返回 None。这里把调用期间的 stdout 抓下来，转成明确的 HTTP 错误，
+        否则网页上只会看到 ``result: null``，用户无法判断是 Key 无效还是没数据。
+        """
         if method not in READONLY_METHODS:
             raise ValueError(f"方法不在白名单: {method}")
         self._ensure()
         fn = getattr(self._tqs, method, None)
         if fn is None:
             raise AidataUnavailable(f"tdxaidata v{self._version} 无 {method}")
+        buffer = io.StringIO()
         try:
-            with self._lock:
+            with self._lock, contextlib.redirect_stdout(buffer):
                 result = fn(**(params or {}))
-        except (AidataTokenRequired, AidataUnavailable):
+        except AidataTokenRequired:
             raise
         except Exception as exc:  # noqa: BLE001
             self._last_error = f"{method}: {type(exc).__name__}: {exc}"
             raise AidataUnavailable(self._last_error) from exc
+        captured = buffer.getvalue().strip()
+        if captured:
+            self._last_error = f"{method}: {captured[:300]}"
+            log.warning("tdxaidata %s 输出: %s", method, captured[:300])
+        if result is None and captured:
+            low = captured.lower()
+            if ("tokenkey" in low or "key error" in low
+                    or "insufficient" in low or "token" in low and "错误" in captured):
+                raise AidataTokenRequired(f"TdxAiData Key 被拒绝：{captured[:200]}")
+            raise AidataUnavailable(f"tdxaidata {method} 失败：{captured[:200]}")
         return self._check_result(result)
 
     def subscribe(self, codes: list[str], callback) -> None:

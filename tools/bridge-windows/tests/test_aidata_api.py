@@ -58,6 +58,17 @@ class _FakeTdx:
     def get_market_snapshot(self, code):
         return {"Code": code, "Now": 10.0}
 
+    def get_match_stkinfo(self, key_word):
+        table = {"茅台": [{"Code": "600519.SH", "Name": "贵州茅台"}],
+                 "600519": [{"Code": "600519.SH", "Name": "贵州茅台"}]}
+        return {"ErrorId": "0", "Value": table.get(key_word, [])}
+
+    def query_stock_positions(self, account_id=0):
+        return [{"Code": "600760.SH", "TotalVol": 100}]
+
+    def query_stock_orders(self, account_id=0, stock_code="", cancelable_only=False):
+        return [{"Code": "603658.SH", "Status": 1}]
+
 
 class _FakeExecutor:
     class _Guard:
@@ -65,6 +76,9 @@ class _FakeExecutor:
             return {"day_count": 0, "day_limit": 1999}
 
     order_guard = _Guard()
+
+    def resolve_account_id(self, account="", account_type="stock"):
+        return 1
 
 
 class _FakeSubscription:
@@ -151,6 +165,28 @@ async def _run():
         resp = await client.get("/api/v1/subscription/pushes?limit=5", headers=AUTH)
         body = await resp.json()
         assert resp.status == 200 and body["data"]["recent"]
+
+        # 7. 模糊搜索：代码/名称都能匹配；空查询返回空表
+        resp = await client.get("/api/v1/subscription/search?q=%E8%8C%85%E5%8F%B0",
+                                headers=AUTH)
+        body = await resp.json()
+        assert resp.status == 200 and body["data"]["items"][0]["code"] == "600519.SH"
+        resp = await client.get("/api/v1/subscription/search?q=", headers=AUTH)
+        assert (await resp.json())["data"]["items"] == []
+
+        # 8. 一键导入持仓（replace）→ 再并入委托（merge）
+        resp = await client.post("/api/v1/subscription/import", headers=AUTH,
+                                 json={"source": "positions", "mode": "replace"})
+        body = await resp.json()
+        assert resp.status == 200 and body["data"]["imported"] == 1
+        assert body["data"]["codes"] == ["600760.SH"], body["data"]["codes"]
+        resp = await client.post("/api/v1/subscription/import", headers=AUTH,
+                                 json={"source": "orders", "mode": "merge"})
+        body = await resp.json()
+        assert resp.status == 200 and "603658.SH" in body["data"]["codes"]
+        resp = await client.post("/api/v1/subscription/import", headers=AUTH,
+                                 json={"source": "bogus"})
+        assert resp.status == 400
 
     print("✅ TdxAiData / 订阅 HTTP 面：鉴权、503 缺 Key、100 上限、推送读取 全部通过")
 

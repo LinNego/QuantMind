@@ -164,6 +164,10 @@
   .result-box{display:none;margin-top:10px;background:#0b1525;border:1px solid var(--line2);border-radius:9px;padding:12px;
     font:12.5px/1.55 var(--mono);white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto;color:#c9d7e8}
   .msg{font-size:12.5px;color:var(--muted);margin-top:8px;white-space:pre-wrap}
+  .sub-hit{padding:7px 9px;cursor:pointer;border-radius:8px;font-size:13px;display:flex;gap:8px;align-items:baseline}
+  .sub-hit:hover{background:rgba(120,150,190,.16)}
+  .sub-hit b{font-family:var(--mono,monospace);font-size:12.5px}
+  .sub-hit span{color:var(--muted);font-size:12px}
   .empty{padding:18px;text-align:center;color:var(--muted);font-size:12.5px}
   .sparkline{height:3px;border-radius:999px;background:#16243a;margin-top:8px;overflow:hidden}
   .sparkline i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:0;transition:width .4s}
@@ -386,7 +390,20 @@
           </select>
         </div>
         <div class="field">
-          <label>订阅代码（换行或逗号分隔，最多 100 只）</label>
+          <label>模糊搜索添加（代码或名称）</label>
+          <div class="row" style="gap:8px">
+            <input id="subSearch" placeholder="如：茅台 / 600519 / 宁德" autocomplete="off" style="flex:1">
+            <button class="btn ghost" onclick="searchStocks()">搜索</button>
+          </div>
+          <div id="subSearchList"></div>
+        </div>
+        <div class="row" style="margin-bottom:8px">
+          <button class="btn ghost" onclick="importCodes('positions')">一键导入持仓</button>
+          <button class="btn ghost" onclick="importCodes('orders')">一键导入委托</button>
+          <button class="btn ghost" onclick="clearSubCodes()">清空列表</button>
+        </div>
+        <div class="field">
+          <label>订阅代码（可手输 / 搜索添加 / 一键导入，换行或逗号分隔，最多 100 只）</label>
           <textarea id="subCodes" placeholder="600519.SH&#10;000001.SZ"></textarea>
         </div>
         <div class="row">
@@ -816,6 +833,47 @@ async function applySubscription(enabled){
     loadSubscription();
   } catch (e) { $('#subMsg').textContent = '操作失败：' + e.message; }
 }
+let subSearchTimer = null;
+async function searchStocks(){
+  const q = ($('#subSearch').value || '').trim();
+  const box = $('#subSearchList');
+  if (!q) { box.innerHTML = ''; return; }
+  if (!authHeader()['Authorization']) { box.innerHTML = '<div class="empty">请先在顶部输入访问 token</div>'; return; }
+  try {
+    const { body } = await fetchJSON('/api/v1/subscription/search?q=' + encodeURIComponent(q),
+                                     { headers: authHeader() }, 20000);
+    if (!body.success) { box.innerHTML = `<div class="empty">${escapeHtml(errText(body))}</div>`; return; }
+    const items = (body.data && body.data.items) || [];
+    box.innerHTML = items.length ? items.map(it =>
+      `<div class="sub-hit" onclick="addSubCode('${escapeHtml(it.code)}')"><b>${escapeHtml(it.code)}</b><span>${escapeHtml(it.name || '')}</span></div>`
+    ).join('') : '<div class="empty">无匹配</div>';
+  } catch (e) { box.innerHTML = `<div class="empty">搜索失败：${escapeHtml(e.message)}</div>`; }
+}
+function addSubCode(code){
+  const ta = $('#subCodes');
+  const set = new Set(ta.value.split(/[\s,;]+/).map(s => s.trim().toUpperCase()).filter(Boolean));
+  set.add(String(code).toUpperCase());
+  ta.value = Array.from(set).join('\n');
+  $('#subSearch').value = '';
+  $('#subSearchList').innerHTML = '';
+  $('#subMsg').textContent = '已加入 ' + code + '（点「保存并启用」生效）';
+}
+async function importCodes(source){
+  if (!authHeader()['Authorization']) { $('#subMsg').textContent = '请先在顶部输入访问 token'; return; }
+  $('#subMsg').textContent = source === 'positions' ? '正在读取持仓…' : '正在读取委托…';
+  try {
+    const { body } = await fetchJSON('/api/v1/subscription/import', {
+      method: 'POST', headers: { ...authHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, mode: 'merge' })
+    }, 30000);
+    if (!body.success) { $('#subMsg').textContent = errText(body); return; }
+    const d = body.data;
+    $('#subMsg').textContent = `已导入 ${d.imported} 只，当前共 ${d.count} 只`;
+    $('#subCodes').value = (d.codes || []).join('\n');
+    loadSubscription();
+  } catch (e) { $('#subMsg').textContent = '导入失败：' + e.message; }
+}
+function clearSubCodes(){ $('#subCodes').value = ''; $('#subMsg').textContent = '列表已清空（点「保存并启用」生效）'; }
 
 function adminToken(){ return getToken(); }
 async function loadTokens(){
@@ -960,6 +1018,15 @@ function toggleTheme(){
   applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
 }
 
+if ($('#subSearch')) {
+  $('#subSearch').addEventListener('input', () => {
+    clearTimeout(subSearchTimer);
+    subSearchTimer = setTimeout(searchStocks, 300);
+  });
+  $('#subSearch').addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { clearTimeout(subSearchTimer); searchStocks(); }
+  });
+}
 applyTheme(document.documentElement.dataset.theme || 'dark');
 buildSlots();
 initMethods();

@@ -1178,6 +1178,80 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             "last_push_at": data.get("last_push_at", ""),
         }})
 
+    async def subscription_search(request: web.Request):
+        """代码/名称模糊匹配（走 TQ get_match_stkinfo，不需要 aidata Key）。"""
+        q = (request.query.get("q") or "").strip()
+        if not q:
+            return web.json_response({"success": True, "data": {"items": []}})
+        try:
+            limit = max(1, min(int(request.query.get("limit", "20")), 50))
+        except (TypeError, ValueError):
+            limit = 20
+        try:
+            result = await _call_tdx(tdx.get_match_stkinfo, q, kind="data")
+        except Exception as exc:  # noqa: BLE001
+            return json_error(502, "SEARCH_FAILED", f"{type(exc).__name__}: {exc}")
+        raw = result.get("Value") if isinstance(result, dict) else result
+        items = []
+        for row in (raw or [])[:limit]:
+            if isinstance(row, dict):
+                code = str(row.get("Code") or "").strip()
+                if code:
+                    items.append({"code": code, "name": str(row.get("Name") or "")})
+        return web.json_response({"success": True, "data": {"items": items}})
+
+    async def subscription_import(request: web.Request):
+        """一键把持仓/当日委托的股票并入订阅列表。"""
+        if subscription is None:
+            return json_error(503, "SUBSCRIPTION_DISABLED", "订阅未启用")
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return json_error(400, "BAD_JSON", "请求体必须是 JSON")
+        body = body or {}
+        source = str(body.get("source") or "positions")
+        if source not in ("positions", "orders"):
+            return json_error(400, "BAD_SOURCE", "source 必须是 positions 或 orders")
+        try:
+            account_id = await _call_tdx(
+                executor.resolve_account_id,
+                body.get("account", ""), body.get("account_type", "stock"),
+                kind="trade")
+            if source == "positions":
+                raw = await _call_tdx(tdx.query_stock_positions, account_id,
+                                      kind="trade")
+            else:
+                raw = await _call_tdx(tdx.query_stock_orders, account_id, "", False,
+                                      kind="trade")
+        except Exception as exc:  # noqa: BLE001
+            return json_error(502, "ACCOUNT_UNAVAILABLE",
+                              f"{type(exc).__name__}: {exc}")
+        codes = []
+        for row in raw or []:
+            if isinstance(row, dict):
+                code = str(row.get("Code") or row.get("stock_code") or "").strip().upper()
+                if code:
+                    codes.append(code)
+        if not codes:
+            return json_error(404, "EMPTY_SOURCE", "没有可导入的股票")
+        loop = asyncio.get_running_loop()
+        current = await loop.run_in_executor(_SUB_EXECUTOR, subscription.status)
+        if str(body.get("mode") or "merge") == "replace":
+            merged = codes
+        else:
+            merged = list(current.get("codes") or []) + codes
+        try:
+            await loop.run_in_executor(
+                _SUB_EXECUTOR, lambda: subscription.set_config(None, None, merged))
+        except ValueError as exc:
+            return json_error(400, "BAD_CONFIG", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return json_error(502, "SUBSCRIBE_FAILED",
+                              f"{type(exc).__name__}: {exc}")
+        data = await loop.run_in_executor(_SUB_EXECUTOR, subscription.status)
+        return web.json_response({"success": True, "data": {
+            **data, "imported": len(codes)}})
+
     # ---- 桥状态 / 网页控制台 ----
 
     async def system(request: web.Request):
@@ -1347,6 +1421,8 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     app.router.add_get("/api/v1/subscription", subscription_get)
     app.router.add_post("/api/v1/subscription", subscription_set)
     app.router.add_get("/api/v1/subscription/pushes", subscription_pushes)
+    app.router.add_get("/api/v1/subscription/search", subscription_search)
+    app.router.add_post("/api/v1/subscription/import", subscription_import)
     app.router.add_delete("/api/v1/auth/tokens/{token_hash}", delete_token_route)
     app.router.add_get("/ui", ui_page)
 
