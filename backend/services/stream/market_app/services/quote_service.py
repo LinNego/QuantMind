@@ -131,11 +131,22 @@ class QuoteService:
 
     @staticmethod
     def _symbol_market(symbol: str) -> str:
-        """按符号推断市场（与 trade/simulation market_rules 同口径的简化版）。"""
+        """按符号推断市场（与 trade/simulation market_rules 同口径的简化版）。
+
+        A 股认**四种**形态：裸码（``600036``）、后缀式（``600036.SH``）、
+        大写前缀式（``SH600036``——本项目 PG/Redis/前端/多数 API 的标准形态）、
+        小写前缀式（``sh600036``——``market:snapshot`` 键形态）。
+
+        2026-10-23 实测缺陷：前缀式既非 ``isdigit()`` 也不以后缀结尾，一路落到
+        兜底 ``return "US"`` → 走腾讯源 → A 股码取不到价 → ``/api/v1/quotes``
+        404；同一只标的仅因写法不同就分到不同数据源。前缀判断须**不分大小写**。
+        """
         s = str(symbol or "").upper().strip()
         if s.endswith(".HK"):
             return "HK"
         if s.endswith((".SH", ".SZ", ".BJ")) or s.isdigit():
+            return "CN"
+        if s[:2] in {"SH", "SZ", "BJ"} and s[2:].isdigit():
             return "CN"
         if s.endswith((".CN", ".FUT")):
             return "FUTURES"

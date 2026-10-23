@@ -61,6 +61,14 @@ class TrainingRunLogStream:
         self.stream_maxlen = max(
             200, int(os.getenv("TRAINING_LOG_STREAM_MAXLEN", "4000"))
         )
+        # 日志流键的存活窗口（默认 7 天，每次 append 续期）。
+        # `maxlen` 只限**条目数**、不限制**留存时长**——旧实现两者都没有，
+        # 每个训练 run 的 stream 永久驻留：2026-10-23 实测 db4 累积 405 个
+        # stream / 201.8MB，把 Redis 顶到 maxmemory → 全实例写拒绝 → 盘中
+        # 行情快照写不进去。活跃任务靠续期不受影响，结束后的 run 自然回收。
+        self.stream_ttl_sec = max(
+            3600, int(os.getenv("TRAINING_LOG_STREAM_TTL_SECONDS", "604800"))
+        )
         self.state_ttl_sec = max(
             600, int(os.getenv("TRAINING_LOG_STATE_TTL_SECONDS", "172800"))
         )
@@ -169,12 +177,17 @@ class TrainingRunLogStream:
             fields["container_id"] = str(container_id)
 
         try:
-            client.xadd(
-                self._stream_key(run_id),
+            stream_key = self._stream_key(run_id)
+            pipe = client.pipeline(transaction=False)
+            pipe.xadd(
+                stream_key,
                 fields,
                 maxlen=self.stream_maxlen,
                 approximate=True,
             )
+            # 与 xadd 同批续期：活跃 run 不过期，收工后按窗口回收
+            pipe.expire(stream_key, self.stream_ttl_sec)
+            pipe.execute()
         except Exception:
             return
 
