@@ -787,7 +787,7 @@ function fmtUptime(s){
 async function loadLive(){
   try {
     const [sres, hres] = await Promise.allSettled([
-      fetchJSON('/api/v1/system', {}, 6000),
+      fetchJSON('/api/v1/system', { headers: authHeader() }, 6000),
       fetchJSON('/api/v1/health', {}, 4000),
     ]);
     const d = sres.status === 'fulfilled' ? sres.value.body.data : null;
@@ -802,7 +802,7 @@ async function loadLive(){
 
 async function loadStats(){
   try {
-    const { body } = await fetchJSON('/api/v1/stats', {}, 25000);
+    const { body } = await fetchJSON('/api/v1/stats', { headers: authHeader() }, 25000);
     const d = body.data || {};
     S.stats = d;
     const acct = d.account || {};

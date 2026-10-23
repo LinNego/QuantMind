@@ -33,6 +33,10 @@ class _FakeTdx:
                 "Max": "1340.00", "Min": "1310.00", "Volume": "2005",
                 "Amount": "26354.92"}
 
+    def call(self, method, params):
+        # /tdx/call 的实际派发口（真实 TdxClient 的 call 会做参数适配）
+        return self.get_market_snapshot(params.get("stock_code", ""))
+
     def health_check_fast(self, timeout: float = 1.0) -> bool:
         return True
 
@@ -54,6 +58,19 @@ def _worker_app(state: dict) -> web.Application:
     app = web.Application()
 
     async def quote(request):
+        if state["busy"]:
+            return web.json_response(
+                {"error": "worker_busy", "detail": "busy"}, status=503)
+        if state["fail"]:
+            return web.json_response({"error": "boom"}, status=500)
+        state["quote_calls"] += 1
+        codes = (request.query.get("codes") or "").split(",")
+        return web.json_response([
+            {"code": c, "price": 1337.9, "pre_close": 1318.49, "volume": 100}
+            for c in codes if c
+        ])
+
+    async def quotes_ext(request):
         if state["fail"]:
             return web.json_response({"error": "boom"}, status=500)
         state["quote_calls"] += 1
@@ -75,13 +92,14 @@ def _worker_app(state: dict) -> web.Application:
         return web.json_response({"connected": True, "kind": "L2"})
 
     app.router.add_get("/api/quote", quote)
+    app.router.add_get("/api/quotes_ext", quotes_ext)
     app.router.add_get("/api/depth/{code}", depth)
     app.router.add_get("/api/status", status)
     return app
 
 
 async def _run():
-    state = {"quote_calls": 0, "depth_calls": 0, "fail": False}
+    state = {"quote_calls": 0, "depth_calls": 0, "fail": False, "busy": False}
     worker = TestServer(_worker_app(state))
     await worker.start_server()
     base = str(worker.make_url("")).rstrip("/")
@@ -115,18 +133,45 @@ async def _run():
                                      json={"method": "order", "params": {}})
             assert resp.status == 400, resp.status
 
+            # 4b. /tdx/call 只读白名单：写操作一律 403；数据方法仍放行
+            for bad in ("exec_to_tdx", "send_file", "formula_set_data",
+                        "create_sector"):
+                resp = await client.post("/api/v1/tdx/call", headers=AUTH,
+                                         json={"method": bad, "params": {}})
+                body_bad = await resp.json()
+                assert resp.status == 403 and \
+                    body_bad["error"]["code"] == "METHOD_NOT_ALLOWED", \
+                    (bad, resp.status, body_bad)
+            resp = await client.post("/api/v1/tdx/call", headers=AUTH,
+                                     json={"method": "get_market_snapshot",
+                                           "params": {"stock_code": "600519.SH"}})
+            assert resp.status == 200, (resp.status, await resp.json())
+
+            # 4c. worker 饱和（503 worker_busy）不计入熔断：连打 6 次后仍可恢复
+            state["busy"] = True
+            for i in range(6):
+                resp = await client.get(f"/api/v1/ths/quote?codes=60080{i}.SH",
+                                        headers=AUTH)
+                body = await resp.json()
+                assert resp.status == 503 and \
+                    body["error"]["code"] == "THS_BUSY", (i, resp.status, body)
+            state["busy"] = False
+            resp = await client.get("/api/v1/ths/quote?codes=600519.SH", headers=AUTH)
+            assert resp.status == 200, (resp.status, await resp.json())
+
             # 5. 10 档盘口透传
             resp = await client.get("/api/v1/ths/depth/600519.SH?levels=10", headers=AUTH)
             body = await resp.json()
             assert resp.status == 200 and body["data"]["bids"][0]["level"] == 1
             assert state["depth_calls"] == 1
 
-            # 6. TDX ↔ THS 同尺对照
+            # 6. TDX ↔ THS 同尺对照（两源都过 normalize：金额=元、价格=float）
             resp = await client.get("/api/v1/ths/compare?code=600519.SH", headers=AUTH)
             body = await resp.json()
-            assert resp.status == 200
-            assert body["data"]["tdx"]["last"] == "1338.00"
-            assert body["data"]["ths"]["last"] == 1337.9
+            assert resp.status == 200, (resp.status, body)
+            assert body["data"]["tdx"]["last"] == 1338.0, body["data"]["tdx"]
+            assert body["data"]["ths"]["last"] == 1337.9, body["data"]["ths"]
+            assert body["data"]["tdx"]["amount"] == 263549200.0  # 万元 → 元
             assert body["data"]["diff_pct"]["last"] is not None
 
             # 7. 上游失败 → 502；连续 3 次 → 熔断 503

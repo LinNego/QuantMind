@@ -58,7 +58,14 @@ function Start-Bridge {
         # 设置环境变量
         $env:SHARED_DIR = if ($env:SHARED_DIR) { $env:SHARED_DIR } else { $ScriptDir }
         if (-not $env:BRIDGE_AUTH_TOKEN -and (Test-Path (Join-Path $ScriptDir "config.yaml"))) {
-            # 尝试从环境读取; 若无则提示 (首次需手动设置)
+            # 与 launcher.ps1 同一闸门：config 已经依赖 ${BRIDGE_AUTH_TOKEN} 时，
+            # 无 token 拉起 = 全部 401（2026-10-23 生产事故）。宁可拒绝启动，
+            # 也不要把「桥活着但平台全 401」这种假活状态再放出来。
+            $cfgText = Get-Content (Join-Path $ScriptDir "config.yaml") -Raw
+            if ($cfgText -match '(?m)^\s*token:\s*["'']?\$\{BRIDGE_AUTH_TOKEN\}') {
+                Write-Log "拒绝启动：config.yaml 的 auth.token 依赖 BRIDGE_AUTH_TOKEN，本进程未注入"
+                return $null
+            }
             Write-Log "警告: BRIDGE_AUTH_TOKEN 未设置, 桥可能鉴权失败"
         }
         # 后台启动桥 (windowed 模式, 不占用本脚本窗口)

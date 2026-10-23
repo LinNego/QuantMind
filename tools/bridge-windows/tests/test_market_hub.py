@@ -11,7 +11,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.market.quote_hub import QuoteHub  # noqa: E402
-from src.market.schema import normalize_tdx  # noqa: E402
+from src.market.schema import normalize_tdx, normalize_ths  # noqa: E402
 
 
 async def _run():
@@ -62,6 +62,11 @@ async def _run():
     norm = normalize_tdx({"Now": "100", "LastClose": "99", "Amount": "12.34",
                           "Volume": "5"})
     assert norm["amount"] == 123400.0, norm
+
+    # 盘口单位归一：THS depth 的 qty 是「股」，统一字段用「手」（÷100）
+    nth = normalize_ths({}, {"buy": [{"level": "买一", "price": 10.0,
+                                      "qty": 1900}]}, {})
+    assert nth["bids"][0]["volume"] == 19.0, nth
     print("✅ 多源聚合：字段合并 / 源归属 / 回落 / 缺失 / prefer / 统计 / 单位归一 全部通过")
 
 

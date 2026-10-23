@@ -21,6 +21,7 @@ from ..ths.client import ThsClient
 from ..market.quote_hub import PREFERENCE, QuoteHub
 from ..market.schema import FIELD_DEFS, SOURCE_DEFS, normalize_tdx, normalize_ths
 from ..tdx import parser
+from ..tdx.aidata import AidataUnavailable
 from ..utils.auth import verify_token
 from ..utils.system_metrics import SystemMetrics
 
@@ -243,6 +244,25 @@ _cache_stats_cache = {"ts": 0.0, "data": None}
 # `TdxClient.call` 会一律落到 STOCK_SELL（买变卖）。这里直接封死。
 FORBIDDEN_CALL_METHODS = frozenset({"order_stock", "cancel_order_stock", "call"})
 
+#: `/api/v1/tdx/call` 的**只读**白名单（安全审计 2026-10-23）。
+#: 旧实现用 `dir(tdx)` 当白名单，把 `exec_to_tdx` / `send_file` /
+#: `formula_set_data` / `create_sector` / `refresh_*` 等写操作全暴露在
+#: 通用透传口上——只要拿到 token 就能写文件、改公式、改自选板块。
+#: 数据面只允许下列方法；新增数据方法必须同时登记到这里与采集契约。
+READONLY_TDX_METHODS = frozenset({
+    "health_check", "health_check_fast",
+    "get_market_snapshot", "get_market_data", "get_latest_price",
+    "get_stock_info", "get_more_info", "get_stock_list", "get_sector_list",
+    "get_stock_list_in_sector", "get_user_sector", "get_match_stkinfo",
+    "get_relation", "get_divid_factors", "get_gb_info", "get_gb_info_by_date",
+    "get_kzz_info", "get_ipo_info", "get_trackzs_etf_info", "get_pricevol",
+    "get_exday_data", "get_zdt_data", "get_trading_dates",
+    "get_financial_data", "get_financial_data_by_date",
+    "get_gpjy_value", "get_gpjy_value_by_date",
+    "get_bkjy_value", "get_bkjy_value_by_date",
+    "get_scjy_value", "get_scjy_value_by_date", "get_gp_one_data",
+})
+
 # 高频数据方法的审计只存摘要（不存 400KB 的 params/result 全文），
 # 否则 30-40 万行/日 × 2-3KB 会把 tdx_log 重新撑到 8-12GB。
 HIGH_FREQ_DATA_METHODS = frozenset(
@@ -289,6 +309,51 @@ def _aidata_error(exc: Exception):
     if isinstance(exc, ValueError):
         return json_error(400, "BAD_REQUEST", str(exc))
     return json_error(500, "AIDATA_ERROR", f"{name}: {exc}")
+
+
+def _canon_code(raw: str) -> str:
+    """把用户输入的代码统一成 **后缀式**（`600519.SH`）。
+
+    实测（2026-10-23）：TDX 的 get_market_snapshot 只认后缀式（裸码回
+    `stock_code error`），THS worker 只认裸码，前端/用户却常用前缀式。
+    统一在入口归一，往下各源再各取所需，避免「输入格式不对=全部源失败」。
+    """
+    code = str(raw or "").strip().upper()
+    if not code:
+        return code
+    if "." in code:
+        num, _, suffix = code.partition(".")
+        return f"{num}.{suffix}" if num and suffix else code
+    for prefix in ("SH", "SZ", "BJ"):
+        if code.startswith(prefix) and code[2:].isdigit():
+            return f"{code[2:]}.{prefix}"
+    if code.isdigit() and len(code) == 6:
+        if code.startswith("88"):  # 880xxx 是通达信板块码，属沪市
+            return f"{code}.SH"
+        head = code[0]
+        if head in "69":
+            return f"{code}.SH"
+        if head in "48":
+            return f"{code}.BJ"
+        return f"{code}.SZ"
+    return code
+
+
+async def _run_aidata(service, fn, *args, timeout: float = 25.0):
+    """aidata 单线程池执行 + 硬超时（审计 HIGH-3）。
+
+    DLL 调用线程**取消不掉**：`wait_for` 超时后线程仍在跑并占着服务锁，
+    所以超时必须同时 `mark_timeout()`，让后续请求在冷却期内快速失败，
+    而不是排队等同一把锁把整个 `/aidata/*` 拖死。
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_AIDATA_EXECUTOR, fn, *args), timeout=timeout)
+    except asyncio.TimeoutError:
+        service.mark_timeout(getattr(fn, "__name__", "call"))
+        raise AidataUnavailable(
+            f"TdxAiData 调用超时（{timeout:.0f}s），已标记上游卡死") from None
 
 
 def _cache_result(cache_db, method: str, symbol: str, params: dict, result: dict):
@@ -711,10 +776,12 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
                 return json_error(415, "UNSUPPORTED_MEDIA_TYPE", "仅支持 application/json")
 
         # 只读状态/页面豁免鉴权 (仅展示, 不含写操作)
-        # ⚠️ `/api/v1/cache/logs` 与 `/api/v1/cache/trades` **不在此列**：
-        # 它们返回调用明细与交易台账（含标的/方向/数量/委托号），属于敏感数据，
-        # 必须带 token；仅行情缓存 kline/get 保持匿名可读。
-        read_only = ("/api/v1/health", "/api/v1/stats", "/api/v1/system",
+        # ⚠️ `/api/v1/stats` 与 `/api/v1/system` **不在此列**：前者返回实盘
+        # 账户余额/资产/持仓数（总资产永不可见），后者暴露主机名/路径/IP。
+        # 安全审计 2026-10-23：这两个端点曾在匿名可读名单里。
+        # `/cache/logs` 与 `/cache/trades` 返回调用明细与交易台账（含标的/方向/
+        # 数量/委托号），也必须带 token；仅行情缓存 kline/get 保持匿名可读。
+        read_only = ("/api/v1/health",
                      "/ui", "/favicon.ico", "/api/v1/cache/kline",
                      "/api/v1/cache/get")
         if path in read_only:
@@ -984,7 +1051,11 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             return json_error(
                 403, "METHOD_FORBIDDEN",
                 f"{method} 只能经 /api/v1/plans/execute 或 /api/v1/orders/cancel 调用")
-        # 白名单: 只允许已定义的方法, 防止任意调用
+        # 白名单：只放行只读数据方法（写操作一律 403，防任意文件/公式/板块写入）
+        if method not in READONLY_TDX_METHODS:
+            return json_error(
+                403, "METHOD_NOT_ALLOWED",
+                f"{method} 不在数据面只读白名单（写操作请走专用端点）")
         allowed = [m for m in dir(tdx) if not m.startswith("_") and callable(getattr(tdx, m))]
         if method not in allowed:
             return json_error(400, "UNKNOWN_METHOD", f"不支持的方法: {method}")
@@ -1095,8 +1166,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     async def aidata_status(request: web.Request):
         if aidata is None:
             return json_error(503, "AIDATA_DISABLED", "TdxAiData 未启用")
-        data = await asyncio.get_running_loop().run_in_executor(
-            _AIDATA_EXECUTOR, aidata.status)
+        data = await _run_aidata(aidata, aidata.status, timeout=10.0)
         return web.json_response({"success": True, "data": data})
 
     async def aidata_set_token(request: web.Request):
@@ -1108,8 +1178,8 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             return json_error(400, "BAD_JSON", "请求体必须是 JSON")
         token_value = str((body or {}).get("token") or "")
         try:
-            res = await asyncio.get_running_loop().run_in_executor(
-                _AIDATA_EXECUTOR, aidata.set_token, token_value)
+            res = await _run_aidata(aidata, aidata.set_token, token_value,
+                                    timeout=10.0)
         except Exception as exc:  # noqa: BLE001
             return _aidata_error(exc)
         return web.json_response({"success": True, "data": res})
@@ -1123,8 +1193,8 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         except Exception:  # noqa: BLE001
             return json_error(400, "BAD_JSON", "请求体必须是 JSON")
         try:
-            res = await asyncio.get_running_loop().run_in_executor(
-                _AIDATA_EXECUTOR, aidata.record_balance, (body or {}).get("value"))
+            res = await _run_aidata(aidata, aidata.record_balance,
+                                    (body or {}).get("value"), timeout=10.0)
         except Exception as exc:  # noqa: BLE001
             return _aidata_error(exc)
         return web.json_response({"success": True, "data": res})
@@ -1141,8 +1211,8 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         if not isinstance(params, dict):
             return json_error(400, "BAD_PARAMS", "params 必须是对象")
         try:
-            result = await asyncio.get_running_loop().run_in_executor(
-                _AIDATA_EXECUTOR, lambda: aidata.call(method, params))
+            result = await _run_aidata(
+                aidata, lambda: aidata.call(method, params), timeout=60.0)
         except Exception as exc:  # noqa: BLE001
             return _aidata_error(exc)
         return web.json_response({"success": True, "data": {
@@ -1153,8 +1223,14 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     async def subscription_get(request: web.Request):
         if subscription is None:
             return json_error(503, "SUBSCRIPTION_DISABLED", "订阅未启用")
-        # status 是纯内存读取，走默认线程池：绝不能被 set_config 的阻塞订阅占死
-        data = await asyncio.to_thread(subscription.status)
+        # status 是纯内存读取，走默认线程池：绝不能被 set_config 的阻塞订阅占死；
+        # 但后端反查 DLL 订阅列表仍可能卡住，加 5s 硬超时（审计 MEDIUM）。
+        try:
+            data = await asyncio.wait_for(
+                asyncio.to_thread(subscription.status), 5.0)
+        except asyncio.TimeoutError:
+            return json_error(504, "SUBSCRIBE_STATUS_TIMEOUT",
+                              "订阅状态查询超时（DLL 无响应）")
         return web.json_response({"success": True, "data": data})
 
     async def subscription_set(request: web.Request):
@@ -1170,16 +1246,26 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             return json_error(400, "BAD_CODES", "codes 必须是数组")
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(
-                _SUB_EXECUTOR,
-                lambda: subscription.set_config(
-                    body.get("enabled"), body.get("mode"), codes))
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    _SUB_EXECUTOR,
+                    lambda: subscription.set_config(
+                        body.get("enabled"), body.get("mode"), codes)),
+                60.0)
+        except asyncio.TimeoutError:
+            return json_error(504, "SUBSCRIBE_TIMEOUT",
+                              "订阅配置超时（DLL 无响应）")
         except ValueError as exc:
             return json_error(400, "BAD_CONFIG", str(exc))
         except Exception as exc:  # noqa: BLE001
             return json_error(502, "SUBSCRIBE_FAILED",
                               f"{type(exc).__name__}: {exc}")
-        data = await loop.run_in_executor(_SUB_EXECUTOR, subscription.status)
+        try:
+            data = await asyncio.wait_for(
+                loop.run_in_executor(_SUB_EXECUTOR, subscription.status), 5.0)
+        except asyncio.TimeoutError:
+            return json_error(504, "SUBSCRIBE_STATUS_TIMEOUT",
+                              "订阅状态查询超时（DLL 无响应）")
         return web.json_response({"success": True, "data": data})
 
     async def subscription_pushes(request: web.Request):
@@ -1189,7 +1275,12 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             limit = max(1, min(int(request.query.get("limit", "50")), 200))
         except (TypeError, ValueError):
             limit = 50
-        data = await asyncio.to_thread(subscription.status)
+        try:
+            data = await asyncio.wait_for(
+                asyncio.to_thread(subscription.status), 5.0)
+        except asyncio.TimeoutError:
+            return json_error(504, "SUBSCRIBE_STATUS_TIMEOUT",
+                              "订阅状态查询超时（DLL 无响应）")
         return web.json_response({"success": True, "data": {
             "recent": data.get("recent", [])[:limit],
             "latest": data.get("latest", {}),
@@ -1450,9 +1541,9 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     async def _aidata_quote_fetch(code: str) -> dict:
         if aidata is None:
             raise RuntimeError("TdxAiData 未配置")
-        raw = await asyncio.get_running_loop().run_in_executor(
-            _AIDATA_EXECUTOR,
-            lambda: aidata.call("get_market_snapshot", {"stock_code": code}))
+        raw = await _run_aidata(
+            aidata, lambda: aidata.call("get_market_snapshot",
+                                        {"stock_code": code}), timeout=10.0)
         return normalize_tdx(raw or {})
 
     async def _ths_quote_fetch(code: str) -> dict:
@@ -1463,12 +1554,14 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         """
         if ths is None:
             raise RuntimeError("同花顺旁路未配置")
-        ext = await ths.call("quotes_ext", {"codes": code})
+        # 轻请求短超时：worker 繁忙时快速失败，交给 TDX 兜底（实测 worker
+        # 一次重接口就能把轻请求拖到 8s 超时）。
+        ext = await ths.call("quotes_ext", {"codes": code}, timeout_s=4.0)
         item = ext[0] if isinstance(ext, list) and ext else (
             ext if isinstance(ext, dict) else {})
         try:
             depth = await ths.call("depth", {"code": code, "levels": 5},
-                                   timeout_s=6.0)
+                                   timeout_s=3.0)
         except Exception:  # noqa: BLE001
             depth = {}
         if not item and not depth:
@@ -1480,7 +1573,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
                           "ths": _ths_quote_fetch})
 
     async def market_quote(request: web.Request):
-        code = (request.query.get("code") or "").strip()
+        code = _canon_code(request.query.get("code") or "")
         if not code:
             return json_error(400, "BAD_REQUEST", "缺少 code")
         prefer_raw = (request.query.get("prefer") or "").strip()
@@ -1501,7 +1594,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
 
     async def market_raw(request: web.Request):
         """三源原始返回（测试台用）。aidata 仅在 ?aidata=1 时查询。"""
-        code = (request.query.get("code") or "").strip()
+        code = _canon_code(request.query.get("code") or "")
         if not code:
             return json_error(400, "BAD_REQUEST", "缺少 code")
         out: dict = {}
@@ -1512,9 +1605,10 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             errors["tdx"] = f"{type(exc).__name__}: {exc}"
         if request.query.get("aidata") == "1" and aidata is not None:
             try:
-                out["aidata"] = await asyncio.get_running_loop().run_in_executor(
-                    _AIDATA_EXECUTOR,
-                    lambda: aidata.call("get_market_snapshot", {"stock_code": code}))
+                out["aidata"] = await _run_aidata(
+                    aidata, lambda: aidata.call("get_market_snapshot",
+                                                {"stock_code": code}),
+                    timeout=10.0)
             except Exception as exc:  # noqa: BLE001
                 errors["aidata"] = f"{type(exc).__name__}: {exc}"
         if ths is not None and ths.enabled:
@@ -1554,6 +1648,8 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             return json_error(503, "THS_CIRCUIT_OPEN", str(exc))
         if name == "ThsUnavailable":
             return json_error(502, "THS_UNAVAILABLE", str(exc))
+        if name == "ThsBusy":
+            return json_error(503, "THS_BUSY", str(exc))
         if isinstance(exc, ValueError):
             return json_error(400, "THS_BAD_ARGUMENT", str(exc))
         return json_error(500, "THS_ERROR", f"{name}: {exc}")
@@ -1689,26 +1785,23 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         return web.Response(body=body, content_type="image/png")
 
     async def ths_compare(request: web.Request):
-        """TDX 与 THS 同尺对照：同一只股票的最新价/量。"""
-        code = (request.query.get("code") or "").strip()
+        """TDX 与 THS 同尺对照。
+
+        两源都必须走**同一套 normalize**（`normalize_tdx`/`normalize_ths`）：
+        旧实现 TDX 侧直取原始 `Amount`（万元），与 `/market/quote`（元）口径
+        不一致，对照表会多出 1e4 倍差异（审计 MEDIUM）。
+        """
+        code = _canon_code(request.query.get("code") or "")
         if not code:
             return json_error(400, "THS_BAD_ARGUMENT", "缺少 code")
-        data, err = await _ths_call("quote", {"codes": code})
-        if err is not None:
-            return err
-        item = (data or [{}])[0] if isinstance(data, list) else (data or {})
-        ths_norm = ThsClient.normalize_quote(item)
-        try:
-            tdx_snap = await _call_tdx(tdx.get_market_snapshot, code, kind="data")
-        except Exception as exc:  # noqa: BLE001
-            return json_error(502, "TDX_UNAVAILABLE", f"{type(exc).__name__}: {exc}")
-        tdx_norm = {
-            "code": code, "source": "tdx",
-            "last": tdx_snap.get("Now"), "prev_close": tdx_snap.get("LastClose"),
-            "open": tdx_snap.get("Open"), "high": tdx_snap.get("Max"),
-            "low": tdx_snap.get("Min"), "volume": tdx_snap.get("Volume"),
-            "amount": tdx_snap.get("Amount"),
-        }
+        td, th = await asyncio.gather(_tdx_quote_fetch(code),
+                                      _ths_quote_fetch(code),
+                                      return_exceptions=True)
+        if isinstance(td, Exception):
+            return json_error(502, "TDX_UNAVAILABLE",
+                              f"{type(td).__name__}: {td}")
+        if isinstance(th, Exception):
+            return _ths_error(th)
 
         def diff_pct(a, b):
             try:
@@ -1717,10 +1810,14 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             except (TypeError, ValueError):
                 return None
 
+        fields = ("last", "prev_close", "open", "high", "low",
+                  "volume", "amount", "change_pct")
         return web.json_response({"success": True, "data": {
-            "code": code, "tdx": tdx_norm, "ths": ths_norm,
-            "diff_pct": {"last": diff_pct(tdx_norm["last"], ths_norm["last"]),
-                         "volume": diff_pct(tdx_norm["volume"], ths_norm["volume"])},
+            "code": code,
+            "tdx": {**td, "code": code, "source": "tdx"},
+            "ths": {**th, "code": code, "source": "ths"},
+            "unit": "amount=元, volume=手（两源同尺）",
+            "diff_pct": {f: diff_pct(td.get(f), th.get(f)) for f in fields},
         }})
 
     app.router.add_get("/api/v1/subscription/search", subscription_search)

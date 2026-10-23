@@ -64,6 +64,9 @@ class SubscriptionManager:
         self._latest: dict[str, dict] = {}
         self._tq = None
         self._thread: threading.Thread | None = None
+        # 启动超时后可能「其实已订阅成功」的孤儿订阅：(mode, codes)。
+        # 下一次 stop/set_config 时补偿取消，避免幽灵订阅占满 100 名额。
+        self._orphans: list[tuple[str, list[str]]] = []
         self._snap_q: queue.Queue = queue.Queue(maxsize=1000)
         self._snap_thread: threading.Thread | None = None
         self._load_state()
@@ -204,6 +207,9 @@ class SubscriptionManager:
             with self._lock:
                 self._state = "error"
                 self._error = f"{type(exc).__name__}: {exc}"
+                if "超时" in str(exc):
+                    # 超时的线程可能稍后才真正订阅成功——记入孤儿，停/改时补偿取消
+                    self._orphans.append((mode, list(codes)))
             log.warning("订阅启动失败(%s): %s", mode, exc)
             raise
         with self._lock:
@@ -220,20 +226,38 @@ class SubscriptionManager:
 
     def _stop_with(self, mode: str, codes: list[str], was: str = "running") -> None:
         """按**调用方给的**旧 mode/codes 取消订阅（set_config 改列表时用）。"""
-        if was == "stopped":
+        if was != "stopped":
+            try:
+                self._unsubscribe(mode, codes, f"{mode} 取消订阅")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("取消订阅失败(忽略): %s", exc)
+        # 补偿：启动超时遗留的孤儿订阅（可能实际已成功订阅）
+        with self._lock:
+            orphans, self._orphans = list(self._orphans), []
+        for omode, ocodes in orphans:
+            if omode == mode and ocodes == codes:
+                continue
+            try:
+                self._unsubscribe(omode, ocodes, f"{omode} 补偿取消订阅")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("补偿取消订阅失败(忽略): %s", exc)
+
+    def _unsubscribe(self, mode: str, codes: list[str], label: str) -> None:
+        """取消订阅；DLL 调用同样限时，绝不能挂死调用线程。"""
+        if not codes:
             return
-        try:
-            if mode == "aidata" and self.aidata is not None:
-                self.aidata.unsubscribe(codes)
-            elif self._tq is not None and codes:
+        if mode == "aidata" and self.aidata is not None:
+            self._run_with_timeout(lambda: self.aidata.unsubscribe(codes),
+                                   10.0, label)
+        elif mode == "tq" and self._tq is not None:
+            def _do():
                 # tqcenter 的取消方法叫 unsubscribe_hq（不是 unsubscribe）；
                 # 名字取错会静默留下旧订阅，累计到 100 后再也加不进去。
                 fn = (getattr(self._tq, "unsubscribe_hq", None)
                       or getattr(self._tq, "unsubscribe", None))
                 if fn is not None:
                     fn(codes)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("取消订阅失败(忽略): %s", exc)
+            self._run_with_timeout(_do, 10.0, label)
 
     @staticmethod
     def _run_with_timeout(fn, timeout: float, label: str) -> None:

@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import threading
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -73,7 +74,9 @@ class AidataService:
                  max_rows_per_call: int = 0,
                  rows_per_token: int = 200,
                  min_tokens_per_call: int = 1,
-                 daily_token_budget: int = 0):
+                 daily_token_budget: int = 0,
+                 stuck_cooldown_s: float = 60.0,
+                 lock_timeout_s: float = 30.0):
         self.enabled = enabled
         self.vendor_dir = vendor_dir or ""
         self._ini_override = ini_path or ""
@@ -89,6 +92,11 @@ class AidataService:
         self._usage_lock = threading.Lock()
         self._usage = self._load_usage()
         self._lock = threading.Lock()
+        # 上游 DLL 卡死防护：HTTP 层超时后调 mark_timeout()，之后一段时间
+        # 内的调用直接快速失败，不再排队等锁（审计 HIGH-3）。
+        self.stuck_cooldown_s = float(stuck_cooldown_s or 60.0)
+        self.lock_timeout_s = float(lock_timeout_s or 30.0)
+        self._stuck_until = 0.0
         self._tqs = None
         self._pkg_dir = ""
         self._version = ""
@@ -139,7 +147,8 @@ class AidataService:
         except OSError:
             return ""
         # 注意：不要用 \s —— 多行模式下 \s* 会跨行，把下一节的 "[TcHqHost]" 当成 token。
-        m = re.search(r"(?mi)^[ \t]*token[ \t]*=[ \t]*([^\s]*)[ \t]*$", text)
+        # `[ \t\r]*`：ini 常是 CRLF，`$` 只能匹配到 \r 之前，不吃掉 \r 就永远不命中。
+        m = re.search(r"(?mi)^[ \t]*token[ \t]*=[ \t]*([^\s]*)[ \t\r]*$", text)
         return m.group(1) if m else ""
 
     def set_token(self, token: str) -> dict:
@@ -335,14 +344,38 @@ class AidataService:
 
     # ---- 状态 ----
 
+    def _acquire(self, label: str) -> None:
+        """拿服务锁；等锁超时=上游卡死，快速失败而不是永久挂起。"""
+        if not self._lock.acquire(timeout=self.lock_timeout_s):
+            self.mark_timeout(label)
+            raise AidataUnavailable(
+                f"TdxAiData 上游卡死（{label} 等锁超过 "
+                f"{self.lock_timeout_s:.0f}s）")
+
+    def mark_timeout(self, label: str = "") -> None:
+        """由 HTTP 层的 wait_for 超时回调：标记上游卡死，冷却期内快速失败。
+
+        DLL 调用在独立线程里执行，线程卡住时取消不掉；这里至少保证后续
+        请求不再排队等锁（审计 HIGH-3：一次卡死不应拖垮整个 /aidata/*）。
+        """
+        self._stuck_until = time.monotonic() + self.stuck_cooldown_s
+        self._last_error = (f"上游卡死{('：' + label) if label else ''}，"
+                            f"冷却 {self.stuck_cooldown_s:.0f}s")
+        log.error("TdxAiData %s", self._last_error)
+
     def status(self) -> dict:
         token = self.read_token()
         subscribed: list[str] = []
         if self._tqs is not None:
-            try:
-                subscribed = list(self._tqs.get_subscribe_hq_stock_list() or [])
-            except Exception:  # noqa: BLE001
-                subscribed = []
+            acquired = self._lock.acquire(timeout=1.0)
+            if acquired:
+                try:
+                    subscribed = list(self._tqs.get_subscribe_hq_stock_list() or [])
+                except Exception:  # noqa: BLE001
+                    subscribed = []
+                finally:
+                    self._lock.release()
+        now = time.monotonic()
         return {
             "enabled": self.enabled,
             "available": self._tqs is not None,
@@ -357,6 +390,7 @@ class AidataService:
             "subscribed": subscribed,
             "load_error": self._load_error,
             "last_error": self._last_error,
+            "stuck_for_s": round(max(self._stuck_until - now, 0.0), 1),
             "vendor_dir": self.vendor_dir,
             "max_rows_per_call": self.max_rows_per_call,
             "usage": self.usage_status(),
@@ -386,6 +420,10 @@ class AidataService:
         if method not in READONLY_METHODS:
             raise ValueError(f"方法不在白名单: {method}")
         self._ensure()
+        remaining = self._stuck_until - time.monotonic()
+        if remaining > 0:
+            raise AidataUnavailable(
+                f"TdxAiData 上游卡死冷却中（{remaining:.0f}s 后重试）")
         fn = getattr(self._tqs, method, None)
         if fn is None:
             raise AidataUnavailable(f"tdxaidata v{self._version} 无 {method}")
@@ -393,8 +431,14 @@ class AidataService:
         self._check_daily_budget()
         buffer = io.StringIO()
         try:
-            with self._lock, contextlib.redirect_stdout(buffer):
-                result = fn(**(params or {}))
+            # 锁等待有上限：DLL 卡死时抛 AidataUnavailable，不把线程永久挂住。
+            # redirect_stdout 是进程级的，必须在锁内进入/退出，避免串捕获。
+            self._acquire(method)
+            try:
+                with contextlib.redirect_stdout(buffer):
+                    result = fn(**(params or {}))
+            finally:
+                self._lock.release()
         except (AidataTokenRequired, AidataBudgetExceeded):
             raise
         except Exception as exc:  # noqa: BLE001
@@ -420,13 +464,19 @@ class AidataService:
         fn = getattr(self._tqs, "subscribe", None)
         if fn is None:
             raise AidataUnavailable("tdxaidata 无 subscribe")
-        with self._lock:
+        self._acquire("subscribe")
+        try:
             fn(codes, callback)
+        finally:
+            self._lock.release()
 
     def unsubscribe(self, codes: list[str]) -> None:
         self._ensure()
         fn = getattr(self._tqs, "unsubscribe", None)
         if fn is None:
             return
-        with self._lock:
+        self._acquire("unsubscribe")
+        try:
             fn(codes)
+        finally:
+            self._lock.release()

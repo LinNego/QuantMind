@@ -199,7 +199,11 @@ async def main():
             timeout_s=float(cfg.get("ths.timeout_s", 8.0) or 8.0),
             cache_enabled=bool(cfg.get("ths.cache_enabled", True)),
             circuit_failures=int(cfg.get("ths.circuit_failures", 5) or 5),
-            circuit_cooldown_s=float(cfg.get("ths.circuit_cooldown_s", 30) or 30))
+            circuit_cooldown_s=float(cfg.get("ths.circuit_cooldown_s", 30) or 30),
+            max_concurrency=int(cfg.get("ths.max_concurrency", 4) or 4),
+            gate_wait_s=float(cfg.get("ths.gate_wait_s", 0.3) or 0.0),
+            circuit_timeout_failures=int(
+                cfg.get("ths.circuit_timeout_failures", 10) or 10))
         log.info("同花顺旁路: enabled=%s base_url=%s", ths.enabled, ths.base_url)
     except Exception as e:
         log.warning(f"同花顺旁路初始化失败: {e}")

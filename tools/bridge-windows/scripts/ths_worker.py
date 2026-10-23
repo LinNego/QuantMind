@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
+import socket
 import sys
 import threading
 import time
@@ -60,6 +62,148 @@ def main() -> None:
 
     runtime = ThsRuntime(env_path=str(env_path))
     app: FastAPI = create_app(runtime)
+
+    # ---- 并发闸门（2026-10-23 压测教训）--------------------------------------
+    # 上游 MAIN 连接由一把 `_sock_lock` 串行化（send+全部响应读取），32 路并发
+    # 只会把请求堆在 FastAPI 线程池里：重接口（K 线/超级盘口，30s+）队头阻塞，
+    # 轻请求全部超时，最终把 THS 会话拖断且不自愈。这里按端点分级限流：
+    # - 重接口并发 1：它们本来就吃满 MAIN 管道；
+    # - 轻接口并发 6：留一点流水线，同时不让线程池无限堆积；
+    # - 闸门满 → 立刻 503 worker_busy（桥侧有 TDX 兜底，比静默超时好）。
+    GATE_LIGHT = 3
+    GATE_HEAVY = 1
+    HEAVY_PREFIXES = (
+        "/api/kline/", "/api/superorder", "/api/order-details/",
+        "/api/order-queues/", "/api/board/", "/api/market_snapshot",
+        "/api/stocks", "/api/stock_list_ranked", "/api/hot",
+        "/api/dde_rank", "/api/history_timeline/", "/api/auction/",
+        "/api/closing_auction/", "/api/intraday_auctions/",
+        "/api/hot_boards", "/api/dynamic_plate_refresh",
+    )
+    GATE_SKIP = ("/api/status", "/api/qr", "/api/bridge", "/openapi", "/docs")
+    # 单请求硬超时：上游协议偶尔会无限挂（实测 history_timeline >45s 不返回，
+    # 持有 MAIN socket 锁 → 之后所有请求排队、连接被拖死）。超时后主动
+    # shutdown MAIN socket 让挂住的读线程立即返回，再由重连看门狗重建会话。
+    HEAVY_TIMEOUT_S = 30.0
+    LIGHT_TIMEOUT_S = 8.0
+    gates = {"light": asyncio.Semaphore(GATE_LIGHT),
+             "heavy": asyncio.Semaphore(GATE_HEAVY)}
+    gate_stats = {"light_inflight": 0, "heavy_inflight": 0, "rejected": 0,
+                  "light_timeouts": 0, "heavy_timeouts": 0}
+
+    def _kick_connection(kind: str) -> None:
+        """shutdown 上游 MAIN socket：不拿 `_sock_lock`，专治挂死的读线程。"""
+        client = getattr(runtime, "_client", None)
+        sock = getattr(client, "_sock", None) if client is not None else None
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+            print(f"[ths-worker] {kind} 超时：已 shutdown MAIN socket 触发自愈",
+                  flush=True)
+        except OSError as exc:
+            print(f"[ths-worker] socket shutdown 失败: {exc}", flush=True)
+
+    @app.middleware("http")
+    async def concurrency_gate(request, call_next):
+        path = request.url.path
+        if path.startswith(GATE_SKIP):
+            return await call_next(request)
+        kind = "heavy" if path.startswith(HEAVY_PREFIXES) else "light"
+        # 重接口在跑时 MAIN 管道被占满：轻请求立刻 503，让桥毫秒级回落 TDX，
+        # 而不是排队 8s 后超时（实测：一次 24s 的 auction 会拖垮全部盘口请求）。
+        if kind == "light" and gate_stats["heavy_inflight"] > 0:
+            gate_stats["rejected"] += 1
+            return JSONResponse(
+                {"error": "worker_busy", "detail": "heavy task in flight"},
+                status_code=503)
+        sem = gates[kind]
+        bus = JSONResponse(
+            {"error": "worker_busy", "detail": f"{kind} 闸门已满，请稍后重试"},
+            status_code=503)
+        # 重接口 30s+ 占满管道，满了就立刻拒；轻接口允许排队 2s 吸收突发。
+        if sem.locked():
+            if kind == "heavy":
+                gate_stats["rejected"] += 1
+                return bus
+            try:
+                await asyncio.wait_for(sem.acquire(), timeout=0.5)
+            except asyncio.TimeoutError:
+                gate_stats["rejected"] += 1
+                return bus
+        else:
+            await sem.acquire()
+        gate_stats[f"{kind}_inflight"] += 1
+        try:
+            return await asyncio.wait_for(
+                call_next(request),
+                timeout=(HEAVY_TIMEOUT_S if kind == "heavy" else LIGHT_TIMEOUT_S))
+        except asyncio.TimeoutError:
+            gate_stats[f"{kind}_timeouts"] += 1
+            threading.Thread(target=_kick_connection, args=(kind,),
+                             name="ths-kick", daemon=True).start()
+            return JSONResponse(
+                {"error": "worker_timeout",
+                 "detail": f"{kind} 上游超时，已触发连接自愈"},
+                status_code=504)
+        finally:
+            gate_stats[f"{kind}_inflight"] -= 1
+            sem.release()
+
+    @app.get("/api/bridge/gates")
+    def bridge_gates():
+        return {**gate_stats,
+                "limits": {"light": GATE_LIGHT, "heavy": GATE_HEAVY},
+                "connected": bool(runtime.status().get("connected")),
+                "ts": int(time.time())}
+
+    # ---- 断线自愈：心跳是 observe_only，不会自己重连 ------------------------
+    def _reconnect_loop() -> None:
+        delay = 20.0
+        while True:
+            time.sleep(delay)
+            try:
+                st = runtime.status()
+                if st.get("connected"):
+                    delay = 20.0
+                    continue
+                has_creds = bool(os.environ.get("THS_USERNAME")
+                                 or st.get("credentials"))
+                if not has_creds:
+                    print("[ths-worker] 断线且无账号凭据，跳过重连", flush=True)
+                    delay = 60.0
+                    continue
+                print("[ths-worker] 检测到断线，尝试重连…", flush=True)
+                box: dict = {}
+
+                def _do() -> None:
+                    try:
+                        box["r"] = runtime.connect()
+                    except Exception as exc:  # noqa: BLE001
+                        box["e"] = exc
+
+                th = threading.Thread(target=_do, name="ths-reconnect", daemon=True)
+                th.start()
+                th.join(30)
+                if th.is_alive():
+                    print("[ths-worker] 重连超时（30s），稍后再试", flush=True)
+                    delay = 60.0
+                    continue
+                if "e" in box or not (box.get("r") or {}).get("success"):
+                    err = box.get("e") or (box.get("r") or {}).get("error")
+                    delay = min(delay * 2, 120.0)
+                    print(f"[ths-worker] 重连失败: {err}（{delay:.0f}s 后重试）",
+                          flush=True)
+                else:
+                    delay = 20.0
+                    print("[ths-worker] 重连成功", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                delay = min(delay * 2, 120.0)
+                print(f"[ths-worker] 重连异常: {type(exc).__name__}: {exc}",
+                      flush=True)
+
+    threading.Thread(target=_reconnect_loop, name="ths-reconnect-watchdog",
+                     daemon=True).start()
 
     state = {"state": "idle", "qrid": "", "url": "", "error": "",
              "account": "", "started_at": 0}
@@ -129,8 +273,12 @@ def main() -> None:
     @app.post("/api/qr/start")
     def qr_start():
         with state_lock:
-            if state["state"] in ("waiting", "scanned", "connecting"):
+            # 原子占位：旧实现先查后置，两个并发请求会各建一个 session/qrid，
+            # 后到的覆盖先到的，前端拿到的二维码可能永远扫不上（审计 MEDIUM）。
+            if state["state"] in ("starting", "waiting", "scanned", "connecting"):
                 return dict(state)
+            state["state"] = "starting"
+            state["error"] = ""
         try:
             session = qr_login._session()  # noqa: SLF001 上游私有构造，集中适配
             qrid = qr_login.create_qrcode(session)

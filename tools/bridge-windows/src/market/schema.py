@@ -28,10 +28,11 @@ FIELD_DEFS: list[tuple[str, str, str, str, tuple[str, ...]]] = [
      ("ths", "aidata", "tdx")),
     ("amount", "成交额", "元", "当日累计成交金额；TDX 原始为万元，聚合层已 ×10000 归一为元",
      ("ths", "aidata", "tdx")),
-    ("change_pct", "涨跌幅", "%", "相对昨收；源内直取或本地计算", ("ths", "tdx")),
-    ("bids", "买盘", "档位数组", "[{level,price,volume}]；TDX 5 档，THS 可 10 档",
+    ("change_pct", "涨跌幅", "%", "相对昨收；源内直取或本地计算",
      ("ths", "aidata", "tdx")),
-    ("asks", "卖盘", "档位数组", "[{level,price,volume}]；TDX 5 档，THS 可 10 档",
+    ("bids", "买盘", "档位数组（volume=手）", "[{level,price,volume}]；TDX 5 档，THS 可 10 档",
+     ("ths", "aidata", "tdx")),
+    ("asks", "卖盘", "档位数组（volume=手）", "[{level,price,volume}]；TDX 5 档，THS 可 10 档",
      ("ths", "aidata", "tdx")),
     ("inside", "内盘", "手", "主动卖成交量（TDX 快照 Inside）", ("aidata", "tdx")),
     ("outside", "外盘", "手", "主动买成交量（TDX 快照 Outside）", ("aidata", "tdx")),
@@ -51,7 +52,7 @@ SOURCE_DEFS: dict[str, dict] = {
         "label": "通达信（免费客户端）",
         "endpoint": "TQ 17709 get_market_snapshot（经桥 /api/v1/tdx/call）",
         "fields": ["last", "prev_close", "open", "high", "low", "volume",
-                   "amount", "bids", "asks", "inside", "outside"],
+                   "amount", "change_pct", "bids", "asks", "inside", "outside"],
         "cost": "0",
         "notes": "5 档；未订阅/未查看的标的可能滞后",
     },
@@ -59,7 +60,7 @@ SOURCE_DEFS: dict[str, dict] = {
         "label": "通达信（TdxAiData 付费）",
         "endpoint": "tdxaidata get_market_snapshot（桥 /api/v1/aidata/call）",
         "fields": ["last", "prev_close", "open", "high", "low", "volume",
-                   "amount", "bids", "asks", "inside", "outside"],
+                   "amount", "change_pct", "bids", "asks", "inside", "outside"],
         "cost": "按 200 条/词元",
         "notes": "与 tdx 同源不同通道；批量取更省",
     },
@@ -105,7 +106,8 @@ def normalize_tdx(raw: dict) -> dict:
     # 统一字段一律用元，这里 ×10000 归一；THS 侧 quotes_ext.amount 本身是元。
     amount = _f(raw.get("Amount"))
     if amount is not None:
-        amount *= 10000.0
+        # 四舍五入到分：26354.92×10000 在浮点里是 263549199.99999997
+        amount = round(amount * 10000.0, 2)
     return {
         "last": last,
         "prev_close": prev,
@@ -148,8 +150,12 @@ def normalize_ths(quote: dict | None, depth: dict | None,
             lv = item.get("level")
             if isinstance(lv, str):
                 lv = _level_map.get(lv.strip(), lv)
-            out.append({"level": lv, "price": price,
-                        "volume": _f(item.get("volume", item.get("qty")))})
+            vol = _f(item.get("volume", item.get("qty")))
+            # THS 盘口 qty 单位是**股**（amount = price × qty 可验证），
+            # TDX 的 Buyv/Sellv 是**手**；统一字段一律用手（÷100）。
+            if vol is not None and item.get("qty") is not None:
+                vol = round(vol / 100.0, 2)
+            out.append({"level": lv, "price": price, "volume": vol})
         return out or None
 
     # `/api/quotes_ext`（统一列表字段）是标量的主来源：price/chg_pct/amount/
