@@ -586,6 +586,23 @@ def main():
     assert "TokenKey" in _svc_err.status()["last_error"]
     print("  ✅ tqs 打印式失败→明确异常（Key 被拒）")
 
+    # 用量计量与单次行数上限（2000 笔逐笔≈40 词元，必须能拦）
+    _svc_b = AidataService(enabled=False, ini_path=_aini, max_rows_per_call=100)
+    try:
+        _svc_b._check_row_budget({"wantnum": 2000})
+        raise AssertionError("超限应被拒")
+    except ValueError:
+        pass
+    _svc_b._check_row_budget({"wantnum": 100})
+    assert AidataService._count_rows({"Time": [1, 2, 3]}) == 3
+    assert AidataService._count_rows([{"a": 1}, {"a": 2}]) == 2
+    _svc_b._usage = {"day": "20260101", "calls": 0, "bytes": 0, "rows": 0,
+                     "by_method": {}}
+    _svc_b.usage_path = ""
+    _svc_b._record_usage("get_tick_data", {"Time": [1, 2, 3], "Price": [1, 2, 3]})
+    assert _svc_b._usage["calls"] == 1 and _svc_b._usage["rows"] == 3
+    print("  ✅ 用量计量 + 单次行数上限")
+
     # 实时订阅：去重大写、100 上限、无 Key 拒绝 aidata 模式、启动失败置 error。
     print("\n=== 实时订阅管理 ===")
     from src.tdx.subscription import SubscriptionManager

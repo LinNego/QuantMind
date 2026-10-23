@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import logging
 import os
 import re
 import sys
 import threading
+from datetime import datetime
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
@@ -63,10 +65,15 @@ class AidataService:
     """tdxaidata 的门面：状态、Token 管理、只读查询、订阅。"""
 
     def __init__(self, vendor_dir: str = "", ini_path: str = "",
-                 enabled: bool = True):
+                 enabled: bool = True, usage_path: str = "",
+                 max_rows_per_call: int = 1000):
         self.enabled = enabled
         self.vendor_dir = vendor_dir or ""
         self._ini_override = ini_path or ""
+        self.usage_path = usage_path or ""
+        self.max_rows_per_call = max(1, int(max_rows_per_call or 1000))
+        self._usage_lock = threading.Lock()
+        self._usage = self._load_usage()
         self._lock = threading.Lock()
         self._tqs = None
         self._pkg_dir = ""
@@ -154,6 +161,84 @@ class AidataService:
         return {"ini_path": path, "token_configured": bool(token),
                 "token_len": len(token)}
 
+    # ---- 用量计量（按数据量估算，防无感烧词元） ----
+
+    def _load_usage(self) -> dict:
+        today = datetime.now().strftime("%Y%m%d")
+        default = {"day": today, "calls": 0, "bytes": 0, "rows": 0, "by_method": {}}
+        if not self.usage_path or not os.path.exists(self.usage_path):
+            return default
+        try:
+            with open(self.usage_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return default
+        if str(data.get("day")) != today:
+            return default
+        data.setdefault("by_method", {})
+        return data
+
+    def _persist_usage(self) -> None:
+        if not self.usage_path:
+            return
+        os.makedirs(os.path.dirname(self.usage_path) or ".", exist_ok=True)
+        tmp = self.usage_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._usage, fh, ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.usage_path)
+        except OSError as exc:
+            log.warning("aidata 用量落盘失败(忽略): %s", exc)
+
+    @staticmethod
+    def _count_rows(result: Any) -> int:
+        if isinstance(result, dict):
+            return max((len(v) for v in result.values() if isinstance(v, list)), default=1)
+        if isinstance(result, list):
+            return len(result)
+        return 1
+
+    def _record_usage(self, method: str, result: Any) -> None:
+        today = datetime.now().strftime("%Y%m%d")
+        try:
+            size = len(json.dumps(result, ensure_ascii=False, default=str).encode("utf-8"))
+        except (TypeError, ValueError):
+            size = 0
+        rows = self._count_rows(result)
+        with self._usage_lock:
+            if str(self._usage.get("day")) != today:
+                self._usage = {"day": today, "calls": 0, "bytes": 0, "rows": 0,
+                               "by_method": {}}
+            self._usage["calls"] += 1
+            self._usage["bytes"] += size
+            self._usage["rows"] += rows
+            m = self._usage["by_method"].setdefault(method, {"calls": 0, "bytes": 0, "rows": 0})
+            m["calls"] += 1
+            m["bytes"] += size
+            m["rows"] += rows
+            self._persist_usage()
+
+    def _check_row_budget(self, params: dict) -> None:
+        """单次拉取行数上限：逐笔/分时最容易一把拉爆余额（2000 笔≈40 词元）。"""
+        for key in ("wantnum", "count", "limit", "stock_page_size"):
+            raw = params.get(key)
+            if raw is None:
+                continue
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if key == "wantnum" and value <= 0:
+                continue  # 0=不限，交给下面的默认上限
+            if key == "wantnum" and value == 0:
+                continue
+            if value > self.max_rows_per_call:
+                raise ValueError(
+                    f"{key}={value} 超过单次上限 {self.max_rows_per_call}"
+                    f"（aidata.max_rows_per_call 可调）")
+
     # ---- 状态 ----
 
     def status(self) -> dict:
@@ -179,6 +264,8 @@ class AidataService:
             "load_error": self._load_error,
             "last_error": self._last_error,
             "vendor_dir": self.vendor_dir,
+            "max_rows_per_call": self.max_rows_per_call,
+            "usage": dict(self._usage),
         }
 
     # ---- 调用 ----
@@ -208,6 +295,7 @@ class AidataService:
         fn = getattr(self._tqs, method, None)
         if fn is None:
             raise AidataUnavailable(f"tdxaidata v{self._version} 无 {method}")
+        self._check_row_budget(params or {})
         buffer = io.StringIO()
         try:
             with self._lock, contextlib.redirect_stdout(buffer):
@@ -227,7 +315,10 @@ class AidataService:
                     or "insufficient" in low or "token" in low and "错误" in captured):
                 raise AidataTokenRequired(f"TdxAiData Key 被拒绝：{captured[:200]}")
             raise AidataUnavailable(f"tdxaidata {method} 失败：{captured[:200]}")
-        return self._check_result(result)
+        checked = self._check_result(result)
+        if checked is not None:
+            self._record_usage(method, checked)
+        return checked
 
     def subscribe(self, codes: list[str], callback) -> None:
         self._ensure()

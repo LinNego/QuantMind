@@ -157,7 +157,9 @@ async def main():
         aidata = AidataService(
             vendor_dir=vendor_dir,
             ini_path=cfg.get("aidata.ini_path", "") or "",
-            enabled=bool(cfg.get("aidata.enabled", True)))
+            enabled=bool(cfg.get("aidata.enabled", True)),
+            usage_path=os.path.join(data_dir, "aidata_usage.json"),
+            max_rows_per_call=int(cfg.get("aidata.max_rows_per_call", 1000) or 1000))
         sub_state = cfg.get("subscription.state_file", "") or os.path.join(
             data_dir, "subscription.json")
         if not os.path.isabs(sub_state):

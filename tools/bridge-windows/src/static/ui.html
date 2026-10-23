@@ -351,7 +351,8 @@
           <div class="m"><span>方法数</span><strong id="adMethods">--</strong></div>
           <div class="m"><span>已订阅</span><strong id="adSub">--</strong></div>
         </div>
-        <div class="hint mono" id="adIni" style="margin:6px 0 10px">--</div>
+        <div class="hint mono" id="adIni" style="margin:6px 0 4px">--</div>
+        <div class="hint mono" id="adUsage" style="margin:0 0 10px">--</div>
         <div class="field">
           <label>① 桥访问 token（面板鉴权用，<b>不是</b>数据服务 Key）</label>
           <input id="tokenPanel" type="password" placeholder="填写后本页所有面板自动加载" autocomplete="off">
@@ -764,6 +765,14 @@ async function loadAidata(){
     $('#adMethods').textContent = (d.methods || []).length;
     $('#adSub').textContent = (d.subscribed || []).length;
     $('#adIni').textContent = d.ini_path || '--';
+    const u = d.usage || {};
+    const kb = ((u.bytes || 0) / 1024);
+    // 实测口径：约 0.025 词元/行（两次抽样 0.024 / 0.025）
+    const est = (u.rows || 0) * 0.025;
+    $('#adUsage').textContent = '今日用量：' + (u.calls || 0) + ' 次 / '
+      + kb.toFixed(1) + ' KB / ' + (u.rows || 0) + ' 行 ≈ '
+      + est.toFixed(1) + ' 词元（按 0.025/行）· 单次上限 '
+      + (d.max_rows_per_call || '--') + ' 行';
     const sel = $('#adMethod');
     if (!sel.options.length) {
       const pref = ['get_minute_data','get_tick_data','get_market_snapshot','get_call_auction',

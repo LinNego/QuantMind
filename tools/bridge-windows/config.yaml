@@ -63,6 +63,7 @@ aidata:
   enabled: true
   vendor_dir: "./vendor"
   ini_path: ""            # 空 = <vendor>/tdxaidata/lib/TdxAiData.ini
+  max_rows_per_call: 1000 # 单次拉取行数上限（逐笔 wantnum / 分时 count 等，防止一把拉爆词元）
   max_symbols: 100        # 通达信 SDK 单次订阅硬上限（累计并集）
 
 # 实时订阅：tq = 免费（客户端通知，桥再拉快照）；aidata = 付费（完整盘口推送）。
