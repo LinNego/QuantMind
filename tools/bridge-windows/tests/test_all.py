@@ -631,7 +631,17 @@ def main():
         raise AssertionError("空列表启用应被拒")
     except ValueError:
         pass
-    print("  ✅ 去重大写 / 100 上限 / 无 Key 拒绝 / 空列表拒绝")
+    # 通道上限：免费 tq 硬限 100；付费 aidata 可配（默认 500），切换时自动截断
+    _mgr3 = SubscriptionManager(aidata=_FakeAidata(token=True),
+                                state_file=os.path.join(_sdir, "sub3.json"),
+                                max_symbols=100, max_symbols_aidata=500)
+    _mgr3.set_config(enabled=False, mode="aidata",
+                     codes=[f"{i:06d}.SZ" for i in range(600)])
+    assert _mgr3.status()["count"] == 500, _mgr3.status()["count"]
+    assert _mgr3.status()["max_symbols"] == 500
+    _mgr3.set_config(mode="tq")
+    assert _mgr3.status()["count"] == 100, "切回 tq 未截断到 100"
+    print("  ✅ 去重大写 / tq≤100 / aidata≤500 / 切换截断 / 无 Key 拒绝")
 
     srv.shutdown()
     print(f"\n=== 结果: {passed} 通过, {failed} 失败 ===")

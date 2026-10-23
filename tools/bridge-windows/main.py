@@ -169,7 +169,9 @@ async def main():
             tq_sys_path=tq_sys,
             state_file=sub_state,
             snapshot_fetcher=tdx.get_market_snapshot,
-            max_symbols=int(cfg.get("aidata.max_symbols", 100) or 100))
+            max_symbols=int(cfg.get("subscription.max_symbols_tq",
+                                    cfg.get("aidata.max_symbols", 100)) or 100),
+            max_symbols_aidata=int(cfg.get("subscription.max_symbols_aidata", 500) or 500))
         a_status = aidata.status()
         log.info("TdxAiData: available=%s token=%s ini=%s",
                  a_status.get("available"), a_status.get("token_configured"),

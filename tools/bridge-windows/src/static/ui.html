@@ -196,14 +196,18 @@
     </div>
     <div class="top-actions">
       <span class="clock" id="clock">--:--:--</span>
-      <input id="tokenTop" type="password" placeholder="访问 token" autocomplete="off"
-             style="width:190px;padding:6px 10px;border-radius:8px;border:1px solid rgba(120,150,190,.35);background:transparent;color:inherit;font-size:12px">
+      <input id="tokenTop" type="password" placeholder="桥访问 token（非数据服务 Key）" autocomplete="off"
+             style="width:230px;padding:6px 10px;border-radius:8px;border:1px solid rgba(120,150,190,.35);background:transparent;color:inherit;font-size:12px">
       <button class="btn ghost" id="themeBtn" onclick="toggleTheme()">浅色</button>
       <button class="btn ghost" onclick="refreshAll()">刷新</button>
     </div>
   </header>
 
   <main>
+    <div id="authBanner" style="display:none;margin:0 0 14px;padding:10px 14px;border-radius:10px;background:rgba(255,190,80,.12);border:1px solid rgba(255,190,80,.45);color:#ffd479;font-size:13px;line-height:1.6">
+      未填写「桥访问 token」——所有带锁的接口（数据服务 / 订阅 / 日志）都不会工作。<br>
+      请在<b>右上角</b>或下方「数据服务」面板里输入。它和数据服务 Key（TDX-…）是<b>两个不同的东西</b>。
+    </div>
     <section class="grid kpi-grid">
       <div class="kpi" id="kpiOrders">
         <div class="label">今日下单</div>
@@ -349,7 +353,11 @@
         </div>
         <div class="hint mono" id="adIni" style="margin:6px 0 10px">--</div>
         <div class="field">
-          <label>数据服务 Key（写入 TdxAiData.ini [Token]，保存后不回显）</label>
+          <label>① 桥访问 token（面板鉴权用，<b>不是</b>数据服务 Key）</label>
+          <input id="tokenPanel" type="password" placeholder="填写后本页所有面板自动加载" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>② 数据服务 Key（通达信付费 Key，形如 TDX-…；写入 TdxAiData.ini [Token]，保存后不回显）</label>
           <input id="adTokenInput" type="password" placeholder="商城 → 我的订单 → 积分和Key管理" autocomplete="off">
         </div>
         <div class="row">
@@ -373,7 +381,7 @@
         <div class="result-box" id="adResult"></div>
       </div>
       <div class="panel">
-        <div class="panel-head"><h2>实时订阅</h2><span class="hint" id="subHint">最多 100 只 · SDK 硬上限</span></div>
+        <div class="panel-head"><h2>实时订阅</h2><span class="hint" id="subHint">通道上限按模式区分</span></div>
         <div class="metrics" style="border-top:none;margin-top:0;padding-top:0">
           <div class="m"><span>状态</span><strong id="subState">--</strong></div>
           <div class="m"><span>通道</span><strong id="subMode">--</strong></div>
@@ -733,15 +741,18 @@ function clearResult(){ const b = $('#resultBox'); b.style.display = 'none'; b.t
 
 // ---- TdxAiData（独立数据接口） / 实时订阅 ----
 function getToken(){
-  const top = (($('#tokenTop') && $('#tokenTop').value) || '').trim();
-  return top || (($('#tokenInput') && $('#tokenInput').value) || '').trim();
+  for (const id of ['tokenTop', 'tokenPanel', 'tokenInput']) {
+    const el = document.getElementById(id);
+    if (el && el.value.trim()) return el.value.trim();
+  }
+  return '';
 }
 function authHeader(){ const t = getToken(); return t ? { 'Authorization': 'Bearer ' + t } : {}; }
 function errText(body){ return (body && body.error && body.error.message) || '请求失败'; }
 function escapeHtml(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 async function loadAidata(){
-  if (!authHeader()['Authorization']) { $('#adMsg').textContent = '请先在顶部输入访问 token'; return; }
+  if (!authHeader()['Authorization']) { $('#adMsg').textContent = '请先填写「桥访问 token」（右上角或本面板 ①）'; return; }
   try {
     const { body } = await fetchJSON('/api/v1/aidata/status', { headers: authHeader() });
     if (!body.success) { $('#adMsg').textContent = errText(body); return; }
@@ -799,7 +810,7 @@ async function callAidata(){
 function clearAidataResult(){ const b = $('#adResult'); b.style.display = 'none'; b.textContent = ''; }
 
 async function loadSubscription(){
-  if (!authHeader()['Authorization']) { $('#subMsg').textContent = '请先在顶部输入访问 token'; return; }
+  if (!authHeader()['Authorization']) { $('#subMsg').textContent = '请先填写「桥访问 token」（右上角或本面板 ①）'; return; }
   try {
     const { body } = await fetchJSON('/api/v1/subscription', { headers: authHeader() });
     if (!body.success) { $('#subMsg').textContent = errText(body); return; }
@@ -810,6 +821,8 @@ async function loadSubscription(){
     $('#subPushes').textContent = fmtInt(d.pushes_total);
     $('#subLast').textContent = d.last_push_at || '--';
     $('#subBackend').textContent = (d.subscribed || []).length;
+    $('#subHint').textContent = (d.mode === 'tq' ? '免费 tq 通道' : '付费 aidata 通道')
+      + ' ≤ ' + (d.max_symbols || '--') + ' 只';
     $('#subModeSel').value = d.mode;
     if (document.activeElement !== $('#subCodes')) $('#subCodes').value = (d.codes || []).join('\n');
     const rows = (d.recent || []).slice(0, 20).map(r => `<tr>
@@ -838,7 +851,7 @@ async function searchStocks(){
   const q = ($('#subSearch').value || '').trim();
   const box = $('#subSearchList');
   if (!q) { box.innerHTML = ''; return; }
-  if (!authHeader()['Authorization']) { box.innerHTML = '<div class="empty">请先在顶部输入访问 token</div>'; return; }
+  if (!authHeader()['Authorization']) { box.innerHTML = '<div class="empty">请先填写「桥访问 token」（右上角或本面板 ①）</div>'; return; }
   try {
     const { body } = await fetchJSON('/api/v1/subscription/search?q=' + encodeURIComponent(q),
                                      { headers: authHeader() }, 20000);
@@ -859,7 +872,7 @@ function addSubCode(code){
   $('#subMsg').textContent = '已加入 ' + code + '（点「保存并启用」生效）';
 }
 async function importCodes(source){
-  if (!authHeader()['Authorization']) { $('#subMsg').textContent = '请先在顶部输入访问 token'; return; }
+  if (!authHeader()['Authorization']) { $('#subMsg').textContent = '请先填写「桥访问 token」（右上角或本面板 ①）'; return; }
   $('#subMsg').textContent = source === 'positions' ? '正在读取持仓…' : '正在读取委托…';
   try {
     const { body } = await fetchJSON('/api/v1/subscription/import', {
@@ -1018,10 +1031,35 @@ function toggleTheme(){
   applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
 }
 
+function setTokenEverywhere(v){
+  ['tokenTop', 'tokenPanel', 'tokenInput'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && el.value !== v) el.value = v;
+  });
+}
+function updateAuthBanner(){
+  const el = document.getElementById('authBanner');
+  if (el) el.style.display = getToken() ? 'none' : 'block';
+}
+['tokenTop', 'tokenPanel', 'tokenInput'].forEach(id => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener('input', () => {
+    setTokenEverywhere(el.value);
+    updateAuthBanner();
+    clearTimeout(window.__tokenTimer);
+    window.__tokenTimer = setTimeout(() => { loadAidata(); loadSubscription(); }, 400);
+  });
+});
+updateAuthBanner();
 if ($('#subSearch')) {
   $('#subSearch').addEventListener('input', () => {
     clearTimeout(subSearchTimer);
     subSearchTimer = setTimeout(searchStocks, 300);
+  });
+  $('#subModeSel').addEventListener('change', () => {
+    const m = $('#subModeSel').value;
+    $('#subHint').textContent = m === 'tq' ? '免费 tq 通道 ≤ 100 只' : '付费 aidata 通道（上限见状态）';
   });
   $('#subSearch').addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter') { clearTimeout(subSearchTimer); searchStocks(); }

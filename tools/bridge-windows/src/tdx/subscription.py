@@ -26,6 +26,7 @@ from datetime import datetime
 log = logging.getLogger(__name__)
 
 MAX_SUBSCRIBE_SYMBOLS = 100
+DEFAULT_AIDATA_MAX_SYMBOLS = 500
 MODES = ("tq", "aidata")
 
 
@@ -34,13 +35,19 @@ class SubscriptionManager:
 
     def __init__(self, aidata=None, tq_sys_path: str = "",
                  state_file: str = "", snapshot_fetcher=None,
-                 max_symbols: int = MAX_SUBSCRIBE_SYMBOLS):
+                 max_symbols: int = MAX_SUBSCRIBE_SYMBOLS,
+                 max_symbols_aidata: int = DEFAULT_AIDATA_MAX_SYMBOLS):
         self.aidata = aidata
         self.tq_sys_path = tq_sys_path or ""
         self.state_file = state_file or ""
         self.snapshot_fetcher = snapshot_fetcher
-        self.max_symbols = min(int(max_symbols or MAX_SUBSCRIBE_SYMBOLS),
-                               MAX_SUBSCRIBE_SYMBOLS)
+        # 100 只是**免费 tq 通道**的硬上限（tqcenter.subscribe_hq 源码写死）；
+        # 付费 tdxaidata 的 subscribe 在 Python 层没有 100 检查（源码实测），
+        # 真实上限以通达信服务端为准，这里按可配上限执行。
+        self.max_symbols_tq = min(int(max_symbols or MAX_SUBSCRIBE_SYMBOLS),
+                                  MAX_SUBSCRIBE_SYMBOLS)
+        self.max_symbols_aidata = max(1, int(max_symbols_aidata or
+                                             DEFAULT_AIDATA_MAX_SYMBOLS))
         self._lock = threading.Lock()
         self._enabled = False
         self._mode = "tq"
@@ -88,7 +95,11 @@ class SubscriptionManager:
 
     # ---- 配置 ----
 
-    def _clean_codes(self, codes) -> list[str]:
+    def _limit_for(self, mode: str | None = None) -> int:
+        return (self.max_symbols_tq if (mode or self._mode) == "tq"
+                else self.max_symbols_aidata)
+
+    def _clean_codes(self, codes, mode: str | None = None) -> list[str]:
         out: list[str] = []
         seen = set()
         for raw in codes or []:
@@ -97,37 +108,41 @@ class SubscriptionManager:
                 continue
             seen.add(code)
             out.append(code)
-        return out[: self.max_symbols]
+        return out[: self._limit_for(mode)]
+
+    @property
+    def max_symbols(self) -> int:
+        """当前通道的上限（保留旧属性名，UI/日志用）。"""
+        return self._limit_for()
 
     def set_config(self, enabled: bool | None = None, mode: str | None = None,
                    codes: list[str] | None = None) -> dict:
-        stop_first = False
+        """改配置；**全部校验通过后才落状态**。
+
+        旧实现是边走边改：`mode=aidata` 因缺 Key 抛错时 `self._mode` 已经改成
+        aidata，下一次设置代码就按 500 截断（2026-10-23 单测抓到）。
+        """
         with self._lock:
             # 取消订阅必须用**旧**列表：tqcenter 的 subscribe_hq 是累计并集，
             # 拿新列表去取消会把刚加上的又取消掉、旧的却留着（2026-10-23 实测）。
             old_mode, old_codes, old_state = self._mode, list(self._codes), self._state
-            if mode is not None:
-                mode = str(mode)
-                if mode not in MODES:
-                    raise ValueError(f"mode 必须是 {MODES}")
-                if mode != self._mode:
-                    self._mode = mode
-                    stop_first = True
-            if codes is not None:
-                cleaned = self._clean_codes(codes)
-                if cleaned != self._codes:
-                    self._codes = cleaned
-                    stop_first = True
-            if enabled is not None:
-                enabled = bool(enabled)
-                if enabled and not self._codes:
-                    raise ValueError("订阅列表为空")
-                if self._mode == "aidata" and enabled:
-                    if self.aidata is None or not self.aidata.status().get("token_configured"):
-                        raise ValueError("aidata 模式需要先配置 TdxAiData 付费 Key")
-                if enabled != self._enabled:
-                    self._enabled = enabled
-                    stop_first = True
+            new_mode = self._mode if mode is None else str(mode)
+            if new_mode not in MODES:
+                raise ValueError(f"mode 必须是 {MODES}")
+            if codes is None:
+                # 切换通道时按新上限重新截断（aidata 500 → tq 100）
+                new_codes = old_codes[: self._limit_for(new_mode)]
+            else:
+                new_codes = self._clean_codes(codes, new_mode)
+            new_enabled = self._enabled if enabled is None else bool(enabled)
+            if new_enabled and not new_codes:
+                raise ValueError("订阅列表为空")
+            if new_enabled and new_mode == "aidata":
+                if self.aidata is None or not self.aidata.status().get("token_configured"):
+                    raise ValueError("aidata 模式需要先配置 TdxAiData 付费 Key")
+            stop_first = (new_mode != old_mode or new_codes != old_codes
+                          or new_enabled != self._enabled)
+            self._mode, self._codes, self._enabled = new_mode, new_codes, new_enabled
             self._persist()
             codes_now, mode_now, enabled_now = list(self._codes), self._mode, self._enabled
         if stop_first:
@@ -159,8 +174,9 @@ class SubscriptionManager:
             with self._lock:
                 self._state = "stopped"
             raise ValueError("订阅列表为空")
-        if len(codes) > self.max_symbols:
-            raise ValueError(f"订阅上限 {self.max_symbols} 只")
+        limit = self._limit_for()
+        if len(codes) > limit:
+            raise ValueError(f"{self._mode} 通道订阅上限 {limit} 只")
         self._ensure_snapshot_worker()
         try:
             if mode == "aidata":
@@ -300,7 +316,9 @@ class SubscriptionManager:
                 "error": self._error,
                 "codes": list(self._codes),
                 "count": len(self._codes),
-                "max_symbols": self.max_symbols,
+                "max_symbols": self._limit_for(),
+                "max_symbols_tq": self.max_symbols_tq,
+                "max_symbols_aidata": self.max_symbols_aidata,
                 "pushes_total": self._pushes_total,
                 "last_push_at": (datetime.fromtimestamp(self._last_push_ts)
                                  .isoformat(timespec="seconds")
