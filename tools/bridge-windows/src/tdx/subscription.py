@@ -183,10 +183,15 @@ class SubscriptionManager:
             raise ValueError(f"{self._mode} 通道订阅上限 {limit} 只")
         self._ensure_snapshot_worker()
         try:
+            # DLL 的 subscribe 是阻塞调用，且在本进程内可能长时间不返回
+            # （与 tqcenter 同进程时实测会卡死，2026-10-23）。放到独立线程并限时，
+            # 绝不让唯一的订阅执行器被它占死——否则 /subscription 状态接口也会排队。
             if mode == "aidata":
-                self._start_aidata(codes)
+                self._run_with_timeout(lambda: self._start_aidata(codes),
+                                       15.0, "aidata 订阅")
             else:
-                self._start_tq(codes)
+                self._run_with_timeout(lambda: self._start_tq(codes),
+                                       15.0, "tq 订阅")
         except Exception as exc:  # noqa: BLE001
             with self._lock:
                 self._state = "error"
@@ -222,6 +227,25 @@ class SubscriptionManager:
         except Exception as exc:  # noqa: BLE001
             log.warning("取消订阅失败(忽略): %s", exc)
 
+    @staticmethod
+    def _run_with_timeout(fn, timeout: float, label: str) -> None:
+        """在独立守护线程里跑阻塞的 subscribe/initialize，超时就报错（线程自行泄漏）。"""
+        box: dict = {}
+
+        def runner():
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001
+                box["err"] = exc
+
+        thread = threading.Thread(target=runner, name="sub-start", daemon=True)
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            raise RuntimeError(f"{label} 超时（{timeout:.0f}s 未返回）")
+        if "err" in box:
+            raise box["err"]
+
     def _start_aidata(self, codes: list[str]) -> None:
         if self.aidata is None:
             raise RuntimeError("AidataService 未初始化")
@@ -252,6 +276,18 @@ class SubscriptionManager:
             parsed = {}
         if isinstance(parsed, dict):
             symbol = str(parsed.get("Code") or parsed.get("code") or "")
+            if not symbol:
+                # 付费通道（tdxaidata）推送体：
+                # {"ResultSets":[{"ColDes":[...],"Content":[[...]]}]}
+                rs = parsed.get("ResultSets")
+                if isinstance(rs, list) and rs:
+                    cols = rs[0].get("ColDes") or []
+                    rows = rs[0].get("Content") or []
+                    if rows and isinstance(rows[0], list):
+                        row = dict(zip(cols, rows[0]))
+                        symbol = str(row.get("code") or "")
+                        if symbol:
+                            parsed = row
         with self._lock:
             self._pushes_total += 1
             self._last_push_ts = time.time()

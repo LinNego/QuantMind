@@ -1133,8 +1133,8 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     async def subscription_get(request: web.Request):
         if subscription is None:
             return json_error(503, "SUBSCRIPTION_DISABLED", "订阅未启用")
-        data = await asyncio.get_running_loop().run_in_executor(
-            _SUB_EXECUTOR, subscription.status)
+        # status 是纯内存读取，走默认线程池：绝不能被 set_config 的阻塞订阅占死
+        data = await asyncio.to_thread(subscription.status)
         return web.json_response({"success": True, "data": data})
 
     async def subscription_set(request: web.Request):
@@ -1169,8 +1169,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
             limit = max(1, min(int(request.query.get("limit", "50")), 200))
         except (TypeError, ValueError):
             limit = 50
-        data = await asyncio.get_running_loop().run_in_executor(
-            _SUB_EXECUTOR, subscription.status)
+        data = await asyncio.to_thread(subscription.status)
         return web.json_response({"success": True, "data": {
             "recent": data.get("recent", [])[:limit],
             "latest": data.get("latest", {}),

@@ -38,6 +38,14 @@ READONLY_METHODS = frozenset({
     "get_stock_info", "get_stock_info_batch", "get_domain_sorthq",
     "get_subscribe_hq_stock_list", "get_gpjy_value", "get_bkjy_value",
     "get_scjy_value", "get_gp_one_data",
+    # 2026-10-23 付费 Key 打通后补：包里有、白名单之前没放行的只读方法
+    "get_trading_dates", "get_financial_data", "get_financial_data_by_date",
+    "get_gpjy_value_by_date", "get_bkjy_value_by_date", "get_scjy_value_by_date",
+    "get_divid_factors", "get_gb_info", "get_gb_info_by_date",
+    "get_kzz_info", "get_kzz_info_batch", "get_ipo_info",
+    "get_sector_list", "get_sector_list_ds", "get_user_sector",
+    "get_relation", "get_trackzs_etf_info", "get_zdt_data",
+    "get_block_from_stock", "get_match_stkinfo",
 })
 
 _TOKEN_HINT = "Need TokenKey"
