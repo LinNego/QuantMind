@@ -1328,7 +1328,10 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
         try:
             with open(html_path, "r", encoding="utf-8") as f:
                 html = f.read()
-            return _web.Response(text=html, content_type="text/html", charset="utf-8")
+            # 网页必须每次取最新：桥升级后浏览器缓存旧 UI 会让用户以为「没有新功能」。
+            return _web.Response(text=html, content_type="text/html", charset="utf-8",
+                                 headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                                          "Pragma": "no-cache", "Expires": "0"})
         except OSError:
             return _web.Response(text="<h1>ui.html 未找到</h1>", content_type="text/html")
 

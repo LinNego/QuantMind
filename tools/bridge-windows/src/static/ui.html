@@ -192,6 +192,8 @@
     </div>
     <div class="top-actions">
       <span class="clock" id="clock">--:--:--</span>
+      <input id="tokenTop" type="password" placeholder="访问 token" autocomplete="off"
+             style="width:190px;padding:6px 10px;border-radius:8px;border:1px solid rgba(120,150,190,.35);background:transparent;color:inherit;font-size:12px">
       <button class="btn ghost" id="themeBtn" onclick="toggleTheme()">浅色</button>
       <button class="btn ghost" onclick="refreshAll()">刷新</button>
     </div>
@@ -442,7 +444,7 @@
   </main>
 
   <footer>
-    <span>TDX Bridge · 实盘交易通道 · 硬上限 299/秒 · 1999/日（写死）</span>
+    <span>TDX Bridge · <b id="uiVersion" style="color:#7fe3a8">UI 2026-10-23b（数据服务/订阅）</b> · 实盘交易通道 · 硬上限 299/秒 · 1999/日（写死）</span>
     <span id="lastUpdate">等待数据…</span>
   </footer>
 </div>
@@ -659,7 +661,7 @@ async function loadStats(){
 }
 
 async function loadLogs(){
-  const token = $('#tokenInput').value.trim();
+  const token = getToken();
   const tbody = $('#logTable tbody');
   if (!token) {
     tbody.innerHTML = '<tr><td colspan="5" class="empty">输入 token 后点击刷新查看调用日志</td></tr>';
@@ -688,7 +690,7 @@ async function loadLogs(){
 
 async function callMethod(){
   const method = $('#methodSelect').value;
-  const token = $('#tokenInput').value.trim();
+  const token = getToken();
   let params;
   try { params = JSON.parse($('#paramsBox').value || '{}'); }
   catch (e) {
@@ -713,12 +715,16 @@ function showResult(text, tone){
 function clearResult(){ const b = $('#resultBox'); b.style.display = 'none'; b.textContent = ''; }
 
 // ---- TdxAiData（独立数据接口） / 实时订阅 ----
-function authHeader(){ const t = $('#tokenInput').value.trim(); return t ? { 'Authorization': 'Bearer ' + t } : {}; }
+function getToken(){
+  const top = (($('#tokenTop') && $('#tokenTop').value) || '').trim();
+  return top || (($('#tokenInput') && $('#tokenInput').value) || '').trim();
+}
+function authHeader(){ const t = getToken(); return t ? { 'Authorization': 'Bearer ' + t } : {}; }
 function errText(body){ return (body && body.error && body.error.message) || '请求失败'; }
 function escapeHtml(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 async function loadAidata(){
-  if (!authHeader()['Authorization']) return;
+  if (!authHeader()['Authorization']) { $('#adMsg').textContent = '请先在顶部输入访问 token'; return; }
   try {
     const { body } = await fetchJSON('/api/v1/aidata/status', { headers: authHeader() });
     if (!body.success) { $('#adMsg').textContent = errText(body); return; }
@@ -776,7 +782,7 @@ async function callAidata(){
 function clearAidataResult(){ const b = $('#adResult'); b.style.display = 'none'; b.textContent = ''; }
 
 async function loadSubscription(){
-  if (!authHeader()['Authorization']) return;
+  if (!authHeader()['Authorization']) { $('#subMsg').textContent = '请先在顶部输入访问 token'; return; }
   try {
     const { body } = await fetchJSON('/api/v1/subscription', { headers: authHeader() });
     if (!body.success) { $('#subMsg').textContent = errText(body); return; }
@@ -811,7 +817,7 @@ async function applySubscription(enabled){
   } catch (e) { $('#subMsg').textContent = '操作失败：' + e.message; }
 }
 
-function adminToken(){ return $('#tokenInput').value.trim(); }
+function adminToken(){ return getToken(); }
 async function loadTokens(){
   const token = adminToken();
   if (!token) { $('#tokenMsg').textContent = '请先输入管理员 token'; return; }
