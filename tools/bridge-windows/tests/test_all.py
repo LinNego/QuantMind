@@ -643,6 +643,20 @@ def main():
     assert _mgr3.status()["count"] == 100, "切回 tq 未截断到 100"
     print("  ✅ 去重大写 / tq≤100 / aidata≤500 / 切换截断 / 无 Key 拒绝")
 
+    # 限流：已鉴权走独立高预算（平台与管理端共用出口 IP，不能互相挤爆）
+    print("\n=== 限流：已鉴权独立预算 ===")
+    from src.security.rate_limiter import RateLimiter
+    _rl = RateLimiter(per_minute=5, authed_per_minute=50,
+                      local_per_minute=100, write_per_minute=2)
+    for _ in range(30):
+        assert _rl.check("1.2.3.4", "/api/v1/stats", True) is None, "已鉴权被 5/分钟掐了"
+    for _ in range(5):
+        _rl.check("5.6.7.8", "/api/v1/data", False)
+    assert _rl.check("5.6.7.8", "/api/v1/data", False) is not None, "未鉴权第 6 次应被拒"
+    for _ in range(50):
+        assert _rl.check("127.0.0.1", "/api/v1/stats", True) is None, "本机高预算失效"
+    print("  ✅ 已鉴权 6000 / 未鉴权 per_minute / 本机独立预算")
+
     srv.shutdown()
     print(f"\n=== 结果: {passed} 通过, {failed} 失败 ===")
     return 1 if failed else 0

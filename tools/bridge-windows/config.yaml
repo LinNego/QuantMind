@@ -9,7 +9,8 @@ security:
   # 600/分钟与部署端一致，也是热集行情轮转的设计预算（`tdx_hot_set_feed` 默认
   # 0.18s/只 ≈ 333/min，与持仓馈送/账户同步/推送共用同一配额）。旧默认 60 会让
   # 自带配置起桥的部署立刻自锁（热集一轮就打满），实测 429 刷屏。
-  rate_limit_per_minute: 600
+  rate_limit_per_minute: 600          # 未鉴权请求/IP/分钟（防爆破）
+  authed_rate_limit_per_minute: 6000  # 已鉴权请求/IP/分钟（平台与管理端常共用出口 IP）
   write_rate_limit: 10
   fail_ban_threshold: 5
   fail_ban_seconds: 30

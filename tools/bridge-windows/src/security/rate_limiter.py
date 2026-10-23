@@ -24,9 +24,13 @@ class RateLimiter:
     def __init__(self, per_minute: int = 60, write_per_minute: int = 10,
                  fail_ban_threshold: int = 5, fail_ban_seconds: int = 30,
                  local_per_minute: int = 6000,
-                 local_write_per_minute: int = 30000):
+                 local_write_per_minute: int = 30000,
+                 authed_per_minute: int = 6000):
         self.per_minute = per_minute
         self.write_per_minute = write_per_minute
+        # 已鉴权请求的独立预算：限流是防爆破，不该把合法客户端一起掐死。
+        # 平台容器与管理端常常共用同一个出口 IP（NAT），600/分钟会被互相挤爆。
+        self.authed_per_minute = authed_per_minute
         # 本机（127.0.0.1）是可信的本地采集器/测试，给独立高预算；
         # 远程 IP 仍按 per_minute/write_per_minute。交易硬上限（299/1999）
         # 由 security/trade_limits.py 独立强制，不依赖这里。
@@ -64,10 +68,15 @@ class RateLimiter:
         is_write = any(path.startswith(p) for p in WRITE_PATHS)
         is_local = ip in ("127.0.0.1", "::1")
         bucket = self._write_windows if is_write else self._windows
-        if is_local:
-            limit = self.local_write_per_minute if is_write else self.local_per_minute
+        if is_write:
+            limit = (self.local_write_per_minute if is_local
+                     else self.write_per_minute)
+        elif is_local:
+            limit = self.local_per_minute
+        elif auth_ok:
+            limit = self.authed_per_minute
         else:
-            limit = self.write_per_minute if is_write else self.per_minute
+            limit = self.per_minute
         if not self._check_window(bucket, ip, limit):
             return f"请求过于频繁 (限 {limit}/分钟)"
 

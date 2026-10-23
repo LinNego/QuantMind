@@ -122,6 +122,13 @@ class SubscriptionManager:
         旧实现是边走边改：`mode=aidata` 因缺 Key 抛错时 `self._mode` 已经改成
         aidata，下一次设置代码就按 500 截断（2026-10-23 单测抓到）。
         """
+        # aidata Key 校验放在锁外：_on_push 会从 DLL 回调线程拿管理锁，
+        # 若这里持锁再回调 tqcenter/aidata，锁序反转会死锁（2026-10-23 实测）。
+        check_mode = str(mode) if mode is not None else self._mode
+        will_enable = self._enabled if enabled is None else bool(enabled)
+        if will_enable and check_mode == "aidata":
+            if self.aidata is None or not self.aidata.status().get("token_configured"):
+                raise ValueError("aidata 模式需要先配置 TdxAiData 付费 Key")
         with self._lock:
             # 取消订阅必须用**旧**列表：tqcenter 的 subscribe_hq 是累计并集，
             # 拿新列表去取消会把刚加上的又取消掉、旧的却留着（2026-10-23 实测）。
@@ -137,9 +144,6 @@ class SubscriptionManager:
             new_enabled = self._enabled if enabled is None else bool(enabled)
             if new_enabled and not new_codes:
                 raise ValueError("订阅列表为空")
-            if new_enabled and new_mode == "aidata":
-                if self.aidata is None or not self.aidata.status().get("token_configured"):
-                    raise ValueError("aidata 模式需要先配置 TdxAiData 付费 Key")
             stop_first = (new_mode != old_mode or new_codes != old_codes
                           or new_enabled != self._enabled)
             self._mode, self._codes, self._enabled = new_mode, new_codes, new_enabled
@@ -297,18 +301,23 @@ class SubscriptionManager:
     # ---- 状态 ----
 
     def status(self) -> dict:
+        # 后端订阅查询**必须在 manager 锁外**：DLL 推送线程持 tqcenter 的
+        # _callback_lock 调进 _on_push 再拿 manager 锁；这里若持锁反查
+        # get_subscribe_hq_stock_list() 就是锁序反转 → 接口永久挂住。
         with self._lock:
-            subscribed = []
-            if self._mode == "aidata" and self.aidata is not None:
-                try:
-                    subscribed = list(self.aidata.status().get("subscribed") or [])
-                except Exception:  # noqa: BLE001
-                    subscribed = []
-            elif self._tq is not None:
-                try:
-                    subscribed = list(self._tq.get_subscribe_hq_stock_list() or [])
-                except Exception:  # noqa: BLE001
-                    subscribed = []
+            mode = self._mode
+        subscribed = []
+        if mode == "aidata" and self.aidata is not None:
+            try:
+                subscribed = list(self.aidata.status().get("subscribed") or [])
+            except Exception:  # noqa: BLE001
+                subscribed = []
+        elif mode == "tq" and self._tq is not None:
+            try:
+                subscribed = list(self._tq.get_subscribe_hq_stock_list() or [])
+            except Exception:  # noqa: BLE001
+                subscribed = []
+        with self._lock:
             return {
                 "enabled": self._enabled,
                 "mode": self._mode,

@@ -192,7 +192,9 @@ async def main():
             per_minute=cfg.get("security.rate_limit_per_minute", 60),
             write_per_minute=cfg.get("security.write_rate_limit", 10),
             fail_ban_threshold=cfg.get("security.fail_ban_threshold", 5),
-            fail_ban_seconds=cfg.get("security.fail_ban_seconds", 30))
+            fail_ban_seconds=cfg.get("security.fail_ban_seconds", 30),
+            authed_per_minute=int(cfg.get(
+                "security.authed_rate_limit_per_minute", 6000) or 6000))
         memory_cache = MemoryCache()
         log.info("安全加固已启用: IP限流 + 内存缓存")
     except Exception as e:
