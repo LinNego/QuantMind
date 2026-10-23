@@ -17,6 +17,7 @@ from ..executor.order_tracker import OrderTracker
 from ..executor.plan_executor import PlanExecutor
 from ..security.trade_limits import TradeRateGuard
 from ..tdx.client import TdxClient, TdxError, TdxTimeoutError
+from ..ths.client import ThsClient
 from ..tdx import parser
 from ..utils.auth import verify_token
 from ..utils.system_metrics import SystemMetrics
@@ -647,7 +648,7 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
               tracker: OrderTracker, sltp, cache_db=None, port: int = 8550,
               extra_tokens: list = None, rate_limiter=None,
               memory_cache=None, trade_limits_dir: str = "",
-              aidata=None, subscription=None) -> web.Application:
+              aidata=None, subscription=None, ths=None) -> web.Application:
     app = web.Application()
     if trade_limits_dir:
         # 撤单日计数独立持久化；桥重启不清零
@@ -1438,8 +1439,165 @@ def build_app(token: str, tdx: TdxClient, executor: PlanExecutor,
     app.router.add_get("/api/v1/subscription", subscription_get)
     app.router.add_post("/api/v1/subscription", subscription_set)
     app.router.add_get("/api/v1/subscription/pushes", subscription_pushes)
+    # ---- 同花顺旁路（独立 worker；桥只管鉴权/缓存/熔断/审计） ----
+
+    def _ths_error(exc: Exception):
+        name = type(exc).__name__
+        if name == "ThsDisabled":
+            return json_error(503, "THS_DISABLED", str(exc))
+        if name == "ThsCircuitOpen":
+            return json_error(503, "THS_CIRCUIT_OPEN", str(exc))
+        if name == "ThsUnavailable":
+            return json_error(502, "THS_UNAVAILABLE", str(exc))
+        if isinstance(exc, ValueError):
+            return json_error(400, "THS_BAD_ARGUMENT", str(exc))
+        return json_error(500, "THS_ERROR", f"{name}: {exc}")
+
+    async def _ths_call(method: str, params: dict):
+        """调用 worker 并写审计日志；返回 (data, error_response)。"""
+        t0 = time.monotonic()
+        try:
+            data = await ths.call(method, params)
+        except Exception as exc:  # noqa: BLE001
+            _record_call(cache_db, "ths." + method, params, error=str(exc),
+                         duration_ms=round((time.monotonic() - t0) * 1000, 1),
+                         category="ths")
+            return None, _ths_error(exc)
+        _record_call(cache_db, "ths." + method, params, result=data,
+                     duration_ms=round((time.monotonic() - t0) * 1000, 1),
+                     category="ths")
+        return data, None
+
+    async def ths_status(request: web.Request):
+        if ths is None:
+            return json_error(503, "THS_DISABLED", "同花顺旁路未配置")
+        data = ths.status()
+        try:
+            data["worker"] = await ths.call("status", {}, use_cache=False)
+        except Exception as exc:  # noqa: BLE001
+            data["worker_error"] = f"{type(exc).__name__}: {exc}"
+        return web.json_response({"success": True, "data": data})
+
+    async def ths_call(request: web.Request):
+        """通用透传：{"method":"depth","params":{"code":"600519.SH","levels":10}}"""
+        if ths is None:
+            return json_error(503, "THS_DISABLED", "同花顺旁路未配置")
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return json_error(400, "BAD_JSON", "请求体必须是 JSON")
+        method = str((body or {}).get("method") or "")
+        params = (body or {}).get("params") or {}
+        if not isinstance(params, dict):
+            return json_error(400, "BAD_PARAMS", "params 必须是对象")
+        data, err = await _ths_call(method, params)
+        if err is not None:
+            return err
+        return web.json_response({"success": True,
+                                  "data": {"method": method, "result": _jsonable(data)}})
+
+    async def ths_quote(request: web.Request):
+        codes = (request.query.get("codes") or "").strip()
+        if not codes:
+            return json_error(400, "THS_BAD_ARGUMENT", "缺少 codes（逗号分隔）")
+        data, err = await _ths_call("quote", {"codes": codes})
+        if err is not None:
+            return err
+        return web.json_response({"success": True, "data": _jsonable(data)})
+
+    async def ths_depth(request: web.Request):
+        code = request.match_info.get("code", "")
+        try:
+            levels = int(request.query.get("levels", "5"))
+        except (TypeError, ValueError):
+            return json_error(400, "THS_BAD_ARGUMENT", "levels 必须是 5 或 10")
+        if levels not in (5, 10):
+            return json_error(400, "THS_BAD_ARGUMENT", "levels 必须是 5 或 10")
+        data, err = await _ths_call("depth", {"code": code, "levels": levels})
+        if err is not None:
+            return err
+        return web.json_response({"success": True, "data": _jsonable(data)})
+
+    async def ths_flow(request: web.Request):
+        codes = (request.query.get("codes") or "").strip()
+        if not codes:
+            return json_error(400, "THS_BAD_ARGUMENT", "缺少 codes（逗号分隔）")
+        data, err = await _ths_call("quotes_ext", {"codes": codes})
+        if err is not None:
+            return err
+        return web.json_response({"success": True, "data": _jsonable(data)})
+
+    async def ths_dxjl(request: web.Request):
+        try:
+            pages = int(request.query.get("pages", "5"))
+        except (TypeError, ValueError):
+            return json_error(400, "THS_BAD_ARGUMENT", "pages 必须是整数")
+        data, err = await _ths_call("dxjl", {"pages": pages})
+        if err is not None:
+            return err
+        return web.json_response({"success": True, "data": _jsonable(data)})
+
+    async def ths_boards(request: web.Request):
+        category = request.query.get("category")
+        params = {"category": category} if category else {}
+        data, err = await _ths_call("boards", params)
+        if err is not None:
+            return err
+        return web.json_response({"success": True, "data": _jsonable(data)})
+
+    async def ths_connect(request: web.Request):
+        data, err = await _ths_call("connect", {})
+        if err is not None:
+            return err
+        return web.json_response({"success": True, "data": _jsonable(data)})
+
+    async def ths_compare(request: web.Request):
+        """TDX 与 THS 同尺对照：同一只股票的最新价/量。"""
+        code = (request.query.get("code") or "").strip()
+        if not code:
+            return json_error(400, "THS_BAD_ARGUMENT", "缺少 code")
+        data, err = await _ths_call("quote", {"codes": code})
+        if err is not None:
+            return err
+        item = (data or [{}])[0] if isinstance(data, list) else (data or {})
+        ths_norm = ThsClient.normalize_quote(item)
+        try:
+            tdx_snap = await _call_tdx(tdx.get_market_snapshot, code, kind="data")
+        except Exception as exc:  # noqa: BLE001
+            return json_error(502, "TDX_UNAVAILABLE", f"{type(exc).__name__}: {exc}")
+        tdx_norm = {
+            "code": code, "source": "tdx",
+            "last": tdx_snap.get("Now"), "prev_close": tdx_snap.get("LastClose"),
+            "open": tdx_snap.get("Open"), "high": tdx_snap.get("Max"),
+            "low": tdx_snap.get("Min"), "volume": tdx_snap.get("Volume"),
+            "amount": tdx_snap.get("Amount"),
+        }
+
+        def diff_pct(a, b):
+            try:
+                a, b = float(a), float(b)
+                return round((b - a) / a * 100, 4) if a else None
+            except (TypeError, ValueError):
+                return None
+
+        return web.json_response({"success": True, "data": {
+            "code": code, "tdx": tdx_norm, "ths": ths_norm,
+            "diff_pct": {"last": diff_pct(tdx_norm["last"], ths_norm["last"]),
+                         "volume": diff_pct(tdx_norm["volume"], ths_norm["volume"])},
+        }})
+
     app.router.add_get("/api/v1/subscription/search", subscription_search)
     app.router.add_post("/api/v1/subscription/import", subscription_import)
+    # 同花顺旁路（只读；worker 127.0.0.1:8765，绝不对外）
+    app.router.add_get("/api/v1/ths/status", ths_status)
+    app.router.add_post("/api/v1/ths/call", ths_call)
+    app.router.add_get("/api/v1/ths/quote", ths_quote)
+    app.router.add_get("/api/v1/ths/depth/{code}", ths_depth)
+    app.router.add_get("/api/v1/ths/flow", ths_flow)
+    app.router.add_get("/api/v1/ths/dxjl", ths_dxjl)
+    app.router.add_get("/api/v1/ths/boards", ths_boards)
+    app.router.add_post("/api/v1/ths/connect", ths_connect)
+    app.router.add_get("/api/v1/ths/compare", ths_compare)
     app.router.add_delete("/api/v1/auth/tokens/{token_hash}", delete_token_route)
     app.router.add_get("/ui", ui_page)
 

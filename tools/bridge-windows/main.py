@@ -188,6 +188,22 @@ async def main():
     except Exception as e:
         log.warning(f"TdxAiData/订阅初始化失败: {e}")
 
+    # 同花顺旁路（只读；独立 worker，默认关闭）
+    ths = None
+    try:
+        from src.ths.client import ThsClient
+        ths = ThsClient(
+            base_url=cfg.get("ths.base_url", "http://127.0.0.1:8765") or
+            "http://127.0.0.1:8765",
+            enabled=bool(cfg.get("ths.enabled", False)),
+            timeout_s=float(cfg.get("ths.timeout_s", 8.0) or 8.0),
+            cache_enabled=bool(cfg.get("ths.cache_enabled", True)),
+            circuit_failures=int(cfg.get("ths.circuit_failures", 5) or 5),
+            circuit_cooldown_s=float(cfg.get("ths.circuit_cooldown_s", 30) or 30))
+        log.info("同花顺旁路: enabled=%s base_url=%s", ths.enabled, ths.base_url)
+    except Exception as e:
+        log.warning(f"同花顺旁路初始化失败: {e}")
+
     # 安全加固: IP 限流 + 内存缓存
     rate_limiter = None
     memory_cache = None
@@ -206,6 +222,10 @@ async def main():
     except Exception as e:
         log.warning(f"安全加固启用失败: {e}")
 
+    async def _close_ths(_app):
+        if ths is not None:
+            await ths.close()
+
     tasks = []
 
     if args.mode in ("auto", "http"):
@@ -216,7 +236,8 @@ async def main():
                                              cache_db=cache_db, rate_limiter=rate_limiter,
                                              memory_cache=memory_cache,
                                              trade_limits_dir=data_dir,
-                                             aidata=aidata, subscription=subscription)
+                                             aidata=aidata, subscription=subscription,
+                                             ths=ths)
             tasks.append(asyncio.create_task(_wait_forever(runner)))
             log.info(f"通达信桥控制台: http://127.0.0.1:{port}/ui")
             # 自动打开网页控制台 (延迟确保服务已监听)

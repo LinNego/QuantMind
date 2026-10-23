@@ -492,6 +492,30 @@
       <div class="msg" id="tkMsg"></div>
     </section>
 
+    <section class="panel" id="thsPanel">
+      <div class="panel-head">
+        <h2>同花顺 · 资金/盘口</h2>
+        <span class="hint" id="thsHint">只读旁路 · 独立 worker（127.0.0.1:8765）</span>
+      </div>
+      <div class="tk-kpis">
+        <div class="kpi"><div class="label">连接</div><div class="value" id="thsConn">--</div><div class="sub" id="thsAcct">--</div></div>
+        <div class="kpi"><div class="label">账号</div><div class="value" id="thsCred">--</div><div class="sub">L2 / 普通</div></div>
+        <div class="kpi"><div class="label">熔断</div><div class="value" id="thsCircuit">--</div><div class="sub" id="thsCircuitSub">--</div></div>
+        <div class="kpi"><div class="label">上游延迟</div><div class="value" id="thsLatency">--</div><div class="sub" id="thsStats">--</div></div>
+      </div>
+      <div class="row" style="gap:8px;margin-bottom:10px">
+        <input id="thsCode" placeholder="代码，如 600519.SH" style="flex:0 0 190px">
+        <button class="btn ghost" onclick="thsQuery('quote')">报价</button>
+        <button class="btn ghost" onclick="thsQuery('depth')">十档</button>
+        <button class="btn ghost" onclick="thsQuery('flow')">资金流</button>
+        <button class="btn ghost" onclick="thsQuery('dxjl')">短线精灵</button>
+        <button class="btn ghost" onclick="thsQuery('compare')">对照 TDX</button>
+        <button class="btn ghost" onclick="loadThs()">刷新状态</button>
+      </div>
+      <div class="msg" id="thsMsg"></div>
+      <div class="result-box" id="thsResult"></div>
+    </section>
+
     <section class="grid grid-2">
       <div class="panel">
         <div class="panel-head"><h2>接口测试</h2><span class="hint">通用 JSON-RPC 透传（交易方法已封）</span></div>
@@ -1111,10 +1135,10 @@ function buildSlots(){
 function startPolling(){
   stopPolling();
   S.timers = [setInterval(loadLive, 5000), setInterval(loadStats, 15000),
-              setInterval(() => { loadAidata(); loadSubscription(); }, 15000)];
+              setInterval(() => { loadAidata(); loadSubscription(); loadThs(); }, 15000)];
 }
 function stopPolling(){ S.timers.forEach(clearInterval); S.timers = []; }
-function refreshAll(){ loadLive(); loadStats(); loadLogs(); loadAidata(); loadSubscription(); }
+function refreshAll(){ loadLive(); loadStats(); loadLogs(); loadAidata(); loadSubscription(); loadThs(); }
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { stopPolling(); }
@@ -1258,6 +1282,60 @@ function renderTokenStats(d){
 }
 
 async function saveBalanceFromPanel(){ await saveBalance('tkBalanceInput'); }
+
+async function loadThs(){
+  if (!authHeader()['Authorization']) return;
+  try {
+    const { body } = await fetchJSON('/api/v1/ths/status', { headers: authHeader() });
+    if (!body.success) { $('#thsHint').textContent = errText(body); return; }
+    const d = body.data || {};
+    const w = d.worker || {};
+    $('#thsConn').textContent = w.connected ? '已连接' : (d.enabled ? '未连接' : '未启用');
+    $('#thsConn').style.color = w.connected ? '#7fe3a8' : '#ffd479';
+    $('#thsAcct').textContent = w.account_kind || ((w.credentials === false) ? '未配置账号' : '--');
+    $('#thsCred').textContent = w.credentials ? '已配置' : '缺失';
+    $('#thsCred').style.color = w.credentials ? '#7fe3a8' : '#ff9b9b';
+    const c = d.circuit || {};
+    $('#thsCircuit').textContent = c.open ? ('熔断 ' + c.open_for_s + 's') : '正常';
+    $('#thsCircuit').style.color = c.open ? '#ff9b9b' : '';
+    $('#thsCircuitSub').textContent = '连续失败 ' + (c.consecutive_failures || 0) + '/' + (c.threshold || '--');
+    const st = d.stats || {};
+    $('#thsLatency').textContent = (st.last_ms || 0) + ' ms';
+    $('#thsStats').textContent = '调用 ' + (st.calls || 0) + ' · 缓存 ' + (st.cache_hits || 0)
+      + ' · 错 ' + (st.errors || 0);
+    let hint = d.enabled
+      ? ('worker ' + d.base_url + ' · ' + (d.methods || []).length + ' 个方法')
+      : '未启用（config: ths.enabled）';
+    const pre = (w.preheat || {}).error;
+    if (pre) hint += ' · ' + String(pre).slice(0, 60);
+    if (w.credentials === false) hint += ' · 在 data/ths.env 填 THS_USERNAME/THS_PASSWORD 后重启 TdxThsWorker';
+    $('#thsHint').textContent = hint;
+    $('#thsMsg').textContent = d.worker_error ? ('worker 探测失败：' + d.worker_error) : '';
+  } catch (e) { $('#thsHint').textContent = '读取失败：' + e.message; }
+}
+
+async function thsQuery(kind){
+  const code = ($('#thsCode').value || '').trim();
+  const box = $('#thsResult');
+  if (!authHeader()['Authorization']) {
+    box.style.display = 'block'; box.textContent = '请先输入访问 token'; box.style.color = '#ffd479';
+    return;
+  }
+  let url = '';
+  if (kind === 'quote') url = '/api/v1/ths/quote?codes=' + encodeURIComponent(code);
+  else if (kind === 'depth') url = '/api/v1/ths/depth/' + encodeURIComponent(code) + '?levels=10';
+  else if (kind === 'flow') url = '/api/v1/ths/flow?codes=' + encodeURIComponent(code);
+  else if (kind === 'dxjl') url = '/api/v1/ths/dxjl?pages=2';
+  else if (kind === 'compare') url = '/api/v1/ths/compare?code=' + encodeURIComponent(code);
+  box.style.display = 'block'; box.textContent = '调用中…'; box.style.color = '#c9d7e8';
+  try {
+    const { body } = await fetchJSON(url, { headers: authHeader() }, 30000);
+    box.textContent = JSON.stringify(body, null, 2).slice(0, 20000);
+    box.style.color = body.success ? '#b7f7d3' : '#ffd0d0';
+  } catch (e) {
+    box.textContent = '调用失败：' + e.message; box.style.color = '#ffd0d0';
+  }
+}
 
 applyTheme(document.documentElement.dataset.theme || 'dark');
 initCollapsibles();

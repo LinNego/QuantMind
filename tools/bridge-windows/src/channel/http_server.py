@@ -13,11 +13,11 @@ async def start_http_server(host: str, port: int, token: str, tdx: TdxClient,
                             executor: PlanExecutor, tracker: OrderTracker, sltp,
                             cache_db=None, extra_tokens=None, rate_limiter=None,
                             memory_cache=None, trade_limits_dir="",
-                            aidata=None, subscription=None):
+                            aidata=None, subscription=None, ths=None):
     app = build_app(token, tdx, executor, tracker, sltp, cache_db=cache_db, port=port,
                     extra_tokens=extra_tokens, rate_limiter=rate_limiter,
                     memory_cache=memory_cache, trade_limits_dir=trade_limits_dir,
-                    aidata=aidata, subscription=subscription)
+                    aidata=aidata, subscription=subscription, ths=ths)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)

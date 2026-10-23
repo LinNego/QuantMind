@@ -76,6 +76,15 @@ subscription:
   mode: "tq"
   state_file: "./data/subscription.json"
   tq_sys_path: ""         # 空 = <bridge 父目录>/sys（通达信 PYPlugins\sys）
+
+# 同花顺旁路（只读；独立 worker 进程，默认关闭）。开启后 /api/v1/ths/* 才可用。
+ths:
+  enabled: false
+  base_url: "http://127.0.0.1:8765"
+  timeout_s: 8
+  cache_enabled: true
+  circuit_failures: 5
+  circuit_cooldown_s: 30
   max_symbols_tq: 100     # 免费通道硬上限（tqcenter.subscribe_hq 源码写死）
   max_symbols_aidata: 500 # 付费通道（tdxaidata 的 Python 层无 100 检查；真实上限以服务端为准）
   allow_paid_pushes: false # 付费推送按条计费（≈9000 词元/小时），默认硬禁
