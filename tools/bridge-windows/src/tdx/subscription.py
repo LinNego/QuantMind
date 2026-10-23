@@ -264,7 +264,9 @@ class SubscriptionManager:
         if set(target) == set(current):
             target = current
         error = ""
-        if target != current or (auto["enabled"] and not self._enabled):
+        # state=error（如 TQ 未起、start 失败）时下一轮也要重试，不能因集合未变而躺平
+        if (target != current
+                or (auto["enabled"] and (not self._enabled or self._state == "error"))):
             try:
                 self.set_config(True if auto["enabled"] else None, None, target)
             except Exception as exc:  # noqa: BLE001
