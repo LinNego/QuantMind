@@ -33,13 +33,12 @@ META_COLS = {
     "index_code",
     "index_name",
     "close",
-    "fwd_ret_5",
-    "fwd_ret_10",
-    "fwd_ret_20",
+    "sector_code",
+    "sec_eq_ret",
 }
 EMBARGO_EXTRA = 5  # 标签外再留 5 个交易日，防特征窗口重叠
 VAL_DAYS = 126
-HORIZONS = (5, 10, 20)
+HORIZONS = (1, 5, 10, 20)
 
 
 def _auc(y: np.ndarray, p: np.ndarray) -> float:
@@ -126,6 +125,22 @@ def _rule_signal(df: pd.DataFrame) -> np.ndarray:
     return (df["ret_20"].fillna(0) > 0).astype(int).values
 
 
+def _select_features(Xtr: pd.DataFrame, Xval: pd.DataFrame, Xte: pd.DataFrame):
+    """折内特征筛选：覆盖≥50%、非常量、去高相关（|r|>0.98）。"""
+    keep = [
+        c
+        for c in Xtr.columns
+        if Xtr[c].notna().mean() >= 0.5 and Xtr[c].nunique(dropna=True) > 1
+    ]
+    Xtr, Xval, Xte = Xtr[keep], Xval[keep], Xte[keep]
+    if len(keep) > 2:
+        corr = Xtr.corr().abs()
+        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        drop = {c for c in upper.columns if (upper[c] > 0.98).any()}
+        keep = [c for c in keep if c not in drop]
+    return Xtr[keep], Xval[keep], Xte[keep]
+
+
 def _fit_predict(
     name: str,
     Xtr: pd.DataFrame,
@@ -136,7 +151,7 @@ def _fit_predict(
     seed: int = 42,
 ) -> np.ndarray:
     """训练单模型 + 验证集早停/校准，返回测试集 P(up)。"""
-    from sklearn.isotonic import IsotonicRegression
+    from sklearn.linear_model import LogisticRegression
 
     if name == "logistic":
         from sklearn.impute import SimpleImputer
@@ -148,7 +163,7 @@ def _fit_predict(
             [
                 ("imp", SimpleImputer(strategy="median")),
                 ("sc", StandardScaler()),
-                ("clf", LogisticRegression(C=0.2, max_iter=2000, class_weight="balanced")),
+                ("clf", LogisticRegression(C=0.08, max_iter=2000)),
             ]
         )
         pipe.fit(Xtr, ytr)
@@ -158,13 +173,13 @@ def _fit_predict(
         import lightgbm as lgb
 
         model = lgb.LGBMClassifier(
-            n_estimators=400,
+            n_estimators=300,
             learning_rate=0.03,
-            num_leaves=15,
-            min_child_samples=40,
+            num_leaves=7,
+            min_child_samples=80,
             subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=1.0,
+            colsample_bytree=0.6,
+            reg_lambda=3.0,
             random_state=seed,
             n_jobs=4,
             verbose=-1,
@@ -182,13 +197,13 @@ def _fit_predict(
         from xgboost import XGBClassifier
 
         model = XGBClassifier(
-            n_estimators=400,
+            n_estimators=300,
             learning_rate=0.03,
-            max_depth=3,
-            min_child_weight=20,
+            max_depth=2,
+            min_child_weight=40,
             subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=1.0,
+            colsample_bytree=0.6,
+            reg_lambda=3.0,
             random_state=seed,
             n_jobs=4,
             eval_metric="auc",
@@ -201,10 +216,10 @@ def _fit_predict(
         from catboost import CatBoostClassifier
 
         model = CatBoostClassifier(
-            iterations=600,
+            iterations=400,
             learning_rate=0.03,
-            depth=4,
-            l2_leaf_reg=3.0,
+            depth=3,
+            l2_leaf_reg=10.0,
             random_seed=seed,
             verbose=False,
             allow_writing_files=False,
@@ -216,10 +231,14 @@ def _fit_predict(
         raise ValueError(name)
 
     # 校准：验证集 isotonic（测试集仍完全 OOS）
-    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    # 验证集某一类太少时不校准；小样本用 Platt（isotonic 在 ~100 点上易过拟合）
+    pos = int(np.sum(np.asarray(yval) == 1))
+    if pos < 10 or pos > len(yval) - 10:
+        return raw_te
     try:
-        iso.fit(raw_val, yval)
-        return iso.predict(raw_te)
+        platt = LogisticRegression(C=1.0, max_iter=1000)
+        platt.fit(np.asarray(raw_val).reshape(-1, 1), np.asarray(yval))
+        return platt.predict_proba(np.asarray(raw_te).reshape(-1, 1))[:, 1]
     except Exception:
         return raw_te
 
@@ -227,7 +246,14 @@ def _fit_predict(
 def run(features_path: Path, out_dir: Path, test_years: list[int], only_index: str = '', horizons: tuple[int, ...] = HORIZONS) -> dict[str, Any]:
     df = pd.read_parquet(features_path)
     df["trade_date"] = pd.to_datetime(df["trade_date"])
-    feature_cols = [c for c in df.columns if c not in META_COLS]
+    # 任何 fwd_ret_* 都是标签（含 T+1），绝不能进特征——否则 AUC=1.0 假完美
+    feature_cols = [
+        c
+        for c in df.columns
+        if c not in META_COLS
+        and not c.startswith("fwd_ret_")
+        and pd.api.types.is_numeric_dtype(df[c])
+    ]
     models = ("logistic", "lgb", "xgb", "cat")
     report: dict[str, Any] = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -268,9 +294,12 @@ def run(features_path: Path, out_dir: Path, test_years: list[int], only_index: s
                 ]
                 if len(test) < 20:
                     continue
-                Xtr, ytr = fit[feature_cols], fit["y"].values
-                Xval, yval = val_es[feature_cols], val_es["y"].values
-                Xte, yte = test[feature_cols], test["y"].values
+                Xtr, Xval, Xte = _select_features(
+                    fit[feature_cols], val_es[feature_cols], test[feature_cols]
+                )
+                ytr = fit["y"].values
+                yval = val_es["y"].values
+                yte = test["y"].values
                 base_rate = float(ytr.mean())
                 fold: dict[str, Any] = {
                     "year": year,
