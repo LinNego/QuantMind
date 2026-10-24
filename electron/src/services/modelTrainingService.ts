@@ -797,8 +797,10 @@ class ModelTrainingService {
     return resp.data;
   }
 
-  async getMarketRegime(modelId: string, window = 90): Promise<any> {
-    const resp = await this.client.get<any>(`/models/${encodeURIComponent(modelId)}/market-regime`, { params: { window } });
+  async getMarketRegime(modelId: string, window = 90, indexOffset = 1): Promise<any> {
+    const resp = await this.client.get<any>(`/models/${encodeURIComponent(modelId)}/market-regime`, {
+      params: { window, index_offset: indexOffset },
+    });
     return resp.data;
   }
 

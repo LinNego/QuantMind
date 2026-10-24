@@ -1046,10 +1046,59 @@ async def get_model_drift(
     return {"model_id": model_id, **drift}
 
 
+#: 大盘分析可叠加的指数（QuantDB index_daily 后缀口径；顺序即前端图例顺序）
+_MARKET_REGIME_INDICES: tuple[tuple[str, str], ...] = (
+    ("000300.SH", "沪深300"),
+    ("000905.SH", "中证500（沪深500）"),
+    ("000852.SH", "中证1000（沪深1000）"),
+    ("000001.SH", "上证综指（沪市）"),
+    ("399001.SZ", "深证成指（深市）"),
+)
+
+
+def _align_index_points(
+    score_dates: list[str], closes: dict[str, float], offset: int
+) -> list[dict[str, Any]]:
+    """指数收盘对齐到信号日：信号日 T 取 T+offset 个交易日（默认次日可交易）。
+
+    均分是**信号日 T** 的分数（用 T 日收盘及之前的数据算出），而行情收益从
+    T+1 才开始；同日期叠加会让曲线整体错开一天。offset=1 即「T 的分数 vs
+    T+1 的指数」；T+N 模型可传 horizon。缺失日不猜（跳过），由前端 connectNulls。
+    """
+    if not closes:
+        return []
+    index_dates = sorted(closes)
+    pos_by_date = {day: i for i, day in enumerate(index_dates)}
+    step = max(0, int(offset))
+    points: list[dict[str, Any]] = []
+    for day in score_dates:
+        pos = pos_by_date.get(day)
+        if pos is None:
+            continue
+        target_pos = pos + step
+        if target_pos >= len(index_dates):
+            continue
+        target = index_dates[target_pos]
+        points.append(
+            {
+                "trade_date": day,
+                "index_date": target,
+                "close": closes[target],
+            }
+        )
+    return points
+
+
 @router.get("/{model_id}/market-regime", summary="获取模型大盘三态时序（用户态）")
 async def get_model_market_regime(
     model_id: str,
     window: int = Query(90, ge=1, le=200, description="近 N 个交易日"),
+    index_offset: int = Query(
+        1,
+        ge=0,
+        le=20,
+        description="指数相对信号日错开 N 个交易日（1=次日可交易；0=同日期）",
+    ),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     tenant_id = str(current_user.get("tenant_id") or "default")
@@ -1095,6 +1144,15 @@ async def get_model_market_regime(
                 }
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
+    model_meta = (
+        model.get("metadata_json")
+        if isinstance(model.get("metadata_json"), dict)
+        else {}
+    )
+    try:
+        horizon_days = max(1, int(model_meta.get("target_horizon_days") or 1))
+    except (TypeError, ValueError):
+        horizon_days = 1
     # 全市场均值量级小（Top100 均值约 0.02~0.05，全市场约低一个量级），阈值相应下调
     bull_thr, bear_thr = 0.01, 0.0
     series: list[dict[str, Any]] = []
@@ -1243,14 +1301,62 @@ async def get_model_market_regime(
         # 仅保留最近 90 交易日
         if len(series) > int(window):
             series = series[-int(window) :]
+
+        # ── 指数叠加：与均分同日期轴，供前端「时序分 × 大盘指数」对比 ──────
+        # 只读 index_daily（QuantDB），失败不阻断主曲线（返回 indices_error 如实标注）。
+        indices: list[dict[str, Any]] = []
+        indices_error: str | None = None
+        if series:
+            start_iso = str(series[0]["trade_date"])
+            # 指数取到「今天」而不是序列末日：错开 N 个交易日需要末日之后的收盘
+            end_iso = date.today().isoformat()
+            try:
+                from backend.shared.benchmark import load_index_frame
+
+                frame = await asyncio.to_thread(
+                    load_index_frame,
+                    columns=("close",),
+                    symbols=[code for code, _ in _MARKET_REGIME_INDICES],
+                    start=start_iso,
+                    end=end_iso,
+                )
+                closes: dict[str, dict[str, float]] = {}
+                for record in frame.to_dict("records"):
+                    code = str(record.get("symbol") or "")
+                    day = str(record.get("time"))[:10]
+                    try:
+                        close = float(record.get("close"))
+                    except (TypeError, ValueError):
+                        continue
+                    if close > 0:
+                        closes.setdefault(code, {})[day] = round(close, 4)
+                dates = [str(point["trade_date"]) for point in series]
+                for code, name in _MARKET_REGIME_INDICES:
+                    day_map = closes.get(code) or {}
+                    points = _align_index_points(dates, day_map, index_offset)
+                    if points:
+                        indices.append({"code": code, "name": name, "points": points})
+            except Exception as exc:  # noqa: BLE001 - 叠加失败不回滚主曲线
+                indices_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("market-regime 指数叠加读取失败 %s: %s", model_id, exc)
+
         current = series[-1] if series else None
-        return {
+        payload: dict[str, Any] = {
             "model_id": model_id,
             "window": int(window),
+            "horizon_days": horizon_days,
+            "index_offset": int(index_offset),
             "thresholds": {"bull": bull_thr, "bear": bear_thr},
             "series": series,
             "current": current,
+            "indices": indices,
+            "index_options": [
+                {"code": code, "name": name} for code, name in _MARKET_REGIME_INDICES
+            ],
         }
+        if indices_error:
+            payload["indices_error"] = indices_error
+        return payload
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
