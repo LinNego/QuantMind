@@ -1089,6 +1089,110 @@ def _align_index_points(
     return points
 
 
+def _index_scope(index_code: str) -> tuple[str, Any]:
+    """指数对应的**分数口径**：交易所宽基按代码前缀，中证指数按成分股。
+
+    - 上证综指 → 全部 SH 前缀股票；深证成指 → 全部 SZ 前缀；
+    - 沪深300/中证500/中证1000 → QuantDB index_weights 成分股（prefix 化）；
+    - 取不到成分 → ("all", None)，前端回退全市场均分。
+    """
+    if index_code == "000001.SH":
+        return "exchange", "SH"
+    if index_code == "399001.SZ":
+        return "exchange", "SZ"
+    try:
+        from backend.services.engine.data_platform.quantdb_hub import QuantDBDataHub
+        from backend.shared.stock_utils import StockCodeUtil
+
+        frame = QuantDBDataHub.get_instance().fetch_index_weights(index_code)
+        symbol_col = next(
+            (
+                c
+                for c in ("Symbol", "symbol", "wind_code", "ConstituentCode")
+                if c in frame.columns
+            ),
+            None,
+        )
+        if symbol_col and len(frame):
+            symbols = sorted(
+                {
+                    StockCodeUtil.to_prefix(str(raw))
+                    for raw in frame[symbol_col].tolist()
+                    if str(raw or "").strip()
+                }
+            )
+            if symbols:
+                return "constituents", symbols
+    except Exception as exc:  # noqa: BLE001 - 成分读不到按全市场回落
+        logger.warning("指数成分读取失败 %s: %s", index_code, exc)
+    return "all", None
+
+
+def _scoped_score_stats(
+    parquet_file: str,
+    score_col: str,
+    date_col: str,
+    kind: str,
+    value: Any,
+    start_iso: str,
+    end_iso: str,
+) -> dict[str, dict[str, Any]]:
+    """按指数口径计算逐日均分（成分股 join / 交易所前缀），返回 {日期: {avg,median,count}}。"""
+    if kind == "all" or not parquet_file or not score_col or not date_col:
+        return {}
+    try:
+        import duckdb
+
+        con = duckdb.connect()
+        window = (
+            f"CAST(p.{date_col} AS DATE) >= DATE '{start_iso}' "
+            f"AND CAST(p.{date_col} AS DATE) <= DATE '{end_iso}' "
+            f"AND CAST(p.{score_col} AS DOUBLE) IS NOT NULL"
+        )
+        if kind == "exchange":
+            query = (
+                f"SELECT CAST(p.{date_col} AS VARCHAR) AS d, "
+                f"AVG(CAST(p.{score_col} AS DOUBLE))::DOUBLE AS a, "
+                f"MEDIAN(CAST(p.{score_col} AS DOUBLE))::DOUBLE AS m, "
+                f"COUNT(*)::INTEGER AS c "
+                f"FROM read_parquet('{parquet_file}') p "
+                f"WHERE {window} AND CAST(p.symbol AS VARCHAR) LIKE '{value}%' "
+                f"GROUP BY 1"
+            )
+        else:
+            con.execute("CREATE TEMP TABLE idx_map(symbol VARCHAR)")
+            con.executemany(
+                "INSERT INTO idx_map VALUES (?)", [(str(s),) for s in value or []]
+            )
+            query = (
+                f"SELECT CAST(p.{date_col} AS VARCHAR) AS d, "
+                f"AVG(CAST(p.{score_col} AS DOUBLE))::DOUBLE AS a, "
+                f"MEDIAN(CAST(p.{score_col} AS DOUBLE))::DOUBLE AS m, "
+                f"COUNT(*)::INTEGER AS c "
+                f"FROM read_parquet('{parquet_file}') p "
+                f"JOIN idx_map m ON CAST(p.symbol AS VARCHAR) = m.symbol "
+                f"WHERE {window} GROUP BY 1"
+            )
+        rows = con.execute(query).fetchall()
+        con.close()
+        return {
+            str(d)[:10]: {
+                "avg_score": round(float(a or 0), 4),
+                "median_score": round(float(m or 0), 4),
+                "count": int(c or 0),
+            }
+            for d, a, m, c in rows
+        }
+    except Exception as exc:  # noqa: BLE001 - 范围均分失败回退全市场
+        logger.warning(
+            "指数范围均分读取失败 kind=%s value=%s: %s",
+            kind,
+            value if kind == "exchange" else (len(value or []),),
+            exc,
+        )
+        return {}
+
+
 @router.get("/{model_id}/market-regime", summary="获取模型大盘三态时序（用户态）")
 async def get_model_market_regime(
     model_id: str,
@@ -1186,6 +1290,10 @@ async def get_model_market_regime(
         # 若以其为主会导致「大盘分析只显示个股数据」。故优先读 pred.parquet。
         storage_path = str(model.get("storage_path") or "").strip()
         parquet_file: Path | None = None
+        # 供指数「范围均分」二次查询复用（成分股/交易所前缀口径）
+        pred_file_path: str | None = None
+        pred_score_col: str | None = None
+        pred_date_col: str | None = None
         if storage_path:
             import duckdb
 
@@ -1222,6 +1330,9 @@ async def get_model_market_regime(
                         else None
                     )
                     if score_col and date_col:
+                        pred_file_path = str(parquet_file)
+                        pred_score_col = score_col
+                        pred_date_col = date_col
                         q = f"""
                             SELECT CAST({date_col} AS VARCHAR) AS trade_date,
                                    AVG(CAST({score_col} AS DOUBLE))::DOUBLE AS avg_score,
@@ -1310,6 +1421,28 @@ async def get_model_market_regime(
             start_iso = str(series[0]["trade_date"])
             # 指数取到「今天」而不是序列末日：错开 N 个交易日需要末日之后的收盘
             end_iso = date.today().isoformat()
+            # 各指数的分数口径（成分股 / 交易所前缀 / 全市场）
+            index_scopes = {
+                code: _index_scope(code) for code, _ in _MARKET_REGIME_INDICES
+            }
+            scope_stats: dict[str, dict[str, dict[str, Any]]] = {}
+            if pred_file_path and pred_score_col and pred_date_col:
+                for code, _name in _MARKET_REGIME_INDICES:
+                    kind, value = index_scopes[code]
+                    if kind == "all":
+                        continue
+                    stats = await asyncio.to_thread(
+                        _scoped_score_stats,
+                        pred_file_path,
+                        pred_score_col,
+                        pred_date_col,
+                        kind,
+                        value,
+                        start_iso,
+                        end_iso,
+                    )
+                    if stats:
+                        scope_stats[code] = stats
             try:
                 from backend.shared.benchmark import load_index_frame
 
@@ -1335,7 +1468,29 @@ async def get_model_market_regime(
                     day_map = closes.get(code) or {}
                     points = _align_index_points(dates, day_map, index_offset)
                     if points:
-                        indices.append({"code": code, "name": name, "points": points})
+                        stats = scope_stats.get(code) or {}
+                        for point in points:
+                            scoped = stats.get(point["trade_date"])
+                            if scoped:
+                                point.update(scoped)
+                        kind, value = index_scopes[code]
+                        indices.append(
+                            {
+                                "code": code,
+                                "name": name,
+                                "scope": (
+                                    "constituents"
+                                    if kind == "constituents"
+                                    else "exchange"
+                                    if kind == "exchange"
+                                    else "all_market"
+                                ),
+                                "constituent_count": (
+                                    len(value) if kind == "constituents" else None
+                                ),
+                                "points": points,
+                            }
+                        )
             except Exception as exc:  # noqa: BLE001 - 叠加失败不回滚主曲线
                 indices_error = f"{type(exc).__name__}: {exc}"
                 logger.warning("market-regime 指数叠加读取失败 %s: %s", model_id, exc)

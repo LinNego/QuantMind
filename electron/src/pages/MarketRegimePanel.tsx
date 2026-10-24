@@ -7,6 +7,7 @@ import {
   FALLBACK_INDEX_OPTIONS,
   INDEX_COLORS,
   rebaseIndexPoints,
+  resolveScoreRows,
   type RegimeIndexOption,
   type RegimeIndexSeries,
 } from './marketRegimeModel';
@@ -48,6 +49,20 @@ export const MarketRegimePanel: React.FC<{ modelId: string }> = ({ modelId }) =>
   }, [data]);
 
   const selectedSeries = availableIndices.filter((x) => selectedIndices.includes(x.code));
+  // 单选一个有范围的指数 → 均分用该指数范围（成分股/沪市/深市）；多选/仅均分 → 全市场
+  const scopedIndex = selectedSeries.length === 1 ? selectedSeries[0] : null;
+  const scoreInfo = useMemo(() => {
+    const dates = series.map((s: any) => String(s.trade_date));
+    const allRows = series.map((s: any) => ({
+      trade_date: String(s.trade_date),
+      avg_score: s.avg_score,
+      median_score: s.median_score,
+      count: Number(s.count || 0),
+    }));
+    return resolveScoreRows(allRows, scopedIndex, dates);
+  }, [series, scopedIndex]);
+  const scoreName =
+    scoreInfo.scoped && scopedIndex ? `${scopedIndex.name} 均分` : '全市场均分';
 
   const offsetOptions = useMemo(() => {
     const horizon = Number(data?.horizon_days) || 1;
@@ -63,8 +78,8 @@ export const MarketRegimePanel: React.FC<{ modelId: string }> = ({ modelId }) =>
 
   const option = useMemo(() => {
     if (!series.length) return null;
-    const dates = series.map((s: any) => s.trade_date);
-    const vals = series.map((s: any) => s.avg_score);
+    const dates = scoreInfo.rows.map((r) => r.trade_date);
+    const vals = scoreInfo.rows.map((r) => r.avg_score);
     const hasIndex = selectedSeries.length > 0;
     const indexLines = selectedSeries.map((ix) => ({
       name: ix.name,
@@ -85,10 +100,10 @@ export const MarketRegimePanel: React.FC<{ modelId: string }> = ({ modelId }) =>
         formatter: (ps: any) => {
           const list = Array.isArray(ps) ? ps : [ps];
           const idx = list[0]?.dataIndex ?? 0;
-          const row = series[idx];
+          const row = scoreInfo.rows[idx] ?? series[idx] ?? {};
           const lines = [
-            `<b>${row.trade_date}</b>`,
-            `均分 ${row.avg_score} · 中位 ${row.median_score} · 样本 ${row.count}`,
+            `<b>${row.trade_date ?? ''}</b>`,
+            `${scoreName} ${row.avg_score ?? '—'} · 中位 ${row.median_score ?? '—'} · 样本 ${row.count ?? 0}`,
           ];
           for (const p of list) {
             if (p.seriesName === '均分') continue;
@@ -114,7 +129,7 @@ export const MarketRegimePanel: React.FC<{ modelId: string }> = ({ modelId }) =>
         itemWidth: 14,
         itemHeight: 8,
         textStyle: { fontSize: 10 },
-        data: ['均分', ...selectedSeries.map((x) => x.name)],
+        data: [scoreName, ...selectedSeries.map((x) => x.name)],
       },
       grid: { left: 52, right: hasIndex ? 56 : 16, top: 30, bottom: 28 },
       xAxis: {
@@ -151,13 +166,14 @@ export const MarketRegimePanel: React.FC<{ modelId: string }> = ({ modelId }) =>
           ],
       series: [
         {
-          name: '均分',
+          name: scoreName,
           type: 'line',
           yAxisIndex: 0,
           data: vals,
           smooth: true,
           symbol: 'circle',
           symbolSize: 3,
+          connectNulls: true,
           lineStyle: { width: 2, color: '#3b82f6' },
           itemStyle: { color: '#3b82f6' },
           areaStyle: { color: 'rgba(59,130,246,0.08)' },
@@ -165,10 +181,17 @@ export const MarketRegimePanel: React.FC<{ modelId: string }> = ({ modelId }) =>
         ...indexLines,
       ],
     };
-  }, [series, selectedSeries, availableIndices]);
+  }, [series, selectedSeries, availableIndices, scoreInfo, scoreName]);
 
   if (loading) return <div className="flex justify-center py-12"><Spin /></div>;
   if (!series.length) return <Empty description="暂无推理均分时序" />;
+
+  const latestScoped = scoreInfo.scoped
+    ? [...scoreInfo.rows].reverse().find((r) => r.avg_score != null) ?? null
+    : null;
+  const latestScore = latestScoped ?? current;
+  const latestLabel =
+    scoreInfo.scoped && scopedIndex ? `最新均分（${scopedIndex.name}）` : '最新均分';
 
   return (
     <div className="space-y-4">
@@ -181,6 +204,7 @@ export const MarketRegimePanel: React.FC<{ modelId: string }> = ({ modelId }) =>
             children: <div className="text-xs text-slate-600 leading-relaxed space-y-1">
               <div>均分 = 当日全市场 `pred / fusion_score` 均值（与个股终端一致，回退读 `pred.parquet`）。</div>
               <div>均分日期 = **信号日 T**（用 T 日及之前数据算出）；指数默认取 **T+1（次日可交易）** 对齐，可切换 T+N / 不错开。</div>
+              <div>**单选指数时，均分按该指数范围计算**（沪深300/500/1000=成分股，沪市/深市=交易所全部股票）；多选或「仅均分」时用全市场均分。</div>
               <div>指数叠加用于**走势对比**：按窗口首个有效日归一为 100，与均分（左轴）分轴显示，不改变均分口径。</div>
               <div>可多选沪深300 / 中证500 / 中证1000 / 上证综指 / 深证成指；「全部叠加」一次画全。</div>
             </div>,
@@ -190,9 +214,13 @@ export const MarketRegimePanel: React.FC<{ modelId: string }> = ({ modelId }) =>
 
       <div className="grid grid-cols-2 gap-3">
         <Card size="small" className="rounded-2xl text-center">
-          <div className="text-[11px] text-slate-400 font-bold">最新均分</div>
-          <div className="text-lg font-mono font-black text-blue-600">{Number(current?.avg_score ?? 0).toFixed(4)}</div>
-          <div className="text-[11px] text-slate-500 mt-1">{current?.trade_date} · 全市场 {current?.count} 只</div>
+          <div className="text-[11px] text-slate-400 font-bold">{latestLabel}</div>
+          <div className="text-lg font-mono font-black text-blue-600">
+            {latestScore?.avg_score == null ? '—' : Number(latestScore.avg_score).toFixed(4)}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1">
+            {latestScore?.trade_date} · 样本 {latestScore?.count ?? 0} 只
+          </div>
         </Card>
         <Card size="small" className="rounded-2xl text-center">
           <div className="text-[11px] text-slate-400 font-bold">样本</div>
@@ -205,6 +233,12 @@ export const MarketRegimePanel: React.FC<{ modelId: string }> = ({ modelId }) =>
         <div className="flex flex-wrap items-center gap-2 mb-2">
           <TrendingUp size={14} className="text-blue-500" />
           <Text className="text-xs font-black text-slate-700">均分时序 × 大盘指数</Text>
+          {scoreInfo.scoped && scopedIndex && (
+            <Tag color="blue" className="text-[10px]">
+              {scopedIndex.name}
+              {scopedIndex.constituent_count ? ` · ${scopedIndex.constituent_count} 只` : ''}
+            </Tag>
+          )}
           <Select
             mode="multiple"
             size="small"

@@ -2,7 +2,11 @@
  * 大盘分析指数叠加口径：窗口首日归一为 100，缺失日 null（connectNulls）。
  */
 import { describe, it, expect } from 'vitest';
-import { rebaseIndexPoints } from '../marketRegimeModel';
+import {
+  rebaseIndexPoints,
+  resolveScoreRows,
+  type RegimeIndexSeries,
+} from '../marketRegimeModel';
 
 describe('rebaseIndexPoints', () => {
   it('首个有效日 = 100，后续按比例', () => {
@@ -50,5 +54,47 @@ describe('rebaseIndexPoints', () => {
       ['2026-09-01', '2026-09-02', '2026-09-03'],
     );
     expect(out).toEqual([null, 100, null]);
+  });
+});
+
+describe('resolveScoreRows（单选指数用对应范围的均分）', () => {
+  const allMarket = [
+    { trade_date: '2026-09-01', avg_score: -0.01, median_score: -0.005, count: 5000 },
+  ];
+  const dates = ['2026-09-01', '2026-09-02'];
+  const csi300: RegimeIndexSeries = {
+    code: '000300.SH',
+    name: '沪深300',
+    scope: 'constituents',
+    constituent_count: 300,
+    points: [
+      { trade_date: '2026-09-01', close: 100, avg_score: -0.02, median_score: -0.01, count: 300 },
+      { trade_date: '2026-09-02', close: 101, avg_score: -0.03, median_score: -0.02, count: 300 },
+    ],
+  };
+
+  it('单选有范围的指数 → 用该指数范围的均分', () => {
+    const out = resolveScoreRows(allMarket, csi300, dates);
+    expect(out.scoped).toBe(true);
+    expect(out.rows[0].avg_score).toBe(-0.02);
+    expect(out.rows[1].count).toBe(300);
+  });
+
+  it('scope=all_market → 回退全市场', () => {
+    const out = resolveScoreRows(allMarket, { ...csi300, scope: 'all_market' }, dates);
+    expect(out.scoped).toBe(false);
+    expect(out.rows).toBe(allMarket);
+  });
+
+  it('单指数没有逐日均分 → 回退全市场（不画空线）', () => {
+    const noStats: RegimeIndexSeries = {
+      ...csi300,
+      points: csi300.points.map((p) => ({ ...p, avg_score: null })),
+    };
+    expect(resolveScoreRows(allMarket, noStats, dates).scoped).toBe(false);
+  });
+
+  it('未单选（null）→ 全市场', () => {
+    expect(resolveScoreRows(allMarket, null, dates).rows).toBe(allMarket);
   });
 });

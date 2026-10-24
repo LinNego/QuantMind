@@ -10,12 +10,56 @@ export interface RegimeIndexPoint {
   /** 指数实际取数日（信号日 T + offset；与 trade_date 不同时用于 tooltip 说明） */
   index_date?: string;
   close: number;
+  /** 该指数范围（成分股/交易所）当日的均分；后端按 scope 计算 */
+  avg_score?: number | null;
+  median_score?: number | null;
+  count?: number | null;
 }
 
 export interface RegimeIndexSeries {
   code: string;
   name: string;
+  /** constituents=成分股 / exchange=沪市·深市前缀 / all_market=无范围回落 */
+  scope?: 'constituents' | 'exchange' | 'all_market';
+  constituent_count?: number | null;
   points: RegimeIndexPoint[];
+}
+
+export interface RegimeScoreRow {
+  trade_date: string;
+  avg_score: number | null;
+  median_score: number | null;
+  count: number;
+}
+
+/**
+ * 均分口径选择：**单选一个有范围的指数** → 用该指数范围的均分；否则全市场均分。
+ * 用户口径（2026-10-24）：单选不同市场/指数用对应市场的分数；全部叠加用全市场。
+ */
+export function resolveScoreRows(
+  allMarket: RegimeScoreRow[],
+  single: RegimeIndexSeries | null,
+  dates: string[],
+): { rows: RegimeScoreRow[]; scoped: boolean } {
+  const usable =
+    single != null &&
+    single.scope != null &&
+    single.scope !== 'all_market' &&
+    single.points.some((p) => p.avg_score != null);
+  if (!usable || !single) return { rows: allMarket, scoped: false };
+  const byDate = new Map(single.points.map((p) => [String(p.trade_date).slice(0, 10), p]));
+  return {
+    scoped: true,
+    rows: dates.map((d) => {
+      const p = byDate.get(d);
+      return {
+        trade_date: d,
+        avg_score: p?.avg_score ?? null,
+        median_score: p?.median_score ?? null,
+        count: Number(p?.count ?? 0),
+      };
+    }),
+  };
 }
 
 export interface RegimeIndexOption {
