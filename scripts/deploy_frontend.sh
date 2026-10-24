@@ -10,8 +10,8 @@
 #   --skip-build        跳过 npm run build，直接部署当前 dist-react/
 #   --allow-local-live  允许部署**实盘 UI 可见**的产物（构建时 VITE_ENABLE_REAL_TRADING=true，
 #                       底部栏会出现「实盘交易」入口）。默认拒绝，见第 0 步。
-#   --allow-doc-mining  允许部署**文档挖掘 UI 可见**的产物（构建时 VITE_ENABLE_DOC_MINING=true，
-#                       因子挖掘首页会出现「上传文档」入口）。默认拒绝，见第 0b 步。
+#   --allow-doc-mining  兼容旧命令，已无实际作用（文档挖掘 UI 自 2026-10-24 起
+#                       是 Docker 服务器版的**出厂默认**；关闭用 VITE_ENABLE_DOC_MINING=false）
 set -euo pipefail
 
 # ── 配置 ──────────────────────────────────────────────────────
@@ -40,6 +40,15 @@ for arg in "$@"; do
     esac
 done
 
+# ── 文档挖掘 UI：出厂默认开启（2026-10-24）────────────────────
+# Docker 服务器版第一次安装、第一次启动就要能打开「上传文档」链。前端开关是
+# **构建期内联**（Vite 把 env 打进 bundle），所以在脚本入口就把缺省值定成 true：
+# 不带 env 跑 `bash scripts/deploy_frontend.sh` 得到的就是出厂形态。
+# 关闭必须显式：VITE_ENABLE_DOC_MINING=false bash scripts/deploy_frontend.sh
+# 后端还有独立闸门 ENABLE_DOC_MINING（compose 缺省 true），两端同时关才彻底不可用。
+VITE_ENABLE_DOC_MINING="${VITE_ENABLE_DOC_MINING:-true}"
+export VITE_ENABLE_DOC_MINING
+
 # ── 0. 实盘 UI 可见的构建：默认拒绝，显式放行 ─────────────────
 # 栏目源码 electron/src/features/local-live/ 已入仓（2026-10-08），「本机独有目录」
 # 这道旧闸门（源码存在即拒绝）随之退役 —— 留着它会拒绝**每一次**部署。
@@ -65,22 +74,20 @@ fi
 # （这是**提前**失败：省掉一次白构建。放行的提示与真正权威的判据在第 3 步——
 #   那里读的是**产物里的内联标记**，`--skip-build` 与「env 与产物不一致」都跑不掉。）
 
-# ── 0b. 文档挖掘 UI 可见的构建：默认拒绝，显式放行 ─────────────
-# `VITE_ENABLE_DOC_MINING=true` 构建出来的产物，因子挖掘首页会出现「上传文档」
-# 输入方式、挖掘历史出现「文档解析」栏。它本身不是危险面，但**文档会被上传到
-# MinerU 云端解析（数据出网）**——与实盘 UI 同一个理由：面向公网的部署里出现
-# 这一栏必须是**决定**，不能是**意外**（构建脚本里残留的 env / 复制的 shell 环境）。
-# 判据 = 构建开关本身，默认拒绝，加 --allow-doc-mining 放行。
-# 后端还有独立的 ENABLE_DOC_MINING 闸门（默认关）；两端同时开才对用户可用。
-# 启用流程见 docs/文档挖掘_启用与通道指南.md。
+# ── 0b. 文档挖掘 UI 可见性：出厂默认开启 ──────────────────────
+# 2026-10-24 起，`VITE_ENABLE_DOC_MINING=true` 是 Docker 服务器版的**出厂默认**
+# （客户装完第一次启动就要看到入口），不再是"意外"。所以这里不再拒绝，只把
+# **数据出网**这件事说清楚：上传的原件会送往 MinerU 云端解析（界面有固定披露）。
+# 唯一要硬拦的是自相矛盾：**显式要求关闭**却部署了开着的产物（见第 3c 步）。
+# `--allow-doc-mining` 保留仅为兼容旧命令，已无实际作用。
 DOC_MINING_FLAG="$(echo "${VITE_ENABLE_DOC_MINING:-}" | tr '[:upper:]' '[:lower:]')"
-if [[ "${DOC_MINING_FLAG}" == "true" && -z "${ALLOW_DOC_MINING}" ]]; then
-    fail "本次构建打开了文档挖掘 UI（VITE_ENABLE_DOC_MINING=true）。
-       部署后因子挖掘首页会出现「上传文档」入口，上传的原件会送往 MinerU 云端
-       解析（数据出网）。两种出路：
-         · 就是要发布文档挖掘 UI：VITE_ENABLE_DOC_MINING=true bash scripts/deploy_frontend.sh --allow-doc-mining
-         · 部署默认版本（不显示该入口）：去掉 VITE_ENABLE_DOC_MINING 重新构建
-             bash scripts/deploy_frontend.sh"
+if [[ -n "${ALLOW_DOC_MINING}" ]]; then
+    log "--allow-doc-mining 已退役（文档挖掘 UI 出厂默认开启），本参数被忽略"
+fi
+if [[ "${DOC_MINING_FLAG}" == "false" ]]; then
+    log "本次构建**显式关闭**文档挖掘 UI（VITE_ENABLE_DOC_MINING=false）"
+else
+    log "文档挖掘 UI 可见（出厂默认）——上传原件将送往 MinerU 云端解析（数据出网）"
 fi
 
 # ── 1. 检查 web 容器在跑 ───────────────────────────────────────
@@ -132,17 +139,21 @@ fi
 
 # ── 3c. 文档挖掘 UI 判据（权威）：读产物里的**内联开关标记** ──────
 # 同 3b 的机制：Vite 把构建期 env 内联进 bundle，`VITE_ENABLE_DOC_MINING:"true"`
-# 逐字可查。env 与产物不一致、--skip-build 拿旧产物，都拦得住。
+# 逐字可查。出厂默认开 → 产物应带标记；显式关闭 → 不应带。
+# 唯一硬失败 = **显式要求关闭、却部署了开着的产物**（--skip-build 复用旧产物 /
+# env 与产物不一致）：那等于把"已经决定关闭"的数据出网入口又发出去。
 if grep -rqs 'VITE_ENABLE_DOC_MINING:"true"' "${DIST_DIR}/assets"; then
-    if [[ -z "${ALLOW_DOC_MINING}" ]]; then
-        fail "dist-react/ 是**文档挖掘 UI 可见**的构建（产物内联标记 VITE_ENABLE_DOC_MINING:\"true\"），拒绝部署。
-       这就是「因子挖掘首页出现上传文档入口、原件送往 MinerU 云端」的那一类产物。
-       两种出路：
-         · 就是要发布文档挖掘 UI：VITE_ENABLE_DOC_MINING=true bash scripts/deploy_frontend.sh --allow-doc-mining
-         · 部署默认版本：删掉 dist-react/ 后不带该 env 重新构建"
+    if [[ "${DOC_MINING_FLAG}" == "false" ]]; then
+        fail "本次要求**关闭**文档挖掘 UI（VITE_ENABLE_DOC_MINING=false），但 dist-react/ 是开着该入口的产物
+       （产物内联标记 VITE_ENABLE_DOC_MINING:\"true\"）。多半是 --skip-build 复用了旧产物。
+       出路：删掉 dist-react/ 后不带 --skip-build 重新构建。"
     fi
-    warn "部署产物**文档挖掘 UI 可见**（产物内联 VITE_ENABLE_DOC_MINING=true）——上传的原件将送往 MinerU 云端解析。"
-    warn "后端还需 ENABLE_DOC_MINING=true 才能真正可用（只开前端 = 界面在但端点 403）。"
+    log "产物含文档挖掘 UI（内联 VITE_ENABLE_DOC_MINING=true，出厂默认）——原件将经 MinerU 云端解析。"
+else
+    if [[ "${DOC_MINING_FLAG}" != "false" ]]; then
+        warn "产物里没有文档挖掘 UI 的内联标记（VITE_ENABLE_DOC_MINING:\"true\"）——"
+        warn "若这不是有意关闭，多半是 --skip-build 的旧产物或被 electron/.env* 覆盖；检查后重新构建。"
+    fi
 fi
 
 # ── 4. 清空容器旧 assets ─────────────────────────────────────

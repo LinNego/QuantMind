@@ -369,12 +369,16 @@ services:
       - ALPHA_AGENT_SKIP_MEMORY_GATE=${ALPHA_AGENT_SKIP_MEMORY_GATE:-}
 
       # 因子挖掘文档链（上传文档/图片 → MinerU 云端解析 → 提示词整理 → RD-Agent 挖掘）。
-      # ⚠️ 数据出网：上传的原件会送到 MinerU 云端 API。ENABLE_DOC_MINING 默认 false
-      # （端点 403 doc_mining_disabled）；未申请 token 的部署请保持关闭。
+      # 出厂默认开启（2026-10-24）：Docker 服务器版第一次安装、第一次启动就要能打开
+      # 「上传文档」——前端开关是构建期内联（docker/Dockerfile.web 与
+      # deploy_frontend.sh 都缺省 VITE_ENABLE_DOC_MINING=true），后端这里缺省 true。
+      # ⚠️ 数据出网：上传的原件会送到 MinerU 云端 API（界面上传区有固定披露）。
+      # 关闭（两端都要显式关，任一取 false 都是安全的失败方向）：本键改 false 并重建
+      # 容器 + 前端以 VITE_ENABLE_DOC_MINING=false 重新构建部署。
       # 本 compose 是 environment 白名单（无 env_file）——不在此转发的键，.env 里
-      # 填了也读不到（静默不生效）。启用流程（前后端两端同时打开）见
-      # docs/文档挖掘_启用与通道指南.md。
-      - ENABLE_DOC_MINING=${ENABLE_DOC_MINING:-false}
+      # 填了也读不到（静默不生效）。开关矩阵见 docs/文档挖掘_启用与通道指南.md。
+      # 没有 MinerU Token 不影响入口显示：上传会 503 并引导到「解析设置」自配。
+      - ENABLE_DOC_MINING=${ENABLE_DOC_MINING:-true}
       # mineru.net/apiManage/token 申请；缺省 = 上传/整理 503（界面提示 token 未配置）
       - MINERU_API_TOKEN=${MINERU_API_TOKEN:-}
       - MINERU_MODEL_VERSION=${MINERU_MODEL_VERSION:-vlm}

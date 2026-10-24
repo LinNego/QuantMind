@@ -22,6 +22,17 @@ RUN npm install --no-audit --no-fund
 COPY electron ./
 # Re-strip after the full electron/ copy overwrites package.json
 RUN node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));delete p.overrides;fs.writeFileSync('package.json',JSON.stringify(p,null,2));"
+
+# 文档挖掘 UI（因子挖掘「上传文档」链）出厂默认开启（2026-10-24 用户拍板）：
+# Docker 服务器版**第一次安装、第一次启动**就要能打开，不允许"装完没有、再重建/重启一轮"。
+# 前端开关是 Vite **构建期内联**——镜像构建时没开，容器重启、浏览器强刷都补不出来。
+# 显式关闭（重建镜像）：
+#   docker build --build-arg VITE_ENABLE_DOC_MINING=false \
+#     -f docker/Dockerfile.web -t quantmind-web:latest .
+# 后端还有独立闸门 ENABLE_DOC_MINING（docker-compose.yml 缺省 true）；两端同时关才彻底不可用。
+# 上传的原件会送到 MinerU 云端解析（数据出网），界面上传区有固定披露。
+ARG VITE_ENABLE_DOC_MINING=true
+ENV VITE_ENABLE_DOC_MINING=${VITE_ENABLE_DOC_MINING}
 RUN node ../scripts/frontend/copy-monaco-assets.js && npx vite build
 
 FROM nginx:1.25-alpine
