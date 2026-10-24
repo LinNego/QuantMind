@@ -1,6 +1,13 @@
-"""构建「大盘指数预测模型」特征表（P0.5：扩展指数 + 两融/北向/ST）。
+"""构建「大盘指数预测模型」特征表（v2：增量数据 + 波动/风险标签）。
 
-数据边界（2026-10-24 实测）：
+v2 增量（2026-10-24）：
+- 股指期货基差（IF/IH/IC/IM 主力连续，本地期货日线合成）；
+- 宏观日频（SHIBOR / 中美国债收益率 / USD/CNY）；
+- 沪市 ETF 份额月度快照（资金流代理，按下一交易日可用）；
+- 标签扩展：方向 + 未来已实现波动（fwd_vol）+ 高波动 regime（vol_high）
+  + 窗口最大回撤（fwd_mdd）+ 下行风险（down_risk，MDD≤-5%）。
+
+原始数据边界（P0.5，2026-10-24 实测）：
 - index_daily：2016-01-04~至今；核心 5 条 + 创业板指/科创50/上证50/中证800/
   中证100/深证100/科创100/北证50（后两者历史较短）；
 - stock_daily_latest：2016 至今 1,096 万行；**return_1d 是次日收益（前视），禁用**，
@@ -44,6 +51,33 @@ INDEX_CODES: tuple[tuple[str, str], ...] = (
 )
 
 BASE_SECTOR = "/data/quantdb/2_base_sector"
+LABEL_PREFIXES = ("fwd_ret_", "fwd_vol_", "fwd_mdd_", "vol_high_", "down_risk_")
+MARKET_COL_PREFIXES = (
+    "mkt_",
+    "sh_",
+    "sz_",
+    "fin_",
+    "slo_",
+    "north_",
+    "st_",
+    "hsi_",
+    "spx_",
+    "dow",
+    "month",
+    "is_month_end",
+    "is_quarter_end",
+    "pre_holiday_gap",
+    "if_",
+    "ic_",
+    "ih_",
+    "im_",
+    "basis_",
+    "shibor_",
+    "cn_",
+    "us_",
+    "usdcny",
+    "etf_",
+)
 
 _BREADTH_SQL = """
 SELECT trade_date,
@@ -214,10 +248,15 @@ def _index_features(close: pd.Series, volume: pd.Series, amount: pd.Series) -> p
     out["boll_pctb"] = (close - lower) / (upper - lower).replace(0, np.nan)
     for n in (10, 20, 60):
         out[f"vol_{n}"] = ret1.rolling(n).std()
+    out["vol_10_60_ratio"] = out["vol_10"] / out["vol_60"].replace(0, np.nan)
+    out["vol_20_rank_3y"] = out["vol_20"].rolling(756, min_periods=252).rank(pct=True)
     tr = pd.concat(
         [(close - close.shift(1)).abs(), (close / close.shift(1) - 1).abs()], axis=1
     ).max(axis=1)
     out["atr_pct_14"] = tr.rolling(14).mean()
+    out["atr_pct_14_rank_3y"] = out["atr_pct_14"].rolling(
+        756, min_periods=252
+    ).rank(pct=True)
     out["dd_252"] = close / close.rolling(252, min_periods=60).max() - 1
     out["dist_high_20"] = close / close.rolling(20).max() - 1
     out["dist_low_20"] = close / close.rolling(20).min() - 1
@@ -280,6 +319,92 @@ def _cross_market_features(a_dates: pd.Series, start: str, end: str) -> pd.DataF
     return out
 
 
+def _load_macro_features(path: Path) -> pd.DataFrame:
+    df = pd.read_parquet(path)
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.normalize()
+    keep = ["trade_date"] + [
+        c
+        for c in df.columns
+        if c != "trade_date" and pd.api.types.is_numeric_dtype(df[c])
+    ]
+    return df[keep].sort_values("trade_date").drop_duplicates(subset=["trade_date"])
+
+
+def _load_etf_features(path: Path) -> pd.DataFrame:
+    df = pd.read_parquet(path)
+    df["trade_date"] = pd.to_datetime(df["available_date"]).dt.normalize()
+    keep = ["trade_date"] + [c for c in df.columns if c.startswith("etf_")]
+    return df[keep].sort_values("trade_date").drop_duplicates(subset=["trade_date"])
+
+
+def _merge_external(base: pd.DataFrame, ext_dir: Path) -> pd.DataFrame:
+    """把宏观 / ETF 份额 / 期指基差按 PIT 合并到日频市场表。
+
+    - 宏观与基差为当日收盘后可得，按 backward as-of 合并（周末自动取前一值）；
+    - ETF 份额用 `available_date`（下一交易日），禁止用 snapshot_date。
+    """
+    out = base.sort_values("trade_date").reset_index(drop=True)
+
+    macro_path = ext_dir / "macro_daily.parquet"
+    if macro_path.exists():
+        macro = _load_macro_features(macro_path)
+        out = pd.merge_asof(
+            out, macro, on="trade_date", direction="backward", allow_exact_matches=True
+        )
+
+    etf_path = ext_dir / "etf_shares_monthly.parquet"
+    if etf_path.exists():
+        etf = _load_etf_features(etf_path)
+        if not etf.empty:
+            out = pd.merge_asof(
+                out, etf, on="trade_date", direction="backward", allow_exact_matches=True
+            )
+
+    basis_path = ext_dir / "index_futures_basis.parquet"
+    if basis_path.exists():
+        basis = pd.read_parquet(basis_path)
+        basis["trade_date"] = pd.to_datetime(basis["trade_date"]).dt.normalize()
+        basis = basis.sort_values("trade_date").drop_duplicates(subset=["trade_date"])
+        out = pd.merge_asof(
+            out, basis, on="trade_date", direction="backward", allow_exact_matches=True
+        )
+    return out
+
+
+def _rolling_mdd(close: pd.Series, h: int) -> pd.Series:
+    """窗口 [T+1, T+h] 内的最大回撤（峰值到谷底，负数）。"""
+    run_max = close.shift(-1)
+    mdd = pd.Series(0.0, index=close.index)
+    valid = close.shift(-1).notna()
+    for k in range(h):
+        current = close.shift(-(1 + k))
+        run_max = pd.concat([run_max, current], axis=1).max(axis=1)
+        drawdown = current / run_max - 1
+        mdd = pd.concat([mdd, drawdown], axis=1).min(axis=1)
+        if k == h - 1:
+            valid &= current.notna()
+    return mdd.where(valid)
+
+
+def _add_risk_labels(
+    df: pd.DataFrame, horizons: tuple[int, ...]
+) -> pd.DataFrame:
+    """波动/回撤标签（全部只用未来价格，不进特征）。"""
+    ret1 = df["close"].pct_change()
+    rv20 = ret1.rolling(20).std() * np.sqrt(252)
+    threshold = rv20.rolling(252, min_periods=120).quantile(0.67)
+    for h in horizons:
+        # T 处取 ret1[T+1..T+h]：先 shift(-h)，再对 h 个值求标准差
+        vol = ret1.shift(-h).rolling(h).std() * np.sqrt(252)
+        df[f"fwd_vol_{h}"] = vol
+        high = (vol > threshold).astype(float)
+        df[f"vol_high_{h}"] = high.where(vol.notna() & threshold.notna())
+        mdd = _rolling_mdd(df["close"], h)
+        df[f"fwd_mdd_{h}"] = mdd
+        df[f"down_risk_{h}"] = (mdd <= -0.05).astype(float).where(mdd.notna())
+    return df
+
+
 def _add_labels(df: pd.DataFrame, horizons: tuple[int, ...]) -> pd.DataFrame:
     close = df["close"]
     for h in horizons:
@@ -309,6 +434,7 @@ def build(start: str, out_dir: Path, only: list[str] | None = None) -> dict[str,
 
     cross = _cross_market_features(breadth["trade_date"], "2014-01-01", end)
     breadth = breadth.merge(cross, on="trade_date", how="left")
+    breadth = _merge_external(breadth, out_dir.parent / "external")
 
     frames = _load_index_frames(end)
     codes = [c for c, _ in INDEX_CODES if not only or c in only]
@@ -336,6 +462,7 @@ def build(start: str, out_dir: Path, only: list[str] | None = None) -> dict[str,
         gap = one["trade_date"].shift(-1) - one["trade_date"]
         one["pre_holiday_gap"] = (gap.dt.days >= 2).astype(int)
         one = _add_labels(one, (1, 5, 10, 20))
+        one = _add_risk_labels(one, (1, 5, 10, 20))
         rows.append(one)
     full = pd.concat(rows, ignore_index=True)
     full = full[full["trade_date"] >= pd.Timestamp(start)].reset_index(drop=True)
@@ -343,7 +470,11 @@ def build(start: str, out_dir: Path, only: list[str] | None = None) -> dict[str,
 
     out_dir.mkdir(parents=True, exist_ok=True)
     full.to_parquet(out_dir / "index_regime_features.parquet", index=False)
-    label_cols = {f"fwd_ret_{h}" for h in (1, 5, 10, 20)}
+    label_cols = {
+        c
+        for c in full.columns
+        if c.startswith(LABEL_PREFIXES)
+    }
     feature_cols = [
         c
         for c in full.columns
@@ -365,6 +496,9 @@ def build(start: str, out_dir: Path, only: list[str] | None = None) -> dict[str,
             "return_1d 是**次日**收益（前视），禁止用于特征；广度改用 pct_change/100（当日收益）",
             "两融 2016-2026-09；北向 2017-03 起（2024-08 后官方停止逐日披露）；ST 为 PIT",
             "港美特征只取严格早于 A 股 T 日的收盘",
+            "v2 新增：期指基差（IF/IH/IC/IM）、SHIBOR/国债收益率/USD-CNY、沪市 ETF 份额",
+            "ETF 份额为月度快照，按 available_date=下一交易日 合并，避免前视",
+            "波动/回撤标签 fwd_vol/fwd_mdd/vol_high/down_risk 全部只用未来价格，禁止进特征",
         ],
     }
     (out_dir / "feature_meta.json").write_text(

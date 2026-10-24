@@ -29,27 +29,12 @@ import numpy as np
 import pandas as pd
 
 from backend.scripts.market_regime.build_index_regime_features import (
+    MARKET_COL_PREFIXES,
     _index_features,
     _rolling_pct,
 )
 
 SECTOR_TYPE = "行业板块(一级)"
-MARKET_COL_PREFIXES = (
-    "mkt_",
-    "sh_",
-    "sz_",
-    "fin_",
-    "slo_",
-    "north_",
-    "st_",
-    "hsi_",
-    "spx_",
-    "dow",
-    "month",
-    "is_month_end",
-    "is_quarter_end",
-    "pre_holiday_gap",
-)
 
 _SECTOR_SQL = """
 SELECT s.trade_date,
