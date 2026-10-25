@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 from datetime import date, datetime
 from typing import Optional, Tuple
 
@@ -10,6 +11,7 @@ from qlib.backtest.exchange import Exchange
 from qlib.backtest.position import BasePosition
 
 from backend.shared.redis_sentinel_client import get_redis_sentinel_client
+from backend.shared.stock_utils import StockCodeUtil
 
 logger = logging.getLogger(__name__)
 from backend.services.engine.qlib_app.utils.structured_logger import StructuredTaskLogger
@@ -56,6 +58,7 @@ class CnExchange(Exchange):
         impact_cost_coefficient: float = 0.0005,  # 市场冲击成本系数（与 Schema 默认值保持一致）
         backtest_id: str | None = None,  # 新增 backtest_id 用于关联交易记录
         allow_short_selling: bool = False,
+        max_participation_rate: float | None = None,  # 单笔成交占当日量上限（默认 5%，防 75% 一口吃）
         has_price_limits: bool = True,  # HK/US 等无涨跌停市场传 False（防未来补 change 数据后被误拦）
         stamp_duty_on_sell_only: bool = True,  # 港股印花按卖出单边计提简化（与模拟盘 HK_RULES 同口径）
         **kwargs,
@@ -70,6 +73,16 @@ class CnExchange(Exchange):
         self.impact_cost_coefficient = impact_cost_coefficient
         self.backtest_id = backtest_id
         self.allow_short_selling = bool(allow_short_selling)
+        if max_participation_rate is None:
+            try:
+                import os
+
+                max_participation_rate = float(os.getenv("QLIB_MAX_PARTICIPATION_RATE", "0.05"))
+            except Exception:
+                max_participation_rate = 0.05
+        # <=0 关闭该硬约束；非有限值同样视为关闭，避免 NaN 把成交全截成 0
+        rate = float(max_participation_rate)
+        self.max_participation_rate = rate if np.isfinite(rate) and rate > 0 else 0.0
         self.has_price_limits = bool(has_price_limits)
         self.stamp_duty_on_sell_only = bool(stamp_duty_on_sell_only)
 
@@ -326,12 +339,74 @@ class CnExchange(Exchange):
 
         return amount
 
+    #: PIT ST 稀疏表的进程内缓存：``dict[后缀式代码, 升序 YYYYMMDD int 数组]``。
+    #: ``_ST_PIT_LOADED=False`` 表示尚未尝试加载；加载失败/表缺失时缓存 None。
+    _ST_PIT_LOADED: bool = False
+    _ST_PIT_LOOKUP: dict[str, np.ndarray] | None = None
+    _ST_PIT_LOCK = threading.Lock()
+
+    @classmethod
+    def _load_st_pit(cls) -> dict[str, np.ndarray] | None:
+        """加载 PIT ST 稀疏表（``symbol,time,is_st``，只存 True 行）。
+
+        数据面由 ``backend/scripts/build_st_pit.py`` 生成（baostock 逐日 isST）。
+        表缺失/加载失败 → None（调用方按非 ST 处理），**绝不**回退到
+        ``instrument_detail.IsSTGP`` 静态快照 —— 快照回答的是「现在是不是
+        ST」，套到历史就是前视（2026-10-22 审计：预测 top decile 的 ST 占比
+        8.5% vs 全市场 4.0%）。
+        """
+        with cls._ST_PIT_LOCK:
+            if cls._ST_PIT_LOADED:
+                return cls._ST_PIT_LOOKUP
+            cls._ST_PIT_LOADED = True
+            lookup: dict[str, np.ndarray] | None = None
+            try:
+                from backend.services.engine.factor_research.data import load_st_pit
+
+                table = load_st_pit("CN")
+                if table is not None and not table.empty:
+                    frame = pd.DataFrame(
+                        {
+                            "symbol": table["symbol"].astype(str),
+                            "time": pd.to_numeric(
+                                table["time"].astype(str), errors="coerce"
+                            ),
+                        }
+                    ).dropna()
+                    lookup = {
+                        str(symbol): np.sort(group["time"].to_numpy(dtype=np.int64))
+                        for symbol, group in frame.groupby("symbol", sort=False)
+                    }
+            except Exception:
+                logger.warning(
+                    "PIT ST 表加载失败，涨跌停判定按非 ST 处理", exc_info=True
+                )
+                lookup = None
+            cls._ST_PIT_LOOKUP = lookup
+            return lookup
+
+    @classmethod
+    def _resolve_is_st(cls, stock_id: str, trade_date: date | None = None) -> bool:
+        """该标的在 ``trade_date`` 当日是否 ST（PIT 口径，无前视）。
+
+        稀疏表未命中 = 非 ST；表缺失 = 非 ST（保持「不误杀」的乐观口径）。
+        """
+        lookup = cls._load_st_pit()
+        if not lookup:
+            return False
+        days = lookup.get(StockCodeUtil.to_suffix(stock_id))
+        if days is None or days.size == 0:
+            return False
+        key = int(pd.Timestamp(trade_date or date.today()).strftime("%Y%m%d"))
+        pos = int(np.searchsorted(days, key))
+        return pos < days.size and int(days[pos]) == key
+
     @staticmethod
     def _get_limit_threshold(
         stock_id: str,
         trade_date: date | None = None,
         *,
-        is_st: bool = False,
+        is_st: bool | None = None,
     ) -> float:
         """该标的在 ``trade_date`` 当日的涨跌停阈值（含取整容差）。
 
@@ -343,23 +418,21 @@ class CnExchange(Exchange):
         一律给 20%，于是 +9.99% 的真涨停被判成「可交易」——回测里表现为在
         涨停价上成交。本函数现在的契约是「恒等于权威口径减容差」。
 
-        两处**显式**缺口（不是静默降级）：
+        ST 口径：``is_st=None``（默认）时按 PIT 稀疏表逐日判定 —— 无前视；
+        显式传 True/False 的调用方（测试、外部覆盖）优先。
 
-        1. ``is_st`` 默认 False —— Qlib 撮合层拿不到逐日 ST 口径。影响有限且
-           随时间收敛：ST 主板的 5% 保护期只到 2026-07-06，此后 ST 主板同为
-           10%，默认值对当日及以后**正确**；只有回测早于该日的窗口才会把 ST
-           的 5% 涨停当成可交易。刻意不拿 ``_st_symbol_set()`` 的静态快照来补
-           ——那是单日快照，历史回放会带前视偏差，比漏判更严重。
-        2. 0.5pp 容差是启发式，用来吸收 $change 的舍入与涨跌停价的按分取整。
-           真要做到精确，得用 ``compute_limits`` 算出涨跌停价再比价位。
+        唯一**显式**缺口：0.5pp 容差是启发式，用来吸收 $change 的舍入与
+        涨跌停价的按分取整。真要做到精确，得用 ``compute_limits`` 算出
+        涨跌停价再比价位。
         """
         from backend.services.simulation.services.local_market_data import (
             limit_threshold,
         )
 
-        return limit_threshold(
-            stock_id, is_st=is_st, trade_date=trade_date or date.today()
-        )
+        day = trade_date or date.today()
+        if is_st is None:
+            is_st = CnExchange._resolve_is_st(stock_id, day)
+        return limit_threshold(stock_id, is_st=is_st, trade_date=day)
 
     def check_stock_limit(
         self,
@@ -428,6 +501,50 @@ class CnExchange(Exchange):
 
         return order
 
+    def _clip_amount_by_participation(self, order: Order, market_volume: float | None) -> None:
+        """单笔成交不超过当日成交量的 ``max_participation_rate``（默认 5%）。
+
+        旧口径只把参与率塞进冲击成本（>10% 仅 warning），75% 一口吃仍全额成交；
+        这里直接截断，余量视为未成交缺口。``max_participation_rate<=0`` 关闭。
+        """
+        try:
+            rate = float(self.max_participation_rate)
+            if rate <= 0 or market_volume is None:
+                return
+            volume = float(market_volume)
+            if not np.isfinite(volume) or volume <= 0:
+                return
+            factor = float(order.factor) if order.factor is not None else 1.0
+            if not np.isfinite(factor) or factor <= 0:
+                factor = 1.0
+            # 单位对齐：$volume 是**真实股数**（qlib_data_builder 不调整 volume），
+            # 而 deal_amount 是**复权股数**（real_shares = deal_amount × factor）。
+            # 先换算到复权口径，否则 factor>1 时会按 factor 倍放行。
+            cap = volume * rate / factor
+            if order.deal_amount <= cap:
+                return
+            capped = cap
+            try:
+                # 与其它裁剪路径同口径：按整手向下取整
+                capped = float(self.round_amount_by_trade_unit(cap, factor))
+            except Exception:
+                capped = cap
+            capped = max(min(capped, float(order.deal_amount)), 0.0)
+            task_logger.info(
+                "clip_by_participation",
+                "Clip order by participation cap",
+                stock_id=str(order.stock_id),
+                start_time=str(order.start_time),
+                requested=float(order.deal_amount),
+                capped=float(capped),
+                market_volume=float(volume),
+                factor=float(factor),
+                max_participation_rate=rate,
+            )
+            order.deal_amount = capped
+        except Exception:
+            logger.debug("参与率裁剪失败，保留原成交量", exc_info=True)
+
     def _calc_trade_info_by_order(
         self,
         order: Order,
@@ -452,6 +569,9 @@ class CnExchange(Exchange):
         order.factor = self.get_factor(order.stock_id, order.start_time, order.end_time)
         order.deal_amount = order.amount
         self._clip_amount_by_volume(order, dealt_order_amount)
+
+        # 容量硬约束：单笔不超过当日量 max_participation_rate（默认 5%）
+        self._clip_amount_by_participation(order, market_volume)
 
         # Cash / Position limit clipping
         if order.direction == Order.SELL:

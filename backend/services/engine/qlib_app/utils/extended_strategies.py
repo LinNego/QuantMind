@@ -274,7 +274,13 @@ class RedisMomentumStrategy(RedisTopkStrategy):
         ).info("init", "RedisMomentumStrategy initialized")
 
     def _compute_momentum(self, stocks: list[str], ref_date) -> pd.Series:
-        """计算各标的过去 momentum_period 交易日的累计收益率。"""
+        """计算各标的过去 momentum_period 交易日的累计收益率（无前视）。
+
+        约定：ref_date 为 T 日（订单执行日），动量只能用 T-1 及更早收盘。
+        D.features 的 end_time 含端点，直接传 ref_date 会带入 T 日收盘
+        （15:00 才可见），因此取回后必须剔除 date >= T 的 bar，再取最近
+        momentum_period 根。
+        """
         try:
             lookback_buf = int(self.momentum_period * 2.0)
             start_dt = ref_date - pd.Timedelta(days=lookback_buf)
@@ -282,6 +288,14 @@ class RedisMomentumStrategy(RedisTopkStrategy):
             if price_df is None or price_df.empty:
                 raise ValueError("empty price data")
             prices = price_df["$close"].unstack(level="instrument")
+            # 无前视：剔除 T 日及之后（T 日收盘盘前不可见），只留 T-1 及更早
+            try:
+                cutoff = pd.Timestamp(ref_date).normalize()
+                prices = prices[prices.index < cutoff]
+            except Exception:
+                pass
+            if prices.empty or len(prices) < 2:
+                raise ValueError("insufficient pre-T data")
             # 累计收益率 = 最后价格 / 区间初价格 - 1（仅用最新 period 个交易日）
             momentum = prices.iloc[-self.momentum_period :].iloc[-1] / prices.iloc[-self.momentum_period :].iloc[0] - 1
             # 截面归一化到 [-1, 1]，避免量纲影响
@@ -828,9 +842,11 @@ class RedisStopLossStrategy(DynamicRiskMixin, TopkDropoutStrategy, RedisLoggerMi
     止损止盈策略 (Stop Loss / Take Profit)
     逻辑：
     1. 在内存中维护每个股票的持仓成本 (avg_price)。
-    2. 每日检查 (current_price - avg_price) / avg_price。
-    3. 若低于 stop_loss 或高于 take_profit，强制卖出。
+    2. 每日盘前用 T-1 收盘价检查 (price_T-1 - avg_price) / avg_price。
+    3. 若低于 stop_loss 或高于 take_profit，生成 T 日开盘执行的强制卖单。
     4. 正常的 TopK 调仓逻辑叠加在止损逻辑之后 (即止损优先)。
+    无前视约束：绝不能用 T 日收盘价判断 + T 日开盘价成交（报告 3183b3d5
+    的 1696%→523% 未来函数即源于此）。
     """
 
     def __init__(self, *args, **kwargs):
@@ -883,25 +899,42 @@ class RedisStopLossStrategy(DynamicRiskMixin, TopkDropoutStrategy, RedisLoggerMi
 
         current_stocks = current_position.get_stock_list()
 
-        # 获取当前时间
+        # 获取当前时间（无前视：信号只能用 T-1 收盘，T 开盘执行）
+        # qlib 在 T 日盘前调用本方法，订单按 T 日 open 成交，因此 D.features
+        # 绝不能读 trade_date 当天 close（15:00 才可见），必须读上一 bar。
+        signal_date = None
         if hasattr(self.trade_calendar, "get_step_time"):
             trade_step = self.trade_calendar.get_trade_step()
             trade_date, _ = self.trade_calendar.get_step_time(trade_step)
+            try:
+                prev_time, _ = self.trade_calendar.get_step_time(trade_step, shift=1)
+            except Exception:
+                prev_time = None
+            if prev_time is not None:
+                # step=0 时 prev 可能回绕到未来/等于当前，必须丢弃
+                if pd.Timestamp(prev_time) < pd.Timestamp(trade_date):
+                    signal_date = pd.Timestamp(prev_time)
         else:
             trade_step = getattr(self, "trade_step", 0)
             trade_date = self.trade_calendar[trade_step]
+            if trade_step > 0:
+                try:
+                    signal_date = pd.Timestamp(self.trade_calendar[trade_step - 1])
+                except Exception:
+                    signal_date = None
 
         # 强制止损列表
         force_sell_stocks = set()
 
-        if current_stocks:
+        # 首个 bar 无 T-1 可用：跳过止损判断，只走正常 TopK（持仓为空，无影响）
+        if current_stocks and signal_date is not None:
             try:
-                # 批量获取当前价格
+                # 批量获取上一交易日收盘价（T-1，盘前已知）
                 current_prices = D.features(
                     current_stocks,
                     ["$close"],
-                    start_time=trade_date.strftime("%Y-%m-%d"),
-                    end_time=trade_date.strftime("%Y-%m-%d"),
+                    start_time=signal_date.strftime("%Y-%m-%d"),
+                    end_time=signal_date.strftime("%Y-%m-%d"),
                 )
                 if current_prices is not None and not current_prices.empty:
                     # current_prices index: (instrument, date)
