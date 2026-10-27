@@ -238,8 +238,15 @@ scripts/data_repair/_gtja_191_source.py
 # 临时 / 分析 / 备份文件（不提交）
 analysis/
 openbb-cn/
-research/
 scratch/
+# research/ = 个人研究工作区（2026-10 起纳入版本控制，用于跨机器同步）
+# 脚本 / 报告 / 图表都提交；只排除「可再生成的大文件」和本机缓存
+research/**/*.parquet
+research/**/*.feather
+research/**/*.pkl
+research/**/*.h5
+research/**/*.zip
+research/**/__pycache__/
 # 迁移约定：scratch/ 仅供一次性草稿/探测（丢弃区）。
 # 有沉淀价值的因子审计/校验脚本请移入 backend/scripts/audit/ 以纳入版本控制。
 dexter-finance/
@@ -283,3 +290,6 @@ config/training_nodes.yaml
 
 # Windows 保留名残留文件（误重定向产生，不跟踪）
 /nul
+# 例外：research/out/ 里的图表要跨机器同步，保留在版本控制里（out/ 全局被忽略）
+!research/out/
+!research/out/**
