@@ -98,6 +98,7 @@ db.tar.gz
 *.csv
 !backend/tests/**/*.csv
 !data/examples/**/*.csv
+!docs/量化学习/*.csv
 data/backtest_results/
 data/alpha_agent_logs/
 userdata/
