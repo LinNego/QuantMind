@@ -5,7 +5,7 @@
 原则：**只学这 6 课，够你写完整个阶段 1~3。** pandas 剩下 90% 的功能你这辈子用不到。
 
 用法（仓库根目录）：
-    python3 research/01-week1/day4/pandas_drill.py
+    python research/01-week1/day4/pandas_drill.py
 
 每节课的结构都是：演示（能跑出真数据） → 练习（改一行，猜结果，再跑）。
 **不要只读，必须改。** 改坏了就 git checkout 回来。

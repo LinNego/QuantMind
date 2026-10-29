@@ -3,7 +3,7 @@
 
 **只依赖 duckdb**（不 import pandas），所以在宿主机直接跑就行，不需要任何容器：
 
-    python3 research/00_data_check.py
+    python research/00_data_check.py
 
 目标不是"把数据跑一遍"，而是**回答 7 个具体问题**，
 任何一个答案是"我不确定"，就说明还没过关（Gate 1）。
