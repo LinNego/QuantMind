@@ -190,8 +190,14 @@ def lesson6(wide: pd.DataFrame) -> None:
     ret = wide.pct_change(fill_method=None).fillna(0.0)
     port = (w.shift(1) * ret).sum(axis=1)              # 昨天的仓位 × 今天的收益
     nav = (1 + port).cumprod()
-    print("④ 组合日收益（前 5 天）：")
-    print((port * 100).head(5).round(3).to_string(), "\n")
+
+    print("④ 组合日收益 —— 注意前面一段全是 0：")
+    print((port * 100).head(5).round(3).to_string())
+    print("   前 20 天收益为 0 不是 bug：")
+    print("   20 日因子需要 20 天历史，前 20 天算不出名次 → 没有持仓 → 收益 0。")
+    print("   这叫「热启动期」，真实回测里要把它剔掉再算年化。\n")
+    print("   热启动之后长这样（第 21~25 个交易日）：")
+    print((port * 100).iloc[20:25].round(3).to_string(), "\n")
     print("⑤ 净值（连乘）：")
     print(nav.tail(3).round(4).to_string())
     print(f"\n这段区间的总收益：{(nav.iloc[-1] - 1) * 100:.2f}%")
