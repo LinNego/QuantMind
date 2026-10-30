@@ -6,7 +6,7 @@
     SYMBOL 股票代码，带后缀，如 600519.SH / 000001.SZ / 301139.SZ
 
 用法：
-    cd /root/QuantMind
+    cd /root/quant/QuantMind
     /root/quant/.venv/bin/python research/practice.py
 """
 DATE = 20261023

@@ -2,7 +2,7 @@
 """交互式查数据（第 1 天用这个练手）
 
 用法：
-    cd /root/QuantMind
+    cd /root/quant/QuantMind
     /root/quant/.venv/bin/python research/repl.py
 
 进去之后，直接对 `q(...)` 里塞 SQL：

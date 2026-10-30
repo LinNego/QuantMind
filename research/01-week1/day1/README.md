@@ -41,7 +41,7 @@
 ## 3.1 怎么跑
 
 ```bash
-cd /root/QuantMind
+cd /root/quant/QuantMind
 
 # ① 扫表结构（约 20~40 秒）
 /root/quant/.venv/bin/python research/01-week1/day1/inspect_tables.py
