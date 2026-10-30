@@ -15,16 +15,16 @@
     # 默认落盘目录：/home/quantmind/quantdb（/ 分区只剩十几 G，装不下 L0）
 
     # 1) 只算不下：看清单、体积、磁盘够不够
-    /root/quant/.venv/bin/python research/tools/download_quantdb.py --dry-run
+    python research/tools/download_quantdb.py --dry-run
 
     # 2) 真正下载（默认跳过本地已有的表，断点续传）
-    /root/quant/.venv/bin/python research/tools/download_quantdb.py
+    python research/tools/download_quantdb.py
 
     # 3) 只要某几张
-    /root/quant/.venv/bin/python research/tools/download_quantdb.py --only features_daily
+    python research/tools/download_quantdb.py --only features_daily
 
     # 4) 连因子表一起下（L1+L2，约 47 GB，确认磁盘再跑）
-    /root/quant/.venv/bin/python research/tools/download_quantdb.py --include-factors
+    python research/tools/download_quantdb.py --include-factors
 
 设计说明：
     - 远端清单来自魔搭仓库 qusong0627/LightGBM_Alpha300，逐文件带 sha256/size

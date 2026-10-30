@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """day1 · 把 QuantDB 每张表翻一遍：有哪些列、什么类型、多少行、长什么样。
 
-用法（在仓库根目录 /root/quant/QuantMind 下执行）：
+用法（在仓库根目录 /data/ljc/vigap/quant/QuantMind 下执行）：
 
-    /root/quant/.venv/bin/python research/01-week1/day1/inspect_tables.py
+    python research/01-week1/day1/inspect_tables.py
 
 产出：
     research/01-week1/day1/tables_schema.md     ← 数据字典（每张表的全部列 + 类型 + 样本行）

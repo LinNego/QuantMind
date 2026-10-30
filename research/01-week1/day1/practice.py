@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """第 1 天练习：改数字玩（07-阶段0-每日执行计划.md 第 1 天原话）
 
@@ -6,8 +7,8 @@
     SYMBOL 股票代码，带后缀，如 600519.SH / 000001.SZ / 301139.SZ
 
 用法：
-    cd /root/quant/QuantMind
-    /root/quant/.venv/bin/python research/practice.py
+    cd /data/ljc/vigap/quant/QuantMind
+    python research/practice.py
 """
 DATE = 20261023
 SYMBOL = "600519.SH"
@@ -18,7 +19,8 @@ import pandas as pd
 pd.set_option("display.width", 200)
 pd.set_option("display.max_columns", 30)
 
-KU = "/opt/quantmind/data/quantdb/1_kline_data/daily_unadjusted/*/data.parquet"
+DATA_DIR = os.getenv("QM_QUANTDB_DATA_DIR", "/opt/quantmind/data/quantdb")
+KU = f"{DATA_DIR}/1_kline_data/daily_unadjusted/*/data.parquet"
 con = duckdb.connect()
 con.execute("SET threads=8")
 

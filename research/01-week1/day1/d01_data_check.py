@@ -14,6 +14,8 @@
 """
 from __future__ import annotations
 
+import os
+
 import textwrap
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +23,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-ROOT = Path("/opt/quantmind/data/quantdb")
+ROOT = Path(os.getenv("QM_QUANTDB_DATA_DIR", "/opt/quantmind/data/quantdb"))
 OUT = Path(__file__).resolve().parents[2] / "out"
 KU = str(ROOT / "1_kline_data/daily_unadjusted/*/data.parquet")
 KF = str(ROOT / "1_kline_data/daily_forward/*/data.parquet")
