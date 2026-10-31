@@ -10,10 +10,10 @@
 
 | 材料 | 形态 | 用途 | 什么时候用 |
 |---|---|---|---|
-| [pandas_drill.py](../../research/01-week1/day4/pandas_drill.py) | 6 节课，可运行 | **动手入门**：5 只股票 × 40 天，讲完就能写回测 | 第一次学，60 分钟 |
-| [pandas_cheatsheet.md](../../research/01-week1/day4/pandas_cheatsheet.md) | 速查表 | **SQL → pandas 对照**，忘记语法时查 | 写代码时放旁边 |
+| [pandas_drill.py](../../research/lessons/pandas_drill.py) | 6 节课，可运行 | **动手入门**：5 只股票 × 40 天，讲完就能写回测 | 第一次学，60 分钟 |
+| [pandas_cheatsheet.md](../../research/lessons/pandas_cheatsheet.md) | 速查表 | **SQL → pandas 对照**，忘记语法时查 | 写代码时放旁边 |
 | 本文（09） | 概念 + 实测 | **补 drill 没讲的三件事**：pandas 3 与老教程的差异、index 对齐的静默坑、全市场规模的真实数字 | 跑完 drill 再读，30 分钟 |
-| [research/pandas_basics.py](../../research/pandas_basics.py) | 一个脚本 | 全市场 128 万行真实数据走一遍「读→查→变形→算→存」 | 想确认自己会用，十几秒 |
+| [research/lessons/pandas_basics.py](../../research/lessons/pandas_basics.py) | 一个脚本 | 全市场 128 万行真实数据走一遍「读→查→变形→算→存」 | 想确认自己会用，十几秒 |
 
 **别按顺序全读一遍。** 入门只需要：`drill` 跑一遍 → 本文第 0、4 节 → 写你自己的 `research/01_load_data.py`。
 
@@ -72,7 +72,7 @@ px.rolling(20).std()           # 纵向（默认 axis=0）→ 时序：这只股
 
 ## 2. 只学这 8 个，覆盖 95% 的日常
 
-> 带 SQL 对照的完整速查表在 [pandas_cheatsheet.md](../../research/01-week1/day4/pandas_cheatsheet.md)，这里只给「什么时候用哪个」。
+> 带 SQL 对照的完整速查表在 [pandas_cheatsheet.md](../../research/lessons/pandas_cheatsheet.md)，这里只给「什么时候用哪个」。
 
 | 动作 | API | 一句话 |
 |---|---|---|
@@ -92,7 +92,7 @@ px.rolling(20).std()           # 纵向（默认 axis=0）→ 时序：这只股
 ## 3. 拿真实数据走一遍（脚本 6 段，12 秒跑完）
 
 ```bash
-/root/quant/.venv/bin/python research/pandas_basics.py
+/root/quant/.venv/bin/python research/lessons/pandas_basics.py
 ```
 
 它做六件事（整个跑完十几秒），每件都给一个「该看什么」：
@@ -273,9 +273,9 @@ big.open * big.close                                      # 8.7ms
 
 ## 9. 下一步
 
-1. 先把 [pandas_drill.py](../../research/01-week1/day4/pandas_drill.py) 跑一遍，六节课每节都改一行数字再跑——**改坏了才叫学会**。
-2. 再跑 `python research/pandas_basics.py`，把六段输出逐条解释给自己听——**说不出来的那句，就是你还没懂的那句**。
-3. 打开 [research/repl.py](../../research/repl.py)，用 `q("SELECT ...")` 交互式查真实数据，比看教程有用。
+1. 先把 [pandas_drill.py](../../research/lessons/pandas_drill.py) 跑一遍，六节课每节都改一行数字再跑——**改坏了才叫学会**。
+2. 再跑 `python research/lessons/pandas_basics.py`，把六段输出逐条解释给自己听——**说不出来的那句，就是你还没懂的那句**。
+3. 打开 [research/tools/repl.py](../../research/tools/repl.py)，用 `q("SELECT ...")` 交互式查真实数据，比看教程有用。
 4. 然后把 [08](08-全程每日计划.md) 的 **D01–D05** 做了：那些题全部只用本文这 8 个 API。
 4. 想去重/去极值/中性化，接着看 [03-常见陷阱与自检红线.md](03-常见陷阱与自检红线.md) 和 [02-核心概念速通.md](02-核心概念速通.md) 第 7 节的 20 行骨架。
 

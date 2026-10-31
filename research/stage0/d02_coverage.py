@@ -23,7 +23,7 @@ import duckdb
 import pandas as pd
 
 ROOT = Path(os.getenv("QM_QUANTDB_DATA_DIR") or "/opt/quantmind/data/quantdb")
-OUT = Path(__file__).resolve().parents[2] / "out"
+OUT = Path(__file__).resolve().parents[1] / "out"
 
 MAIN = str(ROOT / "1_kline_data/daily_unadjusted/*/data.parquet")
 CAL = str(ROOT / "2_base_sector/trading_calendar/*.parquet")
@@ -173,7 +173,7 @@ def main() -> int:
                  b AS (SELECT DISTINCT symbol FROM read_parquet(
                           '{fd}/**/*.parquet', hive_partitioning=true, union_by_name=true))
             SELECT count(*) AS 缺的股票数,
-                   string_agg(symbol, ', ' ORDER BY symbol) AS 前 10 个样例
+                   string_agg(symbol, ', ' ORDER BY symbol) AS "前 10 个样例"
             FROM (SELECT symbol FROM a EXCEPT SELECT symbol FROM b LIMIT 10)
         """).df()
         say("\n```")

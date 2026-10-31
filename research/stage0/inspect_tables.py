@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """day1 · 把 QuantDB 每张表翻一遍：有哪些列、什么类型、多少行、长什么样。
 
-用法（在仓库根目录 /data/ljc/vigap/quant/QuantMind 下执行）：
+用法（在仓库根目录 /root/quant/QuantMind 下执行）：
 
-    python research/01-week1/day1/inspect_tables.py
+    python research/stage0/inspect_tables.py
 
 产出：
-    research/01-week1/day1/tables_schema.md     ← 数据字典（每张表的全部列 + 类型 + 样本行）
-    research/01-week1/day1/tables_overview.csv  ← 一张表一行：表名/文件数/行数/列数/体积
+    research/out/tables_schema.md     ← 数据字典（每张表的全部列 + 类型 + 样本行）
+    research/out/tables_overview.csv  ← 一张表一行：表名/文件数/行数/列数/体积
 
 只做三件事，不做分析：
     1. DESCRIBE  → 全部列名 + 类型
@@ -31,9 +31,10 @@ from pathlib import Path
 import duckdb
 
 ROOT = Path(os.getenv("QM_QUANTDB_DATA_DIR") or "/opt/quantmind/data/quantdb")
-HERE = Path(__file__).resolve().parent
-MD = HERE / "tables_schema.md"
-CSV = HERE / "tables_overview.csv"
+HERE = Path(__file__).resolve().parents[1]      # research/
+OUT = HERE / "out"
+MD = OUT / "tables_schema.md"
+CSV = OUT / "tables_overview.csv"
 
 # 表名 → 中文名（来自 backend/shared/quantdb_datasets.py 的 29 条 DatasetSpec）
 CN = {

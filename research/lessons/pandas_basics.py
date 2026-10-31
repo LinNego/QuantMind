@@ -4,7 +4,7 @@
 配套文档：docs/量化学习/09-pandas入门.md
 用法：
     cd /root/quant/QuantMind
-    /root/quant/.venv/bin/python research/pandas_basics.py
+    /root/quant/.venv/bin/python research/lessons/pandas_basics.py
 
 数据来源：/opt/quantmind/data/quantdb（hive 分区 parquet），可用
 环境变量 QM_QUANTDB_ROOT 覆盖；找不到数据时退化为合成数据，脚本照样能跑通。

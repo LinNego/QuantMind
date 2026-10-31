@@ -9,7 +9,7 @@
 
 用法：
     qm
-    python research/01-week1/day5/d06_missing.py
+    python research/stage0/d06_missing.py
 产出：
     research/out/D06_missing.md
 """
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import duckdb
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "research" / "out" / "D06_missing.md"
 DATA_DIR = os.getenv("QM_QUANTDB_DATA_DIR", "/opt/quantmind/data/quantdb")
 FEAT = f"{DATA_DIR}/6_ml_datasets/features_daily/*/data.parquet"

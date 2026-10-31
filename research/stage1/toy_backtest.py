@@ -11,8 +11,8 @@
 看 ①→② 掉多少，是"时序"的价值；②→③ 掉多少，是"成本"的价值。
 
 用法（仓库根目录）：
-    python research/01-week1/day3/toy_backtest.py
-    python research/01-week1/day3/toy_backtest.py --topk 50 --rebal 40
+    python research/stage1/toy_backtest.py
+    python research/stage1/toy_backtest.py --topk 50 --rebal 40
 
 产出：
     research/out/tbl/toy_backtest_metrics.csv
@@ -34,7 +34,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[3]          # 仓库根
+ROOT = Path(__file__).resolve().parents[2]          # 仓库根
 OUT_TBL = ROOT / "research" / "out" / "tbl"
 OUT_FIG = ROOT / "research" / "out" / "fig"
 DATA_DIR = os.getenv("QM_QUANTDB_DATA_DIR", "/opt/quantmind/data/quantdb")

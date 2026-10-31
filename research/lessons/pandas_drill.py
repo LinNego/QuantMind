@@ -5,7 +5,7 @@
 原则：**只学这 6 课，够你写完整个阶段 1~3。** pandas 剩下 90% 的功能你这辈子用不到。
 
 用法（仓库根目录）：
-    python research/01-week1/day4/pandas_drill.py
+    python research/lessons/pandas_drill.py
 
 每节课的结构都是：演示（能跑出真数据） → 练习（改一行，猜结果，再跑）。
 **不要只读，必须改。** 改坏了就 git checkout 回来。
@@ -178,6 +178,8 @@ def lesson5(wide: pd.DataFrame) -> None:
     mom = wide / wide.shift(20) - 1
     print((mom * 100).tail(3).round(2).to_string())
     print("\n【练习】把 shift(20) 改成 shift(5)，看 5 日涨幅的分布怎么变。")
+    mom2 = wide / wide.shift(5) - 1
+    print((mom2 * 100).tail(3).round(2).to_string())
 
 
 # ===========================================================================
@@ -196,7 +198,7 @@ def lesson6(wide: pd.DataFrame) -> None:
         index=["周一", "周二", "周三", "周四", "周五"],
     )
     close.index.name = "日期"
-    S = 2          # 用 2 天窗口，这样第三天就能第一次算出因子
+    S = 1          # 用 2 天窗口，这样第三天就能第一次算出因子
 
     print("【第 0 步】收盘价（行=日期，列=股票）")
     print(close.to_string())

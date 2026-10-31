@@ -24,7 +24,7 @@ import duckdb
 import pandas as pd
 
 ROOT = Path(os.getenv("QM_QUANTDB_DATA_DIR", "/opt/quantmind/data/quantdb"))
-OUT = Path(__file__).resolve().parents[2] / "out"
+OUT = Path(__file__).resolve().parents[1] / "out"
 KU = str(ROOT / "1_kline_data/daily_unadjusted/*/data.parquet")
 KF = str(ROOT / "1_kline_data/daily_forward/*/data.parquet")
 KB = str(ROOT / "1_kline_data/daily_backward/*/data.parquet")

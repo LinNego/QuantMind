@@ -1,0 +1,24 @@
+﻿类别,表,中文,布局,文件数,体积,行数,列数
+1_kline_data,daily_backward,日线后复权,partition,2623,394.4 MB,10826172,9
+1_kline_data,daily_forward,日线前复权,partition,2623,383.4 MB,10826172,9
+1_kline_data,daily_unadjusted,日线不复权,partition,2623,223.8 MB,10826172,9
+1_kline_data,index_daily,指数日线,partition,2623,8.1 MB,114653,10
+2_base_sector,index_weights,指数权重,single,7,41.6 KB,2800,3
+2_base_sector,instrument_detail,个股详情,single,1,3.0 MB,5581,152
+2_base_sector,margin_trading,融资融券,partition,2622,136.8 MB,5042454,11
+2_base_sector,sector_concept,板块概念,single,1,170.0 KB,78890,4
+2_base_sector,trading_calendar,交易日历,single,1,15.4 KB,2672,2
+3_financial_data,balance,资产负债表,single,5559,317.4 MB,191900,75
+3_financial_data,capital,股本结构,single,5559,43.3 MB,308841,10
+3_financial_data,cashflow,现金流量表,single,5559,308.7 MB,196961,68
+3_financial_data,dividend_factors,分红送转因子,single,5451,24.1 MB,58933,11
+3_financial_data,holder_num,股东户数,single,5559,144.8 MB,191533,38
+3_financial_data,income,利润表,single,5559,179.3 MB,197727,37
+3_financial_data,per_share,每股指标TTM,single,5558,47.1 MB,191467,10
+3_financial_data,pershare_index,每股财务指标,single,5559,416.5 MB,193749,86
+4_bond_etf,convertible_bond,可转债,single,1,45.2 KB,316,25
+4_bond_etf,etf_pcf,ETF申赎清单,single,3,1.1 MB,192081,31
+5_technical_derived,market_sentiment,市场情绪,partition,2611,967.3 MB,10760462,18
+5_technical_derived,technical_indicators,技术指标,partition,2623,2.4 GB,10827362,36
+5_technical_derived,valuation,估值,partition,2611,809.8 MB,10760462,17
+6_ml_datasets,features_daily,日频特征,partition,2623,3.3 GB,10550057,79
