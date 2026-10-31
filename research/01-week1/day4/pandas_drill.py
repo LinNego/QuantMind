@@ -71,8 +71,10 @@ def lesson1(df: pd.DataFrame) -> None:
     print("\n每列的类型（= DESC table）：")
     print(df.dtypes)
     print("\n数值列的分布（= 一次看 min/max/mean）：")
+    # 这是在干嘛
     print(df.describe().round(2).to_string())
     print("\n【练习】把 df.head(3) 改成 df.tail(5)，猜结果再跑。")
+    print(df.tail(5).to_string(index=False))
 
 
 # ===========================================================================
@@ -97,6 +99,7 @@ def lesson2(df: pd.DataFrame) -> None:
     print("⑤ 排序（= ORDER BY close DESC）")
     print(day.sort_values("close", ascending=False).to_string(index=False))
     print("\n【练习】把 > 100 改成 > 30，看多出哪几只。")
+    print(df[(df["dt"] == 20241231) & (df["close"] > 30)].to_string(index=False), "\n")
 
     print("\n⚠️ 最常见的坑：")
     print("   df['close']        → 一列（Series）")
@@ -123,6 +126,10 @@ def lesson3(df: pd.DataFrame) -> None:
     df2["相对均价"] = (df2["close"] / df2["股票均价"] - 1).round(4)
     print(df2.tail(4)[["symbol", "dt", "close", "股票均价", "相对均价"]].to_string(index=False))
     print("\n【练习】把 'mean' 换成 'std'，看哪只股票波动最大。")
+    df3 = df.copy()
+    df3["股票均价"] = df3.groupby("symbol")["close"].transform("std")
+    df3["相对均价"] = (df3["close"] / df3["股票均价"] - 1).round(4)
+    print(df2.tail(3)[["symbol", "dt", "close", "股票均价", "相对均价"]].to_string(index=False))
 
 
 # ===========================================================================
@@ -140,6 +147,9 @@ def lesson4(df: pd.DataFrame) -> pd.DataFrame:
     print("所以「横向比较」（选股）= axis=1；「纵向比较」（时间）= axis=0。")
     print("这一步是 SQL 做不到的顺手事，也是 pandas 唯一不可替代的地方。")
     print("\n【练习】把 values='close' 改成 'volume'，看看成交量版长什么样。")
+    wide2 = df.pivot(index="dt", columns="symbol", values="close").sort_index()
+    print(wide2.head(3).round(2).to_string())
+
     return wide
 
 
@@ -171,37 +181,113 @@ def lesson5(wide: pd.DataFrame) -> None:
 # 第 6 课：横向排名 + 选股 + 净值（把回测拆成 5 行）
 # ===========================================================================
 def lesson6(wide: pd.DataFrame) -> None:
-    title("第 6 课", "axis=1：每天横向排名 → 选股 → 净值")
+    title("第 6 课", "把前 5 课拼成一个回测：每一步都打印出来")
 
-    mom = wide / wide.shift(20) - 1
-    rank = mom.rank(axis=1, ascending=False)          # 每天横着排名，1 = 涨得最多
-    print("① 每天的名次（axis=1 = 横着算）：")
-    print(rank.tail(3).to_string(), "\n")
+    # 3 只股票 × 5 天的小表：所有数字都能心算，不用信我
+    close = pd.DataFrame(
+        {
+            "A": [10.0, 11.0, 12.0, 13.0, 14.0],
+            "B": [20.0, 21.0, 20.0, 23.0, 26.0],
+            "C": [30.0, 32.0, 35.0, 36.0, 34.0],
+        },
+        index=["周一", "周二", "周三", "周四", "周五"],
+    )
+    close.index.name = "日期"
+    S = 2          # 用 2 天窗口，这样第三天就能第一次算出因子
 
-    pick = rank <= 2                                   # 每天取前 2 名
-    print("② 选中谁（True/False 矩阵）：")
-    print(pick.tail(3).to_string(), "\n")
+    print("【第 0 步】收盘价（行=日期，列=股票）")
+    print(close.to_string())
+    print(f"   形状 {close.shape} = 5 个交易日 × 3 只股票\n")
+
+    sh = close.shift(S)
+    print(f"【第 1 步】close.shift({S}) —— 整张表往下推 {S} 格")
+    print(sh.to_string())
+    print(f"   形状 {sh.shape}，和原来一样：不删行，只是顶上补 {S} 行 NaN")
+    print(f"   周三 A 那格 = {sh.loc['周三', 'A']:.0f}，其实是【周一】A 的价\n")
+
+    mom = close / sh - 1
+    print(f"【第 2 步】因子 mom = close / close.shift({S}) - 1")
+    print((mom * 100).round(2).to_string())
+    print(f"   周三 A = 12.0 / 10.0 - 1 = {(12.0 / 10.0 - 1) * 100:.2f}%  ← 两天涨了 20%\n")
+
+    rank = mom.rank(axis=1, ascending=False)
+    print("【第 3 步】rank(axis=1, ascending=False) —— 每天横着排名")
+    print(rank.to_string())
+    print("   周三这行：A=20.00% 第1，C=16.67% 第2，B=0.00% 第3\n")
+
+    pick = rank <= 2
+    print("【第 4 步】pick = rank <= 2 —— 取前 2 名")
+    print(pick.to_string())
+    print("   True = 今天买它。周三选 A、C；周五变成选 A、B（换仓了）\n")
 
     w = pick.astype(float)
-    w = w.div(w.sum(axis=1).replace(0, float("nan")), axis=0).fillna(0.0)
-    print("③ 权重（选中的平分，每只 0.5）：")
-    print(w.tail(3).round(2).to_string(), "\n")
+    print("【第 5 步】astype(float) —— True/False → 1.0/0.0")
+    print(w.to_string())
+    print("   布尔值不能做除法，先转成数字\n")
 
-    ret = wide.pct_change(fill_method=None).fillna(0.0)
-    port = (w.shift(1) * ret).sum(axis=1)              # 昨天的仓位 × 今天的收益
-    nav = (1 + port).cumprod()
+    rowsum = w.sum(axis=1)
+    print("【第 6 步】w.sum(axis=1) —— 每行加起来 = 今天选了几只")
+    print(rowsum.to_string())
+    print("   周三 = 2.0，表示选了 2 只\n")
 
-    print("④ 组合日收益 —— 注意前面一段全是 0：")
-    print((port * 100).head(5).round(3).to_string())
-    print("   前 20 天收益为 0 不是 bug：")
-    print("   20 日因子需要 20 天历史，前 20 天算不出名次 → 没有持仓 → 收益 0。")
-    print("   这叫「热启动期」，真实回测里要把它剔掉再算年化。\n")
-    print("   热启动之后长这样（第 21~25 个交易日）：")
-    print((port * 100).iloc[20:25].round(3).to_string(), "\n")
-    print("⑤ 净值（连乘）：")
-    print(nav.tail(3).round(4).to_string())
-    print(f"\n这段区间的总收益：{(nav.iloc[-1] - 1) * 100:.2f}%")
-    print("\n【练习】把 rank <= 2 改成 <= 1（只买一只），看净值怎么变。")
+    w = w.div(rowsum.replace(0, float("nan")), axis=0).fillna(0.0)
+    print("【第 7 步】w.div(每行的和, axis=0) —— 把 1.0 摊成 1/N")
+    print(w.round(2).to_string())
+    print("   周三：A=1/2=0.5，C=1/2=0.5，B=0/2=0")
+    print("   验算每行加起来 =", w.sum(axis=1).round(2).tolist(), "（都该是 1.0）")
+    print("   ⚠️ 漏了这步，权重和 = 2.0，等于偷偷用了 2 倍杠杆\n")
+
+    ret = close.pct_change(fill_method=None)
+    print("【第 8 步】ret = close.pct_change() —— 每只股票当天的涨跌")
+    print((ret * 100).round(2).to_string())
+    print("   周四 B = 23/20 - 1 = +15%")
+    print("   周一整行是 NaN：没有'昨天'\n")
+
+    w_prev = w.shift(1)
+    print("【第 9 步】w.shift(1) —— 仓位往下推一格")
+    print(w_prev.round(2).to_string())
+    print("   周四这行拿到的是【周三】的仓位；周五拿到【周四】的")
+    print("   含义：昨天做的决定，今天才生效\n")
+
+    detail = w_prev * ret
+    print("【第 10 步】w_prev * ret —— 每只股票贡献多少收益")
+    print((detail * 100).round(2).to_string())
+    print("   周四这行：A 0.5×8.33%=4.17%，C 0.5×2.86%=1.43%")
+    print("   注意周五持有的仍是【周四选的 A、C】，不是周五才选的 A、B\n")
+
+    port = detail.sum(axis=1)
+    print("【第 11 步】.sum(axis=1) —— 横着加 = 组合当天赚了多少")
+    print((port * 100).round(2).to_string())
+    print(f"   周四 = 4.17% + 1.43% = {(port.loc['周四']) * 100:.2f}%\n")
+
+    nav = (1 + port.fillna(0.0)).cumprod()
+    print("【第 12 步】nav = (1 + port).cumprod() —— 连乘成净值")
+    print(nav.round(4).to_string())
+    print("   周四：1.0000 × (1 + 5.60%) = 1.0560")
+    print("   周五：1.0560 × (1 + 1.07%) = 1.0672")
+    print("   是【乘】不是【加】：第二天赚的钱建在第一天赚的钱之上\n")
+    print(f"【结果】5 天总收益 = {(nav.iloc[-1] - 1) * 100:+.2f}%")
+
+    # ---- 反面对照 ----
+    port_bad = (w * ret).sum(axis=1)
+    nav_bad = (1 + port_bad.fillna(0.0)).cumprod()
+    print("\n【对照】把 w.shift(1) 写成 w（漏掉 shift）：")
+    cmp = pd.DataFrame(
+        {
+            "✅ 有 shift(1)": (port * 100).round(2),
+            "❌ 无 shift": (port_bad * 100).round(2),
+        }
+    )
+    print(cmp.to_string())
+    print(f"   ✅ 正确版 5 天总收益：{(nav.iloc[-1] - 1) * 100:+.2f}%")
+    print(f"   ❌ 作弊版 5 天总收益：{(nav_bad.iloc[-1] - 1) * 100:+.2f}%")
+    print("   周五差得最多：作弊版用【周五收盘才选出来】的 A、B，")
+    print("   去吃【周五白天】的涨跌。这在现实中不可能做到。\n")
+
+    print("【练习】")
+    print("  1. S = 2 改成 S = 1，因子变成'1 日涨幅'，看名次怎么变")
+    print("  2. rank <= 2 改成 rank <= 1（只买一只）")
+    print("  3. 把 w.shift(1) 改回 w，自己算一遍周五那行的差")
 
 
 def main() -> None:
