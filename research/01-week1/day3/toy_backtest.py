@@ -24,6 +24,8 @@
 
 from __future__ import annotations
 
+import os
+
 import argparse
 import sys
 from pathlib import Path
@@ -35,7 +37,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[3]          # 仓库根
 OUT_TBL = ROOT / "research" / "out" / "tbl"
 OUT_FIG = ROOT / "research" / "out" / "fig"
-DATA = "/opt/quantmind/data/quantdb/1_kline_data/daily_forward/*/data.parquet"
+DATA_DIR = os.getenv("QM_QUANTDB_DATA_DIR", "/opt/quantmind/data/quantdb")
+DATA = f"{DATA_DIR}/1_kline_data/daily_forward/*/data.parquet"
 
 # 成本拆分（详见 docs/回测费用配置说明.md）
 COMMISSION = 0.00025   # 佣金 万 2.5，双边

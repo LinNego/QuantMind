@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import os
+
 import duckdb
 import pandas as pd
 
@@ -20,7 +22,8 @@ pd.set_option("display.width", 170)
 pd.set_option("display.max_columns", 20)
 pd.set_option("display.unicode.east_asian_width", True)
 
-DATA = "/opt/quantmind/data/quantdb/1_kline_data/daily_forward/*/data.parquet"
+DATA_DIR = os.getenv("QM_QUANTDB_DATA_DIR", "/opt/quantmind/data/quantdb")
+DATA = f"{DATA_DIR}/1_kline_data/daily_forward/*/data.parquet"
 STOCKS = ("600519.SH", "000001.SZ", "600036.SH", "002594.SZ", "601318.SH")
 
 

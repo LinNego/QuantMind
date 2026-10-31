@@ -2,8 +2,8 @@
 """交互式查数据（第 1 天用这个练手）
 
 用法：
-    cd /root/QuantMind
-    /root/quant/.venv/bin/python research/repl.py
+    cd /data/ljc/vigap/quant/QuantMind
+    python research/repl.py
 
 进去之后，直接对 `q(...)` 里塞 SQL：
 
@@ -17,6 +17,8 @@
 """
 from __future__ import annotations
 
+import os
+
 import re
 import sys
 from pathlib import Path
@@ -24,7 +26,7 @@ from pathlib import Path
 import duckdb
 
 REPO = Path(__file__).resolve().parents[1]
-DATA = Path("/opt/quantmind/data/quantdb")
+DATA = Path(os.getenv("QM_QUANTDB_DATA_DIR", "/opt/quantmind/data/quantdb"))
 SQL_FILE = REPO / "research" / "qdb.sql"
 
 PREFIX = "SELECT * FROM read_parquet('"

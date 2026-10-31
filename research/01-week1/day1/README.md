@@ -41,16 +41,16 @@
 ## 3.1 怎么跑
 
 ```bash
-cd /root/QuantMind
+cd /data/ljc/vigap/quant/QuantMind
 
 # ① 扫表结构（约 20~40 秒）
-/root/quant/.venv/bin/python research/01-week1/day1/inspect_tables.py
+python research/01-week1/day1/inspect_tables.py
 
 # ② 第 1 天体检（约 15 秒）
-/root/quant/.venv/bin/python research/01-week1/day1/d01_data_check.py
+python research/01-week1/day1/d01_data_check.py
 
 # ③ 交互式查数据（改数字用这个）
-/root/quant/.venv/bin/python research/repl.py
+python research/repl.py
 ```
 
 跑完会多两个文件：
