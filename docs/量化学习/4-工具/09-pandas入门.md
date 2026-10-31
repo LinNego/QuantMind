@@ -10,10 +10,10 @@
 
 | 材料 | 形态 | 用途 | 什么时候用 |
 |---|---|---|---|
-| [pandas_drill.py](../../research/lessons/pandas_drill.py) | 6 节课，可运行 | **动手入门**：5 只股票 × 40 天，讲完就能写回测 | 第一次学，60 分钟 |
-| [pandas_cheatsheet.md](../../research/lessons/pandas_cheatsheet.md) | 速查表 | **SQL → pandas 对照**，忘记语法时查 | 写代码时放旁边 |
+| [pandas_drill.py](../../../research/lessons/pandas_drill.py) | 6 节课，可运行 | **动手入门**：5 只股票 × 40 天，讲完就能写回测 | 第一次学，60 分钟 |
+| [pandas_cheatsheet.md](../../../research/lessons/pandas_cheatsheet.md) | 速查表 | **SQL → pandas 对照**，忘记语法时查 | 写代码时放旁边 |
 | 本文（09） | 概念 + 实测 | **补 drill 没讲的三件事**：pandas 3 与老教程的差异、index 对齐的静默坑、全市场规模的真实数字 | 跑完 drill 再读，30 分钟 |
-| [research/lessons/pandas_basics.py](../../research/lessons/pandas_basics.py) | 一个脚本 | 全市场 128 万行真实数据走一遍「读→查→变形→算→存」 | 想确认自己会用，十几秒 |
+| [research/lessons/pandas_basics.py](../../../research/lessons/pandas_basics.py) | 一个脚本 | 全市场 128 万行真实数据走一遍「读→查→变形→算→存」 | 想确认自己会用，十几秒 |
 
 **别按顺序全读一遍。** 入门只需要：`drill` 跑一遍 → 本文第 0、4 节 → 写你自己的 `research/01_load_data.py`。
 
@@ -27,7 +27,7 @@ cd /root/QuantMind
 # 3.0.6
 ```
 
-- 必须用仓库的 venv。系统自带的 `python3` 里是 pandas 2.2.3，会报 `_ARRAY_API not found`（[07](07-阶段0-每日执行计划.md) 第 1 天提过）。
+- 必须用仓库的 venv。系统自带的 `python3` 里是 pandas 2.2.3，会报 `_ARRAY_API not found`（[07](../2-阶段0/07-阶段0-每日执行计划.md) 第 1 天提过）。
 - 本机是 **pandas 3.0**，而网上 90% 的教程写的是 2.x / 1.x。下面四条差异会让「照抄」直接报错，或者更糟——**静默不生效**：
 
 | 变化 | 老教程写法 | 本机实测结果 |
@@ -66,13 +66,13 @@ px.rank(axis=1, pct=True)      # 横向 → 截面：今天 5000 只里排第几
 px.rolling(20).std()           # 纵向（默认 axis=0）→ 时序：这只股票自己过去 20 天的波动
 ```
 
-这正是 [02-核心概念速通.md](02-核心概念速通.md) 第三节那张「截面 vs 时序」图的代码版。**截面不是机器学习的概念，是数据形状的概念**——按当天排名就是截面。
+这正是 [02-核心概念速通.md](../3-方法与陷阱/02-核心概念速通.md) 第三节那张「截面 vs 时序」图的代码版。**截面不是机器学习的概念，是数据形状的概念**——按当天排名就是截面。
 
 ---
 
 ## 2. 只学这 8 个，覆盖 95% 的日常
 
-> 带 SQL 对照的完整速查表在 [pandas_cheatsheet.md](../../research/lessons/pandas_cheatsheet.md)，这里只给「什么时候用哪个」。
+> 带 SQL 对照的完整速查表在 [pandas_cheatsheet.md](../../../research/lessons/pandas_cheatsheet.md)，这里只给「什么时候用哪个」。
 
 | 动作 | API | 一句话 |
 |---|---|---|
@@ -137,7 +137,7 @@ df.isna().mean().sort_values(ascending=False).head(3)   # 缺失率
 (df.close * df.volume / df.amount).median()   # 9994
 ```
 
-≈ 10000 → `amount` 的单位是**万元**。这就是 [08](08-全程每日计划.md) 里 D07 那道题，一行代码出答案。**任何一列，先确认单位再用。**
+≈ 10000 → `amount` 的单位是**万元**。这就是 [08](../1-开始/08-全程每日计划.md) 里 D07 那道题，一行代码出答案。**任何一列，先确认单位再用。**
 
 ### 3.3 变形：长表 → 宽表，再变回来
 
@@ -161,7 +161,7 @@ ic = rev20.corrwith(fwd5, axis=1, method="spearman").dropna()
 
 `shift(20)` 让前 20 天没有值，`shift(-5)` 让最后 5 天没有值，`dropna()` 后剩 217 天。**看到「样本数比预期少」先数窗口，别急着怀疑数据。**
 
-单年 IC 0.0868 偏高。同一因子跑 2016–2026 全样本（2623 天）是 **IC 0.0567、ICIR 0.387**，正好落在 [02](02-核心概念速通.md) 说的「日频 A 股 0.03~0.06」量级。**这就是为什么不能拿单年数字下结论**——见 [03](03-常见陷阱与自检红线.md) 的自检红线。
+单年 IC 0.0868 偏高。同一因子跑 2016–2026 全样本（2623 天）是 **IC 0.0567、ICIR 0.387**，正好落在 [02](../3-方法与陷阱/02-核心概念速通.md) 说的「日频 A 股 0.03~0.06」量级。**这就是为什么不能拿单年数字下结论**——见 [03](../3-方法与陷阱/03-常见陷阱与自检红线.md) 的自检红线。
 
 ### 3.5 存：长表用 parquet，宽表随意
 
@@ -273,10 +273,10 @@ big.open * big.close                                      # 8.7ms
 
 ## 9. 下一步
 
-1. 先把 [pandas_drill.py](../../research/lessons/pandas_drill.py) 跑一遍，六节课每节都改一行数字再跑——**改坏了才叫学会**。
+1. 先把 [pandas_drill.py](../../../research/lessons/pandas_drill.py) 跑一遍，六节课每节都改一行数字再跑——**改坏了才叫学会**。
 2. 再跑 `python research/lessons/pandas_basics.py`，把六段输出逐条解释给自己听——**说不出来的那句，就是你还没懂的那句**。
-3. 打开 [research/tools/repl.py](../../research/tools/repl.py)，用 `q("SELECT ...")` 交互式查真实数据，比看教程有用。
-4. 然后把 [08](08-全程每日计划.md) 的 **D01–D05** 做了：那些题全部只用本文这 8 个 API。
-4. 想去重/去极值/中性化，接着看 [03-常见陷阱与自检红线.md](03-常见陷阱与自检红线.md) 和 [02-核心概念速通.md](02-核心概念速通.md) 第 7 节的 20 行骨架。
+3. 打开 [research/tools/repl.py](../../../research/tools/repl.py)，用 `q("SELECT ...")` 交互式查真实数据，比看教程有用。
+4. 然后把 [08](../1-开始/08-全程每日计划.md) 的 **D01–D05** 做了：那些题全部只用本文这 8 个 API。
+4. 想去重/去极值/中性化，接着看 [03-常见陷阱与自检红线.md](../3-方法与陷阱/03-常见陷阱与自检红线.md) 和 [02-核心概念速通.md](../3-方法与陷阱/02-核心概念速通.md) 第 7 节的 20 行骨架。
 
 > 最后一句：**本文覆盖了 pandas 不到 5% 的 API，但覆盖了你未来一年 95% 的操作。** 剩下的部分，等你真的写出「第三个类似的循环」时再去查——那时你才知道该搜什么。

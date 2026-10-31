@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """D2 · 规模与覆盖（阶段 0 第 2 天）
 
-对齐 docs/量化学习/07-阶段0-每日执行计划.md 第 2 天：
+对齐 docs/量化学习/2-阶段0/07-阶段0-每日执行计划.md 第 2 天：
   "把第 1 天的脚本改成三个统计：count(DISTINCT symbol) / count(DISTINCT dt) / min(dt), max(dt)"
   "再算「每年最后一个交易日的股票数」"
 

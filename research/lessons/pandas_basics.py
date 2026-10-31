@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pandas 入门：把一年 A 股日线走完「读 → 查 → 变形 → 算 → 存」五步。
 
-配套文档：docs/量化学习/09-pandas入门.md
+配套文档：docs/量化学习/4-工具/09-pandas入门.md
 用法：
     cd /root/quant/QuantMind
     /root/quant/.venv/bin/python research/lessons/pandas_basics.py

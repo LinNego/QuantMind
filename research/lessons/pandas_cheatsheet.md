@@ -114,4 +114,4 @@ s.pct_change(fill_method=None)  # ✅ 明确不填
 | `resample("M")` | `ValueError`，必须写 `"ME"`（`"Y"` → `"YE"`） |
 | 往整数列塞 `NaN` | 仍会升成 `float64`；要保留整数用 `Int64` |
 
-细节和实测数字见 [docs/量化学习/09-pandas入门.md](../../../docs/量化学习/09-pandas入门.md)。
+细节和实测数字见 [docs/量化学习/09-pandas入门.md](../../../docs/量化学习/4-工具/09-pandas入门.md)。
