@@ -53,9 +53,11 @@
 | 想干什么 | pandas |
 |---|---|
 | 长 → 宽 | `wide = df.pivot(index="dt", columns="symbol", values="close")` |
-| 宽 → 长 | `wide.stack().reset_index()` |
+| 宽 → 长 | `wide.reset_index().melt(id_vars="dt", var_name="symbol", value_name="close")` |
 
 SQL 没有真正等价的写法（要写一堆 `CASE WHEN`），这是 pandas 唯一不可替代的地方。
+
+用 `melt` 而不是 `wide.stack().reset_index()`：前者列名干净，后者在 pandas 3 里默认**保留 NaN**，停牌日会多出一堆 NaN 行。
 
 ## 6. 时间序列（对应窗口函数）
 
@@ -88,9 +90,9 @@ SQL 没有真正等价的写法（要写一堆 `CASE WHEN`），这是 pandas �
 ## 8. 三个必踩的坑
 
 ```python
-# 坑 1：链式赋值，改了不生效（SettingWithCopyWarning）
-df[df.close > 100]["flag"] = 1        # ❌ 改的是临时副本
-df.loc[df.close > 100, "flag"] = 1    # ✅
+# 坑 1：链式赋值，改了不生效（pandas 3 起固定抛 ChainedAssignmentError）
+df[df.close > 100]["flag"] = 1        # ❌ 改的是临时副本，原表不变
+df.loc[df.close > 100, "flag"] = 1    # ✅ 一步定位行列
 
 # 坑 2：把 Series 当 DataFrame 用
 df["close"].sum()      # ✅ 一列求和
@@ -100,3 +102,16 @@ df[["close"]].sum()    # ✅ 一张表求和 → 返回 Series（带列名）
 s.pct_change()                  # ⚠️ 旧默认会把 NaN 前向填充
 s.pct_change(fill_method=None)  # ✅ 明确不填
 ```
+
+## 9. pandas 3 与网上老教程的四处差异
+
+本机是 pandas 3.0（`/root/quant/.venv`），网上大部分教程还是 2.x / 1.x。照抄会踩的四处：
+
+| 老教程写法 | 现在的行为 |
+|---|---|
+| `df[mask]["col"] = 1` | 抛 `ChainedAssignmentError`，**且原表不变**（以前可能变） |
+| 假设字符串列是 `object` | 默认已是 `str` dtype |
+| `resample("M")` | `ValueError`，必须写 `"ME"`（`"Y"` → `"YE"`） |
+| 往整数列塞 `NaN` | 仍会升成 `float64`；要保留整数用 `Int64` |
+
+细节和实测数字见 [docs/量化学习/09-pandas入门.md](../../../docs/量化学习/09-pandas入门.md)。
