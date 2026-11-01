@@ -290,6 +290,7 @@ config/training_nodes.yaml
 
 # Windows 保留名残留文件（误重定向产生，不跟踪）
 /nul
-# 例外：research/out/ 里的图表要跨机器同步，保留在版本控制里（out/ 全局被忽略）
+# 例外：学习产出的图表要跨机器同步，保留在版本控制里（out/ 全局被忽略）
+# 2026-11 起，每天的产出直接写进 research/stageN/dayNN-*/（output.md / *.png / *.csv），不再有统一 out/
 !research/out/
 !research/out/**
