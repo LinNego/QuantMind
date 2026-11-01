@@ -325,6 +325,22 @@ def timing_exposure(
     return out
 
 
+def drawdown_guard(
+    con: duckdb.DuckDBPyConnection, symbol: str, threshold: float
+) -> dict[int, bool]:
+    """指数距 250 日高点的回撤是否超过 ``threshold``（True = 本期空仓）。"""
+    if threshold <= 0:
+        return {}
+    px = con.execute(
+        f"SELECT dt, close FROM idx WHERE symbol = '{symbol}' ORDER BY dt"
+    ).df()
+    px["peak"] = px.close.rolling(250, min_periods=60).max()
+    px["dd"] = px.close / px.peak - 1.0
+    return {
+        int(r.dt): bool(r.dd < -threshold) for r in px.itertuples() if pd.notna(r.dd)
+    }
+
+
 def index_nav(
     con: duckdb.DuckDBPyConnection, plan: pd.DataFrame
 ) -> dict[str, pd.Series]:
@@ -504,6 +520,12 @@ def main() -> int:
         "--timing-symbol", default="000852.SH", help="择时指数，默认中证 1000"
     )
     ap.add_argument("--timing-ma", type=int, default=200, help="择时均线天数")
+    ap.add_argument(
+        "--timing-dd",
+        type=float,
+        default=0.0,
+        help="指数距 250 日高点回撤超过该比例时清仓（0.3=跌超30%%空仓，0=不启用）",
+    )
     ap.add_argument("--charts", type=Path, default=None, help="图表输出目录")
     ap.add_argument("--json", type=Path, default=None, help="指标 JSON 输出路径")
     args = ap.parse_args()
@@ -533,9 +555,18 @@ def main() -> int:
 
     weak = {"none": 1.0, "half": 0.5, "flat": 0.0}[args.timing]
     exposure = None
-    if args.timing != "none":
-        table = timing_exposure(con, args.timing_symbol, args.timing_ma, weak)
-        exposure = lambda d: table.get(int(d), 1.0)  # noqa: E731
+    if args.timing != "none" or args.timing_dd > 0:
+        table = (
+            timing_exposure(con, args.timing_symbol, args.timing_ma, weak)
+            if args.timing != "none"
+            else {}
+        )
+        crash = drawdown_guard(con, args.timing_symbol, args.timing_dd)
+
+        def exposure(d):  # noqa: F811
+            if crash.get(int(d), False):
+                return 0.0
+            return table.get(int(d), 1.0)
 
     label = "策略"
     runs = {
