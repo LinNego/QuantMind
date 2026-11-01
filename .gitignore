@@ -294,3 +294,5 @@ config/training_nodes.yaml
 # 2026-11 起，每天的产出直接写进 research/stageN/dayNN-*/（output.md / *.png / *.csv），不再有统一 out/
 !research/out/
 !research/out/**
+data/delisted/
+data/regulatory/
