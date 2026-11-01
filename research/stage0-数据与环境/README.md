@@ -24,7 +24,7 @@
 | [D08 复权三兄弟](day08-复权三兄弟/README.md) | 说清前复权/后复权/不复权各用在哪 | ✅ |
 | [D09 幸存者偏差](day09-幸存者偏差/README.md) | 算每年消失的股票数 → 得到 0 只 | ✅ |
 | [D10 两个暗坑](day10-两个暗坑/README.md) | 禁 `SELECT *`、字符串列必须 CAST | ✅ |
-| [D11 整合脚本](day11-整合脚本/README.md) | 听懂参考实现，能自己跑出体检报告 | ⬜ **下一步** |
+| [D11 整合脚本](day11-整合脚本/README.md) | 一次跑完 9 项检查，发现单点脚本互相矛盾 | ✅ |
 | [D12 Gate 1](day12-Gate1/README.md) | 三问写文字 + 填实验日志第一条 | ⚠️ AI 代写 |
 
 ## Gate 1（三问，不许翻资料）
@@ -44,7 +44,7 @@
 | D02 | [code.py](day02-规模与覆盖/code.py) ｜ [inspect_tables.py](day02-规模与覆盖/inspect_tables.py) | [output.md](day02-规模与覆盖/output.md) |
 | D06 | [code.py](day06-缺失率与起始日/code.py) | [output.md](day06-缺失率与起始日/output.md) |
 | D09 | — | [output.md](day09-幸存者偏差/output.md) |
-| D11 | [full_check.py](day11-整合脚本/full_check.py) | — |
+| D11 | [full_check.py](day11-整合脚本/full_check.py) | [output.md](day11-整合脚本/output.md) |
 | D12 | — | [output.md](day12-Gate1/output.md) |
 
 数据字典（全 23 张表）在 [参考/表结构.md](../参考/表结构.md)。

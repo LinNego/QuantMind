@@ -332,7 +332,7 @@ HERE = Path(__file__).resolve().parent
 for out_dir in (HERE,):
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
-        out = out_dir / "报告.md"
+        out = out_dir / "output.md"
         out.write_text("\n".join(lines), encoding="utf-8")
         print(f"\n报告已写入：{out}")
         break
