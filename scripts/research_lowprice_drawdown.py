@@ -737,6 +737,12 @@ def main() -> int:
 
     def make_excl(events: pd.DataFrame, window_days: int, base=base_pick):
         """返回「剔除事件窗口内标的」的 pick。window_days=0 表示曾经出现过即剔除。"""
+        # 事件表的历史版本把 announce_date 存成字符串（旧抓取脚本遗留）。
+        # 这里统一转数值，否则与 int 日期的信号日比较会直接 TypeError。
+        events = events.assign(
+            announce_date=pd.to_numeric(events.announce_date, errors="coerce")
+        ).dropna(subset=["announce_date", "symbol"])
+        events = events.assign(announce_date=events.announce_date.astype(int))
         bad = {}
         for d in sorted(panel.dt.unique()):
             lo = (

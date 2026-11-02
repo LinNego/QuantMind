@@ -19,10 +19,13 @@
 
 数据源
 ------
-`--source cninfo`（默认）：巨潮资讯**全文检索**，按关键词 + 日期区间翻页。
-按年切片，一次扫完 10 年约 **10 分钟**，不必按天翻全市场公告。
+`--source cninfo`（默认）：巨潮资讯**全文检索**，按关键词翻页（每页 100 条，
+时间倒序），再在本地按披露日过滤。接口在带 `searchkey` 时会忽略日期参数，
+所以不能指望服务端按 `sdate/edate` 切片；关键词 13 个、扫完 10 年约 **10 分钟**。
 `--source em`：东方财富公告库逐日全市场（`akshare.stock_notice_report`），
 约 5 秒/交易日，10 年 ≈ 2.5 小时；口径更全（含当日全部公告），作为兜底保留。
+注意巨潮接口深翻页上限为 200 页（约 2 万条），超出的关键词会记入 `failed`，
+默认以退出码 1 结束，需显式 `--allow-partial` 才放行。
 
 产出
 ----
@@ -65,8 +68,25 @@ NOISE = ("回复", "审核问询", "审查问询", "保荐", "问核", "核查�
 # 检索是全文级的，命中不代表标题命中（比如「年报」里提到立案），
 # 因此仍要过 classify()；反过来标题里写「调查通知书」不含「立案」的也要捞，
 # 所以关键词用一组而不是单个。
+#
+# 2026-11 实测：searchkey 与 sdate/edate 同时传会返回 0 条（接口已不认旧参数），
+# 只带 searchkey 时按时间倒序返回全部命中。因此这里翻页后在本地按时间过滤。
 CNINFO_URL = "http://www.cninfo.com.cn/new/fulltextSearch/full"
-CNINFO_KEYWORDS = ("立案", "调查通知书", "退市风险警示")
+CNINFO_KEYWORDS = (
+    "立案",
+    "调查通知书",
+    "行政处罚",
+    "处罚决定",
+    "警示函",
+    "监管措施",
+    "通报批评",
+    "公开谴责",
+    "纪律处分",
+    "违规",
+    "退市风险警示",
+    "终止上市",
+    "问询函",
+)
 CNINFO_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -75,9 +95,9 @@ CNINFO_HEADERS = {
     "Referer": "http://www.cninfo.com.cn/new/fulltextSearch",
     "Accept": "application/json, text/javascript, */*; q=0.01",
 }
-CNINFO_PAGE_SIZE = 30
-CNINFO_MAX_PAGES = 400
-CNINFO_SLEEP = 0.15  # 翻页间隔，别把对方打挂
+CNINFO_PAGE_SIZE = 100  # 接口上限，传更大也只回 100 条
+CNINFO_MAX_PAGES = 200  # 服务端深翻页上限：第 201 页直接 HTTP 500
+CNINFO_SLEEP = 0.1  # 翻页间隔，别把对方打挂
 
 
 def classify(title: str) -> str | None:
@@ -137,84 +157,89 @@ def _get_json(params: dict, retries: int = 4) -> dict:
 def fetch_cninfo(
     keywords: tuple[str, ...], start: str, end: str
 ) -> tuple[pd.DataFrame, list[str]]:
-    """按「关键词 × 自然年」切片翻页，返回原始公告表与失败的切片描述。"""
-    years = list(range(int(start[:4]), int(end[:4]) + 1))
+    """按关键词翻页（时间倒序），再在本地按披露日过滤。
+
+    巨潮接口在带 ``searchkey`` 时会忽略 ``sdate`` / ``edate``（实测返回 0 条），
+    因此不能靠服务端筛日期：这里一直翻到本页最老的公告早于 ``start`` 为止。
+    """
+    lo_day = int(start.replace("-", ""))
+    hi_day = int(end.replace("-", ""))
     rows: list[dict] = []
     seen: set[str] = set()
     failed: list[str] = []
     for kw in keywords:
-        for y in years:
-            lo = max(pd.Timestamp(f"{y}-01-01"), pd.Timestamp(start))
-            hi = min(pd.Timestamp(f"{y}-12-31"), pd.Timestamp(end))
-            if lo > hi:
-                continue
-            s, e = lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
-            page, total, got = 1, None, 0
-            while page <= CNINFO_MAX_PAGES:
-                try:
-                    js = _get_json(
-                        {
-                            "searchkey": kw,
-                            "sdate": s,
-                            "edate": e,
-                            "isfulltext": "false",
-                            "sortName": "nothing",
-                            "sortType": "desc",
-                            "pageNum": page,
-                        }
-                    )
-                except RuntimeError as exc:
-                    failed.append(f"{kw}/{s}~{e}/p{page}: {exc}")
-                    break
-                anns = js.get("announcements") or []
-                if not anns:
-                    break
-                if total is None:
-                    total = int(js.get("totalAnnouncement") or 0)
-                got += len(anns)
-                for a in anns:
-                    aid = str(a.get("announcementId") or "")
-                    if not aid or aid in seen:
-                        continue
-                    seen.add(aid)
-                    rows.append(
-                        {
-                            "symbol": to_symbol(a.get("secCode") or ""),
-                            "announce_date": a.get("announcementTime"),
-                            "title": _clean_title(
-                                a.get("announcementTitle") or a.get("shortTitle") or ""
-                            ),
-                            "source": "cninfo",
-                        }
-                    )
-                page += 1
-                time.sleep(CNINFO_SLEEP)
-            if total and got < total:
-                failed.append(f"{kw}/{s}~{e}: 只取到 {got}/{total} 条（翻页被截断）")
-            print(
-                f"  {kw}/{s}~{e}: total={total} got={got} rows={len(rows)}",
-                end="\r",
-                flush=True,
+        page, pages, got = 1, None, 0
+        while page <= CNINFO_MAX_PAGES:
+            try:
+                js = _get_json(
+                    {"searchkey": kw, "pageNum": page, "pageSize": CNINFO_PAGE_SIZE}
+                )
+            except RuntimeError as exc:
+                failed.append(f"{kw}/p{page}: {exc}")
+                break
+            anns = js.get("announcements") or []
+            if pages is None:
+                pages = int(js.get("totalpages") or 0)
+            if not anns:
+                # 有 totalpages 却回空页 = 接口异常，不能当成「翻完了」
+                if pages:
+                    failed.append(f"{kw}/p{page}: 返回空页（totalpages={pages}）")
+                break
+            oldest = 99_999_999
+            for a in anns:
+                ms = a.get("announcementTime")
+                if not ms:
+                    continue
+                day = int(
+                    pd.Timestamp(int(ms), unit="ms", tz="UTC")
+                    .tz_convert("Asia/Shanghai")
+                    .strftime("%Y%m%d")
+                )
+                oldest = min(oldest, day)
+                if day < lo_day or day > hi_day:
+                    continue
+                aid = str(a.get("announcementId") or "")
+                title = _clean_title(
+                    a.get("announcementTitle") or a.get("shortTitle") or ""
+                )
+                cat = classify(title)
+                sym = to_symbol(a.get("secCode") or "")
+                if not aid or aid in seen or not cat or not sym:
+                    continue
+                seen.add(aid)
+                rows.append(
+                    {
+                        "symbol": sym,
+                        "announce_date": day,
+                        "category": cat,
+                        "title": title,
+                    }
+                )
+            got += len(anns)
+            if page == 1 or page % 10 == 0 or oldest < lo_day:
+                print(
+                    f"  {kw:<6} p{page}/{pages or '?'} got={got} "
+                    f"kept={len(rows)} oldest={oldest}",
+                    flush=True,
+                )
+            if oldest < lo_day:
+                break
+            if pages and page >= pages:
+                break
+            page += 1
+            time.sleep(CNINFO_SLEEP)
+        if pages and pages > CNINFO_MAX_PAGES:
+            failed.append(
+                f"{kw}: totalpages={pages}，服务端只放前 {CNINFO_MAX_PAGES} 页，"
+                f"最多 {CNINFO_MAX_PAGES * CNINFO_PAGE_SIZE} 条"
             )
     print()
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=["symbol", "announce_date", "category", "title"])
     if df.empty:
+        failed.append("所有关键词均未取到事件（接口可能变更，或日期区间为空）")
         return df, failed
-    df["announce_date"] = (
-        pd.to_datetime(df.announce_date, unit="ms", utc=True)
-        .dt.tz_convert("Asia/Shanghai")
-        .dt.strftime("%Y%m%d")
-        .astype(int)
-    )
-    df["category"] = df.title.map(classify)
-    df = df[
-        df.symbol.notna()
-        & df.category.notna()
-        & df.announce_date.between(
-            int(start.replace("-", "")), int(end.replace("-", ""))
-        )
-    ]
-    return df[["symbol", "announce_date", "category", "title"]], failed
+    df = df.drop_duplicates(["symbol", "announce_date", "category", "title"])
+    return df.sort_values(["announce_date", "symbol"]).reset_index(drop=True), failed
 
 
 def fetch_eastmoney(days: list[str], frames: list[pd.DataFrame]) -> list[pd.DataFrame]:
@@ -270,6 +295,11 @@ def main() -> int:
         default=",".join(CNINFO_KEYWORDS),
         help="巨潮全文检索关键词（逗号分隔）",
     )
+    ap.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="抓取切片失败/被截断时仍按成功退出（默认 fail-closed）",
+    )
     args = ap.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -279,6 +309,12 @@ def main() -> int:
         kws = tuple(k.strip() for k in args.keywords.split(",") if k.strip())
         print(f"巨潮全文检索：{args.start} ~ {args.end}，关键词 {kws}")
         new, failed = fetch_cninfo(kws, args.start, args.end)
+        if new.empty:
+            # 空表不能覆盖旧数据：宁可失败退出，也不要写出一个「看起来正常」的空文件
+            print("❌ 一条事件都没取到，本次不写入；先检查接口或关键词。")
+            for f in failed[:10]:
+                print("   ", f)
+            return 1
         allx = _merge_old(path, new)
         allx.to_parquet(path, index=False)
         print(

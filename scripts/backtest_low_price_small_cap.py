@@ -692,6 +692,9 @@ def main() -> int:
         df = pd.DataFrame(
             {
                 "dt": plan_w.signal_dt.values,
+                # 带上 entry_dt：stats() 按「实际持仓年」分年，指数也要用同一口径，
+                # 否则指数按信号年、策略按持仓年，跨 1 月大跌的年份会错位（2024 差 20pp+）。
+                "entry_dt": plan_w.entry_dt.values,
                 "nav": nav.values,
                 "ret": nav.pct_change().fillna(0),
                 "cost": 0.0,
@@ -748,11 +751,9 @@ def main() -> int:
 
     if args.json:
         payload = {
-            "params": vars(args)
-            | {
-                "data_dir": str(args.data_dir),
-                "charts": str(args.charts),
-                "json": str(args.json),
+            # vars(args) 里 data_dir / events_path 等都是 Path，直接 json.dumps 会崩
+            "params": {
+                k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()
             },
             "universe_size": float(base.groupby("dt").size().mean()),
             "strategy": res[label]
