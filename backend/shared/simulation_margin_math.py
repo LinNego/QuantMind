@@ -17,6 +17,27 @@ from __future__ import annotations
 BORROW_RATE_DAYS = 252.0
 
 
+def maintenance_margin_ratio(
+    equity: float,
+    short_market_value: float,
+    liabilities: float,
+    cash: float | None = None,
+) -> float:
+    """维持担保比例 = 总资产 / 总负债。
+
+    - 分母优先用盯市空头负债（``short_market_value``），无空头时回退历史
+      本金 ``liabilities``；
+    - 传入 ``cash`` 时把融资负债（负现金）一并计入，避免「融资多头 + 融券」
+      的混合账户因漏计融资负债而虚高。
+    """
+    debt = float(short_market_value or 0.0)
+    if debt <= 0:
+        debt = float(liabilities or 0.0)
+    if cash is not None:
+        debt += max(0.0, -float(cash))
+    return float(equity) / debt if debt > 0 else 0.0
+
+
 def default_borrow_rate() -> float:
     """年化融券费率（与撮合侧 settings.DEFAULT_BORROW_RATE 同源）。"""
     try:
