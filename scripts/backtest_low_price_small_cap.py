@@ -15,6 +15,8 @@
 ------------------
 默认：非 ST、非退市风险、沪深主板、上市满 120 天、股价 ≥ 1.5 元、
 5 日均成交额 ≥ 2000 万元、总市值 ≥ 10 亿元。
+另外默认剔除**近 365 天内被证监会立案调查**的标的（`--no-exclude-investigation`
+关闭），事件来自 `data/regulatory/events.parquet`（见 fetch_regulatory_events.py）。
 所有门槛都能用命令行关掉（传 0），`--board all` 则不限制板块。
 
 两种典型用法
@@ -45,6 +47,7 @@ import numpy as np
 import pandas as pd
 
 DATA_DIR = Path("/opt/quantmind/data/quantdb")
+EVENTS_PATH = Path(__file__).resolve().parent.parent / "data/regulatory/events.parquet"
 COST_ONE_WAY = 0.00175  # 买卖各 0.175%，一次完整换手 0.35%
 LABEL_EN = {
     "策略": "10 smallest main-board",
@@ -74,7 +77,7 @@ def connect(data_dir: Path) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     columns = {
         "kb": ("1_kline_data/daily_backward", "symbol, dt, open, volume"),
-        "ku": ("1_kline_data/daily_unadjusted", "symbol, dt, close"),
+        "ku": ("1_kline_data/daily_unadjusted", "symbol, dt, open, close"),
         "feat": (
             "6_ml_datasets/features_daily",
             "symbol, dt, close, total_mv, amount_ma_5, is_st, is_quit_risk, list_date",
@@ -121,9 +124,15 @@ def build_panel(con: duckdb.DuckDBPyConnection, plan: pd.DataFrame) -> pd.DataFr
                    is_quit_risk, list_date
             FROM feat WHERE dt IN ({sig})"""
     ).df()
-    px = con.execute(f"SELECT symbol, dt, close AS px FROM ku WHERE dt IN ({sig})").df()
+    # 不复权价：px = 信号日真实收盘，o_in_raw = 买入日真实开盘（成交价必须用真实价）
+    px = con.execute(
+        f"SELECT symbol, dt, close AS px, open AS px_open FROM ku WHERE dt IN ({sig})"
+    ).df()
     op = con.execute(
         f"SELECT symbol, dt, open, volume FROM kb WHERE dt IN ({ent}) OR dt IN ({exi})"
+    ).df()
+    raw_in = con.execute(
+        f"SELECT symbol, dt, open AS o_in_raw FROM ku WHERE dt IN ({ent})"
     ).df()
     panel = (
         feat.merge(px, on=["symbol", "dt"], how="left")
@@ -138,14 +147,29 @@ def build_panel(con: duckdb.DuckDBPyConnection, plan: pd.DataFrame) -> pd.DataFr
             on=["symbol", "exit_dt"],
             how="left",
         )
+        .merge(
+            raw_in.rename(columns={"dt": "entry_dt"}),
+            on=["symbol", "entry_dt"],
+            how="left",
+        )
     )
     panel["fwd_ret"] = panel["o_out"] / panel["o_in"] - 1.0
-    # 可成交性：T+1 停牌（volume=0）买不进；T+1 开盘一字涨停也买不进。
-    # 创业板 300/301 是 20% 涨跌幅，其余主板 10%（ST 已在股票池剔除）。
-    limit = np.where(panel.symbol.str.startswith(("300", "301")), 0.195, 0.095)
-    gap = panel["o_in"] / panel["adj_close"] - 1.0
-    untradable = (panel["v_in"].fillna(0) == 0) | (gap >= limit)
-    panel.loc[untradable, "fwd_ret"] = np.nan
+    # 可成交性判定：用**真实价**算隔夜缺口（复权价之比会把除权日误判成涨跌停）。
+    # 创业板 300/301 是 20% 涨跌幅、北交所 30%，其余主板 10%（ST 已在股票池剔除）。
+    pre = panel.symbol.str[:3]
+    limit = np.where(
+        pre.isin(["300", "301"]),
+        0.195,
+        np.where(
+            panel.symbol.str[:2].isin(["43", "83", "87", "88", "92"]), 0.295, 0.095
+        ),
+    )
+    gap = panel["o_in_raw"] / panel["px"] - 1.0
+    panel["gap"] = gap
+    # tradable 只描述**入场侧**能否成交（T+1 开盘时可观测：停牌/一字涨停）。
+    # 不能把「未来退出价是否存在」放进来——那是持有期事件，用它筛选股就是未来函数。
+    has_entry = panel["o_in"].notna() & (panel["o_in"] > 0)
+    panel["tradable"] = (panel["v_in"].fillna(0) > 0) & has_entry & (gap < limit)
     panel["list_dt"] = pd.to_datetime(
         panel.list_date.astype(str), format="%Y%m%d", errors="coerce"
     )
@@ -169,7 +193,9 @@ def universe(
     # 直接 == 0 会把整段 2026 数据静默丢光，必须先转数值。
     is_st = pd.to_numeric(panel.is_st, errors="coerce").fillna(0)
     quit_risk = pd.to_numeric(panel.is_quit_risk, errors="coerce").fillna(0)
-    mask = (is_st == 0) & (quit_risk == 0) & panel.fwd_ret.notna()
+    # 注意：这里**只能**用信号日可知的字段。fwd_ret / tradable 依赖 T+1 及之后
+    # 的信息，属于执行层，必须在 run_strategy() 里处理，不能参与选股。
+    mask = (is_st == 0) & (quit_risk == 0)
     prefixes = BOARD_PREFIXES[board]
     if prefixes is not None:
         mask &= pre.isin(prefixes)
@@ -197,66 +223,71 @@ def run_strategy(
 ) -> pd.DataFrame:
     """逐月调仓，返回净值/收益/换手序列。
 
-    ``pool_fn`` 接收单月截面返回候选池；``exposure_fn(dt)`` 返回目标仓位
-    （1.0=满仓，0.5=半仓），未配置时恒为满仓。未投入的现金按 0 收益处理。
+    时序约定
+    --------
+    - ``pool_fn`` 只用**信号日可知**的字段筛选（universe 已保证不含未来信息）；
+    - T+1 能否成交（停牌 / 开盘一字涨停 / 取不到退出价）在执行层用 ``tradable``
+      过滤，买不进的标的直接跳过、对应的钱留在现金里，**不参与选股**；
+    - 旧仓按**上一期**已实现收益漂移到本期，权重向量包含现金（``cash_w``），
+      因此半仓/空仓的买卖都能被正确计费。
+
+    ``exposure_fn(dt)`` 返回目标仓位（1.0=满仓，0.5=半仓，0=空仓）。
     """
-    w_old = pd.Series(dtype=float)
+    w_old = pd.Series(dtype=float)  # 上期末各标的权重（占 NAV 比例）
+    cash_w = 1.0  # 上期末现金权重
+    ret_prev: dict[str, float] = {}  # 上一期各标的的已实现收益
     nav = 1.0
     rows = []
     for d in sorted(base.dt.unique()):
         if start and d < start:
             continue
         snap = base[base.dt == d]
-        sel = pool_fn(snap)
         entry = int(snap.entry_dt.iloc[0]) if "entry_dt" in snap.columns else int(d)
-        if sel.empty:
-            rows.append(
-                {
-                    "dt": d,
-                    "entry_dt": entry,
-                    "nav": nav,
-                    "ret": 0.0,
-                    "cost": 0.0,
-                    "turn": 0.0,
-                    "n": 0,
-                }
-            )
-            w_old = pd.Series(dtype=float)
-            continue
-        sel = sel.nsmallest(topk, "total_mv")
         pos = 1.0 if exposure_fn is None else float(exposure_fn(d))
-        if pos <= 0:
-            rows.append(
-                {
-                    "dt": d,
-                    "entry_dt": entry,
-                    "nav": nav,
-                    "ret": 0.0,
-                    "cost": 0.0,
-                    "turn": 0.0,
-                    "n": 0,
-                }
-            )
-            w_old = pd.Series(dtype=float)
-            continue
-        w = pd.Series(pos / len(sel), index=sel.symbol.values)
+
+        cand = pool_fn(snap)
+        if "tradable" in cand.columns:
+            # 执行层：T+1 开盘买不进的跳过（此时可观测，不算未来函数），
+            # 由后一名补位。**不**用未来退出价是否存在来筛。
+            cand = cand[cand.tradable.fillna(False)]
+        sel = cand.nsmallest(topk, "total_mv")
+
+        # 1) 旧仓用「上一期」收益漂移，现金按 0 收益，一起归一到当前总资产
         if len(w_old):
             grown = w_old * (
-                1 + snap.set_index("symbol").fwd_ret.reindex(w_old.index).fillna(0)
+                1 + pd.Series(ret_prev, dtype=float).reindex(w_old.index).fillna(0.0)
             )
-            grown = grown / grown.sum()
-            keys = w.index.union(grown.index)
-            turn = (
-                0.5
-                * (w.reindex(keys).fillna(0) - grown.reindex(keys).fillna(0))
-                .abs()
-                .sum()
-            )
+            total = float(grown.sum()) + cash_w
+            w_grown = grown / total if total > 0 else pd.Series(dtype=float)
         else:
-            turn = 1.0
-        gross = (w * sel.set_index("symbol").fwd_ret.reindex(w.index)).sum()
-        fee = turn * 2 * cost
-        nav *= 1 + gross - fee
+            w_grown = pd.Series(dtype=float)
+
+        # 2) 目标权重；sel 为空或目标仓位为 0 时目标为空（全部清仓）
+        if sel.empty or pos <= 0:
+            target = pd.Series(dtype=float)
+        else:
+            target = pd.Series(pos / len(sel), index=sel.symbol.values)
+
+        # 3) 交易：买卖分别按成交额计费（现金变动 = -(买卖净额)，无需单独算）
+        keys = w_grown.index.union(target.index)
+        oldv = w_grown.reindex(keys).fillna(0.0)
+        newv = target.reindex(keys).fillna(0.0)
+        buys = float((newv - oldv).clip(lower=0).sum())
+        sells = float((oldv - newv).clip(lower=0).sum())
+        fee = (buys + sells) * cost
+        turn = (buys + sells) / 2
+
+        # 4) 本期收益只用已成交标的
+        if len(target):
+            # 退出价缺失（停牌/数据缺口）按「冻结」处理：本期收益记 0。
+            # 这是保守假设，且不把「有没有退出价」回灌到选股。
+            rets = sel.set_index("symbol").fwd_ret.astype(float).fillna(0.0)
+            gross = float((target * rets.reindex(target.index)).sum())
+        else:
+            gross = 0.0
+        net = gross - fee
+        nav *= 1 + net
+
         rows.append(
             {
                 "dt": d,
@@ -265,13 +296,19 @@ def run_strategy(
                 "ret": gross,
                 "cost": fee,
                 "turn": turn,
-                "n": len(w),
-                "med_px": sel.px.median(),
-                "med_mv": sel.total_mv.median(),
-                "med_amt": sel.amount_ma_5.median(),
+                "n": len(target),
+                "med_px": sel.px.median() if len(sel) else np.nan,
+                "med_mv": sel.total_mv.median() if len(sel) else np.nan,
+                "med_amt": sel.amount_ma_5.median() if len(sel) else np.nan,
             }
         )
-        w_old = w
+        w_old = target
+        cash_w = max(0.0, 1.0 - float(target.sum()))
+        ret_prev = (
+            dict(zip(sel.symbol, sel.fwd_ret.astype(float), strict=False))
+            if len(sel)
+            else {}
+        )
     return pd.DataFrame(rows)
 
 
@@ -323,6 +360,37 @@ def timing_exposure(
         int(r.dt): (1.0 if r.above else weak) for r in px.itertuples() if pd.notna(r.ma)
     }
     return out
+
+
+def investigation_blacklist(
+    path: Path, signal_dates, window_days: int
+) -> dict[int, set[str]]:
+    """每个信号日 → 近 ``window_days`` 天内被立案调查的标的集合。
+
+    只用 ``announce_date <= 信号日`` 的公告，公告日即信息可见日，不构成未来函数。
+    事件表缺列/缺文件时返回空表，脚本退化为「不剔除」。
+    """
+    if window_days <= 0:
+        return {}
+    if not path.exists():
+        raise FileNotFoundError(f"监管事件表不存在：{path}")
+    ev = pd.read_parquet(path)
+    if "category" not in ev.columns:
+        raise ValueError(f"事件表缺 category 列：{path}")
+    ev = ev[ev.category == "investigation"]
+    if ev.empty:
+        raise ValueError(f"事件表里没有 investigation 行：{path}")
+    ev = ev.assign(
+        announce_date=pd.to_numeric(ev.announce_date, errors="coerce")
+    ).dropna(subset=["announce_date", "symbol"])
+    bad: dict[int, set[str]] = {}
+    for d in signal_dates:
+        lo = int(
+            (pd.Timestamp(str(d)) - pd.Timedelta(days=window_days)).strftime("%Y%m%d")
+        )
+        sub = ev[(ev.announce_date <= d) & (ev.announce_date >= lo)]
+        bad[int(d)] = set(sub.symbol)
+    return bad
 
 
 def drawdown_guard(
@@ -526,6 +594,21 @@ def main() -> int:
         default=0.0,
         help="指数距 250 日高点回撤超过该比例时清仓（0.3=跌超30%%空仓，0=不启用）",
     )
+    ap.add_argument(
+        "--exclude-investigation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="剔除近 --investigation-window 天内被立案调查的标的（默认开）",
+    )
+    ap.add_argument(
+        "--investigation-window", type=int, default=365, help="立案剔除回看天数"
+    )
+    ap.add_argument("--events-path", type=Path, default=EVENTS_PATH, help="监管事件表")
+    ap.add_argument(
+        "--allow-missing-events",
+        action="store_true",
+        help="事件表缺失时仍继续（默认 fail-closed，直接报错）",
+    )
     ap.add_argument("--charts", type=Path, default=None, help="图表输出目录")
     ap.add_argument("--json", type=Path, default=None, help="指标 JSON 输出路径")
     args = ap.parse_args()
@@ -545,12 +628,31 @@ def main() -> int:
     end = int(str(args.end).replace("-", ""))
     base = base[(base.dt >= start) & (base.dt <= end)]
 
+    blacklist: dict[int, set[str]] = {}
+    if args.exclude_investigation:
+        try:
+            blacklist = investigation_blacklist(
+                args.events_path, sorted(base.dt.unique()), args.investigation_window
+            )
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            if not args.allow_missing_events:
+                raise SystemExit(
+                    f"立案剔除已开启，但事件表不可用：{exc}\n"
+                    "  先跑 `python scripts/fetch_regulatory_events.py`，"
+                    "或加 `--no-exclude-investigation` / `--allow-missing-events`。"
+                ) from exc
+            print(f"⚠️ 立案剔除未生效（{exc}），按 --allow-missing-events 继续")
+
     def pick(snap: pd.DataFrame) -> pd.DataFrame:
         out = snap
         if args.price_max > 0:
             out = out[out.px <= args.price_max]
         if args.mv_max > 0:
             out = out[out.total_mv <= args.mv_max]
+        if blacklist:
+            bad = blacklist.get(int(snap.dt.iloc[0]), set())
+            if bad:
+                out = out[~out.symbol.isin(bad)]
         return out
 
     weak = {"none": 1.0, "half": 0.5, "flat": 0.0}[args.timing]
@@ -608,6 +710,14 @@ def main() -> int:
         f"成交额 ≥ {args.min_amount:g} 万，上市 ≥ {args.min_listed_days} 天，"
         f"topk={args.topk}，单边费率 {args.cost * 100:.3f}%"
     )
+    if args.exclude_investigation:
+        nbad = sum(len(v) for v in blacklist.values()) / max(len(blacklist), 1)
+        print(
+            f"立案剔除：开（回看 {args.investigation_window} 天，"
+            f"每期平均拉黑 {nbad:.0f} 只，占股票池 {nbad / max(len(base) / base.dt.nunique(), 1) * 100:.1f}%）"
+        )
+    else:
+        print("立案剔除：关")
     for name, r in {**res, **idx_stats}.items():
         print(
             f"{name:<8} 年化 {r['cagr'] * 100:6.2f}%  夏普 {r['sharpe']:5.2f}  "
