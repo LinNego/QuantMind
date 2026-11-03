@@ -29,6 +29,11 @@
     python scripts/backtest_low_price_small_cap.py --board main --topk 10 \
         --price-max 0 --mv-max 0 --min-price 0 --min-amount 0 --min-mv 0 --min-listed-days 0
 
+按月规避 1/4 月（按买入月，flat=整月空仓；half=减半）：
+    python scripts/backtest_low_price_small_cap.py --skip-months 1,4
+    python scripts/backtest_low_price_small_cap.py --skip-months 1,4 --skip-mode half
+    python scripts/backtest_low_price_small_cap.py --skip-months 1:half,4:flat
+
 出图 / 落 JSON：
     python scripts/backtest_low_price_small_cap.py --charts docs/images --json /tmp/lp.json
 
@@ -48,6 +53,9 @@ import pandas as pd
 
 DATA_DIR = Path("/opt/quantmind/data/quantdb")
 EVENTS_PATH = Path(__file__).resolve().parent.parent / "data/regulatory/events.parquet"
+# 保守口径：佣金万2.5 + 印花税万5（仅卖）+ 过户费万0.1 + 滑点0.1%/边 ≈ 0.175%/边。
+# 实际佣金万0.875免5：买入约0.10975%、卖出约0.15975%，平均约0.135%/边，
+# 可用 --cost 0.00135 跑实际口径；默认仍用 0.175% 保守值。
 COST_ONE_WAY = 0.00175  # 买卖各 0.175%，一次完整换手 0.35%
 LABEL_EN = {
     "策略": "10 smallest main-board",
@@ -595,6 +603,17 @@ def main() -> int:
         help="指数距 250 日高点回撤超过该比例时清仓（0.3=跌超30%%空仓，0=不启用）",
     )
     ap.add_argument(
+        "--skip-months",
+        default="",
+        help="按买入月空仓/减半的月份，逗号分隔；可写 1:half,4:flat（不写模式用 --skip-mode）",
+    )
+    ap.add_argument(
+        "--skip-mode",
+        default="flat",
+        choices=["flat", "half"],
+        help="skip-months 的处理：flat=整月空仓；half=仓位减半",
+    )
+    ap.add_argument(
         "--exclude-investigation",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -670,6 +689,33 @@ def main() -> int:
                 return 0.0
             return table.get(int(d), 1.0)
 
+    skip_months: dict[int, str] = {}
+    for item in args.skip_months.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        month, _, mode = item.partition(":")
+        mode = mode or args.skip_mode
+        if mode not in {"flat", "half"}:
+            raise SystemExit(f"--skip-months 的模式只能是 flat/half：{item}")
+        skip_months[int(month)] = mode
+    if skip_months:
+        # 按「买入月」判定：12 月信号、1 月持有的那期算 1 月。
+        entry_of = dict(
+            zip(base.dt.astype(int), base.entry_dt.astype(int), strict=False)
+        )
+        inner = exposure if exposure is not None else (lambda d: 1.0)
+
+        def exposure(d):  # noqa: F811
+            e = float(inner(int(d)))
+            m = int(str(entry_of.get(int(d), int(d)))[4:6])
+            mode = skip_months.get(m)
+            if mode == "flat":
+                return 0.0
+            if mode == "half":
+                return min(e, 0.5)
+            return e
+
     label = "策略"
     runs = {
         "全市场等权": run_strategy(
@@ -713,6 +759,9 @@ def main() -> int:
         f"成交额 ≥ {args.min_amount:g} 万，上市 ≥ {args.min_listed_days} 天，"
         f"topk={args.topk}，单边费率 {args.cost * 100:.3f}%"
     )
+    if skip_months:
+        spec = ",".join(f"{m}:{skip_months[m]}" for m in sorted(skip_months))
+        print(f"月份跳过：{spec}（按买入月）")
     if args.exclude_investigation:
         nbad = sum(len(v) for v in blacklist.values()) / max(len(blacklist), 1)
         print(
