@@ -545,12 +545,16 @@ def stress_survivorship(
     *,
     topk: int,
     start: int | None = 20160101,
-    p_hold: float = 0.04,
-    loss: float = -0.60,
+    p_hold: float = 0.0403,
+    loss: float = -0.71,
     n_paths: int = 200,
     seed: int = 7,
 ) -> dict:
     """给「数据里没有退市股」补一个压力测试。
+
+    默认参数已用 `data/delisted/` 的真实退市数据校准（见
+    `scripts/analyze_delisted_impact.py`）：持仓年退市概率 4.03%、
+    退市前 60 日累计中位跌幅 -71.0%。
 
     做法：每期取实际会持有的 top-k，按标的在候选池里的市值分位给一个年化退市概率
     （最小 25% 组 ×2、中间 ×1、最大 25% 组 ×0.5），每月以 p/12 的概率抽中一次
@@ -1108,9 +1112,9 @@ def main() -> int:
 
     if args.mode in ("stress", "all"):
         print("\n幸存者偏差压力测试（数据里 0 只退市股 → 注入退市冲击）")
-        print("p_hold = 持仓标的的年退市率；top40 每 4% 约等于每年 1.6 次事件")
-        for pb in (0.02, 0.03, 0.04, 0.05):
-            print(f"\n假设：持仓年退市率 {pb:.0%}，单次退市当月损失 -60%")
+        print("p_hold = 持仓标的的年退市率；loss = 单次退市冲击（均为实测校准值）")
+        for pb, ls in ((0.0403, -0.71), (0.0202, -0.71), (0.0605, -0.71)):
+            print(f"\n假设：年退市率 {pb:.2%}，单次损失 {ls:.0%}")
             head = (
                 f"{'topk':>5}{'基准年化':>10}{'注入后均值':>12}"
                 f"{'注入后5%分位':>14}{'均值-分位':>10}{'注入后回撤':>12}"
@@ -1119,7 +1123,7 @@ def main() -> int:
             print("-" * len(head))
             for k in (10, 20, 40):
                 st = stress_survivorship(
-                    panel, base_pick, topk=k, p_hold=pb, loss=-0.60, n_paths=120
+                    panel, base_pick, topk=k, p_hold=pb, loss=ls, n_paths=120
                 )
                 gap = (st["cagr_mean"] - st["cagr_p05"]) * 100
                 print(
