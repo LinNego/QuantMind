@@ -163,12 +163,15 @@ def simulate(
     topk: int = TOPK,
     rank: dict[int, list[str]] | None = None,
     refill: bool = False,
+    cost: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """逐日账本。返回 (日净值, 止盈明细)。
 
     ``refill=True``：止盈卖出后，**次日开盘**用这笔钱买排名下一个的候选股
     （按信号日的市值升序，跳过已持有和本月刚卖过的），不再干等月末调仓。
     """
+    buy_c = cost if cost is not None else BUY_COST
+    sell_c = cost if cost is not None else SELL_COST
     by_dt = {int(d): g for d, g in picks.groupby("dt")}
     cash = capital
     hold: dict[str, dict[str, float]] = {}   # sym -> {shares, cost}
@@ -208,7 +211,7 @@ def simulate(
             pr = px_open(sym, e)
             if pr is None or pr <= 0:
                 continue
-            cash += hold[sym]["shares"] * pr * (1 - SELL_COST)
+            cash += hold[sym]["shares"] * pr * (1 - sell_c)
             hold.pop(sym)
 
         nav_now = cash + sum(h["shares"] * (px_open(s, e) or 0.0) for s, h in hold.items())
@@ -222,14 +225,14 @@ def simulate(
                 cur = int(hold.get(sym, {}).get("shares", 0))
                 diff = want - cur
                 if diff > 0:
-                    unit = pr * LOT * (1 + BUY_COST)
+                    unit = pr * LOT * (1 + buy_c)
                     diff = min(diff, int(cash // unit) * LOT)
                     if diff <= 0:
                         continue
-                    cash -= diff * pr * (1 + BUY_COST)
+                    cash -= diff * pr * (1 + buy_c)
                     hold[sym] = {"shares": cur + diff, "cost": pr}
                 elif diff < 0:
-                    cash += -diff * pr * (1 - SELL_COST)
+                    cash += -diff * pr * (1 - sell_c)
                     keep = cur + diff
                     if keep <= 0:
                         hold.pop(sym, None)
@@ -250,11 +253,11 @@ def simulate(
                         pr = px_open(sym, d)
                         if pr is None:
                             continue
-                        lots = int(amt // (pr * LOT * (1 + BUY_COST)))
+                        lots = int(amt // (pr * LOT * (1 + buy_c)))
                         if lots <= 0:
                             continue
                         sh = lots * LOT
-                        cost = sh * pr * (1 + BUY_COST)
+                        cost = sh * pr * (1 + buy_c)
                         if cost > cash:
                             continue
                         cash -= cost
@@ -277,7 +280,7 @@ def simulate(
                     if hi < trigger:
                         continue
                     fill = max(op, trigger) if np.isfinite(op) else trigger
-                    proceeds = hold[sym]["shares"] * fill * (1 - SELL_COST)
+                    proceeds = hold[sym]["shares"] * fill * (1 - sell_c)
                     cash += proceeds
                     tp_rows.append({
                         "sym": sym, "sell_dt": d, "exit_dt": x,
@@ -354,6 +357,8 @@ def main() -> int:
     ap.add_argument("--start", default="20170101")
     ap.add_argument("--end", default="20261030")
     ap.add_argument("--rebuy", action="store_true", help="止盈后当月末允许买回（默认不买回）")
+    ap.add_argument("--cost", type=float, default=None,
+                    help="统一的单边费率（如 0.00135）；不给则按佣金/过户费/印花税/滑点分项算")
     ap.add_argument("--refill", action="store_true",
                     help="止盈卖出后次日开盘补买「下一名」候选，不再干等月末")
     ap.add_argument("--split", action="store_true", help="A：样本内 / 样本外分别比较")
@@ -379,7 +384,7 @@ def main() -> int:
     def run(tp, label, s=start, e=end, rebuy=args.rebuy):
         nav, tps = simulate(plan, picks, daily, exposure, tp=tp,
                             start=s, end=e, rebuy=rebuy,
-                            rank=rank, refill=args.refill)
+                            rank=rank, refill=args.refill, cost=args.cost)
         m = metrics(nav, label)
         m["tp_count"] = int(len(tps))
         m["n_refill"] = int(nav.attrs.get("n_refill", 0))
