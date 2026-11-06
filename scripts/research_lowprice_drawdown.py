@@ -54,6 +54,7 @@ EVENTS = HERE.parent / "data/regulatory/events.parquet"
 
 # 面板里带过来的因子列（features_daily 一次查全，省得二次 I/O）
 FACTOR_COLS = [
+    "dividend_rate",
     "pe_ttm",
     "pb",
     "ps_ttm",

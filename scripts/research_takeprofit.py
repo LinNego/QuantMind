@@ -141,8 +141,13 @@ def build_exposure(bl, con, plan: pd.DataFrame) -> dict[int, float]:
     out = {}
     for r in plan.itertuples():
         m = int(str(r.entry_dt)[4:6])           # 入场月
-        rule = MONTH_RULE.get(m, 1.0)
-        out[int(r.signal_dt)] = rule * float(ma.get(int(r.signal_dt), 1.0))
+        e = float(ma.get(int(r.signal_dt), 1.0))
+        if m == 4:                              # 4 月空仓，不管均线
+            out[int(r.signal_dt)] = 0.0
+        elif m == 1:                            # 1 月半仓：取 min(e, 0.5)，不是相乘
+            out[int(r.signal_dt)] = min(e, 0.5)
+        else:
+            out[int(r.signal_dt)] = e
     return out
 
 
