@@ -370,6 +370,64 @@ def timing_exposure(
     return out
 
 
+def breadth_table(
+    con: duckdb.DuckDBPyConnection, ma_days: int = 20
+) -> dict[int, float]:
+    """全 A 股「收盘价 > MA20」占比（%），按交易日。
+
+    口径与 docs/广度择时_过拟合检验.md 一致：不复权收盘、按 symbol 滚动
+    ``ma_days`` 日均线、只统计当日已满 ``ma_days`` 根 K 线的股票。
+    信号日当天收盘即可算出，因此不引入未来数据。
+    """
+    if ma_days < 2:
+        raise SystemExit(f"--breadth-ma 至少为 2：{ma_days}")
+    df = con.execute(
+        f"""
+        WITH d AS (
+            SELECT symbol, dt, close,
+                   avg(close) OVER (PARTITION BY symbol ORDER BY dt
+                                    ROWS BETWEEN {ma_days - 1} PRECEDING
+                                    AND CURRENT ROW) AS ma,
+                   row_number() OVER (PARTITION BY symbol ORDER BY dt) AS rn
+            FROM ku
+        )
+        SELECT dt, avg(CASE WHEN close > ma THEN 1.0 ELSE 0.0 END) * 100 AS breadth
+        FROM d WHERE rn >= {ma_days}
+        GROUP BY dt ORDER BY dt
+        """
+    ).df()
+    return {int(r.dt): float(r.breadth) for r in df.itertuples()}
+
+
+def apply_month_skip(prev, entry_of: dict[int, int], skip_months: dict[int, str]):
+    """按「买入月」空仓 / 减半，叠在已有的 exposure 规则之上。"""
+
+    def f(d: int) -> float:
+        e = float(prev(int(d)))
+        m = int(str(entry_of.get(int(d), int(d)))[4:6])
+        mode = skip_months.get(m)
+        if mode == "flat":
+            return 0.0
+        if mode == "half":
+            return min(e, 0.5)
+        return e
+
+    return f
+
+
+def apply_breadth(prev, breadth: dict[int, float], threshold: float, cap: float):
+    """广度低于阈值时把仓位压到 ``cap``（只压不抬，且排在月份规则之后）。"""
+
+    def f(d: int) -> float:
+        e = float(prev(int(d)))
+        b = breadth.get(int(d))
+        if b is not None and b < threshold:
+            e = min(e, cap)
+        return e
+
+    return f
+
+
 def investigation_blacklist(
     path: Path, signal_dates, window_days: int
 ) -> dict[int, set[str]]:
@@ -628,6 +686,21 @@ def main() -> int:
         action="store_true",
         help="事件表缺失时仍继续（默认 fail-closed，直接报错）",
     )
+    ap.add_argument(
+        "--breadth",
+        type=float,
+        default=0.0,
+        help="广度阈值（%%）：信号日全 A 股收盘>MA20 占比低于该值时压低仓位，0=关闭",
+    )
+    ap.add_argument(
+        "--breadth-e",
+        type=float,
+        default=0.3,
+        help="广度低于阈值时的仓位上限（默认 0.3，即三成）",
+    )
+    ap.add_argument(
+        "--breadth-ma", type=int, default=20, help="广度均线天数（默认 20）"
+    )
     ap.add_argument("--charts", type=Path, default=None, help="图表输出目录")
     ap.add_argument("--json", type=Path, default=None, help="指标 JSON 输出路径")
     args = ap.parse_args()
@@ -704,17 +777,21 @@ def main() -> int:
         entry_of = dict(
             zip(base.dt.astype(int), base.entry_dt.astype(int), strict=False)
         )
-        inner = exposure if exposure is not None else (lambda d: 1.0)
+        exposure = apply_month_skip(
+            exposure if exposure is not None else (lambda d: 1.0),
+            entry_of,
+            skip_months,
+        )
 
-        def exposure(d):  # noqa: F811
-            e = float(inner(int(d)))
-            m = int(str(entry_of.get(int(d), int(d)))[4:6])
-            mode = skip_months.get(m)
-            if mode == "flat":
-                return 0.0
-            if mode == "half":
-                return min(e, 0.5)
-            return e
+    breadth: dict[int, float] = {}
+    if args.breadth > 0:
+        breadth = breadth_table(con, args.breadth_ma)
+        exposure = apply_breadth(
+            exposure if exposure is not None else (lambda d: 1.0),
+            breadth,
+            args.breadth,
+            args.breadth_e,
+        )
 
     label = "策略"
     runs = {
@@ -762,6 +839,16 @@ def main() -> int:
     if skip_months:
         spec = ",".join(f"{m}:{skip_months[m]}" for m in sorted(skip_months))
         print(f"月份跳过：{spec}（按买入月）")
+    if args.breadth > 0:
+        n_hit = sum(
+            1
+            for d in plan.signal_dt
+            if breadth.get(int(d), 100.0) < args.breadth
+        )
+        print(
+            f"广度择时：全 A 股 <{args.breadth:g}% → 仓位 ≤ {args.breadth_e:g}"
+            f"（MA{args.breadth_ma}，触发 {n_hit}/{len(plan)} 期）"
+        )
     if args.exclude_investigation:
         nbad = sum(len(v) for v in blacklist.values()) / max(len(blacklist), 1)
         print(

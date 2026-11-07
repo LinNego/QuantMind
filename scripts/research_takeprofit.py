@@ -27,6 +27,9 @@
     python scripts/research_takeprofit.py --split          # A：样本内 vs 样本外
     python scripts/research_takeprofit.py --cash           # B：现金拖累
     python scripts/research_takeprofit.py --rebuy          # 止盈后当月末是否买回
+    python scripts/research_takeprofit.py --breadth 30     # 加广度择时（<30% → e≤0.3）
+    python scripts/research_takeprofit.py --tp 0.20 --breadth 30 \
+        --aw-file data/aw_8020.parquet                     # 闲钱按 80/20 全候记账
 """
 from __future__ import annotations
 
@@ -151,6 +154,66 @@ def build_exposure(bl, con, plan: pd.DataFrame) -> dict[int, float]:
     return out
 
 
+def build_breadth(con, ma_days: int = 20) -> dict[int, float]:
+    """全 A 股「收盘 > MA20」占比（%），口径同 docs/广度择时_过拟合检验.md。"""
+    if ma_days < 2:
+        raise SystemExit(f"--breadth-ma 至少为 2：{ma_days}")
+    df = con.execute(
+        f"""
+        WITH d AS (
+            SELECT symbol, dt, close,
+                   avg(close) OVER (PARTITION BY symbol ORDER BY dt
+                                    ROWS BETWEEN {ma_days - 1} PRECEDING
+                                    AND CURRENT ROW) AS ma,
+                   row_number() OVER (PARTITION BY symbol ORDER BY dt) AS rn
+            FROM ku
+        )
+        SELECT dt, avg(CASE WHEN close > ma THEN 1.0 ELSE 0.0 END) * 100 AS breadth
+        FROM d WHERE rn >= {ma_days}
+        GROUP BY dt ORDER BY dt
+        """
+    ).df()
+    return {int(r.dt): float(r.breadth) for r in df.itertuples()}
+
+
+def parse_weights(spec: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        sym, _, w = part.partition(":")
+        out[sym.strip()] = float(w)
+    total = sum(out.values())
+    if total <= 0:
+        raise SystemExit(f"--aw-weights 权重必须为正：{spec}")
+    return {k: v / total for k, v in out.items()}
+
+
+def load_aw(path: Path, weights: dict[str, float]) -> dict[int, float]:
+    """全天候「每日收益」表：dt,symbol,close（按权重重算）或 dt,aw_ret（直接用）。"""
+    if not path.exists():
+        raise SystemExit(f"全天候收益文件不存在：{path}")
+    df = (
+        pd.read_parquet(path)
+        if path.suffix.lower() in {".parquet", ".pq"}
+        else pd.read_csv(path)
+    )
+    cols = set(df.columns)
+    if "aw_ret" in cols:
+        return {int(r.dt): float(r.aw_ret) for r in df.itertuples()}
+    if not {"symbol", "dt", "close"} <= cols:
+        raise SystemExit("--aw-file 需要列 dt,symbol,close（或 dt,aw_ret）")
+    df["dt"] = df["dt"].astype(int)
+    px = df.pivot_table(index="dt", columns="symbol", values="close").sort_index()
+    ret = px.pct_change().fillna(0.0)
+    missing = [s for s in weights if s not in ret.columns]
+    if missing:
+        raise SystemExit(f"--aw-file 缺这些标的：{missing}")
+    blend = sum(ret[s] * w for s, w in weights.items())
+    return {int(d): float(v) for d, v in blend.items()}
+
+
 # ---------------------------------------------------------------------------
 # 模拟
 # ---------------------------------------------------------------------------
@@ -169,16 +232,34 @@ def simulate(
     rank: dict[int, list[str]] | None = None,
     refill: bool = False,
     cost: float | None = None,
+    aw: dict[int, float] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """逐日账本。返回 (日净值, 止盈明细)。
 
     ``refill=True``：止盈卖出后，**次日开盘**用这笔钱买排名下一个的候选股
     （按信号日的市值升序，跳过已持有和本月刚卖过的），不再干等月末调仓。
+
+    ``aw``：全天候每日收益（小数）。给了就把「闲钱」按全候副本记账——
+    现金不再是 0 收益，而是随 80/20 组合每日复利；买卖股票时在两者之间划转。
+    不给则等价于现金 0 收益（旧口径）。
     """
     buy_c = cost if cost is not None else BUY_COST
     sell_c = cost if cost is not None else SELL_COST
     by_dt = {int(d): g for d, g in picks.groupby("dt")}
-    cash = capital
+    aw_dates = np.array(sorted(aw)) if aw else None
+    aw_levels = (
+        np.concatenate([[1.0], np.cumprod([1.0 + aw[d] for d in aw_dates])])
+        if aw
+        else None
+    )
+
+    def aw_level(d: int) -> float:
+        """截至 d 收盘的全天候净值（起始 1.0）；无数据 = 1.0（现金口径）。"""
+        if aw_dates is None:
+            return 1.0
+        return float(aw_levels[np.searchsorted(aw_dates, d, side="right")])
+
+    cash_units = capital                      # 现金以「全天候份额」记
     hold: dict[str, dict[str, float]] = {}   # sym -> {shares, cost}
     nav_rows: list[dict] = []
     tp_rows: list[dict] = []
@@ -216,10 +297,12 @@ def simulate(
             pr = px_open(sym, e)
             if pr is None or pr <= 0:
                 continue
-            cash += hold[sym]["shares"] * pr * (1 - sell_c)
+            cash_units += hold[sym]["shares"] * pr * (1 - sell_c) / aw_level(e)
             hold.pop(sym)
 
-        nav_now = cash + sum(h["shares"] * (px_open(s, e) or 0.0) for s, h in hold.items())
+        nav_now = cash_units * aw_level(e) + sum(
+            h["shares"] * (px_open(s, e) or 0.0) for s, h in hold.items()
+        )
         if target and expo > 0:
             budget = nav_now * expo / len(target)
             for sym in target:
@@ -231,13 +314,13 @@ def simulate(
                 diff = want - cur
                 if diff > 0:
                     unit = pr * LOT * (1 + buy_c)
-                    diff = min(diff, int(cash // unit) * LOT)
+                    diff = min(diff, int(cash_units * aw_level(e) // unit) * LOT)
                     if diff <= 0:
                         continue
-                    cash -= diff * pr * (1 + buy_c)
+                    cash_units -= diff * pr * (1 + buy_c) / aw_level(e)
                     hold[sym] = {"shares": cur + diff, "cost": pr}
                 elif diff < 0:
-                    cash += -diff * pr * (1 - sell_c)
+                    cash_units += -diff * pr * (1 - sell_c) / aw_level(e)
                     keep = cur + diff
                     if keep <= 0:
                         hold.pop(sym, None)
@@ -263,9 +346,9 @@ def simulate(
                             continue
                         sh = lots * LOT
                         cost = sh * pr * (1 + buy_c)
-                        if cost > cash:
+                        if cost > cash_units * aw_level(d):
                             continue
-                        cash -= cost
+                        cash_units -= cost / aw_level(d)
                         hold[sym] = {"shares": sh, "cost": pr}
                         n_refill += 1
                         break
@@ -286,7 +369,7 @@ def simulate(
                         continue
                     fill = max(op, trigger) if np.isfinite(op) else trigger
                     proceeds = hold[sym]["shares"] * fill * (1 - sell_c)
-                    cash += proceeds
+                    cash_units += proceeds / aw_level(d)
                     tp_rows.append({
                         "sym": sym, "sell_dt": d, "exit_dt": x,
                         "cost": hold[sym]["cost"], "trigger": trigger, "fill": fill,
@@ -300,7 +383,7 @@ def simulate(
                         pending.append(proceeds)
 
             # 2) 日终估值
-            val = cash
+            val = cash_units * aw_level(d)
             for sym, h in hold.items():
                 t = daily.get(sym)
                 pr = None
@@ -309,7 +392,9 @@ def simulate(
                     if not np.isfinite(pr) or pr <= 0:
                         pr = None
                 val += h["shares"] * (pr if pr is not None else h["cost"])
-            nav_rows.append({"dt": d, "nav": val, "cash": cash, "n_hold": len(hold)})
+            nav_rows.append(
+                {"dt": d, "nav": val, "cash": cash_units * aw_level(d), "n_hold": len(hold)}
+            )
 
     nav_df = pd.DataFrame(nav_rows)
     nav_df.attrs["n_refill"] = n_refill
@@ -343,7 +428,6 @@ def metrics(nav: pd.DataFrame, label: str) -> dict:
 
 
 def fmt(rows: list[dict]) -> str:
-    cols = ["label", "annual", "mdd", "sharpe", "calmar", "final"]
     head = f"{'配置':<28}{'年化':>8}{'回撤':>9}{'夏普':>7}{'Calmar':>8}{'末值':>7}"
     out = [head, "-" * 68]
     for r in rows:
@@ -368,6 +452,19 @@ def main() -> int:
                     help="止盈卖出后次日开盘补买「下一名」候选，不再干等月末")
     ap.add_argument("--split", action="store_true", help="A：样本内 / 样本外分别比较")
     ap.add_argument("--cash", action="store_true", help="B：现金拖累与触发明细")
+    ap.add_argument(
+        "--breadth", type=float, default=0.0,
+        help="广度阈值（%%）：信号日全 A 股收盘>MA20 占比低于该值时压低仓位，0=关闭",
+    )
+    ap.add_argument("--breadth-e", type=float, default=0.3,
+                    help="广度低于阈值时的仓位上限（默认 0.3）")
+    ap.add_argument("--breadth-ma", type=int, default=20, help="广度均线天数（默认 20）")
+    ap.add_argument(
+        "--aw-file", type=Path, default=None,
+        help="全天候日线（dt,symbol,close 或 dt,aw_ret）；给了就把闲钱按全候记账",
+    )
+    ap.add_argument("--aw-weights", default="511220.SH:0.8,512890.SH:0.2",
+                    help="全候权重（默认 城投债 80%% + 红利低波 20%%）")
     ap.add_argument("--json", type=Path, default=None)
     args = ap.parse_args()
 
@@ -379,6 +476,21 @@ def main() -> int:
     picks = build_picks(pool)
     rank = build_rank(pool)
     exposure = build_exposure(bl, con, plan)
+    if args.breadth > 0:
+        breadth = build_breadth(con, args.breadth_ma)
+        exposure = {
+            d: (min(e, args.breadth_e) if breadth.get(int(d), 100.0) < args.breadth else e)
+            for d, e in exposure.items()
+        }
+        n_hit = sum(1 for d in exposure if breadth.get(int(d), 100.0) < args.breadth)
+        print(f"广度择时：<{args.breadth:g}% → 仓位 ≤ {args.breadth_e:g}（触发 {n_hit} 期）")
+    aw = (
+        load_aw(args.aw_file, parse_weights(args.aw_weights))
+        if args.aw_file
+        else None
+    )
+    if aw:
+        print(f"全天候记账：{args.aw_weights}，{len(aw)} 个交易日收益")
 
     syms = sorted(picks.symbol.unique())
     print(f"候选股 {len(syms)} 只，调仓期 {len(plan)} 个，缓存 {CACHE}")
@@ -389,7 +501,7 @@ def main() -> int:
     def run(tp, label, s=start, e=end, rebuy=args.rebuy):
         nav, tps = simulate(plan, picks, daily, exposure, tp=tp,
                             start=s, end=e, rebuy=rebuy,
-                            rank=rank, refill=args.refill, cost=args.cost)
+                            rank=rank, refill=args.refill, cost=args.cost, aw=aw)
         m = metrics(nav, label)
         m["tp_count"] = int(len(tps))
         m["n_refill"] = int(nav.attrs.get("n_refill", 0))
