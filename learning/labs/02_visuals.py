@@ -25,7 +25,7 @@ if FONT.exists():
     plt.rcParams["font.family"] = font_manager.FontProperties(fname=str(FONT)).get_name()
 plt.rcParams["axes.unicode_minus"] = False
 
-OUT = Path("/root/quant/QuantMind/docs/images/learning")
+OUT = Path("/root/quant/QuantMind/learning/assets")
 OUT.mkdir(parents=True, exist_ok=True)
 
 DATA = "/opt/quantmind/data/quantdb/6_ml_datasets/features_daily"

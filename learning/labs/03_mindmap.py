@@ -18,7 +18,7 @@ CN = font_manager.FontProperties(fname=str(FONT)).get_name()
 plt.rcParams["font.family"] = CN
 plt.rcParams["axes.unicode_minus"] = False
 
-OUT = Path("/root/quant/QuantMind/docs/images/learning/00_mindmap.png")
+OUT = Path("/root/quant/QuantMind/learning/assets/00_mindmap.png")
 
 # (id, parent, 文本, 颜色, 深度)  深度 0=根 1=阶段 2=模块 3=产出
 NODES = [

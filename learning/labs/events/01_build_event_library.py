@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 SRC = ROOT / "data/regulatory/events.parquet"
 OUT = ROOT / "data/events/event_library.parquet"
 

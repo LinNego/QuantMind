@@ -22,7 +22,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 EVENTS = ROOT / "data/events/event_library.parquet"
 FEAT = "/opt/quantmind/data/quantdb/6_ml_datasets/features_daily"
 OUT = ROOT / "data/events/event_study_result.parquet"

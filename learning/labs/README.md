@@ -3,9 +3,9 @@
 这里放学习阶段的脚本，**不属于生产代码**，可以随便改、随便删。
 
 > **定位**：这是「实验室」，不是教材。
-> 原理与判据在 [research/手册](../../research/手册/README.md)，每章跑什么在
-> [实验手册](../../research/手册/实验手册.md)，自测在 [评测题库](../../research/手册/评测题库.md)，
-> 16 周节奏在 [Agent 与量化学习路线](../../research/手册/Agent与量化学习路线.md)。
+> 原理与判据在 [learning/README.md](../README.md)，每章跑什么在
+> [实验手册](../实验手册.md)，自测在 [评测题库](../评测题库.md)，
+> 16 周节奏在 [Agent 与量化学习路线](../Agent与量化学习路线.md)。
 
 ## 文件
 
@@ -18,21 +18,21 @@
 | [`04_correlation.py`](04_correlation.py) | 谁和小盘策略相关性最低（候选第二腿） | 做到 03/04 时 |
 | [`05_dividend_vs_smallcap.py`](05_dividend_vs_smallcap.py) | 送转 vs 微盘：相关性 / 年化 / 回撤 / 组合效果 | 做到 03 时 |
 
-事件相关脚本在 [`scripts/events/`](../events/)：
+事件相关脚本在 [`learning/labs/events/`](events/)：
 
 | 文件 | 讲什么 |
 |---|---|
-| [`01_build_event_library.py`](../events/01_build_event_library.py) | 公告 → 标准事件库（去重、is_first、days_since） |
-| [`02_event_study.py`](../events/02_event_study.py) | 最小事件研究：AR、t 值、安慰剂 |
+| [`01_build_event_library.py`](events/01_build_event_library.py) | 公告 → 标准事件库（去重、is_first、days_since） |
+| [`02_event_study.py`](events/02_event_study.py) | 最小事件研究：AR、t 值、安慰剂 |
 
 ## 运行方式
 
 ```bash
 cd /root/quant/QuantMind
-/root/quant/.venv/bin/python3 scripts/learning/00_mini.py
+/root/quant/.venv/bin/python3 learning/labs/00_mini.py
 ```
 
-输出图片写到 `docs/images/learning/`。
+输出图片写到 `learning/assets/`。
 
 ## 环境
 
@@ -59,7 +59,9 @@ cd /root/quant/QuantMind
 **前四个够第 1–8 周用。** `alpha_library` 到做「用标准答案校准评测器」时再下。
 
 事件数据在 `data/events/`（`event_library.parquet`、`event_study_result.parquet`），
-由 `scripts/events/01` 和 `02` 生成。
+由 `learning/labs/events/01` 和 `02` 生成。
+
+> 每日 / 每周补数别再用全量下载：见 [QuantDB 增量更新](../../docs/QuantDB增量更新.md)。
 
 ## 记录
 

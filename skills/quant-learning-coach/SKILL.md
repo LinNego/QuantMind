@@ -25,7 +25,7 @@ description: "量化学习教练 — 按《量化手册》出题、判卷、复�
 
 ### 1. 出题（默认）
 
-从 [评测题库](../../research/手册/评测题库.md) 按章节抽 **3 题**，再出 **1 道应用题**（用他手上的数据/策略）。
+从 [评测题库](../../learning/评测题库.md) 按章节抽 **3 题**，再出 **1 道应用题**（用他手上的数据/策略）。
 
 规则：
 - 先问他「哪一章」，没指定就按当前进度抽。
@@ -53,11 +53,11 @@ description: "量化学习教练 — 按《量化手册》出题、判卷、复�
 2. 卡在哪一步？
 3. 下周第一件事是什么？
 
-然后把答案按模板写进 [`scripts/learning/LOG.md`](../../scripts/learning/LOG.md) 当周那一节。
+然后把答案按模板写进 [`learning/labs/LOG.md`](../../learning/labs/LOG.md) 当周那一节。
 
 ### 4. 路线
 
-按 [16 周表](../../research/手册/Agent与量化学习路线.md) 定位他在第几周、当前等级（L0–L4），
+按 [16 周表](../../learning/Agent与量化学习路线.md) 定位他在第几周、当前等级（L0–L4），
 给出**本周唯一交付物**和验收标准。不要一次给三个任务。
 
 ### 5. 元复盘（学 Agent 用）
@@ -88,12 +88,12 @@ description: "量化学习教练 — 按《量化手册》出题、判卷、复�
 
 | 他要 | 你读 |
 |---|---|
-| 总纲 / 等级 | `research/手册/README.md` |
-| 某一章的原理 | `research/手册/0X-*.md` |
-| 动手实验 | `research/手册/实验手册.md` |
-| 题目与判分 | `research/手册/评测题库.md` |
-| 16 周路线 | `research/手册/Agent与量化学习路线.md` |
-| 他的进度 | `scripts/learning/LOG.md` |
+| 总纲 / 等级 | `learning/README.md` |
+| 某一章的原理 | `learning/0X-*.md` |
+| 动手实验 | `learning/实验手册.md` |
+| 题目与判分 | `learning/评测题库.md` |
+| 16 周路线 | `learning/Agent与量化学习路线.md` |
+| 他的进度 | `learning/labs/LOG.md` |
 
 ---
 
