@@ -237,6 +237,62 @@ SELECT MAX(time) FROM read_parquet('/opt/quantmind/data/quantdb/1_kline_data/dai
 
 ---
 
-## 8 一句话
+## 8 实测记录（2026-11-15）
+
+| 项 | 结果 |
+|---|---|
+| 起点 | 数据停在 **2026-10-30**，落后 11 个交易日 |
+| 数据集 | 8 个：3 套日线 + 指数 + 估值 + 技术指标 + 情绪 + 两融 |
+| 下载 | **7,887 个文件，0 失败**，约 1.5 GB，耗时约 13 分钟 |
+| 终点 | **2026-11-13**（最近交易日） |
+| 流量 | 11 GB 额度用掉 1.5 GB，剩余 9.5 GB |
+
+```bash
+export QUANTDB_API_KEY='qdb_...'
+export QM_QUANTDB_DATA_DIR=/opt/quantmind/data/quantdb
+/root/quant/.venv/bin/python3 backend/scripts/quantdb_daily_sync.py   --parquet-only   --datasets daily_unadjusted,daily_forward,daily_backward,index_daily,\
+valuation,technical_indicators,market_sentiment,margin_trading
+```
+
+**两个必须知道的点**：
+
+1. **首轮会「整表重下」几个数据集**（实测：`daily_forward` 2638、`margin_trading` 2637、`valuation` 2476）。
+   原因是本地文件来自 ModelScope，字节指纹与 API release 对象不一致。
+   **这是一次性成本**：跑完一轮，状态库换成 API 指纹，第二次就正常了。
+   实测第二轮 `daily_forward`：`已最新，0 files downloaded`。
+2. 结尾的 `psycopg2 ... no password supplied` **只影响「系统事件记录」**，不影响 parquet。
+   要跑全链路（PG/Qlib）先配好 `DB_PASSWORD`。
+
+---
+
+## 9 L1 / L2 / L1+L2 因子表：先别下
+
+| 数据集 | 大小 | 内容 | 建议 |
+|---|---|---|---|
+| `features_daily` | 3.37 GB | 300+ 维预计算 ML 宽表 | **学习/建模优先** |
+| `l1_factors` | 6.98 GB | 日频因子（2016 起） | 订阅后第二优先 |
+| `l2_factors` | 16.69 GB | 高频微观结构（2023 起） | 有分钟级项目再下 |
+| `l1_l2_factors` | 23.76 GB | L1 + L2 合并（≈两者之和） | **不要和 l1/l2 重复下** |
+
+**硬约束**：
+
+- 第 6 类（模型训练数据集）**仅订阅用户可下载**。免费 / 10GB 体验包用户请求会直接 `403`：
+  `无权访问：模型训练数据集（第 6 大类）仅限订阅用户下载`。
+- 当前额度 9.5 GB：**连 `l1_factors` 单独都紧张**，更不用说 L2。
+
+**订阅后怎么选**（50 GB/月）：
+
+| 目标 | 下什么 | 合计 |
+|---|---|---|
+| 学习 ML / 跑通流程 | `features_daily` | 3.4 GB |
+| 做日频因子研究 | `features_daily` + `l1_factors` | 10.4 GB |
+| 做高频 / 盘口 | `l2_factors`（或 `l1_l2_factors`） | 16.7 / 23.8 GB |
+
+> **别一次全下。** `l1_l2_factors` 就是 L1+L2 的并集，下了它就不要再下 l1/l2。
+> 先把 `features_daily` 用透，再决定要不要为 L2 付第二个月的流量。
+
+---
+
+## 10 一句话
 
 > **首次用 ModelScope，日常用 API；增量靠 release 游标 + 指纹对账，不是靠「再下一次全量」。**
