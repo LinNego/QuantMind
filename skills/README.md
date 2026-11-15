@@ -43,6 +43,12 @@ cp -r skills/<skill-name> ~/.claude/skills/
 | [news-sentiment-research](news-sentiment-research/) | 新闻情绪研究方法论：42万篇 RSS 新闻 → FinBERT+词典情绪 → 事件研究 + 七维分析 → 优化回测 → 研报 MD+PDF | 新闻情绪、新闻规律、情绪回测、消息面 |
 | [news-sentiment-finbert](news-sentiment-finbert/) | RSS 新闻情绪识别（FinBERT）安装与运维：管线架构、权重下载、字典扩充、全量重算 | 新闻情绪、FinBERT、情绪不生效、新闻重算 |
 
+### 学习与教练
+
+| 技能 | 功能 | 触发词示例 |
+|------|------|-----------|
+| [quant-learning-coach](quant-learning-coach/) | 量化学习教练：按手册出题、判卷、复盘，管理 16 周 Agent×量化路线；不代笔、不荐股 | 学量化、考考我、判卷、复盘、学习计划 |
+
 ### 策略 · 因子 · 模型 · 回测
 
 | 技能 | 功能 | 触发词示例 |
