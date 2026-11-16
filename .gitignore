@@ -296,3 +296,6 @@ config/training_nodes.yaml
 !research/out/**
 data/delisted/
 data/regulatory/
+
+# 2026-11 归档：旧学习材料作废，不再引用
+_archive/
