@@ -1,0 +1,142 @@
+# 行业研究卡 v2 —— 纯研究口径，不含交易规则
+# 字段说明见 schema 注释；加行业 = 加一张卡，不改代码。
+
+schema: 2
+
+cards:
+
+- meta: {id: ai, name: AI/算力, chain: midstream, version: 1, updated: 2026-11-22,
+         links: {upstream: [semi, resource], downstream: [consumer]}}
+  drivers: [云厂商capex, 光模块出货, 国产算力订单]
+  indicators:
+    - {key: capex,   name: 北美四大云capex, layer: demand,    source: manual,    freq: quarterly, direction: up,   signal: {type: yoy, op: ">", value: 0.15}, weight: 0.35, fill_by: 财报季}
+    - {key: opt_exp, name: 光模块出口同比,   layer: demand,    source: manual,    freq: monthly,   direction: up,   signal: {type: yoy, op: ">", value: 0.20}, weight: 0.25}
+    - {key: tsmc,    name: 台积电月营收,     layer: price,     source: manual,    freq: monthly,   direction: up,   signal: {type: yoy, op: ">", value: 0.10}, weight: 0.20}
+    - {key: idx,     name: 全指信息,         layer: price,     source: index,     code: sh000993, freq: daily, direction: up, signal: {type: momentum, window: 60, op: ">", value: 0}, weight: 0.20}
+  verify:
+    - {key: gm,  name: 通信设备毛利率, source: financial, freq: quarterly, direction: up}
+    - {key: inv, name: 存货周转天数,   source: financial, freq: quarterly, direction: down}
+  valuation: {index: sh000993, pe_window: 5y, weight: 0.15}
+  thresholds: {start_rs60: 0.05, overheat_rs60: 0.30}
+  invalidate:
+    - 北美四大 capex 指引下调
+    - 光模块出口同比连续 2 个月转负
+
+- meta: {id: semi, name: 半导体, chain: upstream, version: 1, updated: 2026-11-22,
+         links: {upstream: [resource], downstream: [ai, manufacture]}}
+  drivers: [存储价格, 晶圆厂稼动率, 库存周期]
+  indicators:
+    - {key: dram,  name: DRAM现货价,   layer: price,     source: manual,    freq: weekly,  direction: up,   signal: {type: momentum, window: 4, op: ">", value: 0}, weight: 0.35}
+    - {key: util,  name: 晶圆厂稼动率, layer: demand,    source: manual,    freq: monthly, direction: up,   signal: {type: level, op: ">", value: 0.80}, weight: 0.25}
+    - {key: idx,   name: 科创50,       layer: price,     source: index,     code: sh000688, freq: daily, direction: up, signal: {type: momentum, window: 60, op: ">", value: 0}, weight: 0.25}
+    - {key: inv,   name: 渠道库存周数, layer: inventory, source: manual,    freq: monthly, direction: down, signal: {type: level, op: "<", value: 8}, weight: 0.15}
+  verify:
+    - {key: gm,  name: 存储厂毛利率, source: financial, freq: quarterly, direction: up}
+    - {key: inv, name: 库存周转天数, source: financial, freq: quarterly, direction: down}
+  valuation: {index: sh000688, pe_window: 5y, weight: 0.15}
+  thresholds: {start_rs60: 0.05, overheat_rs60: 0.35}
+  invalidate:
+    - DRAM 现货价连续 6 周下跌
+    - 稼动率跌破 70%
+
+- meta: {id: newenergy, name: 新能源, chain: midstream, version: 1, updated: 2026-11-22,
+         links: {upstream: [resource], downstream: [consumer, manufacture]}}
+  drivers: [渗透率, 锂价, 排产]
+  indicators:
+    - {key: lc,    name: 碳酸锂,     layer: price,     source: futures, code: LC0,     freq: daily,   direction: up,   signal: {type: momentum, window: 60, op: ">", value: 0}, weight: 0.35}
+    - {key: si,    name: 工业硅,     layer: price,     source: futures, code: SI0,     freq: daily,   direction: up,   signal: {type: momentum, window: 60, op: ">", value: 0}, weight: 0.15}
+    - {key: sched, name: 电池排产,   layer: demand,    source: manual,  freq: monthly, direction: up,   signal: {type: mom, op: ">", value: 0}, weight: 0.30}
+    - {key: inst,  name: 光伏装机,   layer: demand,    source: manual,  freq: monthly, direction: up,   signal: {type: yoy, op: ">", value: 0.10}, weight: 0.20}
+  verify:
+    - {key: gm,   name: 电池毛利率,   source: financial, freq: quarterly, direction: up}
+    - {key: util, name: 产能利用率,   source: financial, freq: quarterly, direction: up}
+  valuation: {index: sz399808, pe_window: 5y, weight: 0.15}
+  thresholds: {start_rs60: 0.05, overheat_rs60: 0.30}
+  invalidate:
+    - 锂价连续 3 个月下跌
+    - 排产环比下修超 20%
+
+- meta: {id: pharma, name: 医药, chain: downstream, version: 1, updated: 2026-11-22,
+         links: {upstream: [resource], downstream: [consumer]}}
+  drivers: [创新药审批, 集采降价幅度, 医保谈判]
+  indicators:
+    - {key: appr,  name: 创新药获批数, layer: demand, source: manual, freq: monthly, direction: up,   signal: {type: mom, op: ">", value: 0}, weight: 0.35}
+    - {key: bd,    name: BD交易金额,   layer: demand, source: manual, freq: monthly, direction: up,   signal: {type: mom, op: ">", value: 0}, weight: 0.25}
+    - {key: idx,   name: 全指医药,     layer: price,  source: index,  code: sh000991, freq: daily, direction: up, signal: {type: momentum, window: 60, op: ">", value: 0}, weight: 0.40}
+  verify:
+    - {key: rev, name: 单季营收同比, source: financial, freq: quarterly, direction: up}
+    - {key: rd,  name: 研发费用率,   source: financial, freq: quarterly, direction: up}
+  valuation: {index: sh000991, pe_window: 5y, weight: 0.20}
+  thresholds: {start_rs60: 0.03, overheat_rs60: 0.25}
+  invalidate:
+    - 集采平均降价超 60% 且范围扩大
+    - 创新药获批数连续 2 季下滑
+
+- meta: {id: consumer, name: 消费, chain: downstream, version: 1, updated: 2026-11-22,
+         links: {upstream: [resource], downstream: []}}
+  drivers: [居民收入预期, 白酒批价, 渠道库存]
+  indicators:
+    - {key: retail, name: 社零同比,     layer: demand,    source: manual, freq: monthly, direction: up,   signal: {type: level, op: ">", value: 0.03}, weight: 0.25}
+    - {key: price,  name: 白酒批价,     layer: price,     source: manual, freq: monthly, direction: up,   signal: {type: momentum, window: 3, op: ">", value: 0}, weight: 0.25}
+    - {key: inv,    name: 渠道库存月数, layer: inventory, source: manual, freq: monthly, direction: down, signal: {type: level, op: "<", value: 2}, weight: 0.20}
+    - {key: idx,    name: 中证消费,     layer: price,     source: index,  code: sh000932, freq: daily, direction: up, signal: {type: momentum, window: 60, op: ">", value: 0}, weight: 0.30}
+  verify:
+    - {key: pre, name: 预收款同比, source: financial, freq: quarterly, direction: up}
+    - {key: gm,  name: 毛利率,     source: financial, freq: quarterly, direction: up}
+  valuation: {index: sh000932, pe_window: 5y, weight: 0.20}
+  thresholds: {start_rs60: 0.03, overheat_rs60: 0.20}
+  invalidate:
+    - 白酒批价连续 3 个月下跌
+    - 渠道库存回升至 3 个月以上
+
+- meta: {id: finance, name: 金融, chain: midstream, version: 1, updated: 2026-11-22,
+         links: {upstream: [], downstream: [consumer, manufacture]}}
+  drivers: [流动性, 净息差, 资本市场活跃度]
+  indicators:
+    - {key: margin, name: 两融余额同比, layer: demand, source: manual, freq: daily, direction: up,   signal: {type: mom, op: ">", value: 0}, weight: 0.30}
+    - {key: y10,    name: 10Y国债收益率, layer: price, source: manual, freq: daily, direction: up,   signal: {type: momentum, window: 20, op: ">", value: 0}, weight: 0.20}
+    - {key: loan,   name: 社融同比,     layer: demand, source: manual, freq: monthly, direction: up, signal: {type: level, op: ">", value: 0.08}, weight: 0.20}
+    - {key: idx,    name: 全指金融,     layer: price,  source: index,  code: sh000992, freq: daily, direction: up, signal: {type: momentum, window: 60, op: ">", value: 0}, weight: 0.30}
+  verify:
+    - {key: nim, name: 净息差,     source: financial, freq: quarterly, direction: up}
+    - {key: fee, name: 经纪收入同比, source: financial, freq: quarterly, direction: up}
+  valuation: {index: sh000992, pe_window: 5y, weight: 0.20}
+  thresholds: {start_rs60: 0.03, overheat_rs60: 0.15}
+  invalidate:
+    - 净息差继续压缩至 1.2% 以下
+    - 两融余额连续 3 个月下降
+
+- meta: {id: resource, name: 资源, chain: upstream, version: 1, updated: 2026-11-22,
+         links: {upstream: [], downstream: [newenergy, manufacture, ai]}}
+  drivers: [全球需求, 供给扰动, 库存]
+  indicators:
+    - {key: cu,   name: 铜,   layer: price,     source: futures, code: CU0, freq: daily, direction: up,   signal: {type: momentum, window: 60, op: ">", value: 0}, weight: 0.25}
+    - {key: al,   name: 铝,   layer: price,     source: futures, code: AL0, freq: daily, direction: up,   signal: {type: momentum, window: 60, op: ">", value: 0}, weight: 0.15}
+    - {key: au,   name: 黄金, layer: price,     source: futures, code: AU0, freq: daily, direction: up,   signal: {type: momentum, window: 60, op: ">", value: 0}, weight: 0.15}
+    - {key: oil,  name: 原油, layer: price,     source: futures, code: SC0, freq: daily, direction: up,   signal: {type: momentum, window: 60, op: ">", value: 0}, weight: 0.15}
+    - {key: inv,  name: 交易所库存, layer: inventory, source: manual, freq: weekly, direction: down, signal: {type: mom, op: "<", value: 0}, weight: 0.30}
+  verify:
+    - {key: gm, name: 矿企毛利率, source: financial, freq: quarterly, direction: up}
+    - {key: tc, name: 冶炼加工费, source: manual,    freq: monthly,   direction: up}
+  valuation: {index: sh000987, pe_window: 5y, weight: 0.15}
+  thresholds: {start_rs60: 0.03, overheat_rs60: 0.25}
+  invalidate:
+    - 交易所库存连续 8 周累积
+    - 铜价跌破 8 万
+
+- meta: {id: manufacture, name: 高端制造, chain: equipment, version: 1, updated: 2026-11-22,
+         links: {upstream: [resource], downstream: [newenergy, ai]}}
+  drivers: [军工订单, 制造业投资, 设备更新]
+  indicators:
+    - {key: order, name: 军工订单,   layer: demand, source: manual, freq: quarterly, direction: up,   signal: {type: mom, op: ">", value: 0}, weight: 0.30}
+    - {key: pmi,   name: PMI新订单, layer: demand, source: manual, freq: monthly,   direction: up,   signal: {type: level, op: ">", value: 50}, weight: 0.20}
+    - {key: exc,   name: 挖机销量,   layer: demand, source: manual, freq: monthly,   direction: up,   signal: {type: yoy, op: ">", value: 0}, weight: 0.20}
+    - {key: idx,   name: 中证军工,   layer: price,  source: index,  code: sz399967, freq: daily, direction: up, signal: {type: momentum, window: 60, op: ">", value: 0}, weight: 0.30}
+  verify:
+    - {key: backlog, name: 合同负债同比, source: financial, freq: quarterly, direction: up}
+    - {key: gm,      name: 毛利率,       source: financial, freq: quarterly, direction: up}
+  valuation: {index: sz399967, pe_window: 5y, weight: 0.15}
+  thresholds: {start_rs60: 0.03, overheat_rs60: 0.25}
+  invalidate:
+    - 合同负债连续 2 季下滑
+    - PMI 新订单跌破 48

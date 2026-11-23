@@ -1,0 +1,109 @@
+# AI 算力产业链拆解
+schema: 2
+industry: ai
+name: AI/算力
+updated: 2026-11-22
+
+anchors:
+  CU0: {name: 铜, use: PCB/电缆}
+
+segments:
+  - id: optical_module
+    name: 光模块
+    stage: midstream
+    note: 800G/1.6T 数通光模块，AI 集群互联
+    members:
+      - {code: sz300308, name: 中际旭创}
+      - {code: sz300502, name: 新易盛}
+      - {code: sz002281, name: 光迅科技}
+      - {code: sz000988, name: 华工科技}
+      - {code: sh603083, name: 剑桥科技}
+      - {code: sz300394, name: 天孚通信}
+
+  - id: optical_chip
+    name: 光芯片
+    stage: upstream
+    note: EML/DFB 激光器芯片，光模块的上游
+    members:
+      - {code: sh688498, name: 源杰科技}
+      - {code: sh688313, name: 仕佳光子}
+      - {code: sh688048, name: 长光华芯}
+
+  - id: fiber
+    name: 光纤光缆
+    stage: midstream
+    note: 长飞/亨通/中天，运营商集采+海缆+DCI，与光模块不同周期
+    members:
+      - {code: sh601869, name: 长飞光纤}
+      - {code: sh600487, name: 亨通光电}
+      - {code: sh600522, name: 中天科技}
+      - {code: sh600498, name: 烽火通信}
+      - {code: sh600105, name: 永鼎股份}
+
+  - id: pcb
+    name: PCB
+    stage: midstream
+    note: 高多层板/HDI，AI 服务器与交换机载板
+    members:
+      - {code: sz002463, name: 沪电股份}
+      - {code: sh600183, name: 生益科技}
+      - {code: sz002916, name: 深南电路}
+      - {code: sz300476, name: 胜宏科技}
+
+  - id: memory
+    name: 存储
+    stage: upstream
+    note: DRAM/NAND 模组与主控
+    members:
+      - {code: sh603986, name: 兆易创新}
+      - {code: sz301308, name: 江波龙}
+      - {code: sh688525, name: 佰维存储}
+      - {code: sz001309, name: 德明利}
+
+  - id: compute_chip
+    name: 算力芯片
+    stage: upstream
+    note: CPU/GPU/DCU，国产替代主线
+    members:
+      - {code: sh688041, name: 海光信息}
+      - {code: sh688256, name: 寒武纪}
+      - {code: sz300474, name: 景嘉微}
+      - {code: sh688047, name: 龙芯中科}
+
+  - id: idc
+    name: IDC/算力中心
+    stage: downstream
+    note: 机柜租赁、智算中心
+    members:
+      - {code: sz300442, name: 润泽科技}
+      - {code: sz300383, name: 光环新网}
+      - {code: sh603881, name: 数据港}
+      - {code: sz300738, name: 奥飞数据}
+
+  - id: cooling
+    name: 液冷/电源
+    stage: equipment
+    note: 冷板液冷、UPS、HVDC
+    members:
+      - {code: sz002837, name: 英维克}
+      - {code: sz301018, name: 申菱环境}
+      - {code: sz002851, name: 麦格米特}
+      - {code: sz002335, name: 科华数据}
+
+  - id: switch
+    name: 交换机
+    stage: midstream
+    note: 数据中心交换机、白盒
+    members:
+      - {code: sz000938, name: 紫光股份}
+      - {code: sz301165, name: 锐捷网络}
+      - {code: sz000063, name: 中兴通讯}
+
+  - id: server
+    name: 服务器
+    stage: downstream
+    note: AI 服务器整机与代工
+    members:
+      - {code: sz000977, name: 浪潮信息}
+      - {code: sh603019, name: 中科曙光}
+      - {code: sh601138, name: 工业富联}

@@ -1,0 +1,149 @@
+# 新能源产业链拆解（锂电 + 光伏）
+# 用途：① 发现——扫描各环节价格/出口异常 ② 跟踪——合成环节指数看弱强
+schema: 2
+industry: newenergy
+name: 新能源
+updated: 2026-11-22
+
+# 价格锚（期货，自动）
+anchors:
+  LC0: {name: 碳酸锂, use: 锂电}
+  SI0: {name: 工业硅, use: 光伏}
+  SA0: {name: 纯碱,   use: 光伏玻璃}
+  CU0: {name: 铜,     use: 电缆/电机}
+
+segments:
+
+  - id: lithium
+    name: 锂矿
+    stage: upstream
+    price: [LC0]
+    members:
+      - {code: sz002466, name: 天齐锂业}
+      - {code: sz002460, name: 赣锋锂业}
+      - {code: sz000792, name: 盐湖股份}
+      - {code: sz002756, name: 永兴材料}
+      - {code: sz002738, name: 中矿资源}
+
+  - id: cathode
+    name: 正极材料
+    stage: midstream
+    price: [LC0]
+    members:
+      - {code: sh688005, name: 容百科技}
+      - {code: sz300073, name: 当升科技}
+      - {code: sz300769, name: 德方纳米}
+      - {code: sz301358, name: 湖南裕能}
+
+  - id: anode
+    name: 负极材料
+    stage: midstream
+    price: []
+    members:
+      - {code: sh603659, name: 璞泰来}
+      - {code: sh600884, name: 杉杉股份}
+
+  - id: separator
+    name: 隔膜
+    stage: midstream
+    price: []
+    members:
+      - {code: sz002812, name: 恩捷股份}
+      - {code: sz300568, name: 星源材质}
+
+  - id: electrolyte
+    name: 电解液
+    stage: midstream
+    price: [LC0]
+    members:
+      - {code: sz002709, name: 天赐材料}
+      - {code: sz300037, name: 新宙邦}
+      - {code: sz002407, name: 多氟多}
+
+  - id: cell
+    name: 电芯
+    stage: midstream
+    price: []
+    members:
+      - {code: sz300750, name: 宁德时代}
+      - {code: sz300014, name: 亿纬锂能}
+      - {code: sz002074, name: 国轩高科}
+      - {code: sz300207, name: 欣旺达}
+
+  - id: equipment
+    name: 锂电设备
+    stage: equipment
+    price: []
+    members:
+      - {code: sz300450, name: 先导智能}
+      - {code: sh688006, name: 杭可科技}
+
+  - id: polysilicon
+    name: 硅料
+    stage: upstream
+    price: [SI0]
+    members:
+      - {code: sh600438, name: 通威股份}
+      - {code: sh688303, name: 大全能源}
+      - {code: sh600089, name: 特变电工}
+
+  - id: wafer
+    name: 硅片
+    stage: midstream
+    price: [SI0]
+    members:
+      - {code: sz002129, name: TCL中环}
+      - {code: sh601012, name: 隆基绿能}
+      - {code: sh600481, name: 双良节能}
+
+  - id: cell_pv
+    name: 电池片
+    stage: midstream
+    price: [SI0]
+    members:
+      - {code: sh600732, name: 爱旭股份}
+      - {code: sz002865, name: 钧达股份}
+
+  - id: module
+    name: 组件
+    stage: midstream
+    price: [SI0]
+    members:
+      - {code: sh688223, name: 晶科能源}
+      - {code: sh688599, name: 天合光能}
+      - {code: sz002459, name: 晶澳科技}
+
+  - id: inverter
+    name: 逆变器
+    stage: equipment
+    price: []
+    members:
+      - {code: sz300274, name: 阳光电源}
+      - {code: sz300763, name: 锦浪科技}
+      - {code: sh688390, name: 固德威}
+      - {code: sh605117, name: 德业股份}
+
+  - id: glass
+    name: 光伏玻璃
+    stage: material
+    price: [SA0]
+    members:
+      - {code: sh601865, name: 福莱特}
+      - {code: sz002623, name: 亚玛顿}
+
+  - id: film
+    name: 胶膜
+    stage: material
+    price: []
+    members:
+      - {code: sh603806, name: 福斯特}
+      - {code: sh688680, name: 海优新材}
+
+  - id: storage
+    name: 储能
+    stage: downstream
+    price: [LC0]
+    members:
+      - {code: sz300274, name: 阳光电源}
+      - {code: sh688063, name: 派能科技}
+      - {code: sz300068, name: 南都电源}
