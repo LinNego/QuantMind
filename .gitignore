@@ -95,6 +95,12 @@ db.tar.gz
 *.bin
 *.pkl
 *.parquet
+# 例外：研究小缓存要入库（见 refdata/README.md）
+!refdata/*.parquet
+!refdata/*.pkl
+# 但这两个 11-13MB 的估值面板不入库：--rebuild-panel 一分钟就能重建
+refdata/val_month.parquet
+refdata/val_month2.parquet
 *.csv
 !backend/tests/**/*.csv
 !data/examples/**/*.csv
@@ -299,3 +305,6 @@ data/regulatory/
 
 # 2026-11 归档：旧学习材料作废，不再引用
 _archive/
+
+# 研究用大文件价格面板（可由 scripts/build_price_panel.py 重建）
+refdata_big/

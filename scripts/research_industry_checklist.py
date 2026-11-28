@@ -32,7 +32,9 @@ import pandas as pd
 DB = Path("/opt/quantmind/data/quantdb")
 VAL = DB / "5_technical_derived" / "valuation"
 INST = DB / "2_base_sector" / "instrument_detail" / "instrument_list.parquet"
-CACHE = Path("/tmp/val_month.parquet")
+REF = Path(__file__).resolve().parent.parent / "refdata"
+BIG = Path(__file__).resolve().parent.parent / "refdata_big"
+CACHE = REF / "val_month.parquet"
 
 # 阈值
 PB_MAX = 0.20      # PB 36 个月分位
@@ -91,7 +93,12 @@ def build_panel() -> tuple[pd.DataFrame, pd.DatetimeIndex]:
         .sort_values(["ind", "dt"])
     )
 
-    close = pd.read_parquet("/tmp/close_daily_backward.parquet").sort_index()
+    price = next((p for p in (BIG / "close_daily_backward.parquet",
+                              REF / "close_daily_backward.parquet",
+                              Path("/tmp/close_daily_backward.parquet")) if p.exists()), None)
+    if price is None:
+        raise SystemExit("缺少价格面板：先跑 python scripts/build_price_panel.py")
+    close = pd.read_parquet(price).sort_index()
     close.index = pd.to_datetime(close.index)
     ind_px = industry_index(close, lab)
 
